@@ -216,3 +216,43 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# === Project-specific ===
+
+# Private build artifacts — local only, never push
+LAUNCH_POST.md
+PRD.md
+BIZ.md
+GTM.md
+BOTTLENECKS.md
+EVAL_LOG.md
+PROGRESS_NOTES.md
+
+# Local data + model artifacts (large, never push)
+data/raw/
+data/processed/
+data/cache/
+models/*.pkl
+models/*.pth
+models/*.pt
+models/*.bin
+models/*.safetensors
+models/*.h5
+models/*.joblib
+
+# Persistent memory store (project-local)
+.iterate/
+
+# Secrets
+.env.*
+*.pem
+*.key
+secrets/
+credentials/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
