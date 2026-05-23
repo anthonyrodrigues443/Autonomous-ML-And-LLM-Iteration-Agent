@@ -59,6 +59,9 @@ dependencies = [
 # Anthropic Claude is the only major backend that's NOT OpenAI-compatible —
 # install only if you want to use Claude as a backend.
 anthropic = ["anthropic>=0.40.0"]
+# MCP (Model Context Protocol) integration — pluggable tools + data sources
+# (filesystem, postgres, notion, drive, github, etc.). Week 4+ feature.
+mcp = ["mcp>=0.9.0"]
 notion = ["notion-client>=2.2.0"]
 dashboard = ["streamlit>=1.40.0", "plotly>=5.24.0"]
 dev = [

@@ -46,6 +46,27 @@
 
 ---
 
+## Week 4 Backlog (preview — locks in once Wk 1-3 ship)
+
+The Week 4 phase shifts the agent from "runs experiments in isolation" to "discovers data + history via MCP servers and grounds itself before iterating."
+
+| # | Task | Files |
+|---|------|-------|
+| 4.1 | MCP client — connects to multiple servers via stdio/HTTP | `src/iterate/mcp/client.py` |
+| 4.2 | MCP server registry — config-driven lifecycle (spawn/kill/health-check) | `src/iterate/mcp/registry.py` |
+| 4.3 | MCP-to-OpenAI tool bridge — translate MCP tool defs to OpenAI tool schemas (works with Ollama, Groq, etc.) | `src/iterate/mcp/tool_bridge.py` |
+| 4.4 | Wire filesystem MCP server (read local notebooks/docs/logs) | config + docs |
+| 4.5 | Wire postgres MCP server (DB introspection + read-only sampling) | config + docs |
+| 4.6 | Wire notion MCP server (search past experiment pages, write new ones) | config + docs |
+| 4.7 | Discovery flow — `iterate init --discover` introspects all MCPs, surfaces summary, pauses for human review | `src/iterate/core/discovery.py` |
+| 4.8 | Researcher (arxiv + papers-with-code) — uses MCP for paper retrieval where available | `src/iterate/core/researcher.py` |
+| 4.9 | Proposer — uses memory + MCP-discovered context to rank candidates | `src/iterate/core/proposer.py` |
+| 4.10 | Memory store integration — every experiment + tool call logged for audit | `src/iterate/core/memory.py` |
+| 4.11 | Logging adapter via Notion MCP — write experiment cards to Notion | `src/iterate/adapters/logging/notion.py` |
+| 4.12 | Logging adapter for plain markdown (fallback when no Notion) | `src/iterate/adapters/logging/markdown.py` |
+
+---
+
 ## Done
 
 ### 2026-05-23 | Week 0 | Project scoped, repo scaffolded

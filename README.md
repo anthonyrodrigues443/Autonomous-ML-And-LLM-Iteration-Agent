@@ -18,7 +18,7 @@
 | 1 | Framework skeleton + LLM client + first end-to-end smoke test | ⏳ |
 | 2 | `ModelTarget` + sklearn/XGBoost adapters + first tabular iteration | — |
 | 3 | `PromptTarget` + LLM-as-judge eval + first prompt iteration | — |
-| 4 | Researcher + Proposer + Memory + Logging adapters (Notion / MD) | — |
+| 4 | Researcher + Proposer + Memory + Logging + **MCP layer** (filesystem / postgres / notion plug-ins for data discovery + experiment history search) | — |
 | 5 | Termination logic + multi-LLM backend benchmark + Streamlit dashboard + demo | — |
 
 ---
@@ -55,6 +55,42 @@ Every decision cites either a paper or a past experiment. Every failure is logge
 | `PromptTarget` | Runs an LLM prompt, scores outputs (LLM-as-judge or labeled set) | Jigsaw toxicity classification |
 
 Both inherit from `BenchmarkTarget`. Same iteration loop. Different sandbox execution path.
+
+---
+
+## Pluggable tools + data sources (via MCP)
+
+`iterate` uses **Model Context Protocol (MCP)** servers as its tool + data layer. Adding a new data source = config-only, no code changes.
+
+Ships with:
+
+| MCP server | What it enables |
+|---|---|
+| `filesystem` | Read local notebooks, past experiment logs, internal docs |
+| `postgres` | DB introspection + read-only sampling (for data discovery) |
+| `notion` | Search past experiment pages, write new experiment cards |
+
+**The discovery workflow** (Week 4 feature):
+
+```
+> iterate init --target churn_baseline --discover
+
+[agent introspects via MCP]
+  postgres.list_tables             → users, subs, tickets, ...
+  postgres.describe_table("users") → schema
+  notion.search("churn")           → 3 past experiment pages
+  filesystem.search("churn|retention") → 2 local notebooks
+
+Agent SUMMARY (paused for human review):
+  Found 8 tables. Likely relevant: users, subscriptions, support_tickets.
+  Past experiments in Notion: 3 attempts, best F1=0.78 (CatBoost, March).
+  Inferred target: users.churned_30d. Inferred metric: F1.
+  
+  Any other artifacts I should know about?
+  > [paste URLs, additional context, then 'go']
+```
+
+Add any other MCP server (Drive, GitHub, Slack, Sentry, custom) by editing one YAML file. The MCP-to-OpenAI-tool bridge layer means it works against Ollama, Groq, Together, Deepseek, OpenAI, and Anthropic alike.
 
 ---
 
