@@ -19,28 +19,56 @@
 | 2 | `ModelTarget` + sklearn/XGBoost adapters + first tabular iteration | — |
 | 3 | `PromptTarget` + LLM-as-judge eval + first prompt iteration | — |
 | 4 | Researcher + Proposer + Memory + Logging + **MCP layer** (filesystem / postgres / notion plug-ins for data discovery + experiment history search) | — |
-| 5 | Termination logic + multi-LLM backend benchmark + Streamlit dashboard + demo | — |
+| 5 | Termination logic + multi-LLM backend benchmark + **Streamlit chat UI** (demo-ready, looks like a desktop app) + demo video | — |
 
 ---
 
 ## What it does
 
-You give `iterate`:
-- A **dataset** or **prompt + eval set** (a `BenchmarkTarget`)
-- A **baseline metric** to beat
-- **Constraints**: deadline, compute budget, patience threshold
-- A **logging target**: Notion page, Markdown file, Google Drive
-
-It runs an autonomous loop until it beats the baseline, runs out of ideas, or hits the deadline:
+**You give it one input. It figures out the rest.**
 
 ```
-1. Research — query arxiv + papers-with-code for relevant 2024-2026 work
+> iterate "improve our customer churn baseline"
+```
+
+Everything else is discovered:
+
+| The agent autonomously finds | How |
+|---|---|
+| Which repo has the code | Filesystem + GitHub MCP — scan READMEs for keywords, fall back to recent commit activity |
+| Training script + current baseline metric | Code parsing + MLflow / W&B MCP — extract from runs, comments, results JSON |
+| Eval methodology + holdout split | Filesystem — find test/eval scripts |
+| Relevant data tables | Postgres MCP — list, sample, infer relationships |
+| Past experiment history (and why things failed) | Notion MCP — semantic search |
+| Domain context | Synthesize from READMEs + commit messages |
+
+It then **surfaces what it found and pauses for your gap-fill** before iterating:
+
+```
+🤖 I found:
+   Repo:       customer-platform/ml-models/churn (last commit: 3d ago)
+   Training:   train_churn.py — CatBoost, F1=0.78 baseline
+   Past tries: 4 attempts in Notion. Best: March, tenure features, F1=0.78.
+   Tables:     users, subscriptions, support_tickets, events
+   Missing:    No eval script located. Where does evaluation live?
+
+> Eval is in customer-platform/eval/churn_eval.py. Also new plan_tier column.
+
+🤖 Got it. My top recommendation:
+   → LightGBM + focal loss (Lin et al 2024) — addresses class imbalance 
+     that broke March's attempt. Est +0.04 F1, 4 min runtime. Go?
+```
+
+Then the autonomous loop:
+
+```
+1. Research — arxiv + papers-with-code for relevant 2024-2026 work
 2. Propose — LLM ranks candidate experiments by expected impact ÷ cost
 3. Memory check — has this been tried? did conditions change since the last failure?
-4. Run — execute the experiment in a sandboxed environment
+4. Run — execute in a sandboxed environment
 5. Score — compare against baseline
 6. Log — write a reasoning-trail card to your logging target
-7. Decide — continue or terminate (deadline, no-improvement, plateau, idea-exhaustion)
+7. Decide — continue or terminate (deadline / patience / plateau / idea-exhaustion)
 ```
 
 Every decision cites either a paper or a past experiment. Every failure is logged with the **reason it failed** so the agent can revisit when conditions change.
@@ -107,13 +135,11 @@ ollama serve  # starts background server at localhost:11434
 # Install iterate
 pip install iterate
 
-# Initialize a project
+# Run it (the agent discovers everything else)
+iterate "improve our customer churn baseline"
+
+# Power-user: skip discovery, give explicit pointers
 iterate init --data train.csv --target churn --baseline 0.78 --metric f1
-
-# Single iteration
-iterate run
-
-# Autonomous run until deadline
 iterate run --until 2026-06-01 --patience 15
 
 # Inspect history
@@ -123,6 +149,38 @@ iterate best
 ```
 
 Full CLI reference: `iterate --help`
+
+---
+
+## Demo UI (Week 5)
+
+A Streamlit-based chat interface that looks and feels like a desktop app — launches in your browser, runs entirely locally, screenshot-ready for demos:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  iterate                                                  │
+├─────────────────┬────────────────────────────────────────┤
+│ MCP STATUS      │  > iterate "improve churn baseline"     │
+│ ✓ filesystem    │                                          │
+│ ✓ postgres      │  🤖 Scanning your repos...               │
+│ ✓ notion        │     Found 3 candidate repos.             │
+│ ✓ github        │                                          │
+│                 │  🤖 Reading customer-platform/...        │
+│ EXPERIMENTS     │     Baseline: CatBoost F1=0.78           │
+│ #001 ✅ +0.04   │                                          │
+│ #002 ❌         │  🤖 Found 4 past experiments in Notion.   │
+│ #003 🔁         │     Best: March, tenure features.        │
+│                 │                                          │
+│ MEMORY          │  🤖 Anything else I should know about?    │
+│ 47 entries      │                                          │
+│ 12 retried      │  > Eval lives in eval/churn_eval.py      │
+│                 │                                          │
+│ COST            │  🤖 Got it. Top recommendation: ...       │
+│ $0.03 today     │                                          │
+└─────────────────┴────────────────────────────────────────┘
+```
+
+CLI is the canonical install. The Streamlit chat is the demo-ready interface.
 
 ---
 

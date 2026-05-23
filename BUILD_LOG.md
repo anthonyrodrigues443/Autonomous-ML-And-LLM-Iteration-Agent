@@ -48,22 +48,54 @@
 
 ## Week 4 Backlog (preview — locks in once Wk 1-3 ship)
 
-The Week 4 phase shifts the agent from "runs experiments in isolation" to "discovers data + history via MCP servers and grounds itself before iterating."
+The Week 4 phase shifts the agent from "user provides 9 inputs" to **"user provides one input — `iterate 'improve our churn baseline'` — and the agent discovers everything else."**
+
+### Autonomous discovery is the single biggest differentiator. It's the demo headline.
 
 | # | Task | Files |
 |---|------|-------|
 | 4.1 | MCP client — connects to multiple servers via stdio/HTTP | `src/iterate/mcp/client.py` |
 | 4.2 | MCP server registry — config-driven lifecycle (spawn/kill/health-check) | `src/iterate/mcp/registry.py` |
-| 4.3 | MCP-to-OpenAI tool bridge — translate MCP tool defs to OpenAI tool schemas (works with Ollama, Groq, etc.) | `src/iterate/mcp/tool_bridge.py` |
+| 4.3 | MCP-to-OpenAI tool bridge — translate MCP tool defs to OpenAI tool schemas | `src/iterate/mcp/tool_bridge.py` |
 | 4.4 | Wire filesystem MCP server (read local notebooks/docs/logs) | config + docs |
 | 4.5 | Wire postgres MCP server (DB introspection + read-only sampling) | config + docs |
 | 4.6 | Wire notion MCP server (search past experiment pages, write new ones) | config + docs |
-| 4.7 | Discovery flow — `iterate init --discover` introspects all MCPs, surfaces summary, pauses for human review | `src/iterate/core/discovery.py` |
-| 4.8 | Researcher (arxiv + papers-with-code) — uses MCP for paper retrieval where available | `src/iterate/core/researcher.py` |
-| 4.9 | Proposer — uses memory + MCP-discovered context to rank candidates | `src/iterate/core/proposer.py` |
-| 4.10 | Memory store integration — every experiment + tool call logged for audit | `src/iterate/core/memory.py` |
-| 4.11 | Logging adapter via Notion MCP — write experiment cards to Notion | `src/iterate/adapters/logging/notion.py` |
-| 4.12 | Logging adapter for plain markdown (fallback when no Notion) | `src/iterate/adapters/logging/markdown.py` |
+| 4.7 | Wire github MCP server (scan repos for relevance) | config + docs |
+| 4.8 | **Discovery agent** — given one-line goal, scans filesystem/GH/DB/Notion, infers baseline + metric + eval method + relevant tables, surfaces summary, pauses for human gap-fill | `src/iterate/core/discovery.py` |
+| 4.9 | Researcher (arxiv + papers-with-code) | `src/iterate/core/researcher.py` |
+| 4.10 | Proposer — uses memory + discovered context to rank candidates | `src/iterate/core/proposer.py` |
+| 4.11 | Memory store integration — every experiment + tool call logged for audit | `src/iterate/core/memory.py` |
+| 4.12 | Logging adapter via Notion MCP — write experiment cards to Notion | `src/iterate/adapters/logging/notion.py` |
+| 4.13 | Logging adapter for plain markdown (fallback when no Notion) | `src/iterate/adapters/logging/markdown.py` |
+
+### Discovery agent specifics (Task 4.8 — the differentiator)
+
+The discovery agent is what makes the demo wow. It does:
+
+1. Parse the one-line goal into search keywords
+2. List candidate repos (filesystem + github MCP) — rank by README keyword match, fall back to recent commit activity
+3. Read top 1-3 candidate repos: train scripts, notebooks, requirements.txt, model artifacts
+4. Extract current baseline metric (from MLflow runs, W&B, code comments, results JSON)
+5. Identify eval methodology (test split definitions, eval scripts)
+6. Query Postgres MCP: list_tables, sample, infer relationships to the problem
+7. Search Notion MCP: past pages mentioning the project + extract failure reasons
+8. Synthesize "what I found" summary
+9. Identify gaps ("I couldn't find X")
+10. Pause for user input. Commit gap-fill into memory. Then iterate.
+
+---
+
+## Week 5 Backlog (preview)
+
+| # | Task | Files |
+|---|------|-------|
+| 5.1 | Terminator — patience / deadline / compute budget / plateau detection | `src/iterate/core/terminator.py` |
+| 5.2 | Reporter — generates run summary + PR-shaped report | `src/iterate/core/reporter.py` |
+| 5.3 | **Streamlit chat UI** — sidebar (MCP status + experiments + memory + cost), chat input, live agent reasoning stream | `src/iterate/ui/chat.py` |
+| 5.4 | Second example target (intent_clinc150) to prove framework genericity | `examples/intent_clinc150/` |
+| 5.5 | Multi-LLM backend benchmark — same task run on Ollama / Groq / Together / Deepseek / Anthropic | `examples/benchmark/` |
+| 5.6 | Demo video walking through full discovery → iteration loop | `docs/demo.md` + recording |
+| 5.7 | Final README polish, launch post assembly from LAUNCH_POST.md | `README.md`, `LAUNCH_POST.md` |
 
 ---
 
