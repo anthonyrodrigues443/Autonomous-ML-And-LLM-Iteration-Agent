@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # ─── LLM backend (default: local Ollama, $0, no key) ───────────
     iterate_backend_url: str = "http://localhost:11434/v1"
     iterate_backend_api_key: str = "ollama"
-    iterate_model: str = "qwen2.5-coder:14b"
+    iterate_model: str = "qwen3:14b"  # emits structured tool calls (qwen2.5-coder does not)
     iterate_backend_timeout: float = 120.0
 
     # ─── Sandbox + dataset access ──────────────────────────────────

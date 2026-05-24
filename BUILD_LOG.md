@@ -96,7 +96,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 4 | Pydantic schemas — `Experiment`, `ExperimentResult`, `Metrics`, `FailureCase`, `Candidate` | `src/iterate/schemas/experiment.py` | ✅ |
 | 5 | `LLMClient` protocol — what every backend implements | `src/iterate/llm/base.py` | ✅ |
 | 6 | `OpenAICompatibleClient` — first real working LLM call (default: Ollama localhost:11434 + qwen2.5-coder:14b) | `src/iterate/llm/openai_compatible.py` | ✅ |
-| 7 | Smoke test — Ollama call end-to-end (plain chat ✅ live; structured tool-calling ⏳ pending tool-capable model) | `tests/unit/test_openai_compatible.py` | 🟡 |
+| 7 | Smoke test — Ollama call end-to-end (plain chat + structured tool-calling, validated on qwen3:14b) | `tests/unit/test_openai_compatible.py` | ✅ |
 | 8 | CLI scaffold — `iterate --help` runs (no commands yet, just typer setup) | `src/iterate/cli.py` | ⏳ |
 | 9 | First commit message convention doc (semantic commits) | `BUILD_LOG.md` (this section) | ✅ |
 | 10 | Central config (pulled fwd from Day 3) — all defaults in one place, env/secret override | `src/iterate/config.py` | ✅ |
@@ -181,8 +181,10 @@ The discovery agent is what makes the demo wow. It does:
 **Decisions:** (see RESEARCH_LOG 2026-05-24)
 - Direct vendor SDKs, not LangChain. Sync client for v1. Tool-calling in the interface. LLM types in `schemas/llm.py`. Config centralized (defaults one place; secrets override). Next tool-driving model = **qwen3:14b** (validate qwen3:8b first; flip `config.iterate_model` once it tool-calls structurally).
 
+**Update (later 2026-05-24 — carry-over RESOLVED):** `qwen3:14b` finished downloading and was validated through the client — `has_tool_calls=True`, args parsed to dict, `finish=tool_calls`. Flipped `config.iterate_model` default to `qwen3:14b` (+ `.env.example`). Day 2 now complete, including live agentic tool-calling. Noted: qwen3's thinking mode is on by default (spends tokens before the answer → needs generous budgets); bumped the live smoke to `max_tokens=512`.
+
 **Next session (2026-05-25):**
-- Finish `qwen3:14b` download → validate structured tool-calling through the client → flip the default model. Then Day 3 proper: CLI scaffold (`iterate --help`).
+- Day 3 proper: CLI scaffold (`iterate --help`, typer setup). Possibly handle qwen3 thinking-mode toggling when wiring prompts.
 
 ### 2026-05-24 | Week 1 Day 1 | Pre-flight verification + Pydantic schemas
 
