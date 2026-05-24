@@ -30,6 +30,38 @@
 
 ---
 
+## Week 1 Day-by-Day Plan
+
+Realistic per-session scope (3 hours focused). One real commit per day.
+
+| Day | Date | Focus | Lands |
+|---|---|---|---|
+| **1** | 2026-05-24 (Sun) | Pre-flight verification + Pydantic schemas | `src/iterate/schemas/experiment.py` (Experiment, ExperimentResult, Metrics, FailureCase, Candidate) + `tests/unit/test_schemas.py` |
+| **2** | 2026-05-25 (Mon) | LLMClient protocol + OpenAICompatibleClient against Ollama | `src/iterate/llm/base.py` + `src/iterate/llm/openai_compatible.py` + smoke test that actually calls qwen2.5-coder:14b |
+| **3** | 2026-05-26 (Tue) | CLI scaffold + config loader | `src/iterate/cli.py` (typer app, `iterate --help` works) + `src/iterate/config.py` (loads .env, validates) |
+| **4** | 2026-05-27 (Wed) | First tool definition + tool dispatcher (just a stub — real ones land Week 2-4) | `src/iterate/tools/base.py` + a sandbox-stub tool to prove the loop |
+| **5** | 2026-05-28 (Thu) | Anthropic adapter (the one non-OpenAI-compatible backend) — optional via `iterate[anthropic]` | `src/iterate/llm/anthropic_client.py` + parity tests |
+| **6** | 2026-05-29 (Fri) | Memory store skeleton — sqlite + retrieval API (real population happens Week 4) | `src/iterate/core/memory.py` + `tests/unit/test_memory.py` |
+| **7** | 2026-05-30 (Sat) | Polish + smoke test the full Week 1 stack: config loads → llm client connects → tool dispatcher routes → memory writes | Wk1 retrospective entry in BUILD_LOG |
+
+**Slack day:** Sunday May 31 (rest, or catch up on anything that slipped).
+
+### Daily session shape
+
+```
+[20 min]  Read BUILD_LOG → pick today's task
+[30 min]  Research via Claude chat — papers, libraries, alternatives
+[10 min]  Log decision in RESEARCH_LOG (your words)
+[90 min]  Write code (you type, Claude critiques/suggests in chat)
+[20 min]  Tests + verify
+[10 min]  Commit (your own message) + push + PR + merge
+[10 min]  Update BUILD_LOG: move task to Done with brief note
+```
+
+Total: ~3 hrs. If a session needs more, the task was too big — split it.
+
+---
+
 ## Week 1 Backlog (P0 = blocking, ordered)
 
 | # | Task | Files | Done? |
