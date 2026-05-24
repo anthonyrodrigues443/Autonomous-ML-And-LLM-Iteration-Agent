@@ -6,6 +6,30 @@
 
 ---
 
+## Scope & timeline (updated 2026-05-24)
+
+Scope expanded from the original 5-week tabular-ML + prompt build → an **~11-week build (May 23 – ~Aug 8)** covering three target families + the cost-constrained moat. PRD has full detail; README has the public phase table.
+
+- **Targets:** `ModelTarget` (tabular ML) · `DLModelTarget` (vision, transfer learning — validated on local RTX 4050) · `PromptTarget` (production LLM prompts, **prompt-iteration only** — no LLM fine-tuning).
+- **Moat:** cost-constrained optimization — pure score within a hard serving-cost budget; deliverable is a **serving profile** (best affordable model + cheapest cloud + $/mo + req/hr). Plus rich auto-discovered context (DB / MCP / Drive).
+- **Compute:** pluggable backend — local MPS · RTX 4050 (GPU validation) · e2b · cloud-GPU adapter (large jobs).
+
+| Wk | Phase |
+|---|---|
+| 1 | Skeleton + LLM client + smoke test |
+| 2 | `ModelTarget` (tabular) + sklearn/XGBoost |
+| 3 | `PromptTarget` + LLM-as-judge |
+| 4 | `DLModelTarget` — vision transfer learning (validated on 4050) |
+| 5 | Quantization + serving-cost estimator + cost-constrained recommendation + `iterate cost` |
+| 6 | Pluggable compute backends + cloud-GPU adapter interface |
+| 7 | Researcher + Proposer + Memory |
+| 8 | MCP layer + discovery agent  *(the "Week 4 Backlog" preview below)* |
+| 9 | Terminator + multi-LLM + score × serving-cost benchmark |
+| 10 | Streamlit UI + demos + demo video  *(the "Week 5 Backlog" preview below)* |
+| 11 | Buffer / polish / launch |
+
+---
+
 ## Format per session entry
 
 ```markdown
@@ -52,7 +76,7 @@ Realistic per-session scope (3 hours focused). One real commit per day.
 [20 min]  Read BUILD_LOG → pick today's task
 [30 min]  Research via Claude chat — papers, libraries, alternatives
 [10 min]  Log decision in RESEARCH_LOG (your words)
-[90 min]  Write code (you type, Claude critiques/suggests in chat)
+[90 min]  Write code (you decide what + why + critique/suggest/review; Claude writes)
 [20 min]  Tests + verify
 [10 min]  Commit (your own message) + push + PR + merge
 [10 min]  Update BUILD_LOG: move task to Done with brief note
@@ -78,7 +102,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 
 ---
 
-## Week 4 Backlog (preview — locks in once Wk 1-3 ship)
+## Week 4 Backlog (preview — now scheduled for Week 8 under the expanded plan)
 
 The Week 4 phase shifts the agent from "user provides 9 inputs" to **"user provides one input — `iterate 'improve our churn baseline'` — and the agent discovers everything else."**
 
@@ -117,7 +141,7 @@ The discovery agent is what makes the demo wow. It does:
 
 ---
 
-## Week 5 Backlog (preview)
+## Week 5 Backlog (preview — now scheduled for Weeks 9–10 under the expanded plan)
 
 | # | Task | Files |
 |---|------|-------|

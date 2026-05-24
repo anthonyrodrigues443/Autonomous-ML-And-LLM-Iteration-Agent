@@ -4,13 +4,13 @@
 
 > Every YC batch ships 200+ AI startups with 2-3 engineer teams. Under shipping pressure, two things break: nobody re-iterates models against new baselines, and LLM prompts sit in production for months untouched. Engineers re-run failed experiments because nobody logged why. Teams pay GPT-5 prices because nobody tested whether Haiku + better prompting would do the job at 1/50th the cost.
 >
-> AutoML brute-forces. Experiment trackers only log. Prompt evals only evaluate. AIDE iterates Kaggle problems once. `iterate` is the only system that runs an autonomous, literature-aware, memory-persistent improvement loop on BOTH ML models AND LLM prompts in production — with human-approval safety gates and append-only reasoning logs to wherever your team reads.
+> AutoML brute-forces. Experiment trackers only log. Prompt evals only evaluate. AIDE iterates Kaggle problems once. `iterate` is the only system that runs an autonomous, literature-aware, memory-persistent improvement loop on **ML models, DL/vision models, AND LLM prompts** in production — optimizing for the best model you can actually **afford to serve** (cheapest cloud, cost/month, requests/hour) — pulling its own training data + context from your DBs, files, and docs (via MCP) — with human-approval safety gates and append-only reasoning logs to wherever your team reads.
 
 ---
 
 ## Status
 
-🚧 **Building. Week 0 of 5.** First production-ready release planned for end of Week 5.
+🚧 **Building. Week 1 of ~11.** First production-ready release planned for ~Aug 2026.
 
 | Week | Phase | Status |
 |---|---|---|
@@ -18,8 +18,13 @@
 | 1 | Framework skeleton + LLM client + first end-to-end smoke test | ⏳ |
 | 2 | `ModelTarget` + sklearn/XGBoost adapters + first tabular iteration | — |
 | 3 | `PromptTarget` + LLM-as-judge eval + first prompt iteration | — |
-| 4 | Researcher + Proposer + Memory + Logging + **MCP layer** (filesystem / postgres / notion plug-ins for data discovery + experiment history search) | — |
-| 5 | Termination logic + multi-LLM backend benchmark + **Streamlit chat UI** (demo-ready, looks like a desktop app) + demo video | — |
+| 4 | `DLModelTarget` — vision via transfer learning (PyTorch/torchvision), validated on local RTX 4050 | — |
+| 5 | Quantization + serving-cost estimator + **cost-constrained recommendation** + `iterate cost` | — |
+| 6 | Pluggable compute backends (local MPS / RTX 4050 / e2b) + **cloud-GPU adapter** interface | — |
+| 7 | Researcher + Proposer + Memory | — |
+| 8 | **MCP layer** (filesystem / postgres / notion) + discovery agent | — |
+| 9 | Termination logic + multi-LLM + **score × serving-cost benchmark** | — |
+| 10 | **Streamlit chat UI** + demos (tabular churn, vision, toxicity prompt) + demo video | — |
 
 ---
 
@@ -63,7 +68,7 @@ Then the autonomous loop:
 
 ```
 1. Research — arxiv + papers-with-code for relevant 2024-2026 work
-2. Propose — LLM ranks candidate experiments by expected impact ÷ cost
+2. Propose — LLM ranks candidate experiments by expected score gain
 3. Memory check — has this been tried? did conditions change since the last failure?
 4. Run — execute in a sandboxed environment
 5. Score — compare against baseline
@@ -75,14 +80,15 @@ Every decision cites either a paper or a past experiment. Every failure is logge
 
 ---
 
-## Two target families
+## Three target families
 
 | Target | What it iterates on | Example demo (ships with the framework) |
 |---|---|---|
-| `ModelTarget` | Trains a model, scores it on a holdout | Tabular churn prediction (Kaggle) |
-| `PromptTarget` | Runs an LLM prompt, scores outputs (LLM-as-judge or labeled set) | Jigsaw toxicity classification |
+| `ModelTarget` | Trains a tabular model, scores it on a holdout | Tabular churn prediction (Kaggle) |
+| `DLModelTarget` | Transfer-learns a vision model (fine-tunes a pretrained backbone), scores it | Image classification (validated on local RTX 4050) |
+| `PromptTarget` | Runs an LLM prompt in production, scores outputs (LLM-as-judge or labeled set) | Jigsaw toxicity classification |
 
-Both inherit from `BenchmarkTarget`. Same iteration loop. Different sandbox execution path.
+All inherit from `BenchmarkTarget`. Same iteration loop. Different execution path. (LLMs are **prompt-iteration only** — we don't fine-tune foundation models.)
 
 ---
 
@@ -152,7 +158,7 @@ Full CLI reference: `iterate --help`
 
 ---
 
-## Demo UI (Week 5)
+## Demo UI (Week 10)
 
 A Streamlit-based chat interface that looks and feels like a desktop app — launches in your browser, runs entirely locally, screenshot-ready for demos:
 
@@ -191,18 +197,20 @@ iterate/
 ├── core/                # framework reasoning engine
 │   ├── orchestrator     # the main loop
 │   ├── researcher       # arxiv + papers-with-code retrieval
-│   ├── proposer         # LLM ranks candidate experiments
+│   ├── proposer         # ranks candidates by score, within the serving budget
+│   ├── serving_cost     # cheapest-cloud + cost/mo + req/hr estimator
 │   ├── memory           # persistent store (sqlite)
 │   ├── terminator       # deadline / patience / plateau gates
 │   └── reporter         # PR-shaped report generator
 ├── targets/             # what gets iterated on
 │   ├── base             # BenchmarkTarget protocol
-│   ├── model            # ModelTarget
-│   └── prompt           # PromptTarget
+│   ├── model            # ModelTarget (tabular)
+│   ├── dl_model         # DLModelTarget (vision, transfer learning)
+│   └── prompt           # PromptTarget (prompt-iteration)
 ├── adapters/            # pluggable I/O
 │   ├── data/            # csv, kaggle, huggingface, postgres
 │   ├── models/          # sklearn, xgboost, lightgbm, pytorch
-│   ├── compute/         # local, e2b sandbox
+│   ├── compute/         # local (MPS), gpu (RTX 4050), e2b, cloud (user's cloud / rented GPU)
 │   └── logging/         # markdown, notion_mcp, slack
 ├── llm/                 # multi-backend LLM client
 │   ├── anthropic_client # Claude (Opus / Haiku)
@@ -212,11 +220,11 @@ iterate/
 └── schemas/             # Pydantic types
 ```
 
-**The LLM is plug-and-play.** Claude, GPT, Llama 3.3, Deepseek — flip a config flag. The moat is the agentic harness (memory + research + tools + bounded loop), not the model.
+**The LLM is plug-and-play.** Claude, GPT, Llama 3.3, Deepseek — flip a config flag. The moat is the agentic harness (memory + research + tools + bounded loop), not the model — and the optimization target is the best model you can actually *afford to serve*: pure score inside a hard serving-cost budget, with a recommendation of the cheapest cloud to host it on, its monthly cost, and its requests/hour throughput.
 
 ---
 
-## Multi-LLM backend (planned Week 5 benchmark)
+## Multi-LLM backend (planned Week 9 benchmark)
 
 | Backend | Est. cost per run | Notes |
 |---|---|---|
@@ -225,7 +233,7 @@ iterate/
 | Llama 3.3 70B (Together) | ~$0.20 | Free tier available via Groq |
 | Deepseek V3 | ~$0.10 | Strong on code |
 
-Week 5 will ship the head-to-head matrix on identical tasks.
+Week 9 will ship the head-to-head matrix on identical tasks — scored on quality **and** serving cost.
 
 ---
 
@@ -234,6 +242,7 @@ Week 5 will ship the head-to-head matrix on identical tasks.
 | Capability | AutoML (DataRobot/H2O) | W&B / MLflow | Braintrust / LangSmith | AIDE | **iterate** |
 |---|---|---|---|---|---|
 | Iterates ML models | ✅ | — | — | ✅ | ✅ |
+| Iterates DL / vision models (transfer learning) | partial | — | — | partial | ✅ |
 | Iterates LLM prompts | — | — | eval only | — | ✅ |
 | Literature-aware | ❌ | ❌ | ❌ | partial | ✅ |
 | Persistent memory across sessions | ❌ | log only | ❌ | ❌ | ✅ |
@@ -243,6 +252,8 @@ Week 5 will ship the head-to-head matrix on identical tasks.
 | Human-approval gate | ❌ | n/a | ❌ | ❌ | ✅ |
 | Logs to Notion / Drive / MD | ❌ | own dashboard | own dashboard | ❌ | ✅ |
 | Multi-LLM backend | ❌ | n/a | partial | ❌ | ✅ |
+| Cost-to-serve–aware optimization (cheapest cloud, $/mo, req/hr — best score you can afford to serve) | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Auto-discovers training data + context (DB / MCP / Drive) | ❌ | ❌ | ❌ | partial | ✅ |
 | Open-source | mostly ❌ | MLflow yes | ❌ | ✅ | ✅ |
 
 ---

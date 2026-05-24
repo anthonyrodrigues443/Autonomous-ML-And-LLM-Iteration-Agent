@@ -227,6 +227,7 @@ GTM.md
 BOTTLENECKS.md
 EVAL_LOG.md
 PROGRESS_NOTES.md
+IDEAS.md
 
 # Local data + model artifacts (large, never push)
 data/raw/
