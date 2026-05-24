@@ -212,11 +212,11 @@ iterate/
 │   ├── models/          # sklearn, xgboost, lightgbm, pytorch
 │   ├── compute/         # local (MPS), gpu (RTX 4050), e2b, cloud (user's cloud / rented GPU)
 │   └── logging/         # markdown, notion_mcp, slack
-├── llm/                 # multi-backend LLM client
-│   ├── anthropic_client # Claude (Opus / Haiku)
-│   ├── openai_client    # GPT
-│   ├── together_client  # Llama via Together AI
-│   └── deepseek_client  # Deepseek
+├── llm/                  # pluggable multi-backend LLM client
+│   ├── base              # LLMClient protocol (provider-agnostic interface)
+│   ├── openai_compatible # one client for ALL OpenAI-compatible backends
+│   │                     #   (Ollama default · Groq · Together · Deepseek · OpenAI · vLLM)
+│   └── anthropic_client  # Claude — the only non-OpenAI-compatible backend (Week 5, optional)
 └── schemas/             # Pydantic types
 ```
 

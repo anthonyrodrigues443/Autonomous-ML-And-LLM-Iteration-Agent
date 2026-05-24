@@ -94,11 +94,13 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 2 | `.env.example` with Ollama default + optional cloud backend keys (Groq/Together/Deepseek/Anthropic/OpenAI) + e2b + Kaggle | `.env.example` | ✅ |
 | 3 | Empty `src/iterate/` package skeleton (folders + `__init__.py`) | `src/iterate/**/` | ✅ |
 | 4 | Pydantic schemas — `Experiment`, `ExperimentResult`, `Metrics`, `FailureCase`, `Candidate` | `src/iterate/schemas/experiment.py` | ✅ |
-| 5 | `LLMClient` protocol — what every backend implements | `src/iterate/llm/base.py` | ⏳ |
-| 6 | `OpenAICompatibleClient` — first real working LLM call (default: Ollama localhost:11434 + qwen2.5-coder:14b) | `src/iterate/llm/openai_compatible.py` | ⏳ |
-| 7 | Smoke test — verify Ollama call actually works end-to-end | `tests/unit/test_openai_compatible.py` | ⏳ |
+| 5 | `LLMClient` protocol — what every backend implements | `src/iterate/llm/base.py` | ✅ |
+| 6 | `OpenAICompatibleClient` — first real working LLM call (default: Ollama localhost:11434 + qwen2.5-coder:14b) | `src/iterate/llm/openai_compatible.py` | ✅ |
+| 7 | Smoke test — Ollama call end-to-end (plain chat ✅ live; structured tool-calling ⏳ pending tool-capable model) | `tests/unit/test_openai_compatible.py` | 🟡 |
 | 8 | CLI scaffold — `iterate --help` runs (no commands yet, just typer setup) | `src/iterate/cli.py` | ⏳ |
-| 9 | First commit message convention doc (semantic commits) | `BUILD_LOG.md` (this section) | ⏳ |
+| 9 | First commit message convention doc (semantic commits) | `BUILD_LOG.md` (this section) | ✅ |
+| 10 | Central config (pulled fwd from Day 3) — all defaults in one place, env/secret override | `src/iterate/config.py` | ✅ |
+| 11 | LLM contracts — `Message`/`ToolSpec`/`ToolCall`/`Usage`/`ChatResponse` | `src/iterate/schemas/llm.py` | ✅ |
 
 ---
 
@@ -156,6 +158,31 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-24 | Week 1 Day 2 (same day as Day 1 — ahead of ETA) | LLM client layer — partial
+
+**Task:** `LLMClient` protocol + `OpenAICompatibleClient` (Ollama) + smoke test. Pulled `config.py` forward from Day 3.
+
+**What shipped:**
+- Files: `schemas/llm.py` (Message/ToolSpec/ToolCall/Usage/ChatResponse), `llm/base.py` (`LLMClient` Protocol), `llm/openai_compatible.py` (sync client over the OpenAI SDK, Ollama default), `config.py` (central settings — all defaults one place, env/secret override), `tests/unit/test_openai_compatible.py`
+- Deps: `pydantic-settings`; `.env.example` gains `ITERATE_BACKEND_TIMEOUT`; README `llm/` architecture corrected to the openai_compatible design; integration tests made opt-in
+- 28 unit tests + a live smoke; ruff + mypy --strict clean (17 src files)
+- Behavior: provider-agnostic LLM layer — swap backend by config alone; token usage surfaced for cost tracking
+
+**What's tested:**
+- ✅ Offline (deterministic, mocked SDK): translation both ways, tool-call parsing, usage defaulting
+- ✅ Live: plain chat end-to-end (`content='Ok'`, usage populated), error classification + retry, `test_live_ollama_smoke`
+- ⏳ Live **structured tool-calling**: blocked — see below
+
+**What didn't (why Day 2 isn't fully done — the LLM):**
+- `qwen2.5-coder:14b` returns tool calls as **plain text**, not structured `tool_calls` (verified even with `tool_choice="required"`); the `-coder` template lacks tool support. Our client is correct (parses structured calls — proven offline); the model is the gap.
+- Lost ~1h to an Ollama version skew (desktop app 0.20.6 vs CLI 0.24.0) crashing the model runner — fixed by updating the app.
+
+**Decisions:** (see RESEARCH_LOG 2026-05-24)
+- Direct vendor SDKs, not LangChain. Sync client for v1. Tool-calling in the interface. LLM types in `schemas/llm.py`. Config centralized (defaults one place; secrets override). Next tool-driving model = **qwen3:14b** (validate qwen3:8b first; flip `config.iterate_model` once it tool-calls structurally).
+
+**Next session (2026-05-25):**
+- Finish `qwen3:14b` download → validate structured tool-calling through the client → flip the default model. Then Day 3 proper: CLI scaffold (`iterate --help`).
 
 ### 2026-05-24 | Week 1 Day 1 | Pre-flight verification + Pydantic schemas
 
