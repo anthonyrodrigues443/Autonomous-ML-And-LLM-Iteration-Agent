@@ -69,7 +69,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 1 | Project metadata: `pyproject.toml`, deps pinned, ruff + mypy config | `pyproject.toml` | ✅ |
 | 2 | `.env.example` with Ollama default + optional cloud backend keys (Groq/Together/Deepseek/Anthropic/OpenAI) + e2b + Kaggle | `.env.example` | ✅ |
 | 3 | Empty `src/iterate/` package skeleton (folders + `__init__.py`) | `src/iterate/**/` | ✅ |
-| 4 | Pydantic schemas — `Experiment`, `ExperimentResult`, `Metrics`, `FailureCase`, `Candidate` | `src/iterate/schemas/experiment.py` | ⏳ |
+| 4 | Pydantic schemas — `Experiment`, `ExperimentResult`, `Metrics`, `FailureCase`, `Candidate` | `src/iterate/schemas/experiment.py` | ✅ |
 | 5 | `LLMClient` protocol — what every backend implements | `src/iterate/llm/base.py` | ⏳ |
 | 6 | `OpenAICompatibleClient` — first real working LLM call (default: Ollama localhost:11434 + qwen2.5-coder:14b) | `src/iterate/llm/openai_compatible.py` | ⏳ |
 | 7 | Smoke test — verify Ollama call actually works end-to-end | `tests/unit/test_openai_compatible.py` | ⏳ |
@@ -132,6 +132,26 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-24 | Week 1 Day 1 | Pre-flight verification + Pydantic schemas
+
+**Task:** Verify the toolchain runs, then ship the 5 core domain schemas.
+
+**What shipped:**
+- Files: `src/iterate/schemas/experiment.py`, `tests/unit/test_schemas.py`, `.python-version` (3.12), `uv.lock`
+- `Experiment`, `ExperimentResult`, `Metrics`, `FailureCase`, `Candidate` (Pydantic v2, `extra="forbid"`)
+- Validators: finite/non-empty metrics, `primary` ∈ `values`, non-empty `changes`, success ⇒ metrics, completed ⇒ result
+- Behavior: the loop's data contracts now exist + are validated; 20 unit tests green; ruff + mypy --strict clean
+
+**What didn't:**
+- Nothing punted. `mypy src` emits a benign "unused override section" note (only one file checked) — not an error.
+
+**Decisions:** (see RESEARCH_LOG 2026-05-24)
+- `Metrics` = flexible `values` dict + `primary` + `direction` (generic across ML/LLM; stable axis for plateau detection). LLM-designed eval plans deferred to a Week 4 *tool*, never a self-authored schema.
+- Nested composition (not id references) — self-contained auditable snapshot; `id` kept on each model so the Week 4 Memory store can normalize/retrieve.
+
+**Next session (2026-05-25):**
+- Day 2: `LLMClient` protocol (`src/iterate/llm/base.py`) + `OpenAICompatibleClient` against Ollama + smoke test hitting qwen2.5-coder:14b.
 
 ### 2026-05-23 | Week 0 | Project scoped, repo scaffolded
 
