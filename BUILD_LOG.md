@@ -28,6 +28,23 @@ Scope expanded from the original 5-week tabular-ML + prompt build → an **~11-w
 | 10 | Streamlit UI + demos + demo video  *(the "Week 5 Backlog" preview below)* |
 | 11 | Buffer / polish / launch |
 
+### Releases (incremental — ship a working slice, then iterate)
+
+Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. Tag a GitHub release at each milestone; publish to PyPI from v0.1.0.
+
+| Version | After | What's usable |
+|---|---|---|
+| v0.1.0 | Week 2 | Tabular ML iteration, end-to-end |
+| v0.2.0 | Week 3 | + production-prompt iteration |
+| v0.3.0 | Week 4 | + DL/vision (transfer learning) |
+| v0.4.0 | Week 5 | + cost-constrained optimization (the moat) |
+| v0.5.0 | Week 6 | + pluggable compute (local / RTX 4050 / e2b / cloud) |
+| v0.6.0 | Week 7 | + researcher + proposer + memory |
+| v0.7.0 | Week 8 | + MCP discovery (one-line-input UX) |
+| v0.8.0 | Week 9 | + termination + multi-backend benchmark |
+| v0.9.0 | Week 10 | + Streamlit UI + demos |
+| v1.0.0 | Week 11 | Full v1 — autonomous discovery + agentic loop; launch |
+
 ---
 
 ## Format per session entry
@@ -92,17 +109,17 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 
 | # | Task | Files | Done? |
 |---|------|-------|------|
-| 1 | Project metadata: `pyproject.toml`, deps pinned, ruff + mypy config | `pyproject.toml` | ✅ |
-| 2 | `.env.example` with Ollama default + optional cloud backend keys (Groq/Together/Deepseek/Anthropic/OpenAI) + e2b + Kaggle | `.env.example` | ✅ |
-| 3 | Empty `src/iterate/` package skeleton (folders + `__init__.py`) | `src/iterate/**/` | ✅ |
-| 4 | Pydantic schemas — `Experiment`, `ExperimentResult`, `Metrics`, `FailureCase`, `Candidate` | `src/iterate/schemas/experiment.py` | ✅ |
-| 5 | `LLMClient` protocol — what every backend implements | `src/iterate/llm/base.py` | ✅ |
-| 6 | `OpenAICompatibleClient` — first real working LLM call (default: Ollama localhost:11434 + qwen2.5-coder:14b) | `src/iterate/llm/openai_compatible.py` | ✅ |
-| 7 | Smoke test — Ollama call end-to-end (plain chat + structured tool-calling, validated on qwen3:14b) | `tests/unit/test_openai_compatible.py` | ✅ |
-| 8 | CLI scaffold — working command skeleton (`iterate --help` · `version` · `config`); fixed typer single-command collapse | `src/iterate/cli.py` + `tests/unit/test_cli.py` | ✅ |
-| 9 | First commit message convention doc (semantic commits) | `BUILD_LOG.md` (this section) | ✅ |
-| 10 | Central config (pulled fwd from Day 3) — all defaults in one place, env/secret override | `src/iterate/config.py` | ✅ |
-| 11 | LLM contracts — `Message`/`ToolSpec`/`ToolCall`/`Usage`/`ChatResponse` | `src/iterate/schemas/llm.py` | ✅ |
+| 1 | Project metadata: `pyproject.toml`, deps pinned, ruff + mypy config | `pyproject.toml` | done |
+| 2 | `.env.example` with Ollama default + optional cloud backend keys (Groq/Together/Deepseek/Anthropic/OpenAI) + e2b + Kaggle | `.env.example` | done |
+| 3 | Empty `src/iterate/` package skeleton (folders + `__init__.py`) | `src/iterate/**/` | done |
+| 4 | Pydantic schemas — `Experiment`, `ExperimentResult`, `Metrics`, `FailureCase`, `Candidate` | `src/iterate/schemas/experiment.py` | done |
+| 5 | `LLMClient` protocol — what every backend implements | `src/iterate/llm/base.py` | done |
+| 6 | `OpenAICompatibleClient` — first real working LLM call (default: Ollama localhost:11434 + qwen2.5-coder:14b) | `src/iterate/llm/openai_compatible.py` | done |
+| 7 | Smoke test — Ollama call end-to-end (plain chat + structured tool-calling, validated on qwen3:14b) | `tests/unit/test_openai_compatible.py` | done |
+| 8 | CLI scaffold — working command skeleton (`iterate --help` · `version` · `config`); fixed typer single-command collapse | `src/iterate/cli.py` + `tests/unit/test_cli.py` | done |
+| 9 | First commit message convention doc (semantic commits) | `BUILD_LOG.md` (this section) | done |
+| 10 | Central config (pulled fwd from Day 3) — all defaults in one place, env/secret override | `src/iterate/config.py` | done |
+| 11 | LLM contracts — `Message`/`ToolSpec`/`ToolCall`/`Usage`/`ChatResponse` | `src/iterate/schemas/llm.py` | done |
 
 ---
 
@@ -228,9 +245,9 @@ The discovery agent is what makes the demo wow. It does:
 - Behavior: provider-agnostic LLM layer — swap backend by config alone; token usage surfaced for cost tracking
 
 **What's tested:**
-- ✅ Offline (deterministic, mocked SDK): translation both ways, tool-call parsing, usage defaulting
-- ✅ Live: plain chat end-to-end (`content='Ok'`, usage populated), error classification + retry, `test_live_ollama_smoke`
-- ⏳ Live **structured tool-calling**: blocked — see below
+- Offline (deterministic, mocked SDK): translation both ways, tool-call parsing, usage defaulting — passing
+- Live: plain chat end-to-end (`content='Ok'`, usage populated), error classification + retry, `test_live_ollama_smoke` — passing
+- Live **structured tool-calling**: blocked at the time — see below
 
 **What didn't (why Day 2 isn't fully done — the LLM):**
 - `qwen2.5-coder:14b` returns tool calls as **plain text**, not structured `tool_calls` (verified even with `tool_choice="required"`); the `-coder` template lacks tool support. Our client is correct (parses structured calls — proven offline); the model is the gap.

@@ -10,12 +10,12 @@
 
 ## Status
 
-🚧 **Building. Week 1 of ~11.** First production-ready release planned for ~Aug 2026.
+**Building — Week 1 of ~11.** First production-ready release planned for ~Aug 2026.
 
 | Week | Phase | Status |
 |---|---|---|
-| 0 | Scaffolding + scope lock | ✅ |
-| 1 | Framework skeleton + LLM client + first end-to-end smoke test | ⏳ |
+| 0 | Scaffolding + scope lock | done |
+| 1 | Framework skeleton + LLM client + first end-to-end smoke test | done |
 | 2 | `ModelTarget` + sklearn/XGBoost adapters + first tabular iteration | — |
 | 3 | `PromptTarget` + LLM-as-judge eval + first prompt iteration | — |
 | 4 | `DLModelTarget` — vision via transfer learning (PyTorch/torchvision), validated on local RTX 4050 | — |
@@ -50,7 +50,7 @@ Everything else is discovered:
 It then **surfaces what it found and pauses for your gap-fill** before iterating:
 
 ```
-🤖 I found:
+agent> I found:
    Repo:       customer-platform/ml-models/churn (last commit: 3d ago)
    Training:   train_churn.py — CatBoost, F1=0.78 baseline
    Past tries: 4 attempts in Notion. Best: March, tenure features, F1=0.78.
@@ -59,7 +59,7 @@ It then **surfaces what it found and pauses for your gap-fill** before iterating
 
 > Eval is in customer-platform/eval/churn_eval.py. Also new plan_tier column.
 
-🤖 Got it. My top recommendation:
+agent> Got it. My top recommendation:
    → LightGBM + focal loss (Lin et al 2024) — addresses class imbalance 
      that broke March's attempt. Est +0.04 F1, 4 min runtime. Go?
 ```
@@ -135,7 +135,7 @@ Add any other MCP server (Drive, GitHub, Slack, Sentry, custom) by editing one Y
 ```bash
 # Install Ollama (one-time setup)
 brew install ollama
-ollama pull qwen2.5-coder:14b
+ollama pull qwen3:14b
 ollama serve  # starts background server at localhost:11434
 
 # Install iterate
@@ -163,27 +163,20 @@ Full CLI reference: `iterate --help`
 A Streamlit-based chat interface that looks and feels like a desktop app — launches in your browser, runs entirely locally, screenshot-ready for demos:
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  iterate                                                  │
-├─────────────────┬────────────────────────────────────────┤
-│ MCP STATUS      │  > iterate "improve churn baseline"     │
-│ ✓ filesystem    │                                          │
-│ ✓ postgres      │  🤖 Scanning your repos...               │
-│ ✓ notion        │     Found 3 candidate repos.             │
-│ ✓ github        │                                          │
-│                 │  🤖 Reading customer-platform/...        │
-│ EXPERIMENTS     │     Baseline: CatBoost F1=0.78           │
-│ #001 ✅ +0.04   │                                          │
-│ #002 ❌         │  🤖 Found 4 past experiments in Notion.   │
-│ #003 🔁         │     Best: March, tenure features.        │
-│                 │                                          │
-│ MEMORY          │  🤖 Anything else I should know about?    │
-│ 47 entries      │                                          │
-│ 12 retried      │  > Eval lives in eval/churn_eval.py      │
-│                 │                                          │
-│ COST            │  🤖 Got it. Top recommendation: ...       │
-│ $0.03 today     │                                          │
-└─────────────────┴────────────────────────────────────────┘
+Sidebar (live state):
+  MCP status   filesystem, postgres, notion, github  (connected)
+  Experiments  #001 win +0.04    #002 fail    #003 retry
+  Memory       47 entries, 12 retried
+  Cost         $0.03 today
+
+Chat:
+  > iterate "improve churn baseline"
+    Scanning your repos... found 3 candidates.
+    Reading customer-platform/... baseline CatBoost F1=0.78.
+    Found 4 past experiments in Notion (best: March, tenure features).
+    Anything else I should know about?
+  > Eval lives in eval/churn_eval.py
+    Got it. Top recommendation: ...
 ```
 
 CLI is the canonical install. The Streamlit chat is the demo-ready interface.
@@ -241,20 +234,20 @@ Week 9 will ship the head-to-head matrix on identical tasks — scored on qualit
 
 | Capability | AutoML (DataRobot/H2O) | W&B / MLflow | Braintrust / LangSmith | AIDE | **iterate** |
 |---|---|---|---|---|---|
-| Iterates ML models | ✅ | — | — | ✅ | ✅ |
-| Iterates DL / vision models (transfer learning) | partial | — | — | partial | ✅ |
-| Iterates LLM prompts | — | — | eval only | — | ✅ |
-| Literature-aware | ❌ | ❌ | ❌ | partial | ✅ |
-| Persistent memory across sessions | ❌ | log only | ❌ | ❌ | ✅ |
-| Revisits failures when conditions change | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Bounded autonomy (deadline / patience) | ❌ | ❌ | ❌ | partial | ✅ |
-| Auditable reasoning trail | ❌ | — | ❌ | basic | ✅ |
-| Human-approval gate | ❌ | n/a | ❌ | ❌ | ✅ |
-| Logs to Notion / Drive / MD | ❌ | own dashboard | own dashboard | ❌ | ✅ |
-| Multi-LLM backend | ❌ | n/a | partial | ❌ | ✅ |
-| Cost-to-serve–aware optimization (cheapest cloud, $/mo, req/hr — best score you can afford to serve) | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Auto-discovers training data + context (DB / MCP / Drive) | ❌ | ❌ | ❌ | partial | ✅ |
-| Open-source | mostly ❌ | MLflow yes | ❌ | ✅ | ✅ |
+| Iterates ML models | ✓ | — | — | ✓ | ✓ |
+| Iterates DL / vision models (transfer learning) | partial | — | — | partial | ✓ |
+| Iterates LLM prompts | — | — | eval only | — | ✓ |
+| Literature-aware | ✗ | ✗ | ✗ | partial | ✓ |
+| Persistent memory across sessions | ✗ | log only | ✗ | ✗ | ✓ |
+| Revisits failures when conditions change | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Bounded autonomy (deadline / patience) | ✗ | ✗ | ✗ | partial | ✓ |
+| Auditable reasoning trail | ✗ | — | ✗ | basic | ✓ |
+| Human-approval gate | ✗ | n/a | ✗ | ✗ | ✓ |
+| Logs to Notion / Drive / MD | ✗ | own dashboard | own dashboard | ✗ | ✓ |
+| Multi-LLM backend | ✗ | n/a | partial | ✗ | ✓ |
+| Cost-to-serve–aware optimization (cheapest cloud, $/mo, req/hr — best score you can afford to serve) | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Auto-discovers training data + context (DB / MCP / Drive) | ✗ | ✗ | ✗ | partial | ✓ |
+| Open-source | mostly ✗ | MLflow yes | ✗ | ✓ | ✓ |
 
 ---
 
