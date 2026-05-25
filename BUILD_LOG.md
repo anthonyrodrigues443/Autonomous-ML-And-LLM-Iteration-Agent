@@ -70,6 +70,8 @@ Realistic per-session scope (3 hours focused). One real commit per day.
 
 **Slack day:** Sunday May 31 (rest, or catch up on anything that slipped).
 
+**Note (2026-05-25):** Week 1's foundation — schemas + LLM client + config + CLI — shipped in **Days 1–3** (ahead of plan). The original Days 4–7 (tool dispatcher, Anthropic adapter, memory skeleton) were superseded by the expanded 11-week plan: memory + proposer + researcher → **Week 7**; tool dispatcher → **Week 7** (orchestrator); Anthropic adapter → optional/later. Week 1 is effectively complete; next is Week 2.
+
 ### Daily session shape
 
 ```
@@ -97,10 +99,48 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 5 | `LLMClient` protocol — what every backend implements | `src/iterate/llm/base.py` | ✅ |
 | 6 | `OpenAICompatibleClient` — first real working LLM call (default: Ollama localhost:11434 + qwen2.5-coder:14b) | `src/iterate/llm/openai_compatible.py` | ✅ |
 | 7 | Smoke test — Ollama call end-to-end (plain chat + structured tool-calling, validated on qwen3:14b) | `tests/unit/test_openai_compatible.py` | ✅ |
-| 8 | CLI scaffold — `iterate --help` runs (no commands yet, just typer setup) | `src/iterate/cli.py` | ⏳ |
+| 8 | CLI scaffold — working command skeleton (`iterate --help` · `version` · `config`); fixed typer single-command collapse | `src/iterate/cli.py` + `tests/unit/test_cli.py` | ✅ |
 | 9 | First commit message convention doc (semantic commits) | `BUILD_LOG.md` (this section) | ✅ |
 | 10 | Central config (pulled fwd from Day 3) — all defaults in one place, env/secret override | `src/iterate/config.py` | ✅ |
 | 11 | LLM contracts — `Message`/`ToolSpec`/`ToolCall`/`Usage`/`ChatResponse` | `src/iterate/schemas/llm.py` | ✅ |
+
+---
+
+## Week 2 Day-by-Day Plan — `ModelTarget` (tabular ML)
+
+**Week goal:** a tabular ML target that loads data, applies a candidate's changes, trains, scores on a holdout, and returns an `ExperimentResult` — proven end-to-end on a public dataset (churn).
+**Target window:** ~Jun 1–7 (running ahead of plan — log by real date).
+
+| Day | Focus | Lands |
+|---|---|---|
+| 1 | `BenchmarkTarget` protocol — the contract every target implements (prepare data · apply candidate · train · evaluate → `ExperimentResult`) | `src/iterate/targets/base.py` + tests |
+| 2 | Tabular data adapter — load CSV, deterministic train/holdout split | `src/iterate/adapters/data/tabular.py` + tests |
+| 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; baseline train + score → `Metrics` | `src/iterate/targets/model.py` + tests |
+| 4 | Model adapters — sklearn + XGBoost; apply `Candidate.changes` (hyperparams / features) | `src/iterate/adapters/models/` + tests |
+| 5 | Local executor — run one `Experiment`: build candidate → train → score vs baseline → `ExperimentResult` | `src/iterate/adapters/compute/local.py` + tests |
+| 6 | First end-to-end tabular iteration on public churn data — Candidate → run → score → result | `examples/churn_tabular/` + integration test |
+| 7 | Polish + Week 2 retro (BUILD_LOG) | wrap-up |
+
+**Slack:** 1 day.
+
+---
+
+## Week 3 Day-by-Day Plan — `PromptTarget` (production LLM prompts)
+
+**Week goal:** a prompt target that runs a prompt variant over a labeled eval set, scores outputs (labeled metric and LLM-as-judge), and returns an `ExperimentResult` — proven end-to-end on text classification (toxicity).
+**Target window:** ~Jun 8–14 (log by real date).
+
+| Day | Focus | Lands |
+|---|---|---|
+| 1 | `PromptTarget` skeleton — wraps a prompt template + eval set; runs the prompt via `LLMClient`, collects outputs | `src/iterate/targets/prompt.py` + tests |
+| 2 | Text eval-set adapter — load a labeled classification dataset (e.g. Jigsaw toxicity) + split | `src/iterate/adapters/data/text.py` + tests |
+| 3 | Labeled scorer — accuracy/F1 from prompt outputs vs labels → `Metrics` (+ `FailureCase`s) | `src/iterate/core/scorer.py` + tests |
+| 4 | LLM-as-judge scorer — score open-ended outputs via a judge model | scorer extension + tests |
+| 5 | Apply `Candidate` to a `PromptTarget` (candidate = prompt variant) → run + score one experiment | wiring + tests |
+| 6 | First end-to-end prompt iteration on toxicity data — variant → run → judge → result | `examples/toxicity_prompt/` + integration test |
+| 7 | Polish + Week 3 retro | wrap-up |
+
+**Slack:** 1 day.
 
 ---
 
@@ -158,6 +198,24 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-25 | Week 1 Day 3 | CLI scaffold (working) + Week 2–3 plans
+
+**Task:** Make the CLI scaffold real (Task #8) + log the missing Week 2 & 3 day-by-day plans.
+
+**What shipped:**
+- Files: `src/iterate/cli.py` (root callback + `version` + `config` commands), `tests/unit/test_cli.py` (4 tests)
+- Fixed the typer **single-command collapse** bug — `iterate --help` now lists commands, `iterate version` works, `iterate config` prints resolved settings (api-key masked)
+- BUILD_LOG: added Week 2 (ModelTarget / tabular) + Week 3 (PromptTarget / LLM-judge) day-by-day plans; reconciled the stale Week-1 Days 4–7
+- 32 tests pass; ruff + mypy --strict clean
+
+**What didn't:** nothing punted.
+
+**Decisions:**
+- Root `@app.callback()` to stop typer promoting a single command to the app root.
+- Added a `config` command (debug aid + demonstrates the config layer wired to the CLI).
+
+**Next session:** Week 2 Day 1 — `BenchmarkTarget` protocol (`src/iterate/targets/base.py`).
 
 ### 2026-05-24 | Week 1 Day 2 (same day as Day 1 — ahead of ETA) | LLM client layer — partial
 
