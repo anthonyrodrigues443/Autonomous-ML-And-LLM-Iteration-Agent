@@ -216,6 +216,22 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-05-26 | Week 2 Day 1 | `BenchmarkTarget` protocol (v0.1.0 groundwork)
+
+**Task:** Define the contract every target implements, so the orchestrator runs tabular / DL / prompt targets uniformly.
+
+**What shipped:**
+- Files: `src/iterate/targets/base.py` (the `BenchmarkTarget` Protocol), `tests/unit/test_targets_base.py` (4 tests)
+- `Protocol` + `@runtime_checkable`, sync — `name`, `baseline() -> ExperimentResult`, `run(candidate) -> ExperimentResult`
+- 36 tests pass; ruff + mypy --strict clean (18 src files)
+
+**Decisions:** (see RESEARCH_LOG 2026-05-26)
+- The target only **measures**; `baseline()` **always re-measures** the starting point through the target's own eval (never adopts a reported score) → every comparison is apples-to-apples.
+- The target does not judge the winner — the orchestrator/terminator compares. Execution venue is the compute layer's concern, not the target's.
+- A no-op Candidate is impossible (schema validator requires non-empty `changes`), which is *why* `baseline()` is its own method.
+
+**Next session:** Week 2 Day 2 — tabular data adapter (`src/iterate/adapters/data/tabular.py`).
+
 ### 2026-05-25 | Week 1 Day 3 | CLI scaffold (working) + Week 2–3 plans
 
 **Task:** Make the CLI scaffold real (Task #8) + log the missing Week 2 & 3 day-by-day plans.
