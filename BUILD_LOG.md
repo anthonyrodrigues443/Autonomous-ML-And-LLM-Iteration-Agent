@@ -128,15 +128,15 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 **Week goal:** a tabular ML target that loads data, applies a candidate's changes, trains, scores on a holdout, and returns an `ExperimentResult` — proven end-to-end on a public dataset (churn).
 **Target window:** ~Jun 1–7 (running ahead of plan — log by real date).
 
-| Day | Focus | Lands |
-|---|---|---|
-| 1 | `BenchmarkTarget` protocol — the contract every target implements (prepare data · apply candidate · train · evaluate → `ExperimentResult`) | `src/iterate/targets/base.py` + tests |
-| 2 | Tabular data adapter — load CSV, deterministic train/holdout split | `src/iterate/adapters/data/tabular.py` + tests |
-| 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; baseline train + score → `Metrics` | `src/iterate/targets/model.py` + tests |
-| 4 | Model adapters — sklearn + XGBoost; apply `Candidate.changes` (hyperparams / features) | `src/iterate/adapters/models/` + tests |
-| 5 | Local executor — run one `Experiment`: build candidate → train → score vs baseline → `ExperimentResult` | `src/iterate/adapters/compute/local.py` + tests |
-| 6 | First end-to-end tabular iteration on public churn data — Candidate → run → score → result | `examples/churn_tabular/` + integration test |
-| 7 | Polish + Week 2 retro (BUILD_LOG) | wrap-up |
+| Day | Focus | Lands | Done? |
+|---|---|---|---|
+| 1 | `BenchmarkTarget` protocol — the contract every target implements (prepare data · apply candidate · train · evaluate → `ExperimentResult`) | `src/iterate/targets/base.py` + tests | done |
+| 2 | Tabular data adapter — load CSV, deterministic train/holdout split | `src/iterate/adapters/data/tabular.py` + tests | todo |
+| 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; baseline train + score → `Metrics` | `src/iterate/targets/model.py` + tests | todo |
+| 4 | Model adapters — sklearn + XGBoost; apply `Candidate.changes` (hyperparams / features) | `src/iterate/adapters/models/` + tests | todo |
+| 5 | Local executor — run one `Experiment`: build candidate → train → score vs baseline → `ExperimentResult` | `src/iterate/adapters/compute/local.py` + tests | todo |
+| 6 | First end-to-end tabular iteration on public churn data — Candidate → run → score → result | `examples/churn_tabular/` + integration test | todo |
+| 7 | Polish + Week 2 retro (BUILD_LOG) | wrap-up | todo |
 
 **Slack:** 1 day.
 
@@ -147,15 +147,15 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 **Week goal:** a prompt target that runs a prompt variant over a labeled eval set, scores outputs (labeled metric and LLM-as-judge), and returns an `ExperimentResult` — proven end-to-end on text classification (toxicity).
 **Target window:** ~Jun 8–14 (log by real date).
 
-| Day | Focus | Lands |
-|---|---|---|
-| 1 | `PromptTarget` skeleton — wraps a prompt template + eval set; runs the prompt via `LLMClient`, collects outputs | `src/iterate/targets/prompt.py` + tests |
-| 2 | Text eval-set adapter — load a labeled classification dataset (e.g. Jigsaw toxicity) + split | `src/iterate/adapters/data/text.py` + tests |
-| 3 | Labeled scorer — accuracy/F1 from prompt outputs vs labels → `Metrics` (+ `FailureCase`s) | `src/iterate/core/scorer.py` + tests |
-| 4 | LLM-as-judge scorer — score open-ended outputs via a judge model | scorer extension + tests |
-| 5 | Apply `Candidate` to a `PromptTarget` (candidate = prompt variant) → run + score one experiment | wiring + tests |
-| 6 | First end-to-end prompt iteration on toxicity data — variant → run → judge → result | `examples/toxicity_prompt/` + integration test |
-| 7 | Polish + Week 3 retro | wrap-up |
+| Day | Focus | Lands | Done? |
+|---|---|---|---|
+| 1 | `PromptTarget` skeleton — wraps a prompt template + eval set; runs the prompt via `LLMClient`, collects outputs | `src/iterate/targets/prompt.py` + tests | todo |
+| 2 | Text eval-set adapter — load a labeled classification dataset (e.g. Jigsaw toxicity) + split | `src/iterate/adapters/data/text.py` + tests | todo |
+| 3 | Labeled scorer — accuracy/F1 from prompt outputs vs labels → `Metrics` (+ `FailureCase`s) | `src/iterate/core/scorer.py` + tests | todo |
+| 4 | LLM-as-judge scorer — score open-ended outputs via a judge model | scorer extension + tests | todo |
+| 5 | Apply `Candidate` to a `PromptTarget` (candidate = prompt variant) → run + score one experiment | wiring + tests | todo |
+| 6 | First end-to-end prompt iteration on toxicity data — variant → run → judge → result | `examples/toxicity_prompt/` + integration test | todo |
+| 7 | Polish + Week 3 retro | wrap-up | todo |
 
 **Slack:** 1 day.
 
