@@ -88,3 +88,23 @@ This is the "papers → citations" pattern that separates research engineers fro
 **Result (validated same day, 2026-05-24):** qwen3:14b returned `has_tool_calls=True`, `finish=tool_calls`, args parsed to a dict. `config.iterate_model` default flipped to `qwen3:14b`. Caveat found: qwen3 thinking mode is on by default — it spends tokens before the visible answer, so short `max_tokens` yields empty content (`finish=length`); give generous budgets or toggle thinking off.
 
 **Out of scope today:** the Anthropic adapter (separate non-OpenAI-compatible client, later).
+
+## 2026-05-26 — Research: the BenchmarkTarget contract
+
+**Question:** What's the minimal contract every target (tabular ML, DL/vision, prompt) implements so the orchestrator runs any of them the same way — and how do we establish a baseline fairly?
+
+**Sources reviewed:**
+1. [Python `typing.Protocol` / `runtime_checkable`](https://docs.python.org/3/library/typing.html#typing.Protocol) — structural typing; `isinstance` checks member presence, not inheritance.
+2. Prior internal contracts — `LLMClient` (precedent: `Protocol` + sync) and the `Experiment`/`Candidate`/`ExperimentResult` schemas.
+3. The comparability principle — a metric only means something against a baseline measured the *same way* (same eval, same split).
+
+**Approaches considered:**
+- **Single `run(candidate)`, baseline supplied externally:** rejected — reported/external scores aren't comparable, and a "no-op" Candidate can't even be built (the schema validator requires non-empty `changes`).
+- **Granular steps (`prepare`/`train`/`evaluate`) driven by the orchestrator:** rejected — leaks the target's internals, more coupling.
+- **Two methods, `baseline()` + `run(candidate)`, both returning `ExperimentResult`:** chosen.
+
+**Decision:** `BenchmarkTarget` Protocol (`runtime_checkable`, sync) with `name`, `baseline() -> ExperimentResult`, `run(candidate) -> ExperimentResult`. The target only **measures**; `baseline()` **always re-measures** the starting point through the target's own eval (never adopts a reported score), so every comparison is apples-to-apples; the orchestrator/terminator judges winners + termination; execution venue (local/sandbox/cloud) is out of scope (compute layer).
+**Smallest viable implementation:** `src/iterate/targets/base.py` (protocol only) + `tests/unit/test_targets_base.py`.
+**How I'll verify it works:** `isinstance(fake, BenchmarkTarget)` is True; a class missing `run()` is False; both methods return `ExperimentResult`. ruff + mypy --strict clean.
+
+**Out of scope today:** concrete `ModelTarget` (Week 2 Days 2-3); discovering an existing model + asking the user for a source artifact when a prior score is claimed (Week 7-8 — see IDEAS).
