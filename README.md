@@ -16,7 +16,7 @@
 |---|---|---|
 | 0 | Scaffolding + scope lock | done |
 | 1 | Framework skeleton + LLM client + first end-to-end smoke test | done |
-| 2 | `ModelTarget` + sklearn/XGBoost adapters + first tabular iteration | — |
+| 2 | `ModelTarget` + sklearn/XGBoost adapters + first tabular iteration | in progress |
 | 3 | `PromptTarget` + LLM-as-judge eval + first prompt iteration | — |
 | 4 | `DLModelTarget` — vision via transfer learning (PyTorch/torchvision), validated on local RTX 4050 | — |
 | 5 | Quantization + serving-cost estimator + **cost-constrained recommendation** + `iterate cost` | — |
