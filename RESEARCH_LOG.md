@@ -129,3 +129,24 @@ This is the "papers → citations" pattern that separates research engineers fro
 **How I'll verify it works:** same seed → identical split; stratified test/train target means match the overall rate; train/holdout indices disjoint; identical data → identical hash, changed data → different hash. ruff + mypy --strict clean.
 
 **Out of scope today (deferred):** persisting the split snapshot to `.iterate/runs/<id>/` → the executor/run layer (Week 2 Day 5); **hash-based splitting** → Week 8, when data evolves between runs (discovery / retraining) and seed-determinism is no longer enough.
+
+## 2026-05-28 — Research: how open should model selection be, and what shape is a candidate?
+
+**Question:** The Proposer will eventually say "use *this* model with *these* params" from research. What is the agent allowed to pick, how do we instantiate it safely, and what shape should a candidate's `changes` take so today's hyperparameters and tomorrow's arbitrary models use the *same* contract?
+
+**Sources reviewed:**
+1. [scikit-learn — developing estimators / common API](https://scikit-learn.org/stable/developers/develop.html) — every estimator is a class with a uniform `fit`/`predict` and keyword-only constructor params; `get_params`/`set_params` make params a plain dict. So "model + params" is enough to build any of them.
+2. [Python docs — `importlib.import_module`](https://docs.python.org/3/library/importlib.html) + [`inspect.signature`](https://docs.python.org/3/library/inspect.html#inspect.signature) — resolve a class from a dotted path at runtime; introspect its constructor to know whether it accepts `random_state` (so determinism is applied only where supported).
+3. [OWASP — dangers of dynamic import / code execution](https://owasp.org/www-community/attacks/Code_Injection) — resolving arbitrary import strings is RCE-adjacent; the mitigation is an allow-list of trusted module prefixes, never importing whatever string arrives.
+
+**Approaches considered:**
+- **(a) Curated registry** — a hand-maintained dict of "supported" models. Pros: tightest control. Cons: every new model is a code change; caps the agent at *our* list — kills the "use the model research recommends" value. **Rejected.**
+- **(b) Dynamic factory over allow-listed installed libraries** — a candidate names any estimator by import path under `sklearn.*`/`xgboost.*`/`lightgbm.*`; we `importlib`-resolve + instantiate. Pros: any installed estimator, no per-model code; allow-list bounds the RCE surface. Cons: limited to what's *installed*. **Chosen for now (Week 2 Day 4 / v0.1).**
+- **(c) Sandboxed code-gen** — the Proposer *writes* the training script; we run it in an e2b sandbox. Pros: literally any model, installed or not, plus custom architectures. Cons: needs the sandbox executor + a strict script/result contract + heavier security. **Bumped early to v0.2** (right after the v0.1 loop) — it's the real unlock, so it shouldn't wait.
+- **Candidate shape — flat `{"model": x, ...hyperparams}` vs nested `{"model": x, "params": {…}}`** — flat collides if a hyperparameter is ever named `model`, and muddles "which knob is the selector vs a param." Nested cleanly separates *which model* from *its params*.
+
+**Decision:** Ship **(b)** now as `adapters/models/registry.py::build_estimator(task, spec, *, seed)`, with the **nested** spec `{"model": "<import.path>", "params": {…}}` (both optional; default = `HistGradientBoosting` per task). Allow-list `sklearn.*`/`xgboost.*`/`lightgbm.*`; inject `random_state` only when the constructor accepts it (via `inspect.signature`). Sequence **(c) sandboxed code-gen as v0.2** for "any model at all." `ModelTarget` delegates to the factory — model-family switching and hyperparameter tuning now travel the same path.
+**Smallest viable implementation:** `build_estimator` + 8 tests (default-per-task, named model from each allowed lib, `random_state` injected/skipped/not-overridden, disallowed library rejected, non-class path rejected, non-string model rejected); `ModelTarget._evaluate` takes the spec, baseline = `{}`.
+**How I'll verify it works:** factory builds RandomForest/LinearRegression/etc. with the right params; `os.system` and other off-list paths raise; `ModelTarget.run` switches model family end-to-end and scores. ruff + mypy --strict clean; suite stays fast.
+
+**Out of scope today (deferred):** the **sandboxed code-gen path (c)** → v0.2 (Week 4–5); the Proposer actually *choosing* the model/params from research → Week 3 loop + Dial-A research (it just consumes this contract); validating that a named classifier matches a classification task → left to fit-time failure for now (the executor will capture it, Day 5).

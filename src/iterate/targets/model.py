@@ -2,13 +2,14 @@
 
 Wraps a `TabularDataset` + a metric + an estimator in a leakage-safe sklearn
 `Pipeline` (preprocessing fit on train only), trains, and scores on the sealed
-holdout. `baseline()` measures the starting model; `run(candidate)` applies the
-candidate's hyperparameter changes.
+holdout. `baseline()` measures the default model; `run(candidate)` builds whatever
+model the candidate names (any allow-listed estimator) with its params.
 
-Scoped for Day 3: one estimator family (`HistGradientBoosting`) + hyperparameter
-changes. Model-family switching and a richer candidate→model mapping arrive with
-the model adapters (Day 4); robust error handling + execution venue come with the
-executor (Day 5).
+The estimator itself comes from the model factory (`adapters.models.registry`):
+a candidate's `changes` is a `{"model", "params"}` spec, so model-family switching
+and hyperparameters flow through the same path. Robust error handling + execution
+venue come with the executor (Day 5); arbitrary/uninstalled models come with the
+sandboxed code-gen path (v0.2).
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ import math
 from typing import TYPE_CHECKING, Any, Literal
 
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
@@ -32,13 +32,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from threadpoolctl import threadpool_limits
 
+from iterate.adapters.models.registry import Task, build_estimator
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
 if TYPE_CHECKING:
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.schemas.experiment import Candidate
-
-Task = Literal["classification", "regression"]
 
 _CLASSIFICATION_METRICS = {"accuracy", "f1", "precision", "recall"}
 _REGRESSION_METRICS = {"rmse", "mae", "mse", "r2"}
@@ -76,12 +75,6 @@ def _score(task: Task, y_true: Any, y_pred: Any) -> dict[str, float]:
     }
 
 
-def _make_estimator(task: Task, params: dict[str, Any]) -> Any:
-    if task == "classification":
-        return HistGradientBoostingClassifier(**params)
-    return HistGradientBoostingRegressor(**params)
-
-
 class ModelTarget:
     """A tabular ML target: leakage-safe preprocessing + estimator, trained and scored."""
 
@@ -100,14 +93,15 @@ class ModelTarget:
         self._max_threads = max_threads
 
     def baseline(self) -> ExperimentResult:
+        # Empty spec -> the factory's default model for the task, no params.
         return self._evaluate({}, experiment_id="baseline")
 
     def run(self, candidate: Candidate) -> ExperimentResult:
-        # Day 3: candidate.changes are estimator hyperparameters.
+        # candidate.changes is a {"model", "params"} spec: which estimator + its params.
         return self._evaluate(candidate.changes, experiment_id=candidate.id)
 
-    def _evaluate(self, params: dict[str, Any], *, experiment_id: str) -> ExperimentResult:
-        estimator = _make_estimator(self._task, {"random_state": self._dataset.seed, **params})
+    def _evaluate(self, spec: dict[str, Any], *, experiment_id: str) -> ExperimentResult:
+        estimator = build_estimator(self._task, spec, seed=self._dataset.seed)
         pipeline = Pipeline([("preprocess", self._preprocessor()), ("model", estimator)])
         # Cap OpenMP/BLAS threads: on small tabular data the thread-pool overhead
         # dwarfs the actual work (~200x slower here at 10 cores), so 1 thread wins.

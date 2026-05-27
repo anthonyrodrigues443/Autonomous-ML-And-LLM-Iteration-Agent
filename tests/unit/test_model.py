@@ -65,17 +65,33 @@ def test_baseline_handles_categorical_features(tmp_path: Path) -> None:
     assert 0.0 <= result.metrics.primary_value <= 1.0
 
 
-def test_run_applies_candidate_hyperparams(tmp_path: Path) -> None:
+def test_run_applies_candidate_params(tmp_path: Path) -> None:
     ds = load_csv(_classification_csv(tmp_path), target="churn")
     candidate = Candidate(
         description="shallower trees",
-        changes={"max_depth": 2},
+        changes={"params": {"max_depth": 2}},
         rationale="reduce overfitting",
     )
     result = ModelTarget(ds, metric="f1").run(candidate)
     assert isinstance(result, ExperimentResult)
     assert result.metrics is not None
     assert result.experiment_id == candidate.id
+
+
+def test_run_switches_model_family(tmp_path: Path) -> None:
+    # A candidate can name a different estimator entirely, not just tune params.
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    candidate = Candidate(
+        description="try a random forest",
+        changes={
+            "model": "sklearn.ensemble.RandomForestClassifier",
+            "params": {"n_estimators": 25},
+        },
+        rationale="ensemble of shallow trees may generalise better",
+    )
+    result = ModelTarget(ds, metric="f1").run(candidate)
+    assert result.metrics is not None
+    assert 0.0 <= result.metrics.primary_value <= 1.0
 
 
 def test_regression_metric_direction_and_panel(tmp_path: Path) -> None:
