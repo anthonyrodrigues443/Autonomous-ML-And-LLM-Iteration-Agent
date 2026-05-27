@@ -130,7 +130,7 @@ disallow_untyped_defs = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-module = ["kaggle.*", "lightgbm.*", "xgboost.*", "sklearn.*", "e2b_code_interpreter.*"]
+module = ["kaggle.*", "lightgbm.*", "xgboost.*", "sklearn.*", "e2b_code_interpreter.*", "pandas", "pandas.*"]
 ignore_missing_imports = true
 
 # ─── pytest ────────────────────────────────────────────────────

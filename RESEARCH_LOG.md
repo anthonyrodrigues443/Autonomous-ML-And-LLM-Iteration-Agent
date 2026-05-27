@@ -108,3 +108,24 @@ This is the "papers → citations" pattern that separates research engineers fro
 **How I'll verify it works:** `isinstance(fake, BenchmarkTarget)` is True; a class missing `run()` is False; both methods return `ExperimentResult`. ruff + mypy --strict clean.
 
 **Out of scope today:** concrete `ModelTarget` (Week 2 Days 2-3); discovering an existing model + asking the user for a source artifact when a prior score is claimed (Week 7-8 — see IDEAS).
+
+## 2026-05-26 — Research: tabular data splitting + storage (reproducibility, leakage, persistence)
+
+**Question:** How should the tabular data adapter split the data, and how should the split live (RAM vs disk), so the pipeline is reproducible, leakage-safe, and production-grade — even for small datasets?
+
+**Sources reviewed:**
+1. [Stanford CS230 — Splitting into train/dev/test](https://cs230.stanford.edu/blog/split/) — split once via a dedicated step and persist it; never split ad-hoc / by moving files, or you can't reproduce it.
+2. [Engineering for Data Science — repeatable splitting via hashing](https://engineeringfordatascience.com/posts/ml_repeatable_splitting_using_hashing/) — a fixed seed only reproduces if the data never changes; if rows are added/reordered the same seed yields a different split. Robust fix: hash a stable row id (`farmhash.fingerprint64(id) % buckets`) so a row always lands in the same split regardless of order/additions.
+3. [DVC / data versioning](https://www.datacamp.com/tutorial/data-version-control-dvc) — treat data as immutable; snapshot, keep lineage, make every version reproducible/restorable.
+
+**Approaches considered:**
+- **Seed-based `train_test_split`:** reproducible only while the data is static. Fine within a single run (the CSV doesn't change mid-run); fragile across runs when data evolves.
+- **Hash-based splitting:** robust to row additions/reordering; the production-grade choice when data evolves between runs. Doesn't by itself guarantee class balance.
+- **Hold split in RAM vs persist to disk:** in-RAM is fine for small tabular and is normal; persisting the split (or just indices+seed) is better for reproducibility, crash-recovery, audit, and scale. Holding everything in RAM forever does not scale to DL/large data.
+- **Leakage:** split must happen *before* preprocessing; transforms fit on train only, applied to the sealed holdout.
+
+**Decision (v0.1.0):** stratified **seed-based** split (reproducible for a static per-run CSV; preserves class balance for imbalanced targets like churn) + **content-hash the dataset** (`hash_pandas_object` → sha256) recorded on `TabularDataset` as a lightweight data version, so any result traces to the exact data + split. Leakage-safe: the adapter does **load + split only**, no preprocessing.
+**Smallest viable implementation:** `src/iterate/adapters/data/tabular.py` → `load_csv()` returns a `TabularDataset` (train + sealed holdout + target/features/seed/test_size/data_hash). Tests cover determinism, stratification, disjoint splits, hash stability + content-sensitivity, missing-target.
+**How I'll verify it works:** same seed → identical split; stratified test/train target means match the overall rate; train/holdout indices disjoint; identical data → identical hash, changed data → different hash. ruff + mypy --strict clean.
+
+**Out of scope today (deferred):** persisting the split snapshot to `.iterate/runs/<id>/` → the executor/run layer (Week 2 Day 5); **hash-based splitting** → Week 8, when data evolves between runs (discovery / retraining) and seed-determinism is no longer enough.

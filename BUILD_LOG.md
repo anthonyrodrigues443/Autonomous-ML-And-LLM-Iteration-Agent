@@ -6,44 +6,45 @@
 
 ---
 
-## Scope & timeline (updated 2026-05-24)
+## Scope & timeline (re-planned 2026-05-27 — agent-first)
 
-Scope expanded from the original 5-week tabular-ML + prompt build → an **~11-week build (May 23 – ~Aug 8)** covering three target families + the cost-constrained moat. PRD has full detail; README has the public phase table.
+**Agent-first.** The first real release (v0.1) is a *working agentic loop* on tabular ML with explicit inputs — the LLM reads the data, proposes a change, trains, scores, and iterates to the best model by a deadline. After that, two dials turn release to release: **(A) inputs required shrink** (toward one-sentence input) and **(B) problem types grow** (tabular → prompts → DL/vision). The agent is present from v0.1; everything later is capability expansion — not "turn the agent on at Week 7."
 
-- **Targets:** `ModelTarget` (tabular ML) · `DLModelTarget` (vision, transfer learning — validated on local RTX 4050) · `PromptTarget` (production LLM prompts, **prompt-iteration only** — no LLM fine-tuning).
-- **Moat:** cost-constrained optimization — pure score within a hard serving-cost budget; deliverable is a **serving profile** (best affordable model + cheapest cloud + $/mo + req/hr). Plus rich auto-discovered context (DB / MCP / Drive).
-- **Compute:** pluggable backend — local MPS · RTX 4050 (GPU validation) · e2b · cloud-GPU adapter (large jobs).
+*(Supersedes the earlier breadth-first ordering, which wrongly deferred the agentic loop. ~11-week build, May 23 – ~Aug 8.)*
+
+- **Targets:** `ModelTarget` (tabular ML) · `PromptTarget` (production LLM prompts, prompt-iteration only) · `DLModelTarget` (vision, transfer learning — validated on local RTX 4050).
+- **Moat — the specialized combination, not one feature:** a domain specialist for ML/DL/prompt iteration that does *together* what no single tool does — agentic iteration across **ML + DL models AND LLM prompts** · **persistent memory** (revisits past failures when conditions change) · **literature-grounded** proposals · **bounded autonomy** + human-approval gates · **auditable reasoning trail** · **cost-constrained optimization** (best score you can *afford to serve* — cheapest cloud, $/mo, req/hr) · **rich auto-discovered context** (DB / MCP / Drive). Cost-aware serving is the flagship for cost-sensitive startups; the moat is the *combination* + the specialization. (Full matrix: README comparison table.)
+- **Compute:** pluggable backend — local MPS · RTX 4050 (GPU validation) · e2b · cloud-GPU adapter.
 
 | Wk | Phase |
 |---|---|
-| 1 | Skeleton + LLM client + smoke test |
-| 2 | `ModelTarget` (tabular) + sklearn/XGBoost |
-| 3 | `PromptTarget` + LLM-as-judge |
-| 4 | `DLModelTarget` — vision transfer learning (validated on 4050) |
-| 5 | Quantization + serving-cost estimator + cost-constrained recommendation + `iterate cost` |
-| 6 | Pluggable compute backends + cloud-GPU adapter interface |
-| 7 | Researcher + Proposer + Memory |
-| 8 | MCP layer + discovery agent  *(the "Week 4 Backlog" preview below)* |
-| 9 | Terminator + multi-LLM + score × serving-cost benchmark |
-| 10 | Streamlit UI + demos + demo video  *(the "Week 5 Backlog" preview below)* |
-| 11 | Buffer / polish / launch |
+| 1 | Foundation — schemas + LLM client (tool-calling) + config + CLI · done |
+| 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` (sklearn/XGBoost) + local executor |
+| 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory → first autonomous tabular run (**v0.1**) |
+| 4 | Dial A: agent picks the metric + starting model (basic research) → **v0.2** |
+| 5 | Dial B: `PromptTarget` — agentic prompt iteration → **v0.3** |
+| 6 | Dial B: `DLModelTarget` — vision transfer learning (4050) → **v0.4** |
+| 7 | Cost-constrained recommendation + serving profile + `iterate cost` → **v0.5** |
+| 8 | Dial A: infer features/target from the data + a description → **v0.6** |
+| 9 | Dial A: MCP discovery — find the data/code itself → **v0.7** |
+| 10 | Multi-backend benchmark + Streamlit UI + demos → **v0.8 / v0.9** |
+| 11 | Full minimum-viable-input + polish + launch → **v1.0** |
 
 ### Releases (incremental — ship a working slice, then iterate)
 
-Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. Tag a GitHub release at each milestone; publish to PyPI from v0.1.0.
+Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. **The agentic loop is present from v0.1**; two dials then turn — inputs you must give *shrink*, problem types *grow*. Tag a GitHub release at each milestone; publish to PyPI from v0.1.0.
 
-| Version | After | What's usable |
-|---|---|---|
-| v0.1.0 | Week 2 | Tabular ML iteration, end-to-end |
-| v0.2.0 | Week 3 | + production-prompt iteration |
-| v0.3.0 | Week 4 | + DL/vision (transfer learning) |
-| v0.4.0 | Week 5 | + cost-constrained optimization (the moat) |
-| v0.5.0 | Week 6 | + pluggable compute (local / RTX 4050 / e2b / cloud) |
-| v0.6.0 | Week 7 | + researcher + proposer + memory |
-| v0.7.0 | Week 8 | + MCP discovery (one-line-input UX) |
-| v0.8.0 | Week 9 | + termination + multi-backend benchmark |
-| v0.9.0 | Week 10 | + Streamlit UI + demos |
-| v1.0.0 | Week 11 | Full v1 — autonomous discovery + agentic loop; launch |
+| Version | After | Problem types | Inputs you give (shrinking →) |
+|---|---|---|---|
+| v0.1.0 | Week 3 | tabular | data + features + target + metric + baseline/notebook + deadline — **agentic loop on** |
+| v0.2.0 | Week 4 | tabular | data + features + target + baseline + deadline  *(agent picks metric + starting model)* |
+| v0.3.0 | Week 5 | + prompts | prompt + eval set + deadline |
+| v0.4.0 | Week 6 | + DL / vision | data + target + deadline |
+| v0.5.0 | Week 7 | all three | + serving budget / cloud  *(cost-constrained recommendation)* |
+| v0.6.0 | Week 8 | all | data + a one-line description  *(infers features/target/metric)* |
+| v0.7.0 | Week 9 | all | one sentence + a data source  *(MCP finds the data/code)* |
+| v0.8–0.9 | Week 10 | all | + multi-backend benchmark + Streamlit UI |
+| v1.0.0 | Week 11 | all | one sentence  *(full discovery)* |
 
 ---
 
@@ -123,47 +124,49 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 
 ---
 
-## Week 2 Day-by-Day Plan — `ModelTarget` (tabular ML)
+## Week 2 Day-by-Day Plan — Tabular execution substrate
 
-**Week goal:** a tabular ML target that loads data, applies a candidate's changes, trains, scores on a holdout, and returns an `ExperimentResult` — proven end-to-end on a public dataset (churn).
+**Week goal:** the machinery to run one tabular experiment — load data, apply a candidate's changes, train, score on a holdout, return an `ExperimentResult`. Proven with a *supplied* candidate (the agent that proposes candidates is Week 3).
 **Target window:** ~Jun 1–7 (running ahead of plan — log by real date).
 
 | Day | Focus | Lands | Done? |
 |---|---|---|---|
-| 1 | `BenchmarkTarget` protocol — the contract every target implements (prepare data · apply candidate · train · evaluate → `ExperimentResult`) | `src/iterate/targets/base.py` + tests | done |
-| 2 | Tabular data adapter — load CSV, deterministic train/holdout split | `src/iterate/adapters/data/tabular.py` + tests | todo |
-| 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; baseline train + score → `Metrics` | `src/iterate/targets/model.py` + tests | todo |
-| 4 | Model adapters — sklearn + XGBoost; apply `Candidate.changes` (hyperparams / features) | `src/iterate/adapters/models/` + tests | todo |
-| 5 | Local executor — run one `Experiment`: build candidate → train → score vs baseline → `ExperimentResult` | `src/iterate/adapters/compute/local.py` + tests | todo |
-| 6 | First end-to-end tabular iteration on public churn data — Candidate → run → score → result | `examples/churn_tabular/` + integration test | todo |
+| 1 | `BenchmarkTarget` protocol — the contract every target implements (`baseline()` + `run(candidate)` → `ExperimentResult`) | `src/iterate/targets/base.py` + tests | done |
+| 2 | Tabular data adapter — load CSV, deterministic stratified split, content-hash | `src/iterate/adapters/data/tabular.py` + tests | done |
+| 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; `baseline()` train + score → `Metrics` | `src/iterate/targets/model.py` + tests | todo |
+| 4 | Model adapters — sklearn + XGBoost; build a model from `Candidate.changes` (hyperparams / features) | `src/iterate/adapters/models/` + tests | todo |
+| 5 | Local executor — run one `Experiment`: build candidate → train → score → `ExperimentResult` | `src/iterate/adapters/compute/local.py` + tests | todo |
+| 6 | Substrate end-to-end on churn — `baseline()` + `run(supplied candidate)` → result (not yet agent-driven) | `examples/churn_tabular/` + integration test | todo |
 | 7 | Polish + Week 2 retro (BUILD_LOG) | wrap-up | todo |
 
 **Slack:** 1 day.
 
 ---
 
-## Week 3 Day-by-Day Plan — `PromptTarget` (production LLM prompts)
+## Week 3 Day-by-Day Plan — The agentic loop (→ v0.1 agentic tabular)
 
-**Week goal:** a prompt target that runs a prompt variant over a labeled eval set, scores outputs (labeled metric and LLM-as-judge), and returns an `ExperimentResult` — proven end-to-end on text classification (toxicity).
+**Week goal:** close the loop. The LLM autonomously proposes the next candidate, runs it on the Week-2 substrate, scores it, records it, and decides whether to continue — until a deadline / plateau. The first fully autonomous tabular run. Inputs still explicit (data, features, target, metric, baseline/notebook, deadline).
 **Target window:** ~Jun 8–14 (log by real date).
 
 | Day | Focus | Lands | Done? |
 |---|---|---|---|
-| 1 | `PromptTarget` skeleton — wraps a prompt template + eval set; runs the prompt via `LLMClient`, collects outputs | `src/iterate/targets/prompt.py` + tests | todo |
-| 2 | Text eval-set adapter — load a labeled classification dataset (e.g. Jigsaw toxicity) + split | `src/iterate/adapters/data/text.py` + tests | todo |
-| 3 | Labeled scorer — accuracy/F1 from prompt outputs vs labels → `Metrics` (+ `FailureCase`s) | `src/iterate/core/scorer.py` + tests | todo |
-| 4 | LLM-as-judge scorer — score open-ended outputs via a judge model | scorer extension + tests | todo |
-| 5 | Apply `Candidate` to a `PromptTarget` (candidate = prompt variant) → run + score one experiment | wiring + tests | todo |
-| 6 | First end-to-end prompt iteration on toxicity data — variant → run → judge → result | `examples/toxicity_prompt/` + integration test | todo |
-| 7 | Polish + Week 3 retro | wrap-up | todo |
+| 1 | Proposer — LLM proposes the next `Candidate` from the data summary + baseline + past results (+ optional source notebook) | `src/iterate/core/proposer.py` + tests | todo |
+| 2 | Orchestrator — the loop: `baseline()` → propose → `run()` → score → record → decide → repeat | `src/iterate/core/orchestrator.py` + tests | todo |
+| 3 | Terminator — stop on deadline / patience / plateau (minimal) | `src/iterate/core/terminator.py` + tests | todo |
+| 4 | Memory — record every experiment; feed history to the Proposer; avoid repeats (sqlite, minimal) | `src/iterate/core/memory.py` + tests | todo |
+| 5 | CLI `iterate run` — explicit inputs: `--data --features --target --metric --baseline/--notebook --until/--patience` | `src/iterate/cli.py` + tests | todo |
+| 6 | First autonomous tabular run on churn — LLM iterates to best by deadline → tag **v0.1.0** | `examples/churn_tabular/` + integration test | todo |
+| 7 | Polish + Week 3 retro + release **v0.1.0** | wrap-up | todo |
 
 **Slack:** 1 day.
 
 ---
 
-## Week 4 Backlog (preview — now scheduled for Week 8 under the expanded plan)
+## MCP + Discovery Backlog (preview — Week 9 under the agent-first plan)
 
-The Week 4 phase shifts the agent from "user provides 9 inputs" to **"user provides one input — `iterate 'improve our churn baseline'` — and the agent discovers everything else."**
+> **Re-sequenced 2026-05-27 (agent-first):** Proposer (4.10) + Memory (4.11) moved **forward to Week 3** (the core agentic loop); Researcher (4.9) → Week 4 (Dial A). The MCP + discovery items below (4.1–4.8, 4.12–4.13) land at **Week 9** — they're Dial-A input-reduction (toward one-sentence input), *not* prerequisites for the agent.
+
+This phase shifts the agent from "user provides every input" to **"user provides one input — `iterate 'improve our churn baseline'` — and the agent discovers the rest."**
 
 ### Autonomous discovery is the single biggest differentiator. It's the demo headline.
 
@@ -200,7 +203,7 @@ The discovery agent is what makes the demo wow. It does:
 
 ---
 
-## Week 5 Backlog (preview — now scheduled for Weeks 9–10 under the expanded plan)
+## UI + Benchmark Backlog (preview — Week 10 under the agent-first plan)
 
 | # | Task | Files |
 |---|------|-------|
@@ -215,6 +218,23 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-27 | Week 2 Day 2 | Tabular data adapter + agent-first re-plan
+
+**Task:** Tabular data loading/splitting — and re-planned the whole roadmap to agent-first.
+
+**What shipped:**
+- Files: `src/iterate/adapters/data/tabular.py` (`load_csv` → `TabularDataset`), `tests/unit/test_tabular.py` (8 tests)
+- Deterministic **stratified** split + dataset **content-hash** (data versioning); leakage-safe (split before preprocessing)
+- `pandas` added to the mypy ignore list (treated like the other ML libs)
+- 44 tests pass; ruff + mypy --strict clean (19 src files)
+
+**Decisions:** (data-handling research → RESEARCH_LOG 2026-05-26)
+- Stratified seed split + content-hash now; hash-based splitting deferred to Week 9 (evolving data); persist split snapshot → executor (Day 5).
+- **Re-planned the roadmap to agent-first** (was breadth-first): the agentic loop is the **v0.1 milestone (~Week 3)**, not Week 7. Two dials thereafter — inputs shrink, problem types grow. Scope / Releases / Week 2-3 plans rewritten above; Proposer + Memory pulled forward to Week 3.
+- Reframed the moat: specialization + the full differentiator combination, with cost-aware serving as the **flagship** (not the only moat).
+
+**Next session:** Week 2 Day 3 — `ModelTarget` (sklearn baseline): `baseline()` train + score → `Metrics`.
 
 ### 2026-05-26 | Week 2 Day 1 | `BenchmarkTarget` protocol (v0.1.0 groundwork)
 
