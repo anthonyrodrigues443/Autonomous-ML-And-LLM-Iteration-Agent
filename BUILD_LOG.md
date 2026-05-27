@@ -133,7 +133,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 |---|---|---|---|
 | 1 | `BenchmarkTarget` protocol — the contract every target implements (`baseline()` + `run(candidate)` → `ExperimentResult`) | `src/iterate/targets/base.py` + tests | done |
 | 2 | Tabular data adapter — load CSV, deterministic stratified split, content-hash | `src/iterate/adapters/data/tabular.py` + tests | done |
-| 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; `baseline()` train + score → `Metrics` | `src/iterate/targets/model.py` + tests | todo |
+| 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; `baseline()` train + score → `Metrics` | `src/iterate/targets/model.py` + tests | done |
 | 4 | Model adapters — sklearn + XGBoost; build a model from `Candidate.changes` (hyperparams / features) | `src/iterate/adapters/models/` + tests | todo |
 | 5 | Local executor — run one `Experiment`: build candidate → train → score → `ExperimentResult` | `src/iterate/adapters/compute/local.py` + tests | todo |
 | 6 | Substrate end-to-end on churn — `baseline()` + `run(supplied candidate)` → result (not yet agent-driven) | `examples/churn_tabular/` + integration test | todo |
@@ -224,6 +224,24 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-27 | Week 2 Day 3 | `ModelTarget` (tabular) + a ~200x perf fix
+
+**Task:** First concrete target — train + score a tabular model (`baseline()` + minimal `run()`).
+
+**What shipped:**
+- Files: `src/iterate/targets/model.py` (`ModelTarget`), `tests/unit/test_model.py` (6 tests)
+- `baseline()` + `run(candidate)` via a **leakage-safe** sklearn Pipeline (preprocess → estimator, fit on train only); `HistGradientBoosting` default; task + metric panel inferred from `--metric`; deterministic (seed)
+- Demoed live: baseline f1 0.667 → best hand-supplied candidate 0.710 (+0.043). The substrate iterates (manually; the agent drives it Week 3).
+- 50 tests; ruff + mypy --strict clean (20 src files)
+
+**Finding + fix (the important one):**
+- Model tests ran ~83s. Diagnosed to sklearn `HistGradientBoosting` **OpenMP thread oversubscription** on the 10-core M5 — **9.99s/fit on 120 rows vs 0.05s single-threaded (~200x)**. Not the hardware — tiny data + many threads = pure coordination overhead. Would have crippled the agentic loop (it runs many small experiments).
+- Fix: cap threads during fit/predict via `threadpool_limits` (default 1, configurable `max_threads`). Full suite **183s → 4.2s**. Added `threadpoolctl` as a direct dep.
+
+**Decisions:** estimator-family switching + richer candidate→model mapping = Day 4 (model adapters); robust error handling + execution venue = Day 5 (executor); `FailureCase` capture = Week 3.
+
+**Next session:** Week 2 Day 4 — model adapters (sklearn + XGBoost; build a model from `Candidate.changes`).
 
 ### 2026-05-27 | Week 2 Day 2 | Tabular data adapter + agent-first re-plan
 

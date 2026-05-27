@@ -1330,6 +1330,7 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "sqlalchemy" },
     { name = "tenacity" },
+    { name = "threadpoolctl" },
     { name = "typer" },
     { name = "xgboost" },
 ]
@@ -1388,6 +1389,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "streamlit", marker = "extra == 'dashboard'", specifier = ">=1.40.0" },
     { name = "tenacity", specifier = ">=9.0.0" },
+    { name = "threadpoolctl", specifier = ">=3.6.0" },
     { name = "typer", specifier = ">=0.12.0" },
     { name = "vcrpy", marker = "extra == 'dev'", specifier = ">=6.0.0" },
     { name = "xgboost", specifier = ">=2.1.0" },
