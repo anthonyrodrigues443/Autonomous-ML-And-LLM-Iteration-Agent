@@ -6,6 +6,8 @@
 >
 > AutoML brute-forces. Experiment trackers only log. Prompt evals only evaluate. AIDE iterates Kaggle problems once. `iterate` is the only system that runs an autonomous, literature-aware, memory-persistent improvement loop on **ML models, DL/vision models, AND LLM prompts** in production — optimizing for the best model you can actually **afford to serve** (cheapest cloud, cost/month, requests/hour) — pulling its own training data + context from your DBs, files, and docs (via MCP) — with human-approval safety gates and append-only reasoning logs to wherever your team reads.
 
+> **How this gets built:** [WORKFLOW.md](WORKFLOW.md) (the method) · [DECISIONS.md](DECISIONS.md) (every call I made against the AI's default)
+
 ---
 
 ## Status
