@@ -10,7 +10,11 @@
 
 **Agent-first.** The first real release (v0.1) is a *working agentic loop* on tabular ML with explicit inputs — the LLM reads the data, proposes a change, trains, scores, and iterates to the best model by a deadline. After that, two dials turn release to release: **(A) inputs required shrink** (toward one-sentence input) and **(B) problem types grow** (tabular → prompts → DL/vision). The agent is present from v0.1; everything later is capability expansion — not "turn the agent on at Week 7."
 
-*(Supersedes the earlier breadth-first ordering, which wrongly deferred the agentic loop. ~11-week build, May 23 – ~Aug 8.)*
+*(Supersedes the earlier breadth-first ordering, which wrongly deferred the agentic loop. ~12–13-week build, May 23 – ~late Aug.)*
+
+**Updated 2026-05-28 — model flexibility has two tiers, and the second is bumped early:**
+- **(b) Installed-library factory (v0.1):** a candidate names any estimator in an allow-listed installed library (scikit-learn / XGBoost / LightGBM) by import path + params — `{"model": "lightgbm.LGBMClassifier", "params": {…}}` — and we instantiate it. No hand-curated list.
+- **(c) Sandboxed code-gen (v0.2, bumped early):** the Proposer *writes* the training code and runs it in an e2b sandbox → **any model at all**, not just installed libraries. This is the big capability and now lands right after the v0.1 loop, displacing the old v0.2 (agent picks metric+model → now v0.3) and shifting later versions down by one.
 
 - **Targets:** `ModelTarget` (tabular ML) · `PromptTarget` (production LLM prompts, prompt-iteration only) · `DLModelTarget` (vision, transfer learning — validated on local RTX 4050).
 - **Moat — the specialized combination, not one feature:** a domain specialist for ML/DL/prompt iteration that does *together* what no single tool does — agentic iteration across **ML + DL models AND LLM prompts** · **persistent memory** (revisits past failures when conditions change) · **literature-grounded** proposals · **bounded autonomy** + human-approval gates · **auditable reasoning trail** · **cost-constrained optimization** (best score you can *afford to serve* — cheapest cloud, $/mo, req/hr) · **rich auto-discovered context** (DB / MCP / Drive). Cost-aware serving is the flagship for cost-sensitive startups; the moat is the *combination* + the specialization. (Full matrix: README comparison table.)
@@ -19,16 +23,17 @@
 | Wk | Phase |
 |---|---|
 | 1 | Foundation — schemas + LLM client (tool-calling) + config + CLI · done |
-| 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` (sklearn/XGBoost) + local executor |
+| 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` + model factory (any installed sklearn/XGBoost/LightGBM estimator) + local executor |
 | 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory → first autonomous tabular run (**v0.1**) |
-| 4 | Dial A: agent picks the metric + starting model (basic research) → **v0.2** |
-| 5 | Dial B: `PromptTarget` — agentic prompt iteration → **v0.3** |
-| 6 | Dial B: `DLModelTarget` — vision transfer learning (4050) → **v0.4** |
-| 7 | Cost-constrained recommendation + serving profile + `iterate cost` → **v0.5** |
-| 8 | Dial A: infer features/target from the data + a description → **v0.6** |
-| 9 | Dial A: MCP discovery — find the data/code itself → **v0.7** |
-| 10 | Multi-backend benchmark + Streamlit UI + demos → **v0.8 / v0.9** |
-| 11 | Full minimum-viable-input + polish + launch → **v1.0** |
+| 4–5 | **Sandboxed code-gen** — the Proposer *writes* training code, runs it in an e2b sandbox → **any model at all**, not just installed libraries → **v0.2** |
+| 6 | Dial A: agent picks the metric + starting model (basic research) → **v0.3** |
+| 7 | Dial B: `PromptTarget` — agentic prompt iteration → **v0.4** |
+| 8 | Dial B: `DLModelTarget` — vision transfer learning (4050) → **v0.5** |
+| 9 | Cost-constrained recommendation + serving profile + `iterate cost` → **v0.6** |
+| 10 | Dial A: infer features/target from the data + a description → **v0.7** |
+| 11 | Dial A: MCP discovery — find the data/code itself → **v0.8** |
+| 12 | Multi-backend benchmark + Streamlit UI + demos → **v0.9** |
+| 13 | Full minimum-viable-input + polish + launch → **v1.0** |
 
 ### Releases (incremental — ship a working slice, then iterate)
 
@@ -36,15 +41,16 @@ Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. **The
 
 | Version | After | Problem types | Inputs you give (shrinking →) |
 |---|---|---|---|
-| v0.1.0 | Week 3 | tabular | data + features + target + metric + baseline/notebook + deadline — **agentic loop on** |
-| v0.2.0 | Week 4 | tabular | data + features + target + baseline + deadline  *(agent picks metric + starting model)* |
-| v0.3.0 | Week 5 | + prompts | prompt + eval set + deadline |
-| v0.4.0 | Week 6 | + DL / vision | data + target + deadline |
-| v0.5.0 | Week 7 | all three | + serving budget / cloud  *(cost-constrained recommendation)* |
-| v0.6.0 | Week 8 | all | data + a one-line description  *(infers features/target/metric)* |
-| v0.7.0 | Week 9 | all | one sentence + a data source  *(MCP finds the data/code)* |
-| v0.8–0.9 | Week 10 | all | + multi-backend benchmark + Streamlit UI |
-| v1.0.0 | Week 11 | all | one sentence  *(full discovery)* |
+| v0.1.0 | Week 3 | tabular | data + features + target + metric + baseline/notebook + deadline — **agentic loop on** (any installed-library model via the factory) |
+| v0.2.0 | Week 4–5 | tabular | *(same inputs)* — agent **writes & runs training code in a sandbox** → any model at all, not just installed libs |
+| v0.3.0 | Week 6 | tabular | data + features + target + baseline + deadline  *(agent picks metric + starting model)* |
+| v0.4.0 | Week 7 | + prompts | prompt + eval set + deadline |
+| v0.5.0 | Week 8 | + DL / vision | data + target + deadline |
+| v0.6.0 | Week 9 | all three | + serving budget / cloud  *(cost-constrained recommendation)* |
+| v0.7.0 | Week 10 | all | data + a one-line description  *(infers features/target/metric)* |
+| v0.8.0 | Week 11 | all | one sentence + a data source  *(MCP finds the data/code)* |
+| v0.9.0 | Week 12 | all | + multi-backend benchmark + Streamlit UI |
+| v1.0.0 | Week 13 | all | one sentence  *(full discovery)* |
 
 ---
 
@@ -134,7 +140,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 1 | `BenchmarkTarget` protocol — the contract every target implements (`baseline()` + `run(candidate)` → `ExperimentResult`) | `src/iterate/targets/base.py` + tests | done |
 | 2 | Tabular data adapter — load CSV, deterministic stratified split, content-hash | `src/iterate/adapters/data/tabular.py` + tests | done |
 | 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; `baseline()` train + score → `Metrics` | `src/iterate/targets/model.py` + tests | done |
-| 4 | Model adapters — sklearn + XGBoost; build a model from `Candidate.changes` (hyperparams / features) | `src/iterate/adapters/models/` + tests | todo |
+| 4 | Model factory — build any allow-listed installed estimator (sklearn/XGBoost/LightGBM) from a `{"model","params"}` spec in `Candidate.changes` | `src/iterate/adapters/models/registry.py` + tests | done |
 | 5 | Local executor — run one `Experiment`: build candidate → train → score → `ExperimentResult` | `src/iterate/adapters/compute/local.py` + tests | todo |
 | 6 | Substrate end-to-end on churn — `baseline()` + `run(supplied candidate)` → result (not yet agent-driven) | `examples/churn_tabular/` + integration test | todo |
 | 7 | Polish + Week 2 retro (BUILD_LOG) | wrap-up | todo |
@@ -149,10 +155,10 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 **Target window:** ~Jun 8–14 (log by real date).
 
 **v0.1 contract (agreed 2026-05-27):**
-- **Inputs:** `--data` + `--target` (required) · `--metric` (required in v0.1 — agent *choosing* the metric is v0.2; may default by task type) · `--baseline` + `--source` notebook/md/txt (optional; source is read as **context** — what's been tried — NOT auto-executed) · `--until` / `--patience` (optional; **patience** is the primary stop, deadline a backstop). Features auto-derive as all columns except target.
-- **Working:** measure *our own* baseline → loop { propose → train → score on the sealed holdout → record → decide } until plateau or deadline. v0.1 candidate space = tabular ML configs (sklearn / XGBoost).
+- **Inputs:** `--data` + `--target` (required) · `--metric` (required in v0.1 — agent *choosing* the metric is v0.3; may default by task type) · `--baseline` + `--source` notebook/md/txt (optional; source is read as **context** — what's been tried — NOT auto-executed) · `--until` / `--patience` (optional; **patience** is the primary stop, deadline a backstop). Features auto-derive as all columns except target.
+- **Working:** measure *our own* baseline → loop { propose → train → score on the sealed holdout → record → decide } until plateau or deadline. v0.1 candidate space = any installed allow-listed estimator (sklearn / XGBoost / LightGBM) via the model factory, named by `{"model","params"}`.
 - **Output:** the **best model** (artifact + the winning config) + its score vs the **baseline we measured** + an **auditable report** of every experiment and why the winner won. Agent proposes; human reviews.
-- **NOT in v0.1:** cost-constraint / serving profile (v0.5) · auto-reproducing a source notebook by executing it (~Week 9 discovery) · the agent picking the metric (v0.2).
+- **NOT in v0.1:** arbitrary/uninstalled models via sandboxed code-gen (v0.2) · the agent picking the metric (v0.3) · cost-constraint / serving profile (v0.6) · auto-reproducing a source notebook by executing it (~Week 10 discovery).
 
 | Day | Focus | Lands | Done? |
 |---|---|---|---|
@@ -224,6 +230,23 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-28 | Week 2 Day 4 | Model factory (any installed estimator) + bumped sandbox code-gen to v0.2
+
+**Task:** Stop hard-coding the estimator. Build any allow-listed installed model from a candidate's spec — so the Proposer can switch model families, not just tune one.
+
+**What shipped:**
+- Files: `src/iterate/adapters/models/registry.py` (`build_estimator`), `tests/unit/test_model_registry.py` (8 tests); `ModelTarget` rewired to delegate to the factory (dropped its local `_make_estimator`)
+- A candidate's `changes` is now a **nested spec** — `{"model": "<import.path>", "params": {…}}` — instead of flat hyperparameters. `model` is optional (defaults to `HistGradientBoosting` per task); `params` optional.
+- Dynamic instantiation via `importlib`, **allow-listed** to `sklearn.*` / `xgboost.*` / `lightgbm.*` (anything else raises and points at the v0.2 code-gen path). `random_state` injected only when the estimator's signature accepts it (introspected) and not already set.
+- 59 tests pass; ruff + mypy --strict clean (21 src files); suite still ~3.8s (threading cap holding).
+
+**Decisions:**
+- **Nested `{"model","params"}` spec** over flat hyperparameters — clean separation of *which model* from *its params*, no key collisions, and the exact shape the LLM will emit next ("this model, these params, from research"). (RESEARCH_LOG 2026-05-28.)
+- **Two model-flexibility tiers, and (c) bumped early to v0.2:** (b) this factory = any *installed* allow-listed library, shipped now; (c) sandboxed code-gen = the agent *writes* training code and runs it in e2b → *any* model at all, moved to **v0.2** (right after the v0.1 loop). Scope/Releases tables re-sequenced above; later versions shift down one, build now ~12–13 weeks.
+- Allow-list (not arbitrary import) is the safety boundary for (b); arbitrary/uninstalled models are exactly what the sandbox (c) is for.
+
+**Next session:** Week 2 Day 5 — local executor (run one `Experiment`: build candidate → train → score → `ExperimentResult`, with failure capture).
 
 ### 2026-05-27 | Week 2 Day 3 | `ModelTarget` (tabular) + a ~200x perf fix
 
