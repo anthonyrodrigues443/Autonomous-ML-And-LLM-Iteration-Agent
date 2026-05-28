@@ -7,9 +7,10 @@ model the candidate names (any allow-listed estimator) with its params.
 
 The estimator itself comes from the model factory (`adapters.models.registry`):
 a candidate's `changes` is a `{"model", "params"}` spec, so model-family switching
-and hyperparameters flow through the same path. Robust error handling + execution
-venue come with the executor (Day 5); arbitrary/uninstalled models come with the
-sandboxed code-gen path (v0.2).
+and hyperparameters flow through the same path. Failure handling and the execution
+venue live in the executor (`adapters.compute.local`), which catches a bad
+candidate rather than letting it raise; arbitrary or uninstalled models come with
+the sandboxed code-gen path (v0.2).
 """
 
 from __future__ import annotations

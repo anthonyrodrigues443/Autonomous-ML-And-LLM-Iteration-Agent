@@ -143,7 +143,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 4 | Model factory — build any allow-listed installed estimator (sklearn/XGBoost/LightGBM) from a `{"model","params"}` spec in `Candidate.changes` | `src/iterate/adapters/models/registry.py` + tests | done |
 | 5 | Local executor — run one experiment (baseline or candidate), time it, and **capture failures** so a bad candidate can't crash the loop | `src/iterate/adapters/compute/local.py` + tests | done |
 | 6 | Substrate end-to-end on churn — `baseline()` + `run(supplied candidate)` through the executor on real data (not yet agent-driven) | `examples/churn_tabular/` + integration test | done |
-| 7 | Polish + Week 2 retro (BUILD_LOG) | wrap-up | todo |
+| 7 | Polish + Week 2 retro (BUILD_LOG) | wrap-up | done |
 
 **Slack:** 1 day.
 
@@ -230,6 +230,38 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-28 | Week 2 retro | Tabular execution substrate complete
+
+**The week in one line:** went from an empty `targets/` package to a complete, tested substrate that runs one tabular experiment end-to-end — and re-planned the whole roadmap to agent-first while doing it.
+
+**Shipped (Days 1–6):**
+- `BenchmarkTarget` protocol — the contract every target obeys (`baseline()` + `run(candidate)`).
+- Tabular data adapter — `load_csv` → deterministic stratified split → content-hashed `TabularDataset`, leakage-safe.
+- `ModelTarget` — leakage-safe sklearn Pipeline, metric panel, deterministic.
+- Model factory — any allow-listed installed estimator (sklearn/XGBoost/LightGBM) from a nested `{"model","params"}` spec.
+- `LocalExecutor` — runs one experiment, times it, captures failures instead of crashing.
+- End-to-end churn example on the real Telco dataset + an integration test.
+
+**What worked:**
+- The **contract cascade** — each piece shaped the next: the non-empty-`changes` validator from Week 1 forced `baseline()` to be its own method; the executor's failure capture exists *because* targets are allowed to raise.
+- **Measure-don't-assume** earned its keep twice — the ~200x HistGB thread-oversubscription bug and the ~450x LightGBM macOS-wheel finding. Both would have crippled the loop; neither was the hardware.
+- **Clean separation:** the target measures, the executor survives, the data adapter only loads + splits.
+
+**What didn't / punted (tracked in the backlog):**
+- Hard execution isolation (timeouts, resource caps) → v0.2 (e2b sandbox).
+- Richer structured failure capture (vs a plain `error` string) → before v0.1 (Memory needs the "why").
+- LightGBM macOS-ARM wheel is pathologically slow → documented; supported but out of the demo; fine on Linux.
+- Hash-based splitting → later (a static per-run CSV doesn't need it yet).
+
+**Decisions that shaped it (see DECISIONS.md):**
+- **Agent-first re-plan** mid-week — the agentic loop became the v0.1 milestone instead of a Week-7 add-on.
+- **Sandboxed code-gen (c) bumped to v0.2** — "run the model research recommends" shouldn't wait.
+- **Nested candidate spec** over flat — clean model/params separation, the shape the Proposer will emit.
+
+**Pace:** Week 2 done in 6 build sessions, on track.
+
+**Next: Week 3 — the agentic loop → v0.1.** The Proposer generates the candidates we've been hand-supplying; the Orchestrator runs propose → execute → score → record; the Terminator stops on plateau/patience; Memory feeds history back. The first release where the agent drives.
 
 ### 2026-05-28 | Week 2 Day 6 | Substrate end-to-end on real churn data (+ a LightGBM macOS finding)
 

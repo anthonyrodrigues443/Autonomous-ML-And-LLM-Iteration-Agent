@@ -12,7 +12,7 @@
 
 ## Status
 
-**Building — Week 2 of ~13.** First production-ready release planned for ~late Aug 2026.
+**Building — Week 2 complete (tabular substrate done); Week 3 next: the agentic loop → v0.1.** First release **v0.1** (the working agentic loop) lands at the end of Week 3; incremental releases follow through to the full **v1.0** (~late Aug 2026).
 
 **Agent-first:** the autonomous loop is the **v0.1** milestone (Week 3), not a late-stage add-on. After that, two dials turn release to release — the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular → prompts → DL/vision). Full roadmap + daily trail in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -20,7 +20,7 @@
 |---|---|---|
 | 0 | Scaffolding + scope lock | done |
 | 1 | Foundation — schemas + LLM client (tool-calling) + config + CLI | done |
-| 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` + model factory + local executor | in progress |
+| 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` + model factory + local executor | done |
 | 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory → first autonomous tabular run (**v0.1**) | — |
 | 4–5 | **Sandboxed code-gen** — the agent writes + runs training code in e2b → any model at all (**v0.2**) | — |
 | 6 | Agent picks the metric + starting model (**v0.3**) | — |
