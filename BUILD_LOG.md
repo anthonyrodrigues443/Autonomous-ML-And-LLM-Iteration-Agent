@@ -142,7 +142,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 3 | `ModelTarget` (sklearn baseline) — wraps dataset + model + metric; `baseline()` train + score → `Metrics` | `src/iterate/targets/model.py` + tests | done |
 | 4 | Model factory — build any allow-listed installed estimator (sklearn/XGBoost/LightGBM) from a `{"model","params"}` spec in `Candidate.changes` | `src/iterate/adapters/models/registry.py` + tests | done |
 | 5 | Local executor — run one experiment (baseline or candidate), time it, and **capture failures** so a bad candidate can't crash the loop | `src/iterate/adapters/compute/local.py` + tests | done |
-| 6 | Substrate end-to-end on churn — `baseline()` + `run(supplied candidate)` → result (not yet agent-driven) | `examples/churn_tabular/` + integration test | todo |
+| 6 | Substrate end-to-end on churn — `baseline()` + `run(supplied candidate)` through the executor on real data (not yet agent-driven) | `examples/churn_tabular/` + integration test | done |
 | 7 | Polish + Week 2 retro (BUILD_LOG) | wrap-up | todo |
 
 **Slack:** 1 day.
@@ -230,6 +230,22 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-28 | Week 2 Day 6 | Substrate end-to-end on real churn data (+ a LightGBM macOS finding)
+
+**Task:** Prove the whole tabular substrate works together on a real dataset — the last piece before the Week-3 agentic loop.
+
+**What shipped:**
+- Files: `examples/churn_tabular/run.py` + `README.md` + `data.csv` (public Telco Customer Churn, 7043 rows); `tests/integration/test_churn_end_to_end.py` (marked `integration`); a fast build-only factory test for XGBoost/LightGBM in `tests/unit/test_model_registry.py`
+- End-to-end on real data: `load_csv` → `ModelTarget` → model factory → `LocalExecutor`. Re-measured baseline (HistGB) f1 **0.568** → best candidate (XGBoost) **0.576** (+0.008); a deliberately broken candidate is captured as a failure, not a crash.
+- Dataset-specific cleaning (drop `customerID`, coerce `TotalCharges`, encode `Churn` Yes/No → 1/0) lives in the example, not the framework.
+- 64 unit tests + 1 integration test green; ruff + mypy --strict clean (23 src files).
+
+**The finding (measured, not assumed):**
+- A LightGBM candidate took **~155s** vs XGBoost's 0.38s on identical data. Ran it down: not the thread wrapper (slow with *and* without `threadpool_limits`), not the hardware (XGB/HistGB sub-second), not a sklearn/LightGBM OpenMP conflict (slow even with LightGBM imported alone, no sklearn). Root cause: the **LightGBM 4.6 macOS-ARM pip wheel is pathologically slow to train** (~0.2s/tree, ~450x) — a known wheel/`libomp` issue, not our code, and absent on Linux / in the e2b sandbox.
+- Resolution: LightGBM stays factory-supported (build-only unit test) but is omitted from the demo's candidate list; documented as a known issue. Not forcing a from-source build on all installs to fix a local-macOS-only problem. (Backlog + example README.)
+
+**Next session:** Week 2 wrap / Day 7 polish, then **Week 3 — the agentic loop** (Proposer drives the candidates → v0.1). Substrate is complete: contract · data adapter · `ModelTarget` · model factory · executor · end-to-end example.
 
 ### 2026-05-28 | Week 2 Day 5 | Local executor (minimal failure capture)
 
@@ -443,3 +459,4 @@ Items not in this week's top P0 but worth keeping visible.
 
 - **Hard execution isolation → v0.2 (sandbox).** The v0.1 local executor does *minimal* failure capture — catch the exception, record it on `ExperimentResult.error`, keep the loop alive. Real isolation belongs with the e2b sandbox path: per-experiment **timeouts**, **memory/CPU caps**, killing runaway training, and capturing stdout/stderr into `logs`. Deferred deliberately so v0.1 ships; revisit when building the (c) sandboxed code-gen path.
 - **Richer failure capture → before v0.1.** The local executor records a crash as a plain `ExperimentResult.error` string. Before the first release, enrich it for the Week-3 Memory store: a structured `FailureCase` (error_type + the offending spec) and/or captured traceback, so the Proposer reliably avoids re-proposing a known-broken change. (User call 2026-05-28: string is fine now, improve before v0.1.)
+- **Known issue — LightGBM slow on macOS ARM.** The LightGBM 4.6 prebuilt pip wheel for macOS ARM is pathologically slow to *train* (~0.2s/tree, ~450x XGBoost on identical data) — independent of thread settings (`threadpool_limits`, `OMP_NUM_THREADS`) and of whether sklearn is loaded. A known wheel/`libomp` issue, not framework code; does **not** reproduce on Linux or in the e2b sandbox (where v0.2 training runs). LightGBM stays factory-supported (build-only unit test) but is omitted from the churn demo's candidate list. Local-macOS fix: rebuild from source against brew `libomp` (`uv pip install --no-binary lightgbm lightgbm`); deliberately not forced on all installs. (Diagnosed 2026-05-28.)

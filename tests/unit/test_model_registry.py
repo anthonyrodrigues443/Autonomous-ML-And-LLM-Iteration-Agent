@@ -28,6 +28,23 @@ def test_named_model_from_allowed_library() -> None:
     assert est.n_estimators == 7
 
 
+def test_xgboost_and_lightgbm_build() -> None:
+    # The factory must support all three advertised libraries. This only *builds*
+    # (no fit), so it stays instant even where LightGBM's macOS wheel is slow to train.
+    from lightgbm import LGBMClassifier
+    from xgboost import XGBClassifier
+
+    xgb = build_estimator("classification", {"model": "xgboost.XGBClassifier"}, seed=0)
+    lgbm = build_estimator(
+        "classification",
+        {"model": "lightgbm.LGBMClassifier", "params": {"n_estimators": 2}},
+        seed=0,
+    )
+    assert isinstance(xgb, XGBClassifier)
+    assert isinstance(lgbm, LGBMClassifier)
+    assert lgbm.n_estimators == 2
+
+
 def test_random_state_injected_when_supported() -> None:
     est = build_estimator(
         "classification", {"model": "sklearn.ensemble.RandomForestClassifier"}, seed=42

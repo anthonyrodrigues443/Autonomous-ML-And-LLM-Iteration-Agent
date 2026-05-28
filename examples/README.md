@@ -6,11 +6,11 @@ These show how to plug your own ML problem or LLM prompt into the framework. **C
 
 | Example | Target family | Dataset | Demonstrates |
 |---|---|---|---|
-| `churn_tabular/` | `ModelTarget` | Public Kaggle churn dataset | Tabular classification: sklearn/XGBoost/LightGBM iteration against a CatBoost baseline |
+| `churn_tabular/` | `ModelTarget` | Public Kaggle churn dataset (Telco) | Tabular classification: sklearn/XGBoost/LightGBM iteration against a re-measured baseline |
 | `toxicity_jigsaw/` | `PromptTarget` | Jigsaw Toxic Comment Classification (public) | LLM prompt iteration via LLM-as-judge eval |
 | `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | Multi-class prompt iteration; proves the framework generalizes beyond binary |
 
-Each example will ship a `target.py`, a `current_prompt.txt` (for `PromptTarget`) or baseline notebook (for `ModelTarget`), a `golden_set.jsonl`, and a per-example README.
+Each example ships a runnable entry point — `run.py` for `ModelTarget`, a `target.py` + `current_prompt.txt` for `PromptTarget` — example data or a `golden_set.jsonl`, and a per-example README.
 
 ---
 
