@@ -12,21 +12,25 @@
 
 ## Status
 
-**Building — Week 1 of ~11.** First production-ready release planned for ~Aug 2026.
+**Building — Week 2 of ~13.** First production-ready release planned for ~late Aug 2026.
+
+**Agent-first:** the autonomous loop is the **v0.1** milestone (Week 3), not a late-stage add-on. After that, two dials turn release to release — the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular → prompts → DL/vision). Full roadmap + daily trail in [BUILD_LOG.md](BUILD_LOG.md).
 
 | Week | Phase | Status |
 |---|---|---|
 | 0 | Scaffolding + scope lock | done |
-| 1 | Framework skeleton + LLM client + first end-to-end smoke test | done |
-| 2 | `ModelTarget` + sklearn/XGBoost adapters + first tabular iteration | in progress |
-| 3 | `PromptTarget` + LLM-as-judge eval + first prompt iteration | — |
-| 4 | `DLModelTarget` — vision via transfer learning (PyTorch/torchvision), validated on local RTX 4050 | — |
-| 5 | Quantization + serving-cost estimator + **cost-constrained recommendation** + `iterate cost` | — |
-| 6 | Pluggable compute backends (local MPS / RTX 4050 / e2b) + **cloud-GPU adapter** interface | — |
-| 7 | Researcher + Proposer + Memory | — |
-| 8 | **MCP layer** (filesystem / postgres / notion) + discovery agent | — |
-| 9 | Termination logic + multi-LLM + **score × serving-cost benchmark** | — |
-| 10 | **Streamlit chat UI** + demos (tabular churn, vision, toxicity prompt) + demo video | — |
+| 1 | Foundation — schemas + LLM client (tool-calling) + config + CLI | done |
+| 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` + model factory + local executor | in progress |
+| 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory → first autonomous tabular run (**v0.1**) | — |
+| 4–5 | **Sandboxed code-gen** — the agent writes + runs training code in e2b → any model at all (**v0.2**) | — |
+| 6 | Agent picks the metric + starting model (**v0.3**) | — |
+| 7 | `PromptTarget` — agentic prompt iteration (**v0.4**) | — |
+| 8 | `DLModelTarget` — vision transfer learning, validated on local RTX 4050 (**v0.5**) | — |
+| 9 | **Cost-constrained recommendation** + serving profile + `iterate cost` (**v0.6**) | — |
+| 10 | Infer features/target from the data + a description (**v0.7**) | — |
+| 11 | **MCP discovery** — find the data/code itself (**v0.8**) | — |
+| 12 | Multi-backend benchmark + **Streamlit chat UI** + demos (**v0.9**) | — |
+| 13 | Full minimum-viable-input + polish + launch (**v1.0**) | — |
 
 ---
 
@@ -106,7 +110,7 @@ Ships with:
 | `postgres` | DB introspection + read-only sampling (for data discovery) |
 | `notion` | Search past experiment pages, write new experiment cards |
 
-**The discovery workflow** (Week 4 feature):
+**The discovery workflow** (Week 11 feature — v0.8):
 
 ```
 > iterate init --target churn_baseline --discover
@@ -160,7 +164,7 @@ Full CLI reference: `iterate --help`
 
 ---
 
-## Demo UI (Week 10)
+## Demo UI (Week 12 — v0.9)
 
 A Streamlit-based chat interface that looks and feels like a desktop app — launches in your browser, runs entirely locally, screenshot-ready for demos:
 
@@ -211,7 +215,7 @@ iterate/
 │   ├── base              # LLMClient protocol (provider-agnostic interface)
 │   ├── openai_compatible # one client for ALL OpenAI-compatible backends
 │   │                     #   (Ollama default · Groq · Together · Deepseek · OpenAI · vLLM)
-│   └── anthropic_client  # Claude — the only non-OpenAI-compatible backend (Week 5, optional)
+│   └── anthropic_client  # Claude — the only non-OpenAI-compatible backend (optional, later)
 └── schemas/             # Pydantic types
 ```
 
@@ -219,7 +223,7 @@ iterate/
 
 ---
 
-## Multi-LLM backend (planned Week 9 benchmark)
+## Multi-LLM backend (planned Week 12 benchmark)
 
 | Backend | Est. cost per run | Notes |
 |---|---|---|
@@ -228,7 +232,7 @@ iterate/
 | Llama 3.3 70B (Together) | ~$0.20 | Free tier available via Groq |
 | Deepseek V3 | ~$0.10 | Strong on code |
 
-Week 9 will ship the head-to-head matrix on identical tasks — scored on quality **and** serving cost.
+Week 12 will ship the head-to-head matrix on identical tasks — scored on quality **and** serving cost.
 
 ---
 
