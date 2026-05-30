@@ -1,9 +1,10 @@
 """The Orchestrator — closes the agentic loop.
 
 Drives ``baseline → propose → execute → score → record → decide → repeat`` over
-the Week-2 substrate. Holds history in memory; delegates "should I stop?" to a
-`Terminator` (Day 3) — the Memory store (Day 4, sqlite) will replace the
-in-memory list later, same shape.
+the Week-2 substrate. History and proposer failures land in a `Memory` (Day 4,
+sqlite or in-memory); stop logic is delegated to a `Terminator` (Day 3). The
+Proposer reads cross-run history straight from Memory so previous sessions inform
+the next proposal.
 
 `current_model` follows the best-so-far candidate (so the Proposer's prompt always
 reflects "what's currently in use"). On the first iteration it's the model the
@@ -24,6 +25,7 @@ from iterate.schemas.experiment import Experiment
 
 if TYPE_CHECKING:
     from iterate.adapters.compute.local import LocalExecutor
+    from iterate.core.memory import Memory
     from iterate.core.proposer import Proposer
     from iterate.core.terminator import Terminator
     from iterate.schemas.experiment import ExperimentResult
@@ -76,6 +78,7 @@ class Orchestrator:
         proposer: Proposer,
         executor: LocalExecutor,
         terminator: Terminator,
+        memory: Memory,
         *,
         data_summary: str,
         baseline_model: str,
@@ -84,6 +87,7 @@ class Orchestrator:
         self._proposer = proposer
         self._executor = executor
         self._terminator = terminator
+        self._memory = memory
         self._data_summary = data_summary
         self._initial_model = baseline_model
 
@@ -98,9 +102,10 @@ class Orchestrator:
                 stopped_because="baseline_failed",
             )
 
+        run_id = self._memory.start_run(self._target.name, baseline)
         direction = baseline.metrics.direction
         metric = baseline.metrics.primary
-        history: list[Experiment] = []
+        current_run: list[Experiment] = []
         best: Experiment | None = None
         current_model = self._initial_model
         started_at = perf_counter()
@@ -117,10 +122,11 @@ class Orchestrator:
                     data_summary=self._data_summary,
                     baseline=baseline,
                     current_model=current_model,
-                    history=history,
+                    history=self._memory.history(self._target.name),
                 )
             except ProposerError as exc:
                 log.warning("orchestrator: iteration %d proposer failed: %s", iteration, exc)
+                self._memory.record_proposer_failure(run_id, iteration, current_model, str(exc))
                 outcome = "proposer_error"
             else:
                 experiment = Experiment(
@@ -141,7 +147,8 @@ class Orchestrator:
                         "finished_at": _now(),
                     }
                 )
-                history.append(experiment)
+                current_run.append(experiment)
+                self._memory.record(run_id, experiment)
                 last_experiment = experiment
 
                 if result.succeeded and result.metrics is not None:
@@ -182,9 +189,10 @@ class Orchestrator:
                 stopped_because = reason
                 break
 
+        self._memory.finish_run(run_id, stopped_because)
         return RunResult(
             baseline=baseline,
-            history=history,
+            history=current_run,
             best=best,
             stopped_because=stopped_because,
         )

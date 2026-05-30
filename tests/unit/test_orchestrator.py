@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from iterate.adapters.compute.local import LocalExecutor
+from iterate.core.memory import InMemoryMemory
 from iterate.core.orchestrator import Orchestrator, RunResult
 from iterate.core.proposer import ProposerError
 from iterate.core.terminator import Composite, LoopState, MaxIterations, Patience, Terminator
@@ -95,12 +96,18 @@ def _cand(model: str) -> Candidate:
     return Candidate(description=f"try {model}", changes={"model": model}, rationale="test")
 
 
-def _orch(target: _FakeTarget, proposer: _FakeProposer, terminator: Terminator) -> Orchestrator:
+def _orch(
+    target: _FakeTarget,
+    proposer: _FakeProposer,
+    terminator: Terminator,
+    memory: InMemoryMemory | None = None,
+) -> Orchestrator:
     return Orchestrator(
         target,  # type: ignore[arg-type]
         proposer,  # type: ignore[arg-type]
         LocalExecutor(),
         terminator,
+        memory or InMemoryMemory(),
         data_summary="x",
         baseline_model="base.Model",
     )
@@ -201,3 +208,33 @@ def test_orchestrator_propagates_terminator_reason() -> None:
     proposer = _FakeProposer([_cand("a.A")])
     res = _orch(target, proposer, _CustomReason()).run()
     assert res.stopped_because == "custom-stop"
+
+
+def test_proposer_error_records_structured_failure_in_memory() -> None:
+    target = _FakeTarget()
+    proposer = _FakeProposer(always_error=True)
+    memory = InMemoryMemory()
+    _orch(target, proposer, Composite(MaxIterations(10), Patience(2)), memory).run()
+
+    failures = memory.proposer_failures(target.name)
+    assert len(failures) == 2
+    assert failures[0].iteration == 1
+    assert failures[0].current_model == "base.Model"
+    assert "fake error" in failures[0].error
+    assert failures[1].iteration == 2
+
+
+def test_cross_run_history_is_seen_by_next_runs_proposer() -> None:
+    target = _FakeTarget(baseline_score=0.70, results={"a.A": 0.72, "b.B": 0.73})
+    memory = InMemoryMemory()
+
+    proposer_1 = _FakeProposer([_cand("a.A")])
+    _orch(target, proposer_1, MaxIterations(1), memory).run()
+
+    proposer_2 = _FakeProposer([_cand("b.B")])
+    _orch(target, proposer_2, MaxIterations(1), memory).run()
+
+    # Second run's first propose call sees the first run's experiment in history.
+    second_run_history = proposer_2.calls[0]["history"]
+    assert len(second_run_history) == 1
+    assert second_run_history[0].candidate.changes["model"] == "a.A"

@@ -165,7 +165,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 1 | Proposer (+ native `OllamaClient` adapter for `think:false` + centralized `prompts.yaml`) — LLM proposes the next `Candidate` via a `propose_candidate` tool call from data summary + baseline + history | `core/proposer.py` + `llm/ollama_client.py` + `prompts/` + tests | done |
 | 2 | Orchestrator — the loop: `baseline()` → propose → `run()` → score → record → decide → repeat (in-memory history; internal stop logic) | `src/iterate/core/orchestrator.py` + tests | done |
 | 3 | Terminator — stop on deadline / patience / plateau via a delegated protocol; Orchestrator refactored to delegate | `src/iterate/core/terminator.py` + tests | done |
-| 4 | Memory — record every experiment; feed history to the Proposer; avoid repeats (sqlite, minimal) | `src/iterate/core/memory.py` + tests | todo |
+| 4 | Memory — record every experiment; feed **cross-run** history to the Proposer (sqlite + in-memory; structured proposer-failure records) | `src/iterate/core/memory.py` + tests | done |
 | 5 | CLI `iterate run` (+ `--backend` factory) **and source-aware baseline reconstruction** — LLM reads `--source` md/txt/notebook as **text only** (never executes), rebuilds the approach as a spec, we run it through our eval → re-measured baseline | `src/iterate/cli.py` + reconstruction module + tests | todo |
 | 6 | First autonomous tabular run on churn — LLM iterates to best by deadline → tag **v0.1.0** | `examples/churn_tabular/` + integration test | todo |
 | 7 | Polish + Week 3 retro + release **v0.1.0** | wrap-up | todo |
@@ -230,6 +230,27 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-30 | Week 3 Day 4 | Memory (persistent history + cross-run continuity)
+
+**Task:** Move history out of the Orchestrator's RAM and into a `Memory` protocol. Ship both an in-memory implementation (tests, ephemeral runs) and a sqlite-backed one (the real thing that survives `iterate run` exiting). Close the loop on Day 2's deferred "structured proposer-failure records."
+
+**What shipped:**
+- Files: `src/iterate/core/memory.py` (Protocol + 2 implementations + `ProposerFailure` dataclass), `tests/unit/test_memory.py` (14 tests, parameterized over both backends). Orchestrator refactored to delegate.
+- **`Memory` Protocol** — `start_run` · `record` · `record_proposer_failure` · `history` · `proposer_failures` · `finish_run`. Same shape as `Terminator` — one Protocol, swappable backends.
+- **`InMemoryMemory`** — dict-backed; ephemeral.
+- **`SqliteMemory(db_path)`** — stdlib `sqlite3` (no ORM); auto-creates parent dir + schema on first use; persists across processes; one file on disk (default `.iterate/memory.db`, configurable via `ITERATE_MEMORY_DB`). `Experiment` and `ExperimentResult` go in as JSON blobs (pydantic round-trip); proposer failures live in a separate `proposer_failures` table.
+- **Orchestrator refactor:** takes `memory: Memory` as a constructor arg. Calls `memory.start_run` at the top, records each `Experiment` through `memory.record`, structured `ProposerFailure` rows through `memory.record_proposer_failure`, queries `memory.history(target.name)` each iteration (so the Proposer sees **cross-run** history), `memory.finish_run` at the end. `RunResult.history` still returns just the current run's experiments.
+- 124 unit tests pass (was 106; +18 net); ruff + mypy --strict clean (28 src files).
+
+**Decisions:**
+- **Stdlib `sqlite3`, not SQLAlchemy** — ~250 lines of straight SQL that reads top-to-bottom; the Memory protocol is the seam, so swapping in SQLAlchemy or Postgres later is an adapter change, not a refactor.
+- **Cross-run history fed to the Proposer** by default — institutional memory is the value-prop. (A CLI `--fresh` flag at Day 5 can opt out.)
+- **No programmatic dedupe** — give the LLM the full history and trust the prompt's "don't repeat." Add `has_been_tried(changes_hash)` only when failure modes show up in practice.
+- **JSON-blob serialization** for `Experiment` / `ExperimentResult` — pydantic handles it cleanly; no schema changes when the models evolve; no ORM mapping to maintain.
+- **Per-target scope** for history (no data-version hash yet) — that's a Week-9 concern when datasets evolve mid-project.
+
+**Next session:** Week 3 Day 5 — CLI `iterate run` (+ `--backend` flag) and source-aware baseline reconstruction.
 
 ### 2026-05-30 | Week 3 Day 3 | Terminator (delegated stop logic)
 
