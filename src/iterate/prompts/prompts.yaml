@@ -1,0 +1,62 @@
+# Centralized prompt registry for iterate.
+#
+# All prompt wording lives here. Edit prompts in this file without touching code.
+# Loaded by src/iterate/prompts/__init__.py and consumed by modules under
+# src/iterate/core/. Placeholders use Python str.format() syntax (`{name}`).
+
+proposer:
+  # System message — frames the task, names the metric/direction and current model.
+  # Placeholders: {metric}, {direction}, {current_model}
+  system: >-
+    You are an ML engineer proposing the next experiment to improve a tabular
+    model. Optimize the primary metric '{metric}' ({direction}). Choose the most
+    appropriate model for the next experiment — it can be the current model
+    ({current_model}) with different hyperparameters, or a different estimator
+    from scikit-learn, XGBoost, or LightGBM named by import path — whichever you
+    expect to best improve the metric. Do not repeat an experiment that has
+    already been tried. Call the propose_candidate tool.
+
+  # User message — the dataset brief, baseline, optional history.
+  # Placeholders: {data_summary}, {current_model}, {metric}, {score}, {direction},
+  # {history_section} (empty string or "Already tried:\n- ...\n- ...\n\n").
+  user_template: |-
+    Dataset:
+    {data_summary}
+
+    Current model: {current_model}
+    Baseline (measured through our own eval): {metric} = {score} ({direction}).
+
+    {history_section}Propose the next experiment.
+
+  # Header prepended to the formatted history list in {history_section}.
+  history_header: "Already tried:"
+
+  # Sent if the model replied without calling the tool — short, firm.
+  retry_nudge: "You did not call the tool. Call propose_candidate with your proposal now."
+
+  # The single tool exposed to the model. Structure (types, required) is fixed in
+  # code; the wording (description + per-field descriptions) lives here.
+  tool:
+    name: propose_candidate
+    description: "Propose the next experiment to run: the model to use and its hyperparameters."
+    fields:
+      model: >-
+        Import path of the estimator to use, from scikit-learn, XGBoost, or
+        LightGBM (e.g. 'xgboost.XGBClassifier',
+        'sklearn.ensemble.RandomForestClassifier'). Choose the most appropriate
+        model for the next experiment — it may be the current model with
+        different hyperparameters, or a different one.
+      params: >-
+        Hyperparameters for the model, e.g. {"max_depth": 4, "n_estimators":
+        300}. Omit or leave empty to use the model's defaults.
+      description: >-
+        One line naming the model and the specific change being made and its
+        intent, e.g. 'XGBoost with shallow trees (max_depth=4) to curb
+        overfitting'.
+      rationale: >-
+        A concrete reason this should improve the primary metric — grounded in
+        the data, the baseline, or what's already been tried, not 'it might
+        help'.
+      expected_metric_delta: >-
+        Expected signed change in the primary metric, in its units (e.g. +0.03).
+        Optional.

@@ -13,6 +13,8 @@ Entries are factual — what the AI defaulted to, what I decided instead, and wh
 | 2026-05-27 | Frame cost-constrained optimization as *the* moat. | Reframe as the **specialized combination**; cost-aware serving is the *flagship*, not the only moat. | One feature is not defensible. The defensibility is the combination plus the domain specialization. |
 | 2026-05-28 | Candidate spec as a flat `{"model": x, ...hyperparams}`. | Nested `{"model": x, "params": {...}}`. | Clean separation of *which model* from *its params*, no key collisions, and the exact shape the agent will emit from research. |
 | 2026-05-26 | Treat a reported/prior baseline score as the number to beat. | **Never trust a reported score** — always re-measure the baseline through our own eval. | A number computed a different way is not comparable; you cannot honestly claim an improvement against it. |
+| 2026-05-29 | Take `--baseline` + `--source` as context only, no behavior; defer reproduction to Week 10. | **Make the inputs do something in v0.1** — by end of Week 3, source must reconstruct the baseline approach through our eval and then improve from there. | A baseline number we never use is dead weight. If you take an input, it has to drive something. |
+| 2026-05-29 | Implied user-provided source code would be executed in the v0.2 sandbox to reproduce a baseline. | **Never execute user-provided source code — ever.** Source is read-only text the LLM uses to reconstruct the approach; the v0.2 sandbox runs the agent's OWN generated code, never the user's. | User notebooks/scripts are untrusted (malware/RCE-adjacent); a sandbox reduces but doesn't eliminate the risk. Reconstruct-from-text is the right permanent policy. |
 
 ## Craft and detail calls
 
@@ -23,6 +25,8 @@ Entries are factual — what the AI defaulted to, what I decided instead, and wh
 | 2026-05-27 | Leave the BUILD_LOG inconsistent (Week 1 had a "Done?" column; Weeks 2–3 didn't). | Add the column everywhere. | Asymmetry in the public trail looks careless. |
 | 2026-05-26 | Date a research entry to the day it was written up. | Correct it to the day the research actually happened. | The decision trail is only useful if it's accurate. |
 | 2026-05-27 | Mixed day-numbering in the session notes (plan-position vs calendar). | Reconcile to calendar-day headers with plan-position in parentheses. | One unambiguous timeline. |
+| 2026-05-30 | When `/v1` can't disable qwen3 thinking, bundle the workaround into `OpenAICompatibleClient`. | Build a separate **`OllamaClient`** adapter on Ollama's native `/api/chat` with `think:false`; the OpenAI client stays clean for cloud backends. | One backend's quirk shouldn't pollute the shared client. The `LLMClient` protocol is the seam — adding a sibling adapter is the right shape. |
+| 2026-05-30 | Hardcode prompt strings inside `core/proposer.py`. | Centralize every prompt in `src/iterate/prompts/prompts.yaml` (a loader exposes `PROMPTS`); modules reference structured keys. | Prompts change far more often than logic; one file = one place to review and iterate wording. |
 
 ---
 

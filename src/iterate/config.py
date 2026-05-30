@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     iterate_backend_api_key: str = "ollama"
     iterate_model: str = "qwen3:14b"  # emits structured tool calls (qwen2.5-coder does not)
     iterate_backend_timeout: float = 120.0
+    # Ollama's NATIVE endpoint — its own client (OllamaClient) uses this, because the
+    # OpenAI-compatible /v1 layer above cannot disable qwen3 thinking (think:false works
+    # only here): ~20s vs ~128s per tool call.
+    ollama_host: str = "http://localhost:11434"
 
     # ─── Sandbox + dataset access ──────────────────────────────────
     e2b_api_key: str | None = None
