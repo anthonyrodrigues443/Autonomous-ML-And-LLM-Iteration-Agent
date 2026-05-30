@@ -126,3 +126,36 @@ def test_early_stopping_param_triggers_internal_eval_set(tmp_path: Path) -> None
     assert 0.0 <= result.metrics.primary_value <= 1.0
     # Holdout size unchanged — internal eval slice came out of train, not test.
     assert result.metrics.n_samples == ds.n_test
+
+
+def test_lightgbm_with_bare_early_stopping_alias_works(tmp_path: Path) -> None:
+    """LightGBM also accepts ``early_stopping=<int>`` (alias for
+    ``early_stopping_round``). Detection must catch it AND we must supply
+    ``eval_metric`` since LightGBM raises without one."""
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    candidate = Candidate(
+        description="LightGBM with bare early_stopping",
+        changes={
+            "model": "lightgbm.LGBMClassifier",
+            "params": {"n_estimators": 50, "early_stopping": 5, "verbose": -1},
+        },
+        rationale="bound training; LightGBM accepts bare early_stopping as an int",
+    )
+    result = ModelTarget(ds, metric="f1").run(candidate)
+    assert result.metrics is not None
+    assert 0.0 <= result.metrics.primary_value <= 1.0
+
+
+def test_early_stopping_true_for_histgb_does_not_trigger_eval_set(tmp_path: Path) -> None:
+    """sklearn HistGB's ``early_stopping=True`` is internal CV, not eval_set
+    territory. Detection must NOT trigger (otherwise we'd pass an unsupported
+    fit kwarg to HistGB)."""
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    candidate = Candidate(
+        description="HistGB with internal early stopping",
+        changes={"params": {"max_iter": 30, "early_stopping": True}},
+        rationale="HistGB does its own validation split internally",
+    )
+    result = ModelTarget(ds, metric="f1").run(candidate)
+    assert result.metrics is not None
+    assert 0.0 <= result.metrics.primary_value <= 1.0

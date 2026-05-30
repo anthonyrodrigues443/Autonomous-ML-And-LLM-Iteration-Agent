@@ -45,12 +45,32 @@ _CLASSIFICATION_METRICS = {"accuracy", "f1", "precision", "recall"}
 _REGRESSION_METRICS = {"rmse", "mae", "mse", "r2"}
 _MINIMIZE = {"rmse", "mae", "mse"}
 
-# Param names that mean "I need an eval set for early stopping" — XGBoost +
-# LightGBM. When any of these appear in a candidate's params, we split a 90/10
-# fit/eval slice off the training set and pass eval_set to the estimator via the
-# sklearn `Pipeline`'s ``step__param`` fit_params mechanism. The sealed holdout
-# stays untouched.
-_EARLY_STOPPING_PARAM_NAMES = {"early_stopping_rounds", "early_stopping_round"}
+# Param names that mean "I need an eval set for early stopping." XGBoost uses
+# ``early_stopping_rounds`` (plural); LightGBM uses ``early_stopping_round``
+# (singular) and aliases bare ``early_stopping=<int>``. sklearn's HistGB also has
+# ``early_stopping`` but as a bool/"auto" (internal CV — doesn't need eval_set),
+# so we exclude the bool case below.
+_EARLY_STOPPING_PARAM_NAMES = frozenset(
+    {"early_stopping_rounds", "early_stopping_round", "early_stopping"}
+)
+
+
+def _wants_eval_set(params: dict[str, Any]) -> bool:
+    """True iff the candidate's params describe XGBoost/LightGBM-style early stopping.
+
+    Excludes sklearn's ``early_stopping=True|"auto"|False`` (HistGB does its own
+    internal CV; passing it `eval_set` would just error at fit time).
+    """
+    for key in _EARLY_STOPPING_PARAM_NAMES & set(params):
+        value = params[key]
+        if key in {"early_stopping_rounds", "early_stopping_round"}:
+            return True
+        # ``early_stopping`` as a positive int → LightGBM rounds count.
+        if isinstance(value, bool):
+            continue  # bool first, since bool is a subclass of int
+        if isinstance(value, int):
+            return True
+    return False
 
 
 def _task_for_metric(metric: str) -> Task:
@@ -114,7 +134,7 @@ class ModelTarget:
         pipeline = Pipeline([("preprocess", self._preprocessor()), ("model", estimator)])
 
         params = spec.get("params") or {}
-        wants_early_stopping = bool(_EARLY_STOPPING_PARAM_NAMES & set(params))
+        wants_early_stopping = _wants_eval_set(params)
 
         # Cap OpenMP/BLAS threads: on small tabular data the thread-pool overhead
         # dwarfs the actual work (~200x slower here at 10 cores), so 1 thread wins.
@@ -123,7 +143,7 @@ class ModelTarget:
             if wants_early_stopping:
                 # The candidate asked for early stopping → carve a 90/10 fit/eval
                 # slice off the training set; the sealed holdout stays untouched.
-                fit_params = self._fit_with_internal_eval_set(pipeline)
+                fit_params = self._fit_with_internal_eval_set(estimator, params, pipeline)
                 pipeline.fit(*fit_params["xy"], **fit_params["fit_kwargs"])
             else:
                 pipeline.fit(self._dataset.train_features, self._dataset.train_target)
@@ -136,12 +156,16 @@ class ModelTarget:
         )
         return ExperimentResult(experiment_id=experiment_id, metrics=metrics)
 
-    def _fit_with_internal_eval_set(self, pipeline: Pipeline) -> dict[str, Any]:
+    def _fit_with_internal_eval_set(
+        self, estimator: Any, params: dict[str, Any], pipeline: Pipeline
+    ) -> dict[str, Any]:
         """Split train into 90% fit / 10% eval and prepare an ``eval_set`` fit_param.
 
         The preprocess step is fit on the 90% (no leakage from eval into the
         transforms) and the 10% eval features are transformed through it so the
-        estimator sees an apples-to-apples eval_set.
+        estimator sees an apples-to-apples eval_set. LightGBM additionally needs
+        ``eval_metric`` for early stopping; we supply a sensible default if the
+        candidate didn't.
         """
         stratify = self._dataset.train_target if self._task == "classification" else None
         x_fit, x_eval, y_fit, y_eval = train_test_split(
@@ -154,10 +178,15 @@ class ModelTarget:
         preproc = pipeline.named_steps["preprocess"]
         preproc.fit(x_fit)
         x_eval_t = preproc.transform(x_eval)
-        return {
-            "xy": (x_fit, y_fit),
-            "fit_kwargs": {"model__eval_set": [(x_eval_t, y_eval)]},
-        }
+
+        fit_kwargs: dict[str, Any] = {"model__eval_set": [(x_eval_t, y_eval)]}
+        # LightGBM raises if eval_metric isn't set. Supply a task-appropriate
+        # default unless the candidate already specified one in params.
+        if type(estimator).__name__.startswith("LGBM") and "eval_metric" not in params:
+            fit_kwargs["model__eval_metric"] = (
+                "binary_logloss" if self._task == "classification" else "rmse"
+            )
+        return {"xy": (x_fit, y_fit), "fit_kwargs": fit_kwargs}
 
     def _preprocessor(self) -> Any:
         numeric = self._dataset.train_features.select_dtypes(include="number").columns.tolist()
