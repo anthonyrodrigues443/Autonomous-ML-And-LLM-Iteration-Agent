@@ -163,7 +163,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | Day | Focus | Lands | Done? |
 |---|---|---|---|
 | 1 | Proposer (+ native `OllamaClient` adapter for `think:false` + centralized `prompts.yaml`) — LLM proposes the next `Candidate` via a `propose_candidate` tool call from data summary + baseline + history | `core/proposer.py` + `llm/ollama_client.py` + `prompts/` + tests | done |
-| 2 | Orchestrator — the loop: `baseline()` → propose → `run()` → score → record → decide → repeat | `src/iterate/core/orchestrator.py` + tests | todo |
+| 2 | Orchestrator — the loop: `baseline()` → propose → `run()` → score → record → decide → repeat (in-memory history; internal stop logic) | `src/iterate/core/orchestrator.py` + tests | done |
 | 3 | Terminator — stop on deadline / patience / plateau (minimal) | `src/iterate/core/terminator.py` + tests | todo |
 | 4 | Memory — record every experiment; feed history to the Proposer; avoid repeats (sqlite, minimal) | `src/iterate/core/memory.py` + tests | todo |
 | 5 | CLI `iterate run` (+ `--backend` factory) **and source-aware baseline reconstruction** — LLM reads `--source` md/txt/notebook as **text only** (never executes), rebuilds the approach as a spec, we run it through our eval → re-measured baseline | `src/iterate/cli.py` + reconstruction module + tests | todo |
@@ -230,6 +230,24 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-30 | Week 3 Day 2 | Orchestrator (closes the agentic loop)
+
+**Task:** Wire the Week-2 substrate + Day-1 Proposer into the autonomous loop — `baseline → propose → execute → score → record → decide → repeat`.
+
+**What shipped:**
+- Files: `src/iterate/core/orchestrator.py` (`Orchestrator` class + frozen `RunResult` dataclass), `tests/unit/test_orchestrator.py` (9 tests)
+- `RunResult` carries: the re-measured baseline, the full ordered `Experiment` history, the best successful experiment (or `None`), and `stopped_because` (`"max_iterations"` | `"patience"` | `"baseline_failed"`).
+- `current_model` follows the best-so-far candidate — the Proposer's prompt always reflects what's currently in use.
+- 89 unit tests pass (+9 from Day 2); ruff + mypy --strict clean (26 src files).
+
+**Decisions (deliberately YAGNI for Day 2):**
+- **In-memory history** — Memory (sqlite, Day 4) plugs in as a swap.
+- **Internal stop logic** (`max_iterations`, `patience`) — Terminator (Day 3) takes over via a delegated protocol (same shape as the deferred `ComputeBackend` protocol).
+- **`ProposerError` counts toward patience, no history entry** — the iteration was attempted; there's no `Candidate` to wrap as an `Experiment`. Day 4 Memory adds structured proposer-failure records.
+- **No `run_agent.py` script or live integration test** — runnable end-to-end is the Day-5 CLI's job; Day 2 stays on deterministic fakes (no temporary code just for visual confirmation).
+
+**Next session:** Week 3 Day 3 — the Terminator (deadline / patience / plateau as a delegated protocol).
 
 ### 2026-05-30 | Week 3 Day 1 | Proposer + native Ollama adapter + centralized prompts
 
