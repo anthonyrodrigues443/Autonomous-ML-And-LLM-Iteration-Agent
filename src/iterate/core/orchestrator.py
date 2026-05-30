@@ -1,10 +1,9 @@
 """The Orchestrator — closes the agentic loop.
 
 Drives ``baseline → propose → execute → score → record → decide → repeat`` over
-the Week-2 substrate. Holds history in memory and runs its own minimal stop
-checks (`max_iterations` + `patience`). The Memory store (Day 4, sqlite) replaces
-the in-memory list; the Terminator (Day 3) takes over stop logic via a delegated
-protocol — both YAGNI-deferred so this lands clean.
+the Week-2 substrate. Holds history in memory; delegates "should I stop?" to a
+`Terminator` (Day 3) — the Memory store (Day 4, sqlite) will replace the
+in-memory list later, same shape.
 
 `current_model` follows the best-so-far candidate (so the Proposer's prompt always
 reflects "what's currently in use"). On the first iteration it's the model the
@@ -16,14 +15,17 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 from iterate.core.proposer import ProposerError
+from iterate.core.terminator import AttemptOutcome, LoopState
 from iterate.schemas.experiment import Experiment
 
 if TYPE_CHECKING:
     from iterate.adapters.compute.local import LocalExecutor
     from iterate.core.proposer import Proposer
+    from iterate.core.terminator import Terminator
     from iterate.schemas.experiment import ExperimentResult
     from iterate.targets.base import BenchmarkTarget
 
@@ -73,23 +75,17 @@ class Orchestrator:
         target: BenchmarkTarget,
         proposer: Proposer,
         executor: LocalExecutor,
+        terminator: Terminator,
         *,
         data_summary: str,
         baseline_model: str,
-        max_iterations: int = 10,
-        patience: int = 3,
     ) -> None:
-        if max_iterations < 1:
-            raise ValueError("max_iterations must be >= 1")
-        if patience < 1:
-            raise ValueError("patience must be >= 1")
         self._target = target
         self._proposer = proposer
         self._executor = executor
+        self._terminator = terminator
         self._data_summary = data_summary
         self._initial_model = baseline_model
-        self._max_iterations = max_iterations
-        self._patience = patience
 
     def run(self) -> RunResult:
         baseline = self._executor.execute(self._target)
@@ -107,10 +103,15 @@ class Orchestrator:
         history: list[Experiment] = []
         best: Experiment | None = None
         current_model = self._initial_model
-        non_improving = 0
-        stopped_because = "max_iterations"
+        started_at = perf_counter()
+        stopped_because = "exhausted"  # safety: a well-formed terminator always fires
+        iteration = 0
 
-        for iteration in range(1, self._max_iterations + 1):
+        while True:
+            iteration += 1
+            outcome: AttemptOutcome
+            last_experiment: Experiment | None = None
+
             try:
                 candidate = self._proposer.propose(
                     data_summary=self._data_summary,
@@ -120,59 +121,65 @@ class Orchestrator:
                 )
             except ProposerError as exc:
                 log.warning("orchestrator: iteration %d proposer failed: %s", iteration, exc)
-                non_improving += 1
-                if non_improving >= self._patience:
-                    stopped_because = "patience"
-                    break
-                continue
+                outcome = "proposer_error"
+            else:
+                experiment = Experiment(
+                    candidate=candidate,
+                    target=self._target.name,
+                    hypothesis=candidate.description,
+                    status="running",
+                    iteration=iteration,
+                    started_at=_now(),
+                )
+                result = self._executor.execute(self._target, candidate)
+                # Link the result back to *this* experiment (the executor wrote candidate.id).
+                result = result.model_copy(update={"experiment_id": experiment.id})
+                experiment = experiment.model_copy(
+                    update={
+                        "status": "completed" if result.succeeded else "failed",
+                        "result": result,
+                        "finished_at": _now(),
+                    }
+                )
+                history.append(experiment)
+                last_experiment = experiment
 
-            experiment = Experiment(
-                candidate=candidate,
-                target=self._target.name,
-                hypothesis=candidate.description,
-                status="running",
+                if result.succeeded and result.metrics is not None:
+                    log.info(
+                        "orchestrator: iteration %d %s -> %s=%.4f",
+                        iteration,
+                        candidate.changes.get("model"),
+                        metric,
+                        result.metrics.primary_value,
+                    )
+                else:
+                    log.info(
+                        "orchestrator: iteration %d %s -> failed (%s)",
+                        iteration,
+                        candidate.changes.get("model"),
+                        result.error,
+                    )
+
+                if result.succeeded and _improves(result, best, baseline, direction):
+                    best = experiment
+                    model = candidate.changes.get("model")
+                    if isinstance(model, str):
+                        current_model = model
+                    outcome = "improved"
+                else:
+                    outcome = "no_improvement"
+
+            state = LoopState(
                 iteration=iteration,
-                started_at=_now(),
+                baseline=baseline,
+                best=best,
+                last_experiment=last_experiment,
+                last_attempt_outcome=outcome,
+                elapsed_seconds=perf_counter() - started_at,
             )
-            result = self._executor.execute(self._target, candidate)
-            # Link the result back to *this* experiment (the executor wrote candidate.id).
-            result = result.model_copy(update={"experiment_id": experiment.id})
-            experiment = experiment.model_copy(
-                update={
-                    "status": "completed" if result.succeeded else "failed",
-                    "result": result,
-                    "finished_at": _now(),
-                }
-            )
-            history.append(experiment)
-
-            if result.succeeded and result.metrics is not None:
-                log.info(
-                    "orchestrator: iteration %d %s -> %s=%.4f",
-                    iteration,
-                    candidate.changes.get("model"),
-                    metric,
-                    result.metrics.primary_value,
-                )
-            else:
-                log.info(
-                    "orchestrator: iteration %d %s -> failed (%s)",
-                    iteration,
-                    candidate.changes.get("model"),
-                    result.error,
-                )
-
-            if result.succeeded and _improves(result, best, baseline, direction):
-                best = experiment
-                model = candidate.changes.get("model")
-                if isinstance(model, str):
-                    current_model = model
-                non_improving = 0
-            else:
-                non_improving += 1
-
-            if non_improving >= self._patience:
-                stopped_because = "patience"
+            reason = self._terminator.update_and_check(state)
+            if reason is not None:
+                stopped_because = reason
                 break
 
         return RunResult(

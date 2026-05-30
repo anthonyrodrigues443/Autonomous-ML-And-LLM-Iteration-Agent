@@ -13,6 +13,7 @@ import pytest
 from iterate.adapters.compute.local import LocalExecutor
 from iterate.core.orchestrator import Orchestrator, RunResult
 from iterate.core.proposer import ProposerError
+from iterate.core.terminator import Composite, LoopState, MaxIterations, Patience, Terminator
 from iterate.schemas.experiment import Candidate, ExperimentResult, Metrics
 
 
@@ -94,29 +95,21 @@ def _cand(model: str) -> Candidate:
     return Candidate(description=f"try {model}", changes={"model": model}, rationale="test")
 
 
-def _orch(target: _FakeTarget, proposer: _FakeProposer, **kwargs: Any) -> Orchestrator:
+def _orch(target: _FakeTarget, proposer: _FakeProposer, terminator: Terminator) -> Orchestrator:
     return Orchestrator(
         target,  # type: ignore[arg-type]
         proposer,  # type: ignore[arg-type]
         LocalExecutor(),
+        terminator,
         data_summary="x",
         baseline_model="base.Model",
-        **kwargs,
     )
-
-
-def test_validates_constructor_args() -> None:
-    target, proposer = _FakeTarget(), _FakeProposer()
-    with pytest.raises(ValueError, match="max_iterations"):
-        _orch(target, proposer, max_iterations=0)
-    with pytest.raises(ValueError, match="patience"):
-        _orch(target, proposer, patience=0)
 
 
 def test_runs_through_iterations_and_returns_best() -> None:
     target = _FakeTarget(baseline_score=0.70, results={"a.A": 0.72, "b.B": 0.75, "c.C": 0.73})
     proposer = _FakeProposer([_cand("a.A"), _cand("b.B"), _cand("c.C")])
-    res = _orch(target, proposer, max_iterations=3, patience=10).run()
+    res = _orch(target, proposer, MaxIterations(3)).run()
     assert isinstance(res, RunResult)
     assert res.stopped_because == "max_iterations"
     assert len(res.history) == 3
@@ -130,7 +123,7 @@ def test_runs_through_iterations_and_returns_best() -> None:
 def test_stops_at_patience_after_no_improvement() -> None:
     target = _FakeTarget(baseline_score=0.70, results={"a.A": 0.65, "b.B": 0.65})
     proposer = _FakeProposer([_cand("a.A"), _cand("b.B")])
-    res = _orch(target, proposer, max_iterations=10, patience=2).run()
+    res = _orch(target, proposer, Composite(MaxIterations(10), Patience(2))).run()
     assert res.stopped_because == "patience"
     assert len(res.history) == 2
     assert res.best is None
@@ -139,7 +132,7 @@ def test_stops_at_patience_after_no_improvement() -> None:
 def test_proposer_error_counts_toward_patience_no_history_entry() -> None:
     target = _FakeTarget()
     proposer = _FakeProposer(always_error=True)
-    res = _orch(target, proposer, max_iterations=10, patience=2).run()
+    res = _orch(target, proposer, Composite(MaxIterations(10), Patience(2))).run()
     assert res.stopped_because == "patience"
     assert len(res.history) == 0
     assert res.best is None
@@ -149,7 +142,7 @@ def test_proposer_error_counts_toward_patience_no_history_entry() -> None:
 def test_best_is_none_when_all_proposals_fail() -> None:
     target = _FakeTarget(baseline_score=0.70, results={"a.A": None, "b.B": None})
     proposer = _FakeProposer([_cand("a.A"), _cand("b.B")])
-    res = _orch(target, proposer, max_iterations=2, patience=10).run()
+    res = _orch(target, proposer, MaxIterations(2)).run()
     assert res.stopped_because == "max_iterations"
     assert len(res.history) == 2
     assert all(exp.status == "failed" for exp in res.history)
@@ -159,7 +152,7 @@ def test_best_is_none_when_all_proposals_fail() -> None:
 def test_current_model_updates_to_best() -> None:
     target = _FakeTarget(baseline_score=0.70, results={"a.A": 0.72, "b.B": 0.71})
     proposer = _FakeProposer([_cand("a.A"), _cand("b.B")])
-    _orch(target, proposer, max_iterations=2, patience=10).run()
+    _orch(target, proposer, MaxIterations(2)).run()
     assert proposer.calls[0]["current_model"] == "base.Model"
     assert proposer.calls[1]["current_model"] == "a.A"
 
@@ -171,7 +164,7 @@ def test_minimize_direction_picks_lower_score() -> None:
         direction="minimize",
     )
     proposer = _FakeProposer([_cand("a.A"), _cand("b.B"), _cand("c.C")])
-    res = _orch(target, proposer, max_iterations=3, patience=10).run()
+    res = _orch(target, proposer, MaxIterations(3)).run()
     assert res.best is not None
     assert res.best.candidate.changes["model"] == "b.B"
     assert res.best.result is not None
@@ -182,7 +175,7 @@ def test_minimize_direction_picks_lower_score() -> None:
 def test_history_grows_for_each_proposer_call() -> None:
     target = _FakeTarget(results={"a.A": 0.72, "b.B": 0.71})
     proposer = _FakeProposer([_cand("a.A"), _cand("b.B")])
-    _orch(target, proposer, max_iterations=2, patience=10).run()
+    _orch(target, proposer, MaxIterations(2)).run()
     assert len(proposer.calls[0]["history"]) == 0
     assert len(proposer.calls[1]["history"]) == 1
 
@@ -190,8 +183,21 @@ def test_history_grows_for_each_proposer_call() -> None:
 def test_baseline_failure_returns_no_iterations() -> None:
     target = _FakeTarget(baseline_score=None)
     proposer = _FakeProposer([_cand("a.A")])
-    res = _orch(target, proposer).run()
+    res = _orch(target, proposer, MaxIterations(10)).run()
     assert res.stopped_because == "baseline_failed"
     assert res.history == []
     assert res.best is None
     assert len(proposer.calls) == 0
+
+
+def test_orchestrator_propagates_terminator_reason() -> None:
+    """The Orchestrator returns whatever stop reason the Terminator gave."""
+
+    class _CustomReason:
+        def update_and_check(self, state: LoopState) -> str | None:
+            return "custom-stop"
+
+    target = _FakeTarget(results={"a.A": 0.72})
+    proposer = _FakeProposer([_cand("a.A")])
+    res = _orch(target, proposer, _CustomReason()).run()
+    assert res.stopped_because == "custom-stop"

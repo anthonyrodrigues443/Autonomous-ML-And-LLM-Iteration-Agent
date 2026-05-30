@@ -164,7 +164,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 |---|---|---|---|
 | 1 | Proposer (+ native `OllamaClient` adapter for `think:false` + centralized `prompts.yaml`) — LLM proposes the next `Candidate` via a `propose_candidate` tool call from data summary + baseline + history | `core/proposer.py` + `llm/ollama_client.py` + `prompts/` + tests | done |
 | 2 | Orchestrator — the loop: `baseline()` → propose → `run()` → score → record → decide → repeat (in-memory history; internal stop logic) | `src/iterate/core/orchestrator.py` + tests | done |
-| 3 | Terminator — stop on deadline / patience / plateau (minimal) | `src/iterate/core/terminator.py` + tests | todo |
+| 3 | Terminator — stop on deadline / patience / plateau via a delegated protocol; Orchestrator refactored to delegate | `src/iterate/core/terminator.py` + tests | done |
 | 4 | Memory — record every experiment; feed history to the Proposer; avoid repeats (sqlite, minimal) | `src/iterate/core/memory.py` + tests | todo |
 | 5 | CLI `iterate run` (+ `--backend` factory) **and source-aware baseline reconstruction** — LLM reads `--source` md/txt/notebook as **text only** (never executes), rebuilds the approach as a spec, we run it through our eval → re-measured baseline | `src/iterate/cli.py` + reconstruction module + tests | todo |
 | 6 | First autonomous tabular run on churn — LLM iterates to best by deadline → tag **v0.1.0** | `examples/churn_tabular/` + integration test | todo |
@@ -230,6 +230,27 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-30 | Week 3 Day 3 | Terminator (delegated stop logic)
+
+**Task:** Extract the Orchestrator's internal stop logic into a clean `Terminator` protocol; add the missing stop conditions (deadline, plateau).
+
+**What shipped:**
+- Files: `src/iterate/core/terminator.py` (Protocol + 5 concretes + `LoopState` + factory), `tests/unit/test_terminator.py` (18 tests). Orchestrator refactored to delegate.
+- `Terminator` protocol: one method, `update_and_check(state) -> str | None`. Stateful by design (Patience/Plateau track history); single method avoids notify-then-check ordering bugs.
+- Concretes: `MaxIterations(n)`, `Patience(k)` (counts `proposer_error` too), `Deadline(seconds)`, `Plateau(window, epsilon)` (direction-agnostic spread), `Composite(*terminators)`.
+- `Composite` calls **all** children every iteration (each maintains its own state correctly), then returns the first non-`None` reason.
+- `default_terminator(...)` factory: sane Composite of `MaxIterations` + `Patience`, optional `Deadline`.
+- **Orchestrator refactor:** dropped `max_iterations` / `patience` constructor args; takes `terminator: Terminator` instead. Tracks per-iteration outcome (`improved` / `no_improvement` / `proposer_error`) and elapsed wall-time, builds a `LoopState` each iteration, propagates whatever `stopped_because` reason the terminator returns.
+- 106 unit tests pass (was 89; +17 net); ruff + mypy --strict clean (27 src files).
+
+**Decisions:**
+- **One method on Terminator** (`update_and_check`) rather than separate `notify` + `should_stop` — fewer places to call wrong, no ordering ambiguity.
+- **`Composite` calls all children** every iteration (then returns the first reason) rather than short-circuiting — short-circuit would leave later terminators with stale state and they'd fire wrong on the next call.
+- **`Plateau` shipped now** — small (~15 lines), and direction-agnostic via spread (max − min in the window) is more robust to noise than first-vs-last improvement.
+- **Dropped the old Orchestrator constructor args cleanly** (no compatibility shim) — only the existing tests use the Orchestrator today; this was the cleanest moment to refactor.
+
+**Next session:** Week 3 Day 4 — Memory (sqlite, persistent history, feed past attempts to the Proposer, recognise repeats across sessions).
 
 ### 2026-05-30 | Week 3 Day 2 | Orchestrator (closes the agentic loop)
 
