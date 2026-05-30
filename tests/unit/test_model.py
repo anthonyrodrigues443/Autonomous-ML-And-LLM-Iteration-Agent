@@ -106,3 +106,23 @@ def test_unknown_metric_raises(tmp_path: Path) -> None:
     ds = load_csv(_classification_csv(tmp_path), target="churn")
     with pytest.raises(ValueError, match="unknown metric"):
         ModelTarget(ds, metric="bleu")
+
+
+def test_early_stopping_param_triggers_internal_eval_set(tmp_path: Path) -> None:
+    """When a candidate asks for early stopping, we carve a 90/10 eval slice off
+    the training set so XGBoost/LightGBM can monitor it. The sealed holdout is
+    not touched. This used to fail-fast — now it just works."""
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    candidate = Candidate(
+        description="XGBoost with early stopping",
+        changes={
+            "model": "xgboost.XGBClassifier",
+            "params": {"n_estimators": 50, "early_stopping_rounds": 5},
+        },
+        rationale="bound training when validation stops improving",
+    )
+    result = ModelTarget(ds, metric="f1").run(candidate)
+    assert result.metrics is not None
+    assert 0.0 <= result.metrics.primary_value <= 1.0
+    # Holdout size unchanged — internal eval slice came out of train, not test.
+    assert result.metrics.n_samples == ds.n_test
