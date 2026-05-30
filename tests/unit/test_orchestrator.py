@@ -238,3 +238,26 @@ def test_cross_run_history_is_seen_by_next_runs_proposer() -> None:
     second_run_history = proposer_2.calls[0]["history"]
     assert len(second_run_history) == 1
     assert second_run_history[0].candidate.changes["model"] == "a.A"
+
+
+def test_baseline_candidate_routes_through_executor_run() -> None:
+    """When baseline_candidate is given, the baseline measurement uses it."""
+    target = _FakeTarget(baseline_score=0.70, results={"reconstructed.M": 0.74, "a.A": 0.72})
+    proposer = _FakeProposer([_cand("a.A")])
+    seed = _cand("reconstructed.M")
+
+    orch = Orchestrator(
+        target,  # type: ignore[arg-type]
+        proposer,  # type: ignore[arg-type]
+        LocalExecutor(),
+        MaxIterations(1),
+        InMemoryMemory(),
+        data_summary="x",
+        baseline_model="reconstructed.M",
+        baseline_candidate=seed,
+    )
+    res = orch.run()
+
+    # Baseline came from running `seed`, not from target.baseline()
+    assert res.baseline.metrics is not None
+    assert res.baseline.metrics.primary_value == pytest.approx(0.74)

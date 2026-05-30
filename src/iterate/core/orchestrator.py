@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from iterate.core.memory import Memory
     from iterate.core.proposer import Proposer
     from iterate.core.terminator import Terminator
-    from iterate.schemas.experiment import ExperimentResult
+    from iterate.schemas.experiment import Candidate, ExperimentResult
     from iterate.targets.base import BenchmarkTarget
 
 
@@ -82,6 +82,7 @@ class Orchestrator:
         *,
         data_summary: str,
         baseline_model: str,
+        baseline_candidate: Candidate | None = None,
     ) -> None:
         self._target = target
         self._proposer = proposer
@@ -90,9 +91,14 @@ class Orchestrator:
         self._memory = memory
         self._data_summary = data_summary
         self._initial_model = baseline_model
+        self._baseline_candidate = baseline_candidate
 
     def run(self) -> RunResult:
-        baseline = self._executor.execute(self._target)
+        baseline = (
+            self._executor.execute(self._target, self._baseline_candidate)
+            if self._baseline_candidate is not None
+            else self._executor.execute(self._target)
+        )
         if not baseline.succeeded or baseline.metrics is None:
             log.warning("orchestrator: baseline failed (%s); aborting", baseline.error)
             return RunResult(

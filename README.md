@@ -12,7 +12,7 @@
 
 ## Status
 
-**Building — Week 2 complete (tabular substrate done); Week 3 next: the agentic loop → v0.1.** First release **v0.1** (the working agentic loop) lands at the end of Week 3; incremental releases follow through to the full **v1.0** (~late Aug 2026).
+**Building — Week 3 in progress; agentic loop done (Days 1–5), v0.1 tags after Days 6–7.** First release **v0.1** (the working agentic loop) lands at the end of Week 3; incremental releases follow through to the full **v1.0** (~early Sep 2026).
 
 **Agent-first:** the autonomous loop is the **v0.1** milestone (Week 3), not a late-stage add-on. After that, two dials turn release to release — the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular → prompts → DL/vision). Full roadmap + daily trail in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -21,16 +21,17 @@
 | 0 | Scaffolding + scope lock | done |
 | 1 | Foundation — schemas + LLM client (tool-calling) + config + CLI | done |
 | 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` + model factory + local executor | done |
-| 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory → first autonomous tabular run (**v0.1**) | — |
-| 4–5 | **Sandboxed code-gen** — the agent writes + runs training code in e2b → any model at all (**v0.2**) | — |
-| 6 | Agent picks the metric + starting model (**v0.3**) | — |
-| 7 | `PromptTarget` — agentic prompt iteration (**v0.4**) | — |
-| 8 | `DLModelTarget` — vision transfer learning, validated on local RTX 4050 (**v0.5**) | — |
-| 9 | **Cost-constrained recommendation** + serving profile + `iterate cost` (**v0.6**) | — |
-| 10 | Infer features/target from the data + a description (**v0.7**) | — |
-| 11 | **MCP discovery** — find the data/code itself (**v0.8**) | — |
-| 12 | Multi-backend benchmark + **Streamlit chat UI** + demos (**v0.9**) | — |
-| 13 | Full minimum-viable-input + polish + launch (**v1.0**) | — |
+| 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory + CLI → first autonomous tabular run (**v0.1**) | in progress |
+| 4–5 | **Sandboxed code-gen** + cheap interactive wins (live progress, streaming, Ctrl-C) (**v0.2**) | — |
+| 6 | **Full interactive CLI** — pause, mid-run chat, resume (**v0.3**) | — |
+| 7 | Agent picks the metric + starting model (**v0.4**) | — |
+| 8 | `PromptTarget` — agentic prompt iteration (**v0.5**) | — |
+| 9 | `DLModelTarget` — vision transfer learning, validated on local RTX 4050 (**v0.6**) | — |
+| 10 | **Cost-constrained recommendation** + serving profile + `iterate cost` (**v0.7**) | — |
+| 11 | Infer features/target from the data + a description (**v0.8**) | — |
+| 12 | **MCP discovery** — find the data/code itself (**v0.9**) | — |
+| 13 | Multi-backend benchmark + **Streamlit chat UI** + demos (**v0.10**) | — |
+| 14 | Full minimum-viable-input + polish + launch (**v1.0**) | — |
 
 ---
 

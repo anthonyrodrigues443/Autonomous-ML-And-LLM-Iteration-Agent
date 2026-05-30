@@ -60,3 +60,55 @@ proposer:
       expected_metric_delta: >-
         Expected signed change in the primary metric, in its units (e.g. +0.03).
         Optional.
+
+reconstructor:
+  # System prompt for source-aware baseline reconstruction. The LLM reads the
+  # source (md / txt / notebook / .py) AS TEXT ONLY and emits a runnable spec we
+  # then build through our model factory. The user's code is NEVER executed.
+  # Placeholders: {metric}, {direction}
+  system: >-
+    You are reading a source document the user provided so we can reproduce
+    their modeling approach as a baseline. From the source — which is provided
+    as text only and will NEVER be executed — extract the model and key
+    hyperparameters they used, and emit a runnable spec we can build through
+    our model factory (scikit-learn, XGBoost, or LightGBM only). If their model
+    is not available in those libraries (e.g. CatBoost, a custom architecture),
+    pick the closest faithful equivalent. Optimize the primary metric
+    '{metric}' ({direction}). Call the reconstruct_baseline tool.
+
+  # User template — the data brief + source content.
+  # Placeholders: {data_summary}, {metric}, {direction}, {source_text}
+  user_template: |-
+    Dataset:
+    {data_summary}
+
+    Primary metric: {metric} ({direction}).
+
+    Source document the user provided (text only — DO NOT assume it will be executed):
+    ---
+    {source_text}
+    ---
+
+    Reconstruct the baseline approach.
+
+  retry_nudge: "You did not call the tool. Call reconstruct_baseline with the reconstructed approach now."
+
+  tool:
+    name: reconstruct_baseline
+    description: "Emit the reconstructed baseline approach as a runnable model + params spec."
+    fields:
+      model: >-
+        Import path of the estimator that matches the source's approach, from
+        scikit-learn, XGBoost, or LightGBM (e.g. 'xgboost.XGBClassifier'). If
+        the source uses a model outside these libraries (CatBoost, a custom
+        net, etc.), pick the closest faithful equivalent.
+      params: >-
+        Hyperparameters from the source, e.g. {"max_depth": 6, "n_estimators":
+        500}. Omit any value the source doesn't specify (we'll use the model's
+        defaults).
+      description: >-
+        One line naming the reconstructed approach, e.g. 'XGBoost (mirrors the
+        notebook's CatBoost setup; max_depth=6, n_estimators=500)'.
+      rationale: >-
+        Briefly state which parts of the source you drew from and why this is a
+        faithful reconstruction (and what you approximated, if anything).
