@@ -155,18 +155,18 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 **Target window:** ~Jun 8–14 (log by real date).
 
 **v0.1 contract (agreed 2026-05-27):**
-- **Inputs:** `--data` + `--target` (required) · `--metric` (required in v0.1 — agent *choosing* the metric is v0.3; may default by task type) · `--baseline` + `--source` notebook/md/txt (optional; source is read as **context** — what's been tried — NOT auto-executed) · `--until` / `--patience` (optional; **patience** is the primary stop, deadline a backstop). Features auto-derive as all columns except target.
-- **Working:** measure *our own* baseline → loop { propose → train → score on the sealed holdout → record → decide } until plateau or deadline. v0.1 candidate space = any installed allow-listed estimator (sklearn / XGBoost / LightGBM) via the model factory, named by `{"model","params"}`.
+- **Inputs:** `--data` + `--target` (required) · `--metric` (required in v0.1 — agent *choosing* the metric is v0.3; may default by task type) · `--baseline` + `--source` notebook/md/txt (optional; source is **read as text** by the LLM to **reconstruct the baseline approach** — model + params + key preprocessing — which we run through our own eval for a comparable re-measured baseline; the user's actual code is **never executed**) · `--until` / `--patience` (optional; **patience** is the primary stop, deadline a backstop). Features auto-derive as all columns except target.
+- **Working:** measure *our own* baseline (from the factory's default, or reconstructed from `--source` if given) → loop { propose → train → score on the sealed holdout → record → decide } until plateau or deadline. v0.1 candidate space = any installed allow-listed estimator (sklearn / XGBoost / LightGBM) via the model factory, named by `{"model","params"}`.
 - **Output:** the **best model** (artifact + the winning config) + its score vs the **baseline we measured** + an **auditable report** of every experiment and why the winner won. Agent proposes; human reviews.
-- **NOT in v0.1:** arbitrary/uninstalled models via sandboxed code-gen (v0.2) · the agent picking the metric (v0.3) · cost-constraint / serving profile (v0.6) · auto-reproducing a source notebook by executing it (~Week 10 discovery).
+- **NOT in v0.1:** arbitrary/uninstalled models via sandboxed code-gen (v0.2) · the agent picking the metric (v0.3) · cost-constraint / serving profile (v0.6) · **executing user-provided source code — ever** (permanent security policy; the e2b sandbox at v0.2 runs the agent's OWN generated code, never the user's).
 
 | Day | Focus | Lands | Done? |
 |---|---|---|---|
-| 1 | Proposer — LLM proposes the next `Candidate` from the data summary + baseline + past results (+ optional source notebook) | `src/iterate/core/proposer.py` + tests | todo |
+| 1 | Proposer (+ native `OllamaClient` adapter for `think:false` + centralized `prompts.yaml`) — LLM proposes the next `Candidate` via a `propose_candidate` tool call from data summary + baseline + history | `core/proposer.py` + `llm/ollama_client.py` + `prompts/` + tests | done |
 | 2 | Orchestrator — the loop: `baseline()` → propose → `run()` → score → record → decide → repeat | `src/iterate/core/orchestrator.py` + tests | todo |
 | 3 | Terminator — stop on deadline / patience / plateau (minimal) | `src/iterate/core/terminator.py` + tests | todo |
 | 4 | Memory — record every experiment; feed history to the Proposer; avoid repeats (sqlite, minimal) | `src/iterate/core/memory.py` + tests | todo |
-| 5 | CLI `iterate run` — explicit inputs: `--data --features --target --metric --baseline/--notebook --until/--patience` | `src/iterate/cli.py` + tests | todo |
+| 5 | CLI `iterate run` (+ `--backend` factory) **and source-aware baseline reconstruction** — LLM reads `--source` md/txt/notebook as **text only** (never executes), rebuilds the approach as a spec, we run it through our eval → re-measured baseline | `src/iterate/cli.py` + reconstruction module + tests | todo |
 | 6 | First autonomous tabular run on churn — LLM iterates to best by deadline → tag **v0.1.0** | `examples/churn_tabular/` + integration test | todo |
 | 7 | Polish + Week 3 retro + release **v0.1.0** | wrap-up | todo |
 
@@ -230,6 +230,28 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-30 | Week 3 Day 1 | Proposer + native Ollama adapter + centralized prompts
+
+**Task:** Start the agentic loop — the LLM proposes the next Candidate. Took two calendar days because the live path surfaced a hard backend constraint that had to be solved before Day 2 could land.
+
+**What shipped:**
+- **The Proposer** (`src/iterate/core/proposer.py`): turns an LLM call into a structured `Candidate` via a `propose_candidate` tool — REQUIRED `model` (current model or another, by import path), optional `params`, plus `description`/`rationale`/`expected_metric_delta`. Text-reply retry fallback (the LLMClient protocol exposes no `tool_choice`). `summarize_dataset(dataset)` helper for the data brief.
+- **Native Ollama adapter** (`src/iterate/llm/ollama_client.py`): a NEW `LLMClient` implementation hitting Ollama's native `/api/chat` with `think:false`. Lives **alongside** `OpenAICompatibleClient` (unchanged) — Ollama gets its own adapter because its OpenAI `/v1` layer can't disable thinking. Added `ollama_host` to config.
+- **Centralized prompts** (`src/iterate/prompts/prompts.yaml` + 12-line loader): every Proposer prompt — system, user template, history header, retry nudge, tool description + all 5 field descriptions — now lives in one YAML file. Wording can change without touching code.
+- 80 unit tests + 1 integration (live qwen3:14b → valid Candidate in ~40s). ruff + mypy --strict clean (25 src files).
+
+**The finding (measured, not assumed):**
+- The first live Proposer call timed out at **18 minutes** (SDK retries × backend timeout). Diagnosed step by step: real-time streaming via `ollama run` showed qwen3 spending ~900 tokens on `<think>` reasoning before any answer. Tested all the documented thinking-off mechanisms — **`/v1/chat/completions` ignores them all** (`think:false` body param, `/no_think` soft prompt, `chat_template_kwargs:{enable_thinking:false}`). Only Ollama's **native `/api/chat`** honors `think:false`: **128s → 20s** for the same prompt, and the tool call is *richer* (with thinking off the model emitted explicit hyperparameters; with thinking on it sometimes returned no tool call at all). Recorded in memory so we never re-derive it.
+- The fix is the new `OllamaClient`; the OpenAI client stays clean for cloud backends.
+
+**Decisions (see DECISIONS.md):**
+- **Baseline reproduction lands IN v0.1** (not Week 10) — `--baseline` and `--source` have to drive something or they're dead weight. Source is **read as text** by the LLM to reconstruct the approach and re-measure through our own eval. Slotted into Day 5 with the CLI.
+- **Never execute user-provided source code, ever** (malware/RCE). The v0.2 sandbox runs the agent's OWN generated code, never the user's.
+- **Native Ollama as its own adapter** (not bundled into the OpenAI client) — one backend's quirk shouldn't pollute the shared client.
+- **Centralized prompts in YAML** — wording iterates more than code; one file = one place.
+
+**Next session:** Week 3 Day 2 — the Orchestrator (baseline → propose → execute → score → record → decide → repeat).
 
 ### 2026-05-28 | Week 2 retro | Tabular execution substrate complete
 
