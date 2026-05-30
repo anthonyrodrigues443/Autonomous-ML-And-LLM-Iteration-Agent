@@ -29,6 +29,7 @@ from sklearn.metrics import (
     r2_score,
     recall_score,
 )
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from threadpoolctl import threadpool_limits
@@ -43,6 +44,13 @@ if TYPE_CHECKING:
 _CLASSIFICATION_METRICS = {"accuracy", "f1", "precision", "recall"}
 _REGRESSION_METRICS = {"rmse", "mae", "mse", "r2"}
 _MINIMIZE = {"rmse", "mae", "mse"}
+
+# Param names that mean "I need an eval set for early stopping" — XGBoost +
+# LightGBM. When any of these appear in a candidate's params, we split a 90/10
+# fit/eval slice off the training set and pass eval_set to the estimator via the
+# sklearn `Pipeline`'s ``step__param`` fit_params mechanism. The sealed holdout
+# stays untouched.
+_EARLY_STOPPING_PARAM_NAMES = {"early_stopping_rounds", "early_stopping_round"}
 
 
 def _task_for_metric(metric: str) -> Task:
@@ -104,11 +112,21 @@ class ModelTarget:
     def _evaluate(self, spec: dict[str, Any], *, experiment_id: str) -> ExperimentResult:
         estimator = build_estimator(self._task, spec, seed=self._dataset.seed)
         pipeline = Pipeline([("preprocess", self._preprocessor()), ("model", estimator)])
+
+        params = spec.get("params") or {}
+        wants_early_stopping = bool(_EARLY_STOPPING_PARAM_NAMES & set(params))
+
         # Cap OpenMP/BLAS threads: on small tabular data the thread-pool overhead
         # dwarfs the actual work (~200x slower here at 10 cores), so 1 thread wins.
         # Revisit for large datasets / DL, where parallelism actually pays off.
         with threadpool_limits(limits=self._max_threads):
-            pipeline.fit(self._dataset.train_features, self._dataset.train_target)
+            if wants_early_stopping:
+                # The candidate asked for early stopping → carve a 90/10 fit/eval
+                # slice off the training set; the sealed holdout stays untouched.
+                fit_params = self._fit_with_internal_eval_set(pipeline)
+                pipeline.fit(*fit_params["xy"], **fit_params["fit_kwargs"])
+            else:
+                pipeline.fit(self._dataset.train_features, self._dataset.train_target)
             predictions = pipeline.predict(self._dataset.test_features)
         metrics = Metrics(
             values=_score(self._task, self._dataset.test_target, predictions),
@@ -117,6 +135,29 @@ class ModelTarget:
             n_samples=self._dataset.n_test,
         )
         return ExperimentResult(experiment_id=experiment_id, metrics=metrics)
+
+    def _fit_with_internal_eval_set(self, pipeline: Pipeline) -> dict[str, Any]:
+        """Split train into 90% fit / 10% eval and prepare an ``eval_set`` fit_param.
+
+        The preprocess step is fit on the 90% (no leakage from eval into the
+        transforms) and the 10% eval features are transformed through it so the
+        estimator sees an apples-to-apples eval_set.
+        """
+        stratify = self._dataset.train_target if self._task == "classification" else None
+        x_fit, x_eval, y_fit, y_eval = train_test_split(
+            self._dataset.train_features,
+            self._dataset.train_target,
+            test_size=0.1,
+            random_state=self._dataset.seed,
+            stratify=stratify,
+        )
+        preproc = pipeline.named_steps["preprocess"]
+        preproc.fit(x_fit)
+        x_eval_t = preproc.transform(x_eval)
+        return {
+            "xy": (x_fit, y_fit),
+            "fit_kwargs": {"model__eval_set": [(x_eval_t, y_eval)]},
+        }
 
     def _preprocessor(self) -> Any:
         numeric = self._dataset.train_features.select_dtypes(include="number").columns.tolist()
