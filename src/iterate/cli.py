@@ -19,21 +19,18 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from iterate import __version__
-from iterate.adapters.compute.local import LocalExecutor
-from iterate.adapters.data.tabular import load_csv
 from iterate.config import get_settings
-from iterate.core.memory import SqliteMemory
-from iterate.core.orchestrator import Orchestrator
-from iterate.core.proposer import Proposer, summarize_dataset
-from iterate.core.reconstructor import Reconstructor
-from iterate.core.terminator import default_terminator
-from iterate.llm.factory import build_client
-from iterate.targets.model import ModelTarget
+
+# NOTE: the heavy stack (pandas, scikit-learn, joblib, the orchestrator/model
+# chain) is imported lazily inside `run()` — not at module load — so `iterate
+# version` / `config` / `--help` stay instant instead of paying the ~2-3s
+# sklearn+pandas import cost on every invocation.
 
 if TYPE_CHECKING:
     from iterate.core.memory import Memory
     from iterate.core.orchestrator import RunResult
     from iterate.schemas.experiment import Candidate, Experiment
+    from iterate.targets.model import ModelTarget
 
 app = typer.Typer(
     name="iterate",
@@ -123,6 +120,18 @@ def run(
     ),
 ) -> None:
     """Run the agent on a tabular dataset."""
+    # Heavy imports live here, not at module top, so `iterate version`/`--help`
+    # don't pay the pandas + scikit-learn import cost.
+    from iterate.adapters.compute.local import LocalExecutor
+    from iterate.adapters.data.tabular import load_csv
+    from iterate.core.memory import SqliteMemory
+    from iterate.core.orchestrator import Orchestrator
+    from iterate.core.proposer import Proposer, summarize_dataset
+    from iterate.core.reconstructor import Reconstructor
+    from iterate.core.terminator import default_terminator
+    from iterate.llm.factory import build_client
+    from iterate.targets.model import ModelTarget
+
     # ─── Validate ──────────────────────────────────────────────────────────
     if baseline is not None and source is None:
         raise typer.BadParameter("--baseline requires --source")

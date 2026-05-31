@@ -237,9 +237,15 @@ def _stub_run_orchestrator(
             run_id="testrun",
         )
 
-    monkeypatch.setattr(cli_module, "build_client", _fake_build_client)
-    monkeypatch.setattr(cli_module, "Proposer", _fake_proposer_ctor)
-    monkeypatch.setattr(cli_module.Orchestrator, "run", _fake_orchestrator_run)
+    # `run()` imports these lazily (`from … import X`), so patch them at their
+    # source modules — patching cli_module wouldn't be seen by the local import.
+    import iterate.core.orchestrator as orch_module
+    import iterate.core.proposer as proposer_module
+    import iterate.llm.factory as factory_module
+
+    monkeypatch.setattr(factory_module, "build_client", _fake_build_client)
+    monkeypatch.setattr(proposer_module, "Proposer", _fake_proposer_ctor)
+    monkeypatch.setattr(orch_module.Orchestrator, "run", _fake_orchestrator_run)
     return captured
 
 
