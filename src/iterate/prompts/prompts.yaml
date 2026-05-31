@@ -32,7 +32,10 @@ proposer:
   history_header: "Already tried:"
 
   # Sent if the model replied without calling the tool — short, firm.
-  retry_nudge: "You did not call the tool. Call propose_candidate with your proposal now."
+  retry_nudge: >-
+    Your previous reply was discarded because it contained no tool call. Respond
+    ONLY by calling the propose_candidate tool — no prose, no explanation, no
+    markdown. The tool call is the only valid response.
 
   # The single tool exposed to the model. Structure (types, required) is fixed in
   # code; the wording (description + per-field descriptions) lives here.

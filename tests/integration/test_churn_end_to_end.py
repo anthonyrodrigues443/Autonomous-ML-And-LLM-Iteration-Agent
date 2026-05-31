@@ -1,44 +1,36 @@
 """End-to-end integration: the tabular substrate on the real Telco churn dataset.
 
-Exercises load_csv -> ModelTarget -> model factory -> LocalExecutor on real data,
-including graceful failure capture. Marked `integration` (opt-in: run with
-`pytest -m integration`) because it reads the committed dataset and trains a few
-models, so it is slower than the unit suite.
+Exercises load_csv -> ModelTarget -> model factory -> LocalExecutor on the
+committed prepared data (no LLM), including graceful failure capture. Marked
+`integration` (opt-in) because it reads the dataset and trains a few models.
+The agentic loop (with a real LLM) is covered in test_agentic_loop_live.py.
 """
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 
 from iterate.adapters.compute.local import LocalExecutor
+from iterate.adapters.data.tabular import load_csv
 from iterate.schemas.experiment import Candidate
+from iterate.targets.model import ModelTarget
 
-if TYPE_CHECKING:
-    from types import ModuleType
-
-_EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "churn_tabular" / "run.py"
+_CLEAN = Path(__file__).resolve().parents[2] / "examples" / "churn_tabular" / "data.clean.csv"
 
 
-def _load_example() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("churn_run", _EXAMPLE)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _target() -> ModelTarget:
+    dataset = load_csv(_CLEAN, target="Churn")
+    return ModelTarget(dataset, metric="f1")
 
 
 @pytest.mark.integration
 def test_churn_substrate_end_to_end() -> None:
-    run = _load_example()
-    if not run.DATA.exists():
-        pytest.skip("Telco churn data.csv not present")
+    if not _CLEAN.exists():
+        pytest.skip("data.clean.csv not present; run examples/churn_tabular/prepare.py")
 
-    target = run.build_target()
+    target = _target()
     executor = LocalExecutor()
 
     baseline = executor.execute(target)

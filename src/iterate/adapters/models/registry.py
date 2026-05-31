@@ -28,6 +28,16 @@ _DEFAULT_MODEL: dict[str, str] = {
     "regression": "sklearn.ensemble.HistGradientBoostingRegressor",
 }
 
+# Quiet-by-default constructor params for the noisy boosting libraries. XGBoost
+# and LightGBM otherwise print training chatter (info banners, per-round eval) that
+# buries the loop's own output. We inject these only when the candidate didn't set
+# them — the agent's explicit choice always wins. Keyed by the estimator class
+# name's prefix; only applied when the class actually accepts the param.
+_QUIET_DEFAULTS: dict[str, dict[str, Any]] = {
+    "XGB": {"verbosity": 0},
+    "LGBM": {"verbose": -1},
+}
+
 
 def build_estimator(task: Task, spec: dict[str, Any], *, seed: int) -> Any:
     """Build an sklearn-compatible estimator from a ``{"model", "params"}`` spec."""
@@ -36,8 +46,14 @@ def build_estimator(task: Task, spec: dict[str, Any], *, seed: int) -> Any:
         raise TypeError(f"'model' must be a string import path, got {type(path).__name__}")
     params = dict(spec.get("params") or {})
     cls = _resolve(path)
-    if "random_state" in inspect.signature(cls).parameters and "random_state" not in params:
+    accepted = inspect.signature(cls).parameters
+    if "random_state" in accepted and "random_state" not in params:
         params["random_state"] = seed
+    for prefix, defaults in _QUIET_DEFAULTS.items():
+        if cls.__name__.startswith(prefix):
+            for key, value in defaults.items():
+                if key in accepted and key not in params:
+                    params[key] = value
     return cls(**params)
 
 
