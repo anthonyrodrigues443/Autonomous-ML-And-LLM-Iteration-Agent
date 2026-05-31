@@ -12,7 +12,7 @@
 
 ## Status
 
-**Building — Week 3 in progress; agentic loop done (Days 1–5), v0.1 tags after Days 6–7.** First release **v0.1** (the working agentic loop) lands at the end of Week 3; incremental releases follow through to the full **v1.0** (~early Sep 2026).
+**v0.1 released — the working agentic loop on tabular ML.** Install with `pip install iterate-ai`. Incremental releases follow through to the full **v1.0** (~early Sep 2026); the inputs you give shrink and the problem types grow release by release.
 
 **Agent-first:** the autonomous loop is the **v0.1** milestone (Week 3), not a late-stage add-on. After that, two dials turn release to release — the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular → prompts → DL/vision). Full roadmap + daily trail in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -21,7 +21,7 @@
 | 0 | Scaffolding + scope lock | done |
 | 1 | Foundation — schemas + LLM client (tool-calling) + config + CLI | done |
 | 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` + model factory + local executor | done |
-| 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory + CLI → first autonomous tabular run (**v0.1**) | in progress |
+| 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory + CLI → first autonomous tabular run (**v0.1**) | done |
 | 4–5 | **Sandboxed code-gen** + cheap interactive wins (live progress, streaming, Ctrl-C) (**v0.2**) | — |
 | 6 | **Full interactive CLI** — pause, mid-run chat, resume (**v0.3**) | — |
 | 7 | Agent picks the metric + starting model (**v0.4**) | — |
@@ -135,33 +135,46 @@ Add any other MCP server (Drive, GitHub, Slack, Sentry, custom) by editing one Y
 
 ---
 
-## Quick start
+## Quick start (v0.1)
 
-**Local-first. $0. No API keys required.**
+**Local-first. $0. No API keys required.** v0.1 iterates **tabular** models — it
+chooses the best model + hyperparameters from scikit-learn / XGBoost / LightGBM
+for a prepared dataset.
 
 ```bash
-# Install Ollama (one-time setup)
+# 1. Install Ollama + the tool-calling model (one-time)
 brew install ollama
-ollama pull qwen3:14b
-ollama serve  # starts background server at localhost:11434
+ollama pull qwen3:14b          # ~9.3 GB
+ollama serve                   # background server at localhost:11434
 
-# Install iterate
-pip install iterate
+# 2. Install iterate (heads-up: pulls scikit-learn / XGBoost / LightGBM)
+pip install iterate-ai         # "iterate" was taken on PyPI; the command is still `iterate`
 
-# Run it (the agent discovers everything else)
-iterate "improve our customer churn baseline"
+# 3. Prepare a tabular CSV (your standard ML data cleaning) and run
+iterate run --data train.clean.csv --target churn --metric f1
 
-# Power-user: skip discovery, give explicit pointers
-iterate init --data train.csv --target churn --baseline 0.78 --metric f1
-iterate run --until 2026-06-01 --patience 15
+# Seed the baseline from an existing notebook/script (read as text, never executed):
+iterate run --data train.clean.csv --target churn --metric f1 \
+            --source baseline_notebook.ipynb --baseline 0.78
 
-# Inspect history
-iterate history
-iterate why-failed exp_042
-iterate best
+# Use a cloud model instead of local Ollama:
+iterate run --data train.clean.csv --target churn --metric f1 \
+            --backend openai-compatible --base-url https://api.groq.com/openai/v1 \
+            --model llama-3.3-70b --api-key "$GROQ_API_KEY"
 ```
 
-Full CLI reference: `iterate --help`
+The best model is saved to `.iterate/runs/<run_id>/best_model.joblib` (override with
+`--output`) — load and use it directly: `joblib.load(path).predict(X)`. Every
+experiment persists in `.iterate/memory.db`, so the next run builds on it.
+
+Full CLI reference: `iterate run --help`
+
+> **Note on the one-line form.** The `iterate "improve our churn baseline"` experience —
+> where the agent discovers the data, baseline, and metric itself — is the **v1.0 vision**,
+> not v0.1. Today you pass `--data`/`--target`/`--metric` explicitly; the inputs shrink
+> release by release (see the roadmap). Auto-discovery, `iterate history` / `why-failed` /
+> `best`, prompt + vision targets, and cost-constrained serving are all on the roadmap, not
+> shipped in v0.1.
 
 ---
 

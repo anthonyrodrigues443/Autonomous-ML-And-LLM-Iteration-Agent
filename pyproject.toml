@@ -1,5 +1,7 @@
 [project]
-name = "iterate"
+# Distribution name on PyPI ("iterate" is taken). The import package + CLI
+# command are both still `iterate` (like scikit-learn → import sklearn).
+name = "iterate-ai"
 version = "0.1.0"
 description = "Autonomous research-aware iteration agent for ML models and LLM prompts. Multi-LLM backend (Claude/GPT/Llama/Deepseek), persistent memory, literature-grounded experiments, human-approval safety gates."
 authors = [
@@ -26,34 +28,31 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+# v0.1 core: exactly what the tabular agentic loop runs on — nothing speculative.
+# Forward-looking deps (sandbox, dataset adapters) live in extras below so a plain
+# `pip install iterate-ai` stays lean.
 dependencies = [
     # LLM client — OpenAI SDK works against any OpenAI-compatible endpoint
     # (Ollama, Groq, Together, Deepseek, OpenAI, LM Studio, vLLM, llama.cpp server)
     "openai>=1.50.0",
     # Schemas + config
     "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
     "python-dotenv>=1.0.1",
-    # CLI
+    # CLI + output
     "typer>=0.12.0",
     "rich>=13.9.0",
     # Data
     "pandas>=2.2.0",
     "numpy>=1.26.0",
-    # Sandbox
-    "e2b-code-interpreter>=1.0.0",
-    # ML adapters (tabular)
+    # ML adapters (tabular) — the v0.1 model factory's allow-listed libraries.
+    # (scikit-learn brings joblib, used to persist the winning model.)
     "scikit-learn>=1.5.0",
     "xgboost>=2.1.0",
     "lightgbm>=4.5.0",
-    # Persistence
-    "sqlalchemy>=2.0",
-    # Dataset access
-    "kaggle>=1.6.0",
-    "datasets>=3.0.0",
-    # HTTP + retries
+    # HTTP + retries (the native Ollama client)
     "httpx>=0.27.0",
     "tenacity>=9.0.0",
-    "pydantic-settings>=2.5.0",
     "threadpoolctl>=3.6.0",
     # Prompt registry (all prompts live in src/iterate/prompts/prompts.yaml)
     "pyyaml>=6.0",
@@ -63,6 +62,10 @@ dependencies = [
 # Anthropic Claude is the only major backend that's NOT OpenAI-compatible —
 # install only if you want to use Claude as a backend.
 anthropic = ["anthropic>=0.40.0"]
+# Sandboxed code-gen (v0.2) — the agent writes + runs training code in e2b.
+sandbox = ["e2b-code-interpreter>=1.0.0"]
+# Dataset adapters (Kaggle / HuggingFace) — future data-source integrations.
+datasets = ["kaggle>=1.6.0", "datasets>=3.0.0"]
 # MCP (Model Context Protocol) integration — pluggable tools + data sources
 # (filesystem, postgres, notion, drive, github, etc.). Week 4+ feature.
 mcp = ["mcp>=0.9.0"]
@@ -133,7 +136,7 @@ disallow_untyped_defs = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-module = ["kaggle.*", "lightgbm.*", "xgboost.*", "sklearn.*", "e2b_code_interpreter.*", "pandas", "pandas.*", "threadpoolctl", "yaml"]
+module = ["kaggle.*", "lightgbm.*", "xgboost.*", "sklearn.*", "e2b_code_interpreter.*", "pandas", "pandas.*", "threadpoolctl", "yaml", "joblib"]
 ignore_missing_imports = true
 
 # ─── pytest ────────────────────────────────────────────────────

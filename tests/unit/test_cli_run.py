@@ -116,9 +116,7 @@ def test_baseline_divergence_safe_against_zero_reported() -> None:
 def _write_tiny_csv(path: Path) -> None:
     # Need enough rows for stratified train/test split with both classes in each.
     n = 60
-    frame = pd.DataFrame(
-        {"feat": list(range(n)), "churn": [i % 2 for i in range(n)]}
-    )
+    frame = pd.DataFrame({"feat": list(range(n)), "churn": [i % 2 for i in range(n)]})
     frame.to_csv(path, index=False)
 
 
@@ -176,8 +174,14 @@ class _StubProposer:
         return Candidate(description="x", changes={"model": "stub.M"}, rationale="r")
 
 
-def _stub_run_orchestrator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Patch the heavyweight bits so `iterate run` returns instantly. Capture the wiring."""
+def _stub_run_orchestrator(
+    monkeypatch: pytest.MonkeyPatch, *, best_model: str | None = None
+) -> dict[str, Any]:
+    """Patch the heavyweight bits so `iterate run` returns instantly. Capture the wiring.
+
+    If ``best_model`` is given, the stubbed run returns a RunResult with a winning
+    Experiment using that model — so the model-save path is exercised end to end.
+    """
     captured: dict[str, Any] = {}
 
     # Fake LLM client — never called because we also stub Proposer.
@@ -202,14 +206,36 @@ def _stub_run_orchestrator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured["baseline_model"] = self._initial_model
         captured["baseline_candidate"] = self._baseline_candidate
         captured["memory_type"] = type(self._memory).__name__
-        # Return a minimal RunResult that the summary renderer can swallow.
+        from iterate.core.orchestrator import RunResult
+        from iterate.schemas.experiment import Candidate, Experiment
+
         baseline = ExperimentResult(
             experiment_id="b",
             metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize", n_samples=100),
         )
-        from iterate.core.orchestrator import RunResult
-
-        return RunResult(baseline=baseline, history=[], best=None, stopped_because="max_iterations")
+        best: Experiment | None = None
+        if best_model is not None:
+            best = Experiment(
+                candidate=Candidate(
+                    description=f"winner {best_model}", changes={"model": best_model}, rationale="r"
+                ),
+                target="tabular-model",
+                hypothesis="x",
+                status="completed",
+                result=ExperimentResult(
+                    experiment_id="e1",
+                    metrics=Metrics(
+                        values={"f1": 0.8}, primary="f1", direction="maximize", n_samples=100
+                    ),
+                ),
+            )
+        return RunResult(
+            baseline=baseline,
+            history=[best] if best else [],
+            best=best,
+            stopped_because="max_iterations",
+            run_id="testrun",
+        )
 
     monkeypatch.setattr(cli_module, "build_client", _fake_build_client)
     monkeypatch.setattr(cli_module, "Proposer", _fake_proposer_ctor)
@@ -368,3 +394,40 @@ def test_in_memory_memory_used_when_fresh_flag(
     )
     assert result.exit_code == 0
     assert captured["memory_type"] == "SqliteMemory"
+
+
+def test_run_saves_best_model_and_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The winning model + a best.json sidecar are written where --output points."""
+    import joblib
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    out = tmp_path / "models" / "best_model.joblib"
+
+    _stub_run_orchestrator(monkeypatch, best_model="sklearn.linear_model.LogisticRegression")
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--memory",
+            str(tmp_path / "memory.db"),
+            "--output",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert out.exists()
+    sidecar = out.with_name("best.json")
+    assert sidecar.exists()
+    meta = json.loads(sidecar.read_text())
+    assert meta["model"] == "sklearn.linear_model.LogisticRegression"
+    assert meta["metric"] == "f1"
+    # The saved artifact is a usable fitted pipeline.
+    pipeline = joblib.load(out)
+    assert hasattr(pipeline, "predict")
