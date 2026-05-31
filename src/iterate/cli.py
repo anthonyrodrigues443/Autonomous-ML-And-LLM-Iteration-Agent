@@ -119,7 +119,7 @@ def run(
     output: Path | None = typer.Option(
         None,
         "--output",
-        help="Where to save the best model (.joblib). Default: <runs_dir>/<run_id>/best_model.joblib.",
+        help="Where to save the best model. Default: .iterate/runs/<run_id>/best_model.joblib",
     ),
 ) -> None:
     """Run the agent on a tabular dataset."""
