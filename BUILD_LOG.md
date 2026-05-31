@@ -239,6 +239,17 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-05-31 | v0.1.1 | Silence native training noise (demo polish)
+
+**Task:** `verbose=-1` didn't fully muzzle LightGBM — its C++ core writes `[LightGBM] [Info] …` straight to the file descriptors, bypassing Python verbosity. Clean it up for a recordable demo.
+
+**What shipped:**
+- `_silence_native_stdio()` context manager wraps fit + predict: redirects fds 1/2 to devnull **and flushes libc stdio** (`ctypes` `fflush(None)`) before restoring, so buffered native output drains to devnull instead of leaking onto the terminal after the fds are restored.
+- `_silence_lightgbm()` registers a null LightGBM logger once (its C++ logger bypasses C stdio buffering, so the fd redirect alone wasn't enough).
+- Net effect: LightGBM info chatter, XGBoost per-round eval, and the benign sklearn feature-names warning are all gone; only the loop's own output shows.
+- Regression test (`capfd`) asserts no `[LightGBM]` leaks. 161 unit tests; ruff + mypy --strict clean.
+- Version → 0.1.1; published to PyPI.
+
 ### 2026-05-31 | Week 3 Day 7 | Release polish + Week 3 retro + v0.1.0
 
 **Task:** Ship v0.1 honestly — fill the last contract gap (model persistence), trim the install, add release hygiene, reconcile the public docs with what v0.1 actually does, and tag.
