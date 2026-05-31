@@ -239,6 +239,16 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-05-31 | v0.1.3 | Lazy CLI imports — instant `version`/`--help`
+
+**Task:** `iterate version` (and `--help`/`config`) took ~2–3s because `cli.py` imported the full pandas + scikit-learn + orchestrator stack at module load, before any command ran.
+
+**What shipped:**
+- Moved the heavy imports (LocalExecutor, load_csv, SqliteMemory, Orchestrator, Proposer, Reconstructor, terminator, build_client, ModelTarget) out of the module top and **into `run()`** — the only command that needs them. `version`/`config`/`--help` now import only typer + rich + config.
+- `import iterate.cli`: ~2–3s → **0.18s**; `iterate version`: **~0.2s**.
+- Fixed the CLI tests' monkeypatching to target the source modules (lazy `from … import` inside `run()` bypasses a `cli`-module patch).
+- 161 unit tests; ruff + mypy --strict clean. Version → 0.1.3.
+
 ### 2026-05-31 | v0.1.2 | Broaden the Proposer's model space (prompt fix)
 
 **Task:** The Proposer kept re-proposing the 2–3 models named in the prompt examples (XGBoost / RandomForest / LightGBM) instead of exploring scikit-learn's full catalog — classic example-anchoring.
