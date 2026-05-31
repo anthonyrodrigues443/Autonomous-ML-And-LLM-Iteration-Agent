@@ -10,7 +10,7 @@ These show how to plug your own ML problem or LLM prompt into the framework. **C
 | `toxicity_jigsaw/` | `PromptTarget` | Jigsaw Toxic Comment Classification (public) | LLM prompt iteration via LLM-as-judge eval |
 | `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | Multi-class prompt iteration; proves the framework generalizes beyond binary |
 
-Each example ships a runnable entry point — `run.py` for `ModelTarget`, a `target.py` + `current_prompt.txt` for `PromptTarget` — example data or a `golden_set.jsonl`, and a per-example README.
+Each example ships a per-example README with the `iterate run` command to drive it, any dataset-specific prep (e.g. `prepare.py` for `ModelTarget`), and example data or a `golden_set.jsonl`.
 
 ---
 

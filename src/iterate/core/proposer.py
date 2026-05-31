@@ -91,7 +91,7 @@ class Proposer:
         *,
         temperature: float = 0.7,
         max_tokens: int = 2048,
-        max_retries: int = 1,
+        max_retries: int = 2,  # 3 total attempts — local models occasionally reply in prose
     ) -> None:
         self._client = client
         self._temperature = temperature

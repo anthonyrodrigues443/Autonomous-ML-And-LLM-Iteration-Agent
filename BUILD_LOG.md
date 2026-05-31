@@ -175,7 +175,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 3 | Terminator — stop on deadline / patience / plateau via a delegated protocol; Orchestrator refactored to delegate | `src/iterate/core/terminator.py` + tests | done |
 | 4 | Memory — record every experiment; feed **cross-run** history to the Proposer (sqlite + in-memory; structured proposer-failure records) | `src/iterate/core/memory.py` + tests | done |
 | 5 | CLI `iterate run` (+ `--backend` factory, baseline precedence, `--fresh` archive) **and source-aware baseline reconstruction** — LLM reads `--source` md/txt/notebook as **text only** (never executes), rebuilds the approach as a spec, we run it through our eval → re-measured baseline | `src/iterate/cli.py` + `core/reconstructor.py` + `llm/factory.py` + tests | done |
-| 6 | First autonomous tabular run on churn — LLM iterates to best by deadline → tag **v0.1.0** | `examples/churn_tabular/` + integration test | todo |
+| 6 | First autonomous tabular run on churn — reproducible committed demo (`prepare.py` + `iterate run`), verbosity suppression, proposer-yield polish, live agentic integration test | `examples/churn_tabular/` + integration tests | done |
 | 7 | Polish + Week 3 retro + release **v0.1.0** | wrap-up | todo |
 
 **Slack:** 1 day.
@@ -238,6 +238,23 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-31 | Week 3 Day 6 | Reproducible churn demo + demo-clean polish
+
+**Task:** Turn the ad-hoc CLI runs into a committed, reproducible v0.1 demo, and make the terminal output clean enough to record. (Tagging v0.1.0 is Day 7, after the retro.)
+
+**What shipped:**
+- `examples/churn_tabular/prepare.py` — Telco-specific cleaning (drop `customerID`, coerce `TotalCharges`, encode `Churn` Yes/No → 1/0) as a pure `clean()` fn + CLI entry; writes the committed `data.clean.csv`. **Data prep is not part of `iterate`** — standard ML glue, dataset-specific, kept out of the framework.
+- Retired `examples/churn_tabular/run.py` (the Week-2 hand-fed-candidate demo — superseded by `iterate run`).
+- `examples/churn_tabular/README.md` — rewritten for the v0.1 agentic flow (prep step + `iterate run` command + representative output + honest "prep is standard ML, the agent's job is the iteration" note).
+- **Verbosity suppression** (`build_estimator`): inject quiet defaults (`verbosity=0` for XGBoost, `verbose=-1` for LightGBM) only when the candidate didn't set them and the class accepts them — the agent's explicit choice always wins. Kills the library training chatter that buried the loop's own output.
+- **Proposer-yield polish:** default `max_retries` 1 → 2 (3 attempts) + a blunt retry nudge ("respond ONLY by calling the tool — no prose"). Reduces dropped iterations from local-model chatty replies.
+- Tests: `test_prepare_churn.py` (cleaning is correct + idempotent), `tests/integration/test_agentic_loop_live.py` (real qwen3 + real ModelTarget end-to-end, opt-in), rewrote `test_churn_end_to_end.py` to use the committed clean CSV (no `run.py` dependency, no LLM).
+- 158 unit tests pass; all 4 integration tests pass live; ruff + mypy --strict clean (30 src files).
+
+**Finding (honest):** even with 3 proposer attempts, local qwen3:14b still occasionally replies without a tool call and an iteration is lost (recorded as a `ProposerFailure`, loop continues — graceful). This is the model tier's tool-calling ceiling, not a code bug. Remaining levers (few-shot example, lower temperature, a text-fallback parser, or a cloud backend) are deferred; the loop already survives misses correctly, and `--backend openai-compatible` is the reliable path for a flawless run.
+
+**Next session:** Week 3 Day 7 — polish + Week 3 retro + tag **v0.1.0** (first release).
 
 ### 2026-05-30 | Week 3 Day 5 | CLI `iterate run` + source-aware baseline reconstruction + roadmap split
 
