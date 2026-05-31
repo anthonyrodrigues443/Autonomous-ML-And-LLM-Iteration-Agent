@@ -2,7 +2,7 @@
 # Distribution name on PyPI ("iterate" is taken). The import package + CLI
 # command are both still `iterate` (like scikit-learn → import sklearn).
 name = "iterate-ai"
-version = "0.1.1"
+version = "0.1.2"
 description = "Autonomous research-aware iteration agent for ML models and LLM prompts. Multi-LLM backend (Claude/GPT/Llama/Deepseek), persistent memory, literature-grounded experiments, human-approval safety gates."
 authors = [
     { name = "Anthony Rodrigues", email = "anthonyrodrigues443@users.noreply.github.com" },
