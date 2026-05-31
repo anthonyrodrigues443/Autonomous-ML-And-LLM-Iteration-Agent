@@ -13,6 +13,6 @@ Public API (re-exported here when implementations land):
 See README.md for the full architecture. See PRD.md (private) for scope.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __author__ = "Anthony Rodrigues"
 __all__: list[str] = []  # populated as public API surfaces stabilize

@@ -8,13 +8,25 @@ proposer:
   # System message — frames the task, names the metric/direction and current model.
   # Placeholders: {metric}, {direction}, {current_model}
   system: >-
-    You are an ML engineer proposing the next experiment to improve a tabular
-    model. Optimize the primary metric '{metric}' ({direction}). Choose the most
-    appropriate model for the next experiment — it can be the current model
-    ({current_model}) with different hyperparameters, or a different estimator
-    from scikit-learn, XGBoost, or LightGBM named by import path — whichever you
-    expect to best improve the metric. Do not repeat an experiment that has
-    already been tried. Call the propose_candidate tool.
+    You are an ML engineer running a sequence of experiments to improve a tabular
+    model. Optimize the primary metric '{metric}' ({direction}). The current model
+    is {current_model}.
+
+    You have the FULL estimator catalogs of scikit-learn, XGBoost, and LightGBM —
+    hundreds of models, not a short list. That includes linear models
+    (LogisticRegression, RidgeClassifier, SGDClassifier, and the regression
+    equivalents), support vector machines (SVC/SVR, LinearSVC), nearest neighbours
+    (KNeighbors*), naive Bayes, discriminant analysis, single trees, and the whole
+    ensemble family (RandomForest, ExtraTrees, GradientBoosting,
+    HistGradientBoosting, AdaBoost, Bagging, Voting/Stacking), plus XGBoost and
+    LightGBM gradient boosting. Any of them is available by import path; match the
+    task (a *Classifier for classification, a *Regressor for regression).
+
+    Each turn, pick the single most promising next experiment: either a different
+    model family, or the current model with different hyperparameters. Actively
+    EXPLORE — vary the model family across iterations instead of re-proposing the
+    same one, and let the data shape and the results so far guide the choice. Never
+    repeat an experiment already in the history. Call the propose_candidate tool.
 
   # User message — the dataset brief, baseline, optional history.
   # Placeholders: {data_summary}, {current_model}, {metric}, {score}, {direction},
@@ -44,11 +56,14 @@ proposer:
     description: "Propose the next experiment to run: the model to use and its hyperparameters."
     fields:
       model: >-
-        Import path of the estimator to use, from scikit-learn, XGBoost, or
-        LightGBM (e.g. 'xgboost.XGBClassifier',
-        'sklearn.ensemble.RandomForestClassifier'). Choose the most appropriate
-        model for the next experiment — it may be the current model with
-        different hyperparameters, or a different one.
+        Import path of the estimator, from scikit-learn, XGBoost, or LightGBM.
+        EXAMPLES (not a restricted list — any classifier/regressor in those
+        libraries is valid): 'sklearn.linear_model.LogisticRegression',
+        'sklearn.ensemble.ExtraTreesClassifier',
+        'sklearn.ensemble.GradientBoostingClassifier', 'sklearn.svm.SVC',
+        'sklearn.neighbors.KNeighborsClassifier', 'xgboost.XGBClassifier',
+        'lightgbm.LGBMClassifier'. Prefer a model family not yet in the history
+        unless tuning the current one is clearly the stronger move.
       params: >-
         Hyperparameters for the model, e.g. {"max_depth": 4, "n_estimators":
         300}. Omit or leave empty to use the model's defaults.

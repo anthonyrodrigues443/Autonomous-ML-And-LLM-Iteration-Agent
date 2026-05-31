@@ -239,6 +239,19 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-05-31 | v0.1.2 | Broaden the Proposer's model space (prompt fix)
+
+**Task:** The Proposer kept re-proposing the 2–3 models named in the prompt examples (XGBoost / RandomForest / LightGBM) instead of exploring scikit-learn's full catalog — classic example-anchoring.
+
+**What shipped (prompt-only, `prompts.yaml`):**
+- System prompt now states the **full** estimator breadth explicitly (linear models, SVMs, k-NN, naive Bayes, discriminant analysis, single trees, the whole ensemble family, plus XGBoost/LightGBM) and instructs the LLM to **actively vary the model family** across iterations and match the task type.
+- The `model` tool-field examples are now diverse (LogisticRegression, ExtraTrees, GradientBoosting, SVC, KNeighbors, XGB, LGBM) and explicitly labeled "examples, not a restricted list."
+- Live check (5 iters, real qwen3): now proposes **4 distinct families** (XGBoost, LightGBM, RandomForest, GradientBoosting — the last never reached before) vs 2 before. Best f1 0.5676 → 0.5871.
+
+**Honest limit:** local qwen3:14b still gravitates to tree ensembles (didn't reach linear/SVM/kNN) — defensible for tabular churn, and a cloud backend explores wider. Prompt did its job; further breadth is a stronger-model gain.
+
+Version → 0.1.2 (bundles the v0.1.1 noise fix for a single PyPI publish).
+
 ### 2026-05-31 | v0.1.1 | Silence native training noise (demo polish)
 
 **Task:** `verbose=-1` didn't fully muzzle LightGBM — its C++ core writes `[LightGBM] [Info] …` straight to the file descriptors, bypassing Python verbosity. Clean it up for a recordable demo.
