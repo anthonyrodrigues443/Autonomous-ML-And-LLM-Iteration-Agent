@@ -146,6 +146,23 @@ def test_lightgbm_with_bare_early_stopping_alias_works(tmp_path: Path) -> None:
     assert 0.0 <= result.metrics.primary_value <= 1.0
 
 
+def test_lightgbm_training_noise_is_silenced(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """LightGBM's native [LightGBM] [Info] chatter must not leak to the terminal —
+    it's suppressed at the fd level + via register_logger so demo output stays clean."""
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    candidate = Candidate(
+        description="lgbm",
+        changes={"model": "lightgbm.LGBMClassifier", "params": {"n_estimators": 30}},
+        rationale="x",
+    )
+    ModelTarget(ds, metric="f1").run(candidate)
+    captured = capfd.readouterr()
+    assert "[LightGBM]" not in captured.out
+    assert "[LightGBM]" not in captured.err
+
+
 def test_save_model_writes_a_loadable_pipeline(tmp_path: Path) -> None:
     """The winning model must be persisted as a usable artifact — load it and predict."""
     import joblib

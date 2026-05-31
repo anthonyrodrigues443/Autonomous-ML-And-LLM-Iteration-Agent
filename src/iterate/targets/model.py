@@ -16,6 +16,9 @@ the sandboxed code-gen path (v0.2).
 from __future__ import annotations
 
 import math
+import os
+import sys
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Literal
 
 import joblib
@@ -39,6 +42,7 @@ from iterate.adapters.models.registry import Task, build_estimator
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from iterate.adapters.data.tabular import TabularDataset
@@ -56,6 +60,74 @@ _MINIMIZE = {"rmse", "mae", "mse"}
 _EARLY_STOPPING_PARAM_NAMES = frozenset(
     {"early_stopping_rounds", "early_stopping_round", "early_stopping"}
 )
+
+
+_lightgbm_silenced = False
+
+
+def _silence_lightgbm() -> None:
+    """Route LightGBM's logger to a null sink (once). Its C++ logs bypass C stdio
+    buffering, so the fd redirect alone doesn't catch them; this stops them at the
+    source. No-op if LightGBM isn't installed."""
+    global _lightgbm_silenced
+    if _lightgbm_silenced:
+        return
+    _lightgbm_silenced = True
+    try:
+        import logging
+
+        import lightgbm as lgb
+
+        sink = logging.getLogger("iterate.lightgbm")
+        sink.addHandler(logging.NullHandler())
+        sink.setLevel(logging.CRITICAL)
+        lgb.register_logger(sink)
+    except Exception:  # pragma: no cover - lightgbm optional / API drift
+        pass
+
+
+def _flush_c_stdio() -> None:
+    """Flush libc's stdio buffers so buffered native output goes to the *current*
+    fd 1/2 (devnull, mid-suppression) rather than leaking after we restore them.
+
+    LightGBM/XGBoost write through buffered C `stdout`; without this flush the
+    buffer drains onto the real terminal once the fds are restored.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None)
+        libc.fflush(None)  # NULL flushes all open streams
+    except (OSError, AttributeError):  # pragma: no cover - platform-dependent
+        pass
+
+
+@contextmanager
+def _silence_native_stdio() -> Iterator[None]:
+    """Redirect C-level stdout+stderr to devnull for the duration of the block.
+
+    XGBoost and especially LightGBM print training chatter (`[LightGBM] [Info] …`,
+    row-wise/bin notices, per-round eval) from native code that Python-level
+    `verbose`/`verbosity` flags don't fully suppress — it's written straight to file
+    descriptors 1/2. We redirect those fds during the fit so the loop's own output
+    stays clean. Python exceptions still propagate (they're not stdout text), so
+    nothing actionable is lost. Only wraps fit, not the agent's logging.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved_out, saved_err = os.dup(1), os.dup(2)
+    try:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        _flush_c_stdio()  # drain buffered native output to devnull before restoring
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(devnull)
+        os.close(saved_out)
+        os.close(saved_err)
 
 
 def _wants_eval_set(params: dict[str, Any]) -> bool:
@@ -135,7 +207,10 @@ class ModelTarget:
     def _evaluate(self, spec: dict[str, Any], *, experiment_id: str) -> ExperimentResult:
         with threadpool_limits(limits=self._max_threads):
             pipeline = self._build_and_fit(spec)
-            predictions = pipeline.predict(self._dataset.test_features)
+            # predict can also emit native chatter / a benign sklearn feature-names
+            # warning — keep it quiet too so the loop's output stays clean.
+            with _silence_native_stdio():
+                predictions = pipeline.predict(self._dataset.test_features)
         metrics = Metrics(
             values=_score(self._task, self._dataset.test_target, predictions),
             primary=self._metric,
@@ -163,13 +238,15 @@ class ModelTarget:
         estimator = build_estimator(self._task, spec, seed=self._dataset.seed)
         pipeline = Pipeline([("preprocess", self._preprocessor()), ("model", estimator)])
         params = spec.get("params") or {}
-        if _wants_eval_set(params):
-            # The candidate asked for early stopping → carve a 90/10 fit/eval slice
-            # off the training set; the sealed holdout stays untouched.
-            fit_params = self._fit_with_internal_eval_set(estimator, params, pipeline)
-            pipeline.fit(*fit_params["xy"], **fit_params["fit_kwargs"])
-        else:
-            pipeline.fit(self._dataset.train_features, self._dataset.train_target)
+        _silence_lightgbm()
+        with _silence_native_stdio():
+            if _wants_eval_set(params):
+                # The candidate asked for early stopping → carve a 90/10 fit/eval
+                # slice off the training set; the sealed holdout stays untouched.
+                fit_params = self._fit_with_internal_eval_set(estimator, params, pipeline)
+                pipeline.fit(*fit_params["xy"], **fit_params["fit_kwargs"])
+            else:
+                pipeline.fit(self._dataset.train_features, self._dataset.train_target)
         return pipeline
 
     def _fit_with_internal_eval_set(
