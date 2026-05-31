@@ -47,7 +47,7 @@ Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. **The
 
 | Version | After | Problem types | Inputs you give (shrinking →) / New capability |
 |---|---|---|---|
-| v0.1.0 | Week 3 | tabular | data + features + target + metric + baseline/notebook + deadline — **agentic loop on** (any installed-library model via the factory) |
+| v0.1.0 | Week 3 · **RELEASED 2026-05-31** | tabular | data + features + target + metric + baseline/notebook + deadline — **agentic loop on** (any installed-library model via the factory; best model saved as a joblib artifact) |
 | v0.2.0 | Week 4–5 | tabular | *(same inputs)* — agent **writes & runs training code in a sandbox** → any model at all + **live progress / streaming / graceful Ctrl-C** |
 | v0.3.0 | Week 6 | tabular | *(same inputs)* — **full interactive CLI**: pause the loop, chat with the LLM, resume |
 | v0.4.0 | Week 7 | tabular | data + features + target + baseline + deadline  *(agent picks metric + starting model)* |
@@ -176,7 +176,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 4 | Memory — record every experiment; feed **cross-run** history to the Proposer (sqlite + in-memory; structured proposer-failure records) | `src/iterate/core/memory.py` + tests | done |
 | 5 | CLI `iterate run` (+ `--backend` factory, baseline precedence, `--fresh` archive) **and source-aware baseline reconstruction** — LLM reads `--source` md/txt/notebook as **text only** (never executes), rebuilds the approach as a spec, we run it through our eval → re-measured baseline | `src/iterate/cli.py` + `core/reconstructor.py` + `llm/factory.py` + tests | done |
 | 6 | First autonomous tabular run on churn — reproducible committed demo (`prepare.py` + `iterate run`), verbosity suppression, proposer-yield polish, live agentic integration test | `examples/churn_tabular/` + integration tests | done |
-| 7 | Polish + Week 3 retro + release **v0.1.0** | wrap-up | todo |
+| 7 | Polish + Week 3 retro + release **v0.1.0** (model persistence, dep trim, LICENSE, README reconcile, tag) | wrap-up | done |
 
 **Slack:** 1 day.
 
@@ -238,6 +238,47 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-05-31 | Week 3 Day 7 | Release polish + Week 3 retro + v0.1.0
+
+**Task:** Ship v0.1 honestly — fill the last contract gap (model persistence), trim the install, add release hygiene, reconcile the public docs with what v0.1 actually does, and tag.
+
+**What shipped:**
+- **Model persistence (the contract's "artifact"):** the executor used to train + score + discard the fitted model. Now `ModelTarget.save_model(spec, path)` refits the winner on train (same seed → exactly the scored model) and `joblib.dump`s the full pipeline; the CLI writes it to `.iterate/runs/<run_id>/best_model.joblib` (+ a `best.json` config sidecar) and prints the load line. `RunResult` gained `run_id`. Verified live: `joblib.load(path).predict(X)` works.
+- **Dependency trim:** dropped `sqlalchemy` (unused — Memory is stdlib `sqlite3`); moved `e2b-code-interpreter` → `[sandbox]`, `kaggle`/`datasets` → `[datasets]` extras. `pip install iterate-ai` now pulls only what the v0.1 loop runs on.
+- **PyPI dist name `iterate-ai`** (`iterate` was taken; import + command stay `iterate`).
+- **`LICENSE`** (MIT).
+- **README reconciliation:** Quick start rewritten to the real v0.1 flow (`pip install iterate-ai` → Ollama → `iterate run --data … --target … --metric f1`), the one-line discovery form clearly relabeled as the v1 vision, `iterate history`/`why-failed`/`best` marked roadmap. Status → "v0.1 released."
+- 160 unit tests; ruff + mypy --strict clean (30 src files). Live CLI run on real Telco churn saves a working model.
+
+**Decisions:**
+- **Best model saved as a joblib artifact** — "we found the best model" is hollow if the user can't load it. Refit-on-train (matches the reported score) over refit-on-all-data (wouldn't match) for honesty in v0.1.
+- **Lean core deps** — forward-looking libraries belong in extras, not forced on every install.
+
+---
+
+## Week 3 retro — v0.1 shipped (the agentic loop)
+
+**The week in one line:** went from a tabular substrate to a working autonomous agent — `iterate run` reads a dataset, re-measures the baseline, and an LLM iterates model + hyperparameters to the best it can find, with persistent cross-run memory and a saved model artifact.
+
+**Shipped (Days 1–7):** Proposer (+ native `OllamaClient` for `think:false`) · Orchestrator · Terminator (delegated protocol) · Memory (sqlite, cross-run) · CLI `iterate run` + source-aware baseline reconstruction · reproducible churn demo · model persistence + release.
+
+**What worked:**
+- **The four Protocol seams** (`LLMClient`, `BenchmarkTarget`, `Terminator`, `Memory`) — every component swappable without touching the loop. Adding the native Ollama client, the sqlite memory, and the terminator concretes were all adapter changes, not refactors.
+- **Agent-first sequencing paid off** — the loop exists at v0.1, exactly the re-plan's bet.
+- **Measure-don't-assume**, again — the 18-minute proposer hang ran down to qwen3 thinking-mode (only disablable on the native endpoint); the early-stopping failures ran down to a missing eval set.
+
+**What didn't / punted:**
+- **Local-model tool-calling yield** — qwen3 still occasionally replies without a tool call; mitigated (3 attempts + firm nudge), not solved. Cloud backend is the reliable path. Remaining levers (few-shot, lower temp, text-fallback parser) logged, deferred.
+- **"Auditable report" = memory + summary**, not a generated document (Reporter is later).
+- **No `iterate history`/`best`/`why-failed`** query commands yet (data's in memory; CLI surface is a natural early post-v0.1 add).
+- LightGBM macOS-wheel slowness; richer structured failure replay.
+
+**Decisions that shaped it (DECISIONS.md):** native Ollama as its own adapter · reconstruct-from-text, never execute user code · interactivity split (v0.2 cheap wins / v0.3 full chat) · `--baseline` requires `--source` · `--fresh` archives · best model saved as an artifact.
+
+**Pace:** Weeks 1–3 (foundation → substrate → agentic loop + first release) done in ~9 days of sessions, ahead of the nominal cadence.
+
+**Next: v0.2 — sandboxed code-gen** (the agent writes + runs its own training code → any model, not just the three libraries) + the cheap interactive wins (live progress, streaming, Ctrl-C).
 
 ### 2026-05-31 | Week 3 Day 6 | Reproducible churn demo + demo-clean polish
 

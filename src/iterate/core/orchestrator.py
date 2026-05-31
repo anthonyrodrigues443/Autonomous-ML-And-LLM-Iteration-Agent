@@ -42,7 +42,8 @@ class RunResult:
     baseline: ExperimentResult
     history: list[Experiment]
     best: Experiment | None
-    stopped_because: str  # "max_iterations" | "patience" | "baseline_failed"
+    stopped_because: str  # "max_iterations" | "patience" | "plateau" | "baseline_failed"
+    run_id: str = ""  # the Memory run id; "" when the baseline failed before a run started
 
 
 def _now() -> datetime:
@@ -201,6 +202,7 @@ class Orchestrator:
             history=current_run,
             best=best,
             stopped_because=stopped_because,
+            run_id=run_id,
         )
 
 

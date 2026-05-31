@@ -146,6 +146,25 @@ def test_lightgbm_with_bare_early_stopping_alias_works(tmp_path: Path) -> None:
     assert 0.0 <= result.metrics.primary_value <= 1.0
 
 
+def test_save_model_writes_a_loadable_pipeline(tmp_path: Path) -> None:
+    """The winning model must be persisted as a usable artifact — load it and predict."""
+    import joblib
+
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    target = ModelTarget(ds, metric="f1")
+    out = tmp_path / "models" / "best_model.joblib"
+
+    returned = target.save_model(
+        {"model": "xgboost.XGBClassifier", "params": {"n_estimators": 10}}, out
+    )
+
+    assert returned == out
+    assert out.exists()
+    pipeline = joblib.load(out)
+    preds = pipeline.predict(ds.test_features)
+    assert len(preds) == ds.n_test
+
+
 def test_early_stopping_true_for_histgb_does_not_trigger_eval_set(tmp_path: Path) -> None:
     """sklearn HistGB's ``early_stopping=True`` is internal CV, not eval_set
     territory. Detection must NOT trigger (otherwise we'd pass an unsupported

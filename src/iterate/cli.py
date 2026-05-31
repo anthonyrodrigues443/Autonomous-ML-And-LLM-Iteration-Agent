@@ -116,6 +116,11 @@ def run(
         help="Archive the existing memory db and start a new chapter with the factory default baseline.",
     ),
     memory_path: Path | None = typer.Option(None, "--memory", help="Override the memory db path."),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        help="Where to save the best model (.joblib). Default: <runs_dir>/<run_id>/best_model.joblib.",
+    ),
 ) -> None:
     """Run the agent on a tabular dataset."""
     # ─── Validate ──────────────────────────────────────────────────────────
@@ -225,6 +230,13 @@ def run(
         _check_baseline_divergence(
             reported=baseline, measured=result.baseline.metrics.primary_value
         )
+
+    # ─── Save the winning model so the user can actually use it ────────────
+    if result.best is not None and result.best.result is not None:
+        out_path = output or (
+            Path(settings.iterate_runs_dir) / (result.run_id or "run") / "best_model.joblib"
+        )
+        _save_best_model(model_target, result, metric, out_path)
 
     # ─── Summary ───────────────────────────────────────────────────────────
     _render_summary(result, metric)
@@ -366,6 +378,41 @@ def _check_baseline_divergence(
             f"differs from our re-measurement {measured:.4f} ({divergence:.1%} divergence). "
             f"Likely a feature/eval mismatch."
         )
+
+
+def _save_best_model(
+    target: ModelTarget, result: RunResult, metric: str, path: Path
+) -> None:
+    """Refit + persist the winning model, plus a sidecar best.json with its config."""
+    best = result.best
+    assert best is not None
+    best_result = best.result
+    assert best_result is not None
+    spec = best.candidate.changes
+    target.save_model(spec, path)
+
+    score = best_result.metrics.primary_value if best_result.metrics else None
+    sidecar = path.with_name("best.json")
+    sidecar.write_text(
+        json.dumps(
+            {
+                "run_id": result.run_id,
+                "model": spec.get("model"),
+                "params": spec.get("params", {}),
+                "description": best.candidate.description,
+                "rationale": best.candidate.rationale,
+                "metric": metric,
+                "score": score,
+                "model_path": str(path),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    console.print(
+        f"\n[bold]saved best model[/bold] → {path}\n"
+        f"[dim]load it: joblib.load({str(path)!r}).predict(X)[/dim]"
+    )
 
 
 def _render_summary(result: RunResult, metric: str) -> None:

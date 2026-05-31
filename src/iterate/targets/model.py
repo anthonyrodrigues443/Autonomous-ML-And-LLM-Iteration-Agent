@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any, Literal
 
+import joblib
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
@@ -38,6 +39,8 @@ from iterate.adapters.models.registry import Task, build_estimator
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.schemas.experiment import Candidate
 
@@ -130,23 +133,8 @@ class ModelTarget:
         return self._evaluate(candidate.changes, experiment_id=candidate.id)
 
     def _evaluate(self, spec: dict[str, Any], *, experiment_id: str) -> ExperimentResult:
-        estimator = build_estimator(self._task, spec, seed=self._dataset.seed)
-        pipeline = Pipeline([("preprocess", self._preprocessor()), ("model", estimator)])
-
-        params = spec.get("params") or {}
-        wants_early_stopping = _wants_eval_set(params)
-
-        # Cap OpenMP/BLAS threads: on small tabular data the thread-pool overhead
-        # dwarfs the actual work (~200x slower here at 10 cores), so 1 thread wins.
-        # Revisit for large datasets / DL, where parallelism actually pays off.
         with threadpool_limits(limits=self._max_threads):
-            if wants_early_stopping:
-                # The candidate asked for early stopping → carve a 90/10 fit/eval
-                # slice off the training set; the sealed holdout stays untouched.
-                fit_params = self._fit_with_internal_eval_set(estimator, params, pipeline)
-                pipeline.fit(*fit_params["xy"], **fit_params["fit_kwargs"])
-            else:
-                pipeline.fit(self._dataset.train_features, self._dataset.train_target)
+            pipeline = self._build_and_fit(spec)
             predictions = pipeline.predict(self._dataset.test_features)
         metrics = Metrics(
             values=_score(self._task, self._dataset.test_target, predictions),
@@ -155,6 +143,34 @@ class ModelTarget:
             n_samples=self._dataset.n_test,
         )
         return ExperimentResult(experiment_id=experiment_id, metrics=metrics)
+
+    def save_model(self, spec: dict[str, Any], path: Path) -> Path:
+        """Fit ``spec`` on the training data and persist the fitted pipeline to ``path``.
+
+        Same fit the score was measured from (train-only, same seed) → the saved
+        artifact is exactly the model that achieved the reported holdout score.
+        Returns the path written. The caller (CLI) uses this to hand the user the
+        winning model so they don't have to reconstruct it themselves.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with threadpool_limits(limits=self._max_threads):
+            pipeline = self._build_and_fit(spec)
+        joblib.dump(pipeline, path)
+        return path
+
+    def _build_and_fit(self, spec: dict[str, Any]) -> Pipeline:
+        """Build the preprocess+estimator pipeline and fit it on the training split."""
+        estimator = build_estimator(self._task, spec, seed=self._dataset.seed)
+        pipeline = Pipeline([("preprocess", self._preprocessor()), ("model", estimator)])
+        params = spec.get("params") or {}
+        if _wants_eval_set(params):
+            # The candidate asked for early stopping → carve a 90/10 fit/eval slice
+            # off the training set; the sealed holdout stays untouched.
+            fit_params = self._fit_with_internal_eval_set(estimator, params, pipeline)
+            pipeline.fit(*fit_params["xy"], **fit_params["fit_kwargs"])
+        else:
+            pipeline.fit(self._dataset.train_features, self._dataset.train_target)
+        return pipeline
 
     def _fit_with_internal_eval_set(
         self, estimator: Any, params: dict[str, Any], pipeline: Pipeline
