@@ -202,7 +202,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 |---|---|---|---|
 | 1 | **`ComputeBackend` protocol** — extract the execution seam from `LocalExecutor` (it conforms; Orchestrator depends on the protocol); `SandboxExecutor` stub raising NotImplementedError. Settle the two design forks; RESEARCH_LOG entry on the code-gen contract + sandbox choice | `adapters/compute/base.py` + tests | done |
 | 2 | **Code runner primitive** — `CodeRunner` protocol + `LocalCodeRunner` (subprocess) + `E2BCodeRunner` (e2b, lazy-imported, injectable sandbox); run a script with input files under a mandatory timeout, capture stdout/exit/outputs, teardown. The `ComputeBackend.execute` integration lands Day 5 (needs candidates) | `adapters/compute/runner.py` + tests | done |
-| 3 | **Code-gen contract** — strict I/O contract for a generated script: reads the train split + a sealed-holdout features path, writes predictions (or a fitted model) to a known output path; the executor reads them back and scores through OUR eval. Schema for a code-candidate | `schemas/` + contract module + tests | todo |
+| 3 | **Code-gen contract** — fill-in-a-function harness (LLM writes `train_and_predict`; we own the I/O); inputs = train + holdout FEATURES + meta (labels held back); script writes `predictions.csv`; we score through the shared `core.scoring`. Code-candidate = `{"code": ...}`. Proven end-to-end through `LocalCodeRunner` with a canned function (no LLM/e2b) | `core/codegen.py` + `core/scoring.py` + tests | done |
 | 4 | **CodeProposer** — the LLM writes a training script to the contract (new prompt in `prompts.yaml` + tool). Coexists with the spec Proposer (option a). Conformance checks; failures captured, not crashed | `core/code_proposer.py` + tests | todo |
 | 5 | **Wire end-to-end + safety** — Orchestrator runs code-candidates through the sandbox executor; resource caps, timeout, no-network default, "own code only" enforced. First real sandboxed run on churn with a non-allow-listed model (e.g. CatBoost) | orchestrator wiring + integration test | todo |
 | 6 | **Notebook deliverable (B)** — export the winning experiment as a runnable, annotated `.ipynb` (a spec winner rebuilt as cells, or the generated-code winner wrapped with a markdown rationale); execute it to populate outputs (e2b's Jupyter kernel, or papermill/nbconvert on the local path); save next to `best_model.joblib`. The portfolio-worthy "here's exactly what the agent found, runnable" artifact | `core/notebook.py` (+ `nbformat`) + tests | todo |
@@ -269,6 +269,22 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-06-02 | Week 4 Day 3 | Code-gen contract
+
+**Task:** Define the strict agreement between a generated training script and us, so the agent can write any modeling code and we still score it the same way on the same sealed holdout. Proven without an LLM or e2b.
+
+**What shipped:**
+- `src/iterate/core/scoring.py` — extracted `score` / `task_for_metric` / `direction` (+ the metric sets) out of `ModelTarget` so both the spec path and the code-gen path score identically (single ruler, no drift). `ModelTarget` imports from it; behavior unchanged.
+- `src/iterate/core/codegen.py` — the contract:
+  - **Fill-in-a-function harness:** the agent writes `train_and_predict(X_train, y_train, X_holdout) -> predictions`; `assemble_script` wraps it in a fixed preamble (loads `train.csv` / `holdout.csv` / `meta.json`) + postamble (writes `predictions.csv`). The LLM owns only the modeling; we own the I/O.
+  - **Sealed holdout by construction:** `build_inputs` writes train (with target), holdout **features only**, and meta; the holdout labels never leave the host.
+  - **Scoring:** `score_predictions` reads `predictions.csv`, checks length == n_holdout, scores via `core.scoring` → a `Metrics` panel. Missing / empty / wrong-length / unparseable → a captured failure, never a crash.
+  - **Code-candidate = `{"code": ...}`** in `Candidate.changes`; `is_code_candidate` routes it (no new schema).
+- Tests: end-to-end through the **real `LocalCodeRunner`** with a hand-written LogisticRegression `train_and_predict` (assemble → run → score → valid Metrics, no LLM/e2b); holdout labels absent from inputs; wrong-length / missing predictions captured as failures; a raising function captured by the runner. Plus the scoring extraction keeps `ModelTarget` green.
+- 179 unit tests (+6); ruff + mypy --strict clean (35 src files).
+
+**Next session:** Week 4 Day 4 — the CodeProposer (LLM writes `train_and_predict` to this contract; coexists with the spec Proposer).
 
 ### 2026-06-02 | Week 4 Day 2 | Code runner primitive (e2b + local)
 

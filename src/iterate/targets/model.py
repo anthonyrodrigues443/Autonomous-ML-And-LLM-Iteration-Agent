@@ -15,30 +15,21 @@ the sandboxed code-gen path (v0.2).
 
 from __future__ import annotations
 
-import math
 import os
 import sys
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import joblib
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    mean_absolute_error,
-    mean_squared_error,
-    precision_score,
-    r2_score,
-    recall_score,
-)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from threadpoolctl import threadpool_limits
 
 from iterate.adapters.models.registry import Task, build_estimator
+from iterate.core.scoring import direction, score, task_for_metric
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
 if TYPE_CHECKING:
@@ -47,10 +38,6 @@ if TYPE_CHECKING:
 
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.schemas.experiment import Candidate
-
-_CLASSIFICATION_METRICS = {"accuracy", "f1", "precision", "recall"}
-_REGRESSION_METRICS = {"rmse", "mae", "mse", "r2"}
-_MINIMIZE = {"rmse", "mae", "mse"}
 
 # Param names that mean "I need an eval set for early stopping." XGBoost uses
 # ``early_stopping_rounds`` (plural); LightGBM uses ``early_stopping_round``
@@ -148,37 +135,6 @@ def _wants_eval_set(params: dict[str, Any]) -> bool:
     return False
 
 
-def _task_for_metric(metric: str) -> Task:
-    if metric in _REGRESSION_METRICS:
-        return "regression"
-    if metric in _CLASSIFICATION_METRICS:
-        return "classification"
-    known = sorted(_CLASSIFICATION_METRICS | _REGRESSION_METRICS)
-    raise ValueError(f"unknown metric {metric!r}; expected one of {known}")
-
-
-def _direction(metric: str) -> Literal["maximize", "minimize"]:
-    return "minimize" if metric in _MINIMIZE else "maximize"
-
-
-def _score(task: Task, y_true: Any, y_pred: Any) -> dict[str, float]:
-    if task == "regression":
-        mse = float(mean_squared_error(y_true, y_pred))
-        return {
-            "rmse": math.sqrt(mse),
-            "mae": float(mean_absolute_error(y_true, y_pred)),
-            "mse": mse,
-            "r2": float(r2_score(y_true, y_pred)),
-        }
-    average = "binary" if len(set(y_true)) <= 2 else "macro"
-    return {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "f1": float(f1_score(y_true, y_pred, average=average, zero_division=0)),
-        "precision": float(precision_score(y_true, y_pred, average=average, zero_division=0)),
-        "recall": float(recall_score(y_true, y_pred, average=average, zero_division=0)),
-    }
-
-
 class ModelTarget:
     """A tabular ML target: leakage-safe preprocessing + estimator, trained and scored."""
 
@@ -193,7 +149,7 @@ class ModelTarget:
         self.name = name
         self._dataset = dataset
         self._metric = metric
-        self._task: Task = _task_for_metric(metric)
+        self._task: Task = task_for_metric(metric)
         self._max_threads = max_threads
 
     def baseline(self) -> ExperimentResult:
@@ -212,9 +168,9 @@ class ModelTarget:
             with _silence_native_stdio():
                 predictions = pipeline.predict(self._dataset.test_features)
         metrics = Metrics(
-            values=_score(self._task, self._dataset.test_target, predictions),
+            values=score(self._task, self._dataset.test_target, predictions),
             primary=self._metric,
-            direction=_direction(self._metric),
+            direction=direction(self._metric),
             n_samples=self._dataset.n_test,
         )
         return ExperimentResult(experiment_id=experiment_id, metrics=metrics)
