@@ -21,6 +21,11 @@
 - **v0.3 is a new milestone for the real interactivity:** pause via Esc, mid-run chat with the LLM, resume. The hard engineering (async input, in-flight cancellation, conversational state) gets its own focused milestone.
 - Everything that was v0.3+ shifts by one version. The Streamlit UI becomes v0.10 (its main "interactive interface" value is covered by v0.3's CLI; v0.10 carries demos, multi-backend benchmark, polish). Build is now ~14 weeks (was ~13).
 
+**Updated 2026-06-01 — going multi-agent after v0.2 (at the Researcher milestone):**
+- v0.1 and v0.2 stay **single-agent** (one Proposer LLM in a deterministic loop). The architecture moves to **multi-agent at the Researcher milestone (v0.4)** — the natural single-to-multi transition, where the second genuine LLM role appears.
+- Shape: **specialist agents** (Researcher, Proposer, a Critic/Reviewer, later Discovery), each doing one focused job and handing **structured, typed output** to a **supervisor agent** that makes the decisions. Rationale: specialization raises per-agent tool-call reliability, and the supervisor reasons over digested high-quality context instead of raw everything. Our Pydantic schemas are the handoff contracts.
+- Built on our own harness (no LangGraph — Week-1 decision stands). Executor + Memory stay deterministic; the supervisor takes the judgment calls. See DECISIONS.md.
+
 - **Targets:** `ModelTarget` (tabular ML) · `PromptTarget` (production LLM prompts, prompt-iteration only) · `DLModelTarget` (vision, transfer learning — validated on local RTX 4050).
 - **Moat — the specialized combination, not one feature:** a domain specialist for ML/DL/prompt iteration that does *together* what no single tool does — agentic iteration across **ML + DL models AND LLM prompts** · **persistent memory** (revisits past failures when conditions change) · **literature-grounded** proposals · **bounded autonomy** + human-approval gates · **auditable reasoning trail** · **cost-constrained optimization** (best score you can *afford to serve* — cheapest cloud, $/mo, req/hr) · **rich auto-discovered context** (DB / MCP / Drive). Cost-aware serving is the flagship for cost-sensitive startups; the moat is the *combination* + the specialization. (Full matrix: README comparison table.)
 - **Compute:** pluggable backend — local MPS · RTX 4050 (GPU validation) · e2b · cloud-GPU adapter.
@@ -32,7 +37,7 @@
 | 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory → first autonomous tabular run (**v0.1**) |
 | 4–5 | **Sandboxed code-gen** (Proposer writes training code, runs it in e2b → any model at all) **+ cheap interactive wins** (live progress display, streaming LLM responses, graceful Ctrl-C) → **v0.2** |
 | 6 | **Full interactive CLI** — pause via Esc, mid-run chat with the LLM, resume → **v0.3** |
-| 7 | Dial A: agent picks the metric + starting model (basic research) → **v0.4** |
+| 7 | **Multi-agent split** (Researcher + Proposer + Critic specialists → supervisor) + Dial A: agent picks the metric + starting model from research → **v0.4** |
 | 8 | Dial B: `PromptTarget` — agentic prompt iteration → **v0.5** |
 | 9 | Dial B: `DLModelTarget` — vision transfer learning (4050) → **v0.6** |
 | 10 | Cost-constrained recommendation + serving profile + `iterate cost` → **v0.7** |
@@ -50,7 +55,7 @@ Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. **The
 | v0.1.0 | Week 3 · **RELEASED 2026-05-31** | tabular | data + features + target + metric + baseline/notebook + deadline — **agentic loop on** (any installed-library model via the factory; best model saved as a joblib artifact) |
 | v0.2.0 | Week 4–5 | tabular | *(same inputs)* — agent **writes & runs training code in a sandbox** → any model at all + **live progress / streaming / graceful Ctrl-C** |
 | v0.3.0 | Week 6 | tabular | *(same inputs)* — **full interactive CLI**: pause the loop, chat with the LLM, resume |
-| v0.4.0 | Week 7 | tabular | data + features + target + baseline + deadline  *(agent picks metric + starting model)* |
+| v0.4.0 | Week 7 | tabular | data + features + target + baseline + deadline  *(multi-agent: Researcher + Proposer + Critic specialists report to a supervisor; agent picks metric + starting model from research)* |
 | v0.5.0 | Week 8 | + prompts | prompt + eval set + deadline |
 | v0.6.0 | Week 9 | + DL / vision | data + target + deadline |
 | v0.7.0 | Week 10 | all three | + serving budget / cloud  *(cost-constrained recommendation)* |
