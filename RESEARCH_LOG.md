@@ -150,3 +150,24 @@ This is the "papers → citations" pattern that separates research engineers fro
 **How I'll verify it works:** factory builds RandomForest/LinearRegression/etc. with the right params; `os.system` and other off-list paths raise; `ModelTarget.run` switches model family end-to-end and scores. ruff + mypy --strict clean; suite stays fast.
 
 **Out of scope today (deferred):** the **sandboxed code-gen path (c)** → v0.2 (Week 4–5); the Proposer actually *choosing* the model/params from research → Week 3 loop + Dial-A research (it just consumes this contract); validating that a named classifier matches a classification task → left to fit-time failure for now (the executor will capture it, Day 5).
+
+## 2026-06-01 — Research: sandboxed code-gen execution venue + the code-gen contract (v0.2)
+
+**Question:** v0.2 lets the agent write its own training code so it can use any model, not just the allow-listed installed estimators. Where does that generated code run, and what is the contract between the agent's script and our eval so the sealed-holdout guarantee still holds?
+
+**Sources reviewed:**
+1. [e2b code-interpreter docs](https://e2b.dev/docs) — ephemeral cloud sandboxes (fresh micro-VM per run, filesystem + process isolation, torn down after); built for running untrusted/LLM-generated code. Needs an API key; billed by sandbox runtime.
+2. [Python `subprocess` + `resource` limits](https://docs.python.org/3/library/subprocess.html) — running a script locally in a child process with a timeout is simple, but offers no real isolation: the child has the user's permissions and filesystem.
+3. Our own Week-2 decision trail — the compute layer was always meant to be a pluggable port (local MPS / RTX 4050 / e2b / cloud), and we deferred the `ComputeBackend` protocol until the second backend (the sandbox) actually arrived. That is now.
+
+**Approaches considered:**
+- **Run generated code in-process (reuse LocalExecutor as-is):** simplest, but executing arbitrary generated code in our own process risks crashing/contaminating the loop and has zero isolation. Rejected for generated code.
+- **e2b sandbox (cloud):** real isolation, contained blast radius, the right default for code generated autonomously with no human approving each script. Costs money + needs a key + adds latency.
+- **Local child-process executor:** free, offline, fast, uses the user's own GPU/data, but the generated code runs with the user's permissions (no isolation). Fine as an *explicit opt-in*, wrong as a default.
+- **Code-gen contract — return a fitted model vs return predictions:** returning a pickled model invites version/security issues across the sandbox boundary; returning *predictions on the holdout features* (plus optional artifacts) keeps the boundary a plain data file and lets US score through our own eval, preserving the sealed-holdout guarantee.
+
+**Decision (v0.2):** Put execution behind a `ComputeBackend` protocol (extracted Day 1). Ship two backends: `SandboxExecutor` (e2b, the **safe default** for generated code) and a local executor exposed as `--compute local` (**explicit opt-in**, with a warning that generated code runs with the user's permissions). Generated code is the **agent's own, never the user's** (permanent policy). The **contract**: the script receives the train split and the holdout *features* (never the holdout labels), trains on train only, and writes predictions to a known output path; our side reads them back and scores through the existing `Metrics` eval. This keeps the sandbox boundary a plain data handoff and the holdout sealed.
+**Smallest viable implementation (Day 1):** `adapters/compute/base.py::ComputeBackend` protocol; `LocalExecutor` conforms; `SandboxExecutor` stub; Orchestrator depends on the protocol. Contract + executors land Days 2-3.
+**How I'll verify it works:** protocol conformance tests (Day 1); a generated script that trains CatBoost (not allow-listed) runs in the sandbox and is scored through our eval, holdout labels never crossing the boundary (Day 5 integration).
+
+**Out of scope today:** the real e2b adapter (Day 2), the contract module (Day 3), the CodeProposer (Day 4). Network egress policy inside the sandbox (default deny) to be decided when the e2b adapter lands.

@@ -200,7 +200,7 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 
 | Day | Focus | Lands | Done? |
 |---|---|---|---|
-| 1 | **`ComputeBackend` protocol** — extract the execution seam from `LocalExecutor` (it conforms; Orchestrator depends on the protocol); `SandboxExecutor` stub raising NotImplementedError. Settle the two design forks; RESEARCH_LOG entry on the code-gen contract + sandbox choice | `adapters/compute/base.py` + tests | todo |
+| 1 | **`ComputeBackend` protocol** — extract the execution seam from `LocalExecutor` (it conforms; Orchestrator depends on the protocol); `SandboxExecutor` stub raising NotImplementedError. Settle the two design forks; RESEARCH_LOG entry on the code-gen contract + sandbox choice | `adapters/compute/base.py` + tests | done |
 | 2 | **Sandbox executor (core)** — boot a sandbox, upload the dataset, run a script, capture stdout/result/errors, enforce timeout + teardown. Real e2b adapter behind the protocol, plus a `LocalSubprocessExecutor` fallback for keyless dev/test | `adapters/compute/sandbox.py` (+ subprocess fallback) + tests | todo |
 | 3 | **Code-gen contract** — strict I/O contract for a generated script: reads the train split + a sealed-holdout features path, writes predictions (or a fitted model) to a known output path; the executor reads them back and scores through OUR eval. Schema for a code-candidate | `schemas/` + contract module + tests | todo |
 | 4 | **CodeProposer** — the LLM writes a training script to the contract (new prompt in `prompts.yaml` + tool). Coexists with the spec Proposer (option a). Conformance checks; failures captured, not crashed | `core/code_proposer.py` + tests | todo |
@@ -268,6 +268,23 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-06-01 | Week 4 Day 1 | `ComputeBackend` protocol (v0.2 foundation)
+
+**Task:** Extract the execution venue into a swappable seam so the e2b sandbox (Day 2) drops in without touching the Orchestrator. Same "add the protocol when the second backend lands" call as the data source and terminator.
+
+**What shipped:**
+- `src/iterate/adapters/compute/base.py` — `ComputeBackend` protocol (`execute(target, candidate=None) -> ExperimentResult`, must capture failures not raise). `LocalExecutor` conforms unchanged.
+- `src/iterate/adapters/compute/sandbox.py` — `SandboxExecutor` stub (raises NotImplementedError pointing at Day 2); conforms to the protocol so the seam is real.
+- Orchestrator now depends on `ComputeBackend`, not the concrete `LocalExecutor`.
+- RESEARCH_LOG entry settling the **execution venue** (e2b safe default for generated code + a local `--compute local` opt-in) and the **code-gen contract** (script gets train + holdout *features* only, writes predictions, we score through our eval — holdout labels never cross the sandbox boundary).
+- 164 unit tests (+3); ruff + mypy --strict clean (32 src files).
+
+**Decisions (forks settled, see Week 4 plan + DECISIONS direction):**
+- e2b is the safe default for autonomously-generated code; **local execution is a supported opt-in** (`--compute local`) since the protocol makes it free to offer, with a warning that generated code runs with the user's permissions.
+- Code-gen will be a **new candidate type alongside** the v0.1 `{"model","params"}` spec, not a replacement.
+
+**Next session:** Week 4 Day 2 — the sandbox executor core (boot / upload / run / capture / timeout / teardown) + a local fallback executor.
 
 ### 2026-05-31 | v0.1.3 | Lazy CLI imports — instant `version`/`--help`
 
