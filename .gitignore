@@ -241,6 +241,12 @@ models/*.safetensors
 models/*.h5
 models/*.joblib
 
+# Demo videos / large media — never in git history (attach to GitHub Releases instead)
+releases/
+*.mp4
+*.mov
+*.webm
+
 # Persistent memory store (project-local)
 .iterate/
 
