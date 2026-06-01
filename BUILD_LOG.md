@@ -187,6 +187,31 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 
 ---
 
+## Week 4 Day-by-Day Plan — Sandboxed code-gen (→ v0.2)
+
+**Week goal:** lift the model ceiling. v0.1 can only run allow-listed installed estimators via the `{"model","params"}` factory. v0.2 lets the agent **write its own training code** and run it in an **e2b sandbox**, so it can use any model the research points to (CatBoost, a custom net, a stacking pipeline, a library we never installed). Plus the cheap interactive wins (live progress, streaming, graceful Ctrl-C). This is the biggest single capability jump in the roadmap, hence a full day-by-day. Stays single-agent (multi-agent lands at v0.4).
+**Target window:** ~Jun 2–9 (may flow into early Week 5; log by real date).
+
+**Hard boundaries (locked):** we run **the agent's OWN generated code, in the sandbox, never the user's code** (the permanent security policy). The sealed-holdout principle holds: a generated script trains on train data only and is scored through **our** eval on the holdout it never sees.
+
+**Design forks to settle on Day 1 (my recommendation in parens):**
+- **e2b access + local option:** need an `E2B_API_KEY` (paid cloud sandbox, free tier exists; now in the `[sandbox]` extra). (Build behind the `ComputeBackend` protocol with a **local executor** that runs generated code on the user's machine. The local executor is both the keyless dev/test path AND a **user-facing backend** via `--compute local`. e2b is the **safe default** (isolated, contained blast radius for autonomously-generated code); local is an **explicit opt-in with a clear warning** (free, offline, uses the user's own GPU, but generated code runs with the user's permissions). Fits the existing "pluggable compute backend" vision.)
+- **Code-gen vs spec coexistence:** (a new **code-candidate** type alongside the v0.1 `{"model","params"}` spec; the Proposer picks the spec path for installed models and the code path for anything beyond the three libraries. Keep the cheap reliable spec path; code-gen is the escape hatch, not a replacement.)
+
+| Day | Focus | Lands | Done? |
+|---|---|---|---|
+| 1 | **`ComputeBackend` protocol** — extract the execution seam from `LocalExecutor` (it conforms; Orchestrator depends on the protocol); `SandboxExecutor` stub raising NotImplementedError. Settle the two design forks; RESEARCH_LOG entry on the code-gen contract + sandbox choice | `adapters/compute/base.py` + tests | todo |
+| 2 | **Sandbox executor (core)** — boot a sandbox, upload the dataset, run a script, capture stdout/result/errors, enforce timeout + teardown. Real e2b adapter behind the protocol, plus a `LocalSubprocessExecutor` fallback for keyless dev/test | `adapters/compute/sandbox.py` (+ subprocess fallback) + tests | todo |
+| 3 | **Code-gen contract** — strict I/O contract for a generated script: reads the train split + a sealed-holdout features path, writes predictions (or a fitted model) to a known output path; the executor reads them back and scores through OUR eval. Schema for a code-candidate | `schemas/` + contract module + tests | todo |
+| 4 | **CodeProposer** — the LLM writes a training script to the contract (new prompt in `prompts.yaml` + tool). Coexists with the spec Proposer (option a). Conformance checks; failures captured, not crashed | `core/code_proposer.py` + tests | todo |
+| 5 | **Wire end-to-end + safety** — Orchestrator runs code-candidates through the sandbox executor; resource caps, timeout, no-network default, "own code only" enforced. First real sandboxed run on churn with a non-allow-listed model (e.g. CatBoost) | orchestrator wiring + integration test | todo |
+| 6 | **Cheap interactive wins** — live progress display (rich `Live`: iteration / model / score / best updating in place), streaming LLM responses (client stream path), graceful Ctrl-C (finish or abort current iteration, persist state, clean exit) | `llm/*` stream methods + CLI live view + tests | todo |
+| 7 | Polish + Week 4 retro + release **v0.2.0** (tag + PyPI) | wrap-up | todo |
+
+**Slack:** 1 day (likely needed — sandbox infra + code-gen reliability are the riskiest work so far).
+
+---
+
 ## MCP + Discovery Backlog (preview — Week 9 under the agent-first plan)
 
 > **Re-sequenced 2026-05-27 (agent-first):** Proposer (4.10) + Memory (4.11) moved **forward to Week 3** (the core agentic loop); Researcher (4.9) → Week 4 (Dial A). The MCP + discovery items below (4.1–4.8, 4.12–4.13) land at **Week 9** — they're Dial-A input-reduction (toward one-sentence input), *not* prerequisites for the agent.
