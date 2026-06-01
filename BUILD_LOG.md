@@ -189,8 +189,8 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 
 ## Week 4 Day-by-Day Plan — Sandboxed code-gen (→ v0.2)
 
-**Week goal:** lift the model ceiling. v0.1 can only run allow-listed installed estimators via the `{"model","params"}` factory. v0.2 lets the agent **write its own training code** and run it in an **e2b sandbox**, so it can use any model the research points to (CatBoost, a custom net, a stacking pipeline, a library we never installed). Plus the cheap interactive wins (live progress, streaming, graceful Ctrl-C). This is the biggest single capability jump in the roadmap, hence a full day-by-day. Stays single-agent (multi-agent lands at v0.4).
-**Target window:** ~Jun 2–9 (may flow into early Week 5; log by real date).
+**Week goal:** lift the model ceiling. v0.1 can only run allow-listed installed estimators via the `{"model","params"}` factory. v0.2 lets the agent **write its own training code** and run it in an **e2b sandbox**, so it can use any model the research points to (CatBoost, a custom net, a stacking pipeline, a library we never installed). It also ships a **notebook deliverable**: the winning experiment exported as a runnable, annotated `.ipynb` (works for a spec winner or a generated-code winner). Plus the cheap interactive wins (live progress, streaming, graceful Ctrl-C). The biggest single capability jump in the roadmap, hence a full day-by-day. Stays single-agent (multi-agent lands at v0.4).
+**Target window:** ~Jun 1–10 (flows into early Week 5; log by real date). Days 1–2 done.
 
 **Hard boundaries (locked):** we run **the agent's OWN generated code, in the sandbox, never the user's code** (the permanent security policy). The sealed-holdout principle holds: a generated script trains on train data only and is scored through **our** eval on the holdout it never sees.
 
@@ -201,14 +201,15 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | Day | Focus | Lands | Done? |
 |---|---|---|---|
 | 1 | **`ComputeBackend` protocol** — extract the execution seam from `LocalExecutor` (it conforms; Orchestrator depends on the protocol); `SandboxExecutor` stub raising NotImplementedError. Settle the two design forks; RESEARCH_LOG entry on the code-gen contract + sandbox choice | `adapters/compute/base.py` + tests | done |
-| 2 | **Sandbox executor (core)** — boot a sandbox, upload the dataset, run a script, capture stdout/result/errors, enforce timeout + teardown. Real e2b adapter behind the protocol, plus a `LocalSubprocessExecutor` fallback for keyless dev/test | `adapters/compute/sandbox.py` (+ subprocess fallback) + tests | todo |
+| 2 | **Code runner primitive** — `CodeRunner` protocol + `LocalCodeRunner` (subprocess) + `E2BCodeRunner` (e2b, lazy-imported, injectable sandbox); run a script with input files under a mandatory timeout, capture stdout/exit/outputs, teardown. The `ComputeBackend.execute` integration lands Day 5 (needs candidates) | `adapters/compute/runner.py` + tests | done |
 | 3 | **Code-gen contract** — strict I/O contract for a generated script: reads the train split + a sealed-holdout features path, writes predictions (or a fitted model) to a known output path; the executor reads them back and scores through OUR eval. Schema for a code-candidate | `schemas/` + contract module + tests | todo |
 | 4 | **CodeProposer** — the LLM writes a training script to the contract (new prompt in `prompts.yaml` + tool). Coexists with the spec Proposer (option a). Conformance checks; failures captured, not crashed | `core/code_proposer.py` + tests | todo |
 | 5 | **Wire end-to-end + safety** — Orchestrator runs code-candidates through the sandbox executor; resource caps, timeout, no-network default, "own code only" enforced. First real sandboxed run on churn with a non-allow-listed model (e.g. CatBoost) | orchestrator wiring + integration test | todo |
-| 6 | **Cheap interactive wins** — live progress display (rich `Live`: iteration / model / score / best updating in place), streaming LLM responses (client stream path), graceful Ctrl-C (finish or abort current iteration, persist state, clean exit) | `llm/*` stream methods + CLI live view + tests | todo |
-| 7 | Polish + Week 4 retro + release **v0.2.0** (tag + PyPI) | wrap-up | todo |
+| 6 | **Notebook deliverable (B)** — export the winning experiment as a runnable, annotated `.ipynb` (a spec winner rebuilt as cells, or the generated-code winner wrapped with a markdown rationale); execute it to populate outputs (e2b's Jupyter kernel, or papermill/nbconvert on the local path); save next to `best_model.joblib`. The portfolio-worthy "here's exactly what the agent found, runnable" artifact | `core/notebook.py` (+ `nbformat`) + tests | todo |
+| 7 | **Cheap interactive wins** — live progress display (rich `Live`: iteration / model / score / best updating in place), streaming LLM responses (client stream path), graceful Ctrl-C (finish or abort current iteration, persist state, clean exit) | `llm/*` stream methods + CLI live view + tests | todo |
+| 8 | Polish + Week 4 retro + release **v0.2.0** (tag + PyPI) | wrap-up | todo |
 
-**Slack:** 1 day (likely needed — sandbox infra + code-gen reliability are the riskiest work so far).
+**Slack:** 1 day (likely needed — sandbox infra + code-gen reliability are the riskiest work so far). v0.2 is now 8 days (added the notebook deliverable), so it runs into early Week 5.
 
 ---
 
@@ -268,6 +269,26 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-06-02 | Week 4 Day 2 | Code runner primitive (e2b + local)
+
+**Task:** Build the low-level primitive that physically runs a Python script in a venue and returns its outputs. De-risks the riskiest unknown in v0.2 ("can we run code safely and get results back") before wiring it into the loop.
+
+**What shipped:**
+- `src/iterate/adapters/compute/runner.py`:
+  - `CodeRunner` protocol — `run(script, *, inputs, outputs, timeout) -> RunResult`; must capture a failing script (nonzero exit / timeout), not raise.
+  - `RunResult` — stdout / stderr / exit_code / outputs (name → bytes) / timed_out, with a `succeeded` property.
+  - `LocalCodeRunner` — temp dir, write inputs + script, `subprocess.run` with mandatory timeout (kills on expiry), read named outputs back. The `--compute local` path; no isolation.
+  - `E2BCodeRunner` — boot sandbox, upload inputs, run, download outputs, teardown in `finally`. `e2b_code_interpreter` lazy-imported (module loads without the `[sandbox]` extra); sandbox factory injectable for tests.
+- Tests: `LocalCodeRunner` tested for real offline (round-trip, timeout, nonzero exit, missing-output); `E2BCodeRunner` tested with a fake sandbox (upload/run/read/teardown, execution-error mapping, teardown-on-raise); protocol conformance. A live e2b test in the integration suite skips without `[sandbox]` + `E2B_API_KEY`.
+- 173 unit tests (+9); ruff + mypy --strict clean (33 src files).
+
+**Honest scope flags (in the module docstring too):**
+- **Not in Day 2:** the `ComputeBackend.execute(target, candidate)` integration — that needs code-candidates + the contract, so it completes Day 5. `SandboxExecutor` stays a stub until then. Day 2 is purely the runner primitive.
+- **e2b not live-verified:** `E2BCodeRunner` is written to the documented e2b API and fake-tested, but not run against real e2b yet (no key in dev); the exact calls may need small fixes on first live run (Day 5 / when a key is added).
+- **Network egress-deny is NOT yet enforced** for e2b (needs a custom sandbox template); flagged, not assumed. Local runner has no isolation by design.
+
+**Next session:** Week 4 Day 3 — the code-gen contract (script I/O: gets train + holdout features, writes predictions; we score through our eval).
 
 ### 2026-06-01 | Week 4 Day 1 | `ComputeBackend` protocol (v0.2 foundation)
 
