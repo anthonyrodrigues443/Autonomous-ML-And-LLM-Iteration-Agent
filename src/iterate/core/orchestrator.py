@@ -24,7 +24,7 @@ from iterate.core.terminator import AttemptOutcome, LoopState
 from iterate.schemas.experiment import Experiment
 
 if TYPE_CHECKING:
-    from iterate.adapters.compute.local import LocalExecutor
+    from iterate.adapters.compute.base import ComputeBackend
     from iterate.core.memory import Memory
     from iterate.core.proposer import Proposer
     from iterate.core.terminator import Terminator
@@ -77,7 +77,7 @@ class Orchestrator:
         self,
         target: BenchmarkTarget,
         proposer: Proposer,
-        executor: LocalExecutor,
+        executor: ComputeBackend,
         terminator: Terminator,
         memory: Memory,
         *,
