@@ -99,6 +99,53 @@ def test_missing_predictions_is_a_captured_failure(tmp_path: Path) -> None:
     assert "no predictions" in (result.error or "")
 
 
+def test_required_imports_maps_and_filters_stdlib() -> None:
+    code = (
+        "def train_and_predict(a, b, c):\n"
+        "    import json, os\n"  # stdlib — filtered out
+        "    import numpy as np\n"  # name == package
+        "    import sklearn.ensemble\n"  # dotted -> top level, mapped name
+        "    from xgboost import XGBClassifier\n"  # from-import
+        "    import cv2\n"  # aliased package name
+        "    return []\n"
+    )
+    assert codegen.required_imports(code) == ["numpy", "opencv-python", "scikit-learn", "xgboost"]
+
+
+def test_required_imports_ignores_relative_imports() -> None:
+    code = "def train_and_predict(a, b, c):\n    from . import helpers\n    return []\n"
+    assert codegen.required_imports(code) == []
+
+
+def test_required_imports_of_unparseable_code_is_empty() -> None:
+    assert codegen.required_imports("def train_and_predict(:\n") == []
+
+
+def test_validate_accepts_a_well_formed_function() -> None:
+    assert codegen.validate_train_and_predict(_GOOD_FN) is None
+
+
+def test_validate_rejects_syntax_error() -> None:
+    assert "did not parse" in (codegen.validate_train_and_predict("def f(:\n") or "")
+
+
+def test_validate_rejects_missing_entry_point() -> None:
+    reason = codegen.validate_train_and_predict("def other(a, b, c):\n    return []\n")
+    assert reason is not None
+    assert codegen.ENTRY_POINT in reason
+
+
+def test_validate_rejects_wrong_arity() -> None:
+    reason = codegen.validate_train_and_predict("def train_and_predict(a, b):\n    return []\n")
+    assert reason is not None
+    assert "X_train" in reason
+
+
+def test_validate_allows_varargs() -> None:
+    code = "def train_and_predict(*args, **kwargs):\n    return []\n"
+    assert codegen.validate_train_and_predict(code) is None
+
+
 def test_raising_function_is_captured_by_the_runner(tmp_path: Path) -> None:
     ds = load_csv(_classification_csv(tmp_path), target="churn")
     bad_fn = "def train_and_predict(X_train, y_train, X_holdout):\n    raise ValueError('boom')\n"

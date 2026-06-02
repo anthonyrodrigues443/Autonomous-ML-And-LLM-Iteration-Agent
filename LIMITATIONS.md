@@ -24,7 +24,7 @@ cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 be
 
 | Limitation (today) | Lifted at | Notes |
 |---|---|---|
-| Spec path limited to allow-listed installed libraries (scikit-learn / XGBoost / LightGBM). | **v0.2** | Being lifted now: code-gen lets the agent write + run any model. |
+| Spec path limited to allow-listed installed libraries (scikit-learn / XGBoost / LightGBM). | **v0.2** | Superseded by the code-gen path (Day 4): the CodeProposer has **no library allow-list** — it writes a `train_and_predict` and imports whatever it wants; we install its imports before running. The spec path keeps the allow-list as the cheap/fast/reliable option. |
 | Spec-path preprocessing is fixed (median impute + one-hot). | **v0.2** | The code-gen path lets the agent preprocess freely. Spec-path flexibility itself: TBD. |
 
 ## Data & inputs (the "shrink the inputs" dial)
@@ -55,6 +55,8 @@ cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 be
 |---|---|---|
 | e2b network egress-deny not enforced (needs a custom sandbox template). | **v0.2.x** | Flagged in `compute/runner.py`. |
 | e2b path not live-verified yet (no key in dev). | **v0.2** | Verified when a key is added (Day 5). |
+| Import→package resolution for install-on-demand is a hand-kept alias map (`sklearn`→`scikit-learn`, …) with import-name fallback. | **TBD** | Provisional architecture — to be revisited (logged in DECISIONS.md). Backstop: a wrong/missing package fails its install → captured failure + retry, so the map only needs the common stack. |
+| Auto-install of the agent's imports runs only in the disposable sandbox, never the user's local venv. | **permanent (local) / by-design** | `--compute local` will not silently mutate your environment (typosquat / dependency-conflict risk). On local, a missing import is a captured failure; install-on-demand is a sandbox feature. |
 | Code-gen winners return predictions, not a pickled model. | **permanent** | Security/portability; the readable artifact is the v0.2 notebook deliverable. |
 | No cloud-GPU compute backend (local + e2b only). | ~v0.6 | When DL / large-model training needs it. |
 

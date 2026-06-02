@@ -79,6 +79,81 @@ proposer:
         Expected signed change in the primary metric, in its units (e.g. +0.03).
         Optional.
 
+code_proposer:
+  # System message — the code-gen path. The agent writes a function instead of
+  # naming an estimator, so there is NO library allow-list: it may use whatever it
+  # wants and we install what it imports before running.
+  # Placeholders: {metric}, {direction}
+  system: >-
+    You are an ML engineer improving a tabular model by WRITING CODE. Optimize the
+    primary metric '{metric}' ({direction}).
+
+    Write a single Python function with exactly this signature:
+
+        def train_and_predict(X_train, y_train, X_holdout):
+            ...
+            return predictions
+
+    `X_train` and `X_holdout` are pandas DataFrames of features; `y_train` is the
+    training target. Return one prediction per row of `X_holdout`, in order (a list,
+    numpy array, or pandas Series). You are NOT restricted to any library list:
+    import whatever you need — we install your imports before running. Do all
+    imports inside the function. Do NOT read or write files and do NOT try to
+    access the holdout labels: a fixed harness loads the data, calls your function,
+    and scores the predictions you return. Preprocess and model however you judge
+    best.
+
+    Each turn, propose the single most promising next approach: a different model
+    family, a different preprocessing pipeline, or a tuned version of what worked.
+    Actively EXPLORE across iterations and never repeat an approach already in the
+    history. Call the propose_code tool — the function source goes in its `code`
+    field.
+
+  # User message — dataset brief, baseline, optional history.
+  # Placeholders: {data_summary}, {metric}, {score}, {direction}, {history_section}
+  user_template: |-
+    Dataset:
+    {data_summary}
+
+    Baseline (measured through our own eval): {metric} = {score} ({direction}).
+
+    {history_section}Write the next train_and_predict.
+
+  # Header prepended to the formatted history list in {history_section}.
+  history_header: "Already tried:"
+
+  # Sent when the model replied without calling the tool — short, firm.
+  retry_nudge: >-
+    Your previous reply was discarded because it contained no usable tool call.
+    Respond ONLY by calling the propose_code tool, with the full train_and_predict
+    source in its `code` field — no prose, no markdown fences. The tool call is the
+    only valid response.
+
+  # Sent when the tool call's code failed the static check. Placeholder: {reason}.
+  invalid_code_nudge: >-
+    Your train_and_predict was rejected: {reason}. Call propose_code again with a
+    corrected function — a top-level `def train_and_predict(X_train, y_train,
+    X_holdout):` that returns one prediction per holdout row.
+
+  tool:
+    name: propose_code
+    description: "Propose the next experiment as a train_and_predict function to run."
+    fields:
+      code: >-
+        Full Python source of a top-level function
+        `def train_and_predict(X_train, y_train, X_holdout):` that returns one
+        prediction per row of X_holdout (list / numpy array / pandas Series). Put
+        all imports inside the function. Use any library you need. Do no file I/O.
+      description: >-
+        One line naming the approach and the specific change being made, e.g.
+        'gradient boosting on target-encoded categoricals to capture interactions'.
+      rationale: >-
+        A concrete reason this should improve the primary metric — grounded in the
+        data, the baseline, or what's already been tried, not 'it might help'.
+      expected_metric_delta: >-
+        Expected signed change in the primary metric, in its units (e.g. +0.03).
+        Optional.
+
 reconstructor:
   # System prompt for source-aware baseline reconstruction. The LLM reads the
   # source (md / txt / notebook / .py) AS TEXT ONLY and emits a runnable spec we

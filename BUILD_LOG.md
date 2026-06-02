@@ -270,6 +270,25 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-06-02 | Week 4 Day 4 | CodeProposer (LLM writes the code)
+
+**Task:** Add the third LLM caller (sibling of the spec `Proposer` and the `Reconstructor`): instead of naming an allow-listed estimator, it WRITES a `train_and_predict` function to the Day-3 contract. Built and proven in isolation with a fake LLM; wired into the loop on Day 5.
+
+**What shipped:**
+- `src/iterate/core/code_proposer.py` — `CodeProposer`: same `LLMClient` protocol + tool-call + retry machinery as the spec proposer, emits `changes = {"code": "<train_and_predict source>"}`. **No library allow-list on this path** — the prompt tells the agent to import whatever it needs; we install its imports before running (Day-5 executor). A cheap static guard (`validate_train_and_predict`) turns malformed snippets into a targeted re-prompt instead of a wasted run; a compact history formatter summarizes past attempts by description + score so whole function bodies are never echoed back into the prompt.
+- `src/iterate/core/codegen.py` — two deterministic AST helpers (no LLM):
+  - `validate_train_and_predict(code)` — parses, requires a top-level `train_and_predict` of the right arity; returns a precise reason or `None`.
+  - `required_imports(code)` — top-level imports minus the stdlib, mapped to pip distribution names (`sklearn`→`scikit-learn`, `cv2`→`opencv-python`, …). Consumed by the Day-5 executor to install-on-demand.
+- `code_proposer` prompt block in `prompts.yaml` (system / user / nudges / tool wording).
+- Tests: build a code candidate from a tool call; **bridge test** runs a CodeProposer candidate through the real `LocalCodeRunner` + `score_predictions` (proves its output is directly contract-runnable, no LLM); non-parsing / wrong-name / no-tool-call retry then raise; recovery after one bad attempt; prompt carries the brief + metric; history summarized without raw code. Plus `required_imports` / `validate_*` unit tests (stdlib filtered, dotted + aliased names, relative imports ignored, arity + varargs).
+- 196 unit tests (+17); ruff + mypy --strict clean (36 src files).
+
+**Design call (yours):** no library allow-list even on the code path — the agent uses whatever it wants and we install its imports. Logged in DECISIONS.md. The import-name→package-name resolution is a provisional hand-kept map; the resolve-and-install **architecture is TBD** (you'll revisit it) — the soft-fail backstop (a bad install becomes a captured failure + retry) means the map only needs to cover the common stack to keep that rare.
+
+**Not in Day 4:** executor routing on `is_code_candidate`, the install-then-run step in the sandbox, the first live e2b run, and the live qwen3 integration test — all Day 5.
+
+**Next session:** Week 4 Day 5 — wire the code path end-to-end (executor routes code candidates, installs imports, runs in the sandbox, scores) + first real sandboxed run + safety.
+
 ### 2026-06-02 | Week 4 Day 3 | Code-gen contract
 
 **Task:** Define the strict agreement between a generated training script and us, so the agent can write any modeling code and we still score it the same way on the same sealed holdout. Proven without an LLM or e2b.
