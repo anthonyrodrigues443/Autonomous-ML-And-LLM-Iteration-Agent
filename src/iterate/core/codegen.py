@@ -20,7 +20,9 @@ train_and_predict source>"}``; the executor routes on the presence of ``"code"``
 
 from __future__ import annotations
 
+import ast
 import json
+import sys
 from typing import TYPE_CHECKING, Any
 
 from iterate.core.scoring import direction, score, task_for_metric
@@ -34,6 +36,9 @@ TRAIN_CSV = "train.csv"
 HOLDOUT_CSV = "holdout.csv"
 META_JSON = "meta.json"
 PREDICTIONS_CSV = "predictions.csv"
+
+# The single function the agent must define; the harness calls it.
+ENTRY_POINT = "train_and_predict"
 
 # The harness around the LLM's train_and_predict. Loads inputs, calls the
 # function, writes predictions. The LLM source is inserted between the two halves.
@@ -55,9 +60,23 @@ X_holdout = pd.read_csv({HOLDOUT_CSV!r})  # FEATURES ONLY — labels are held ba
 
 _POSTAMBLE = f"""
 # ─── harness: run the agent's function and write predictions ───
-_preds = train_and_predict(X_train, y_train, X_holdout)
+_preds = {ENTRY_POINT}(X_train, y_train, X_holdout)
 pd.Series(list(_preds)).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)
 """
+
+# import-name -> pip distribution name, for the cases where they differ. PROVISIONAL:
+# this hand-kept map is a stop-gap. The architecture for resolving + installing the
+# agent's imports is TBD (tracked in DECISIONS.md / LIMITATIONS.md) and will be
+# revisited; for now an unknown import falls back to its own name and a bad guess
+# simply fails the install, surfacing as a captured experiment failure.
+_IMPORT_TO_PACKAGE = {
+    "sklearn": "scikit-learn",
+    "cv2": "opencv-python",
+    "PIL": "pillow",
+    "bs4": "beautifulsoup4",
+    "skimage": "scikit-image",
+    "yaml": "pyyaml",
+}
 
 
 def is_code_candidate(changes: dict[str, Any]) -> bool:
@@ -68,6 +87,52 @@ def is_code_candidate(changes: dict[str, Any]) -> bool:
 def assemble_script(code: str) -> str:
     """Wrap the agent's `train_and_predict` source in the I/O harness."""
     return _PREAMBLE + code.strip() + "\n" + _POSTAMBLE
+
+
+def validate_train_and_predict(code: str) -> str | None:
+    """Static check of a generated snippet; returns an error reason or ``None`` if OK.
+
+    Catches the cheap-to-detect mistakes (won't parse, no `train_and_predict`,
+    wrong arity) before we ever spend a run on it, so the proposer can re-prompt
+    with a precise reason instead of burning an iteration on a doomed script.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return f"code did not parse: {exc}"
+    func = next(
+        (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == ENTRY_POINT),
+        None,
+    )
+    if func is None:
+        return f"no top-level function named {ENTRY_POINT!r} was defined"
+    n_positional = len(func.args.posonlyargs) + len(func.args.args)
+    if n_positional < 3 and func.args.vararg is None:
+        return f"{ENTRY_POINT} must accept (X_train, y_train, X_holdout)"
+    return None
+
+
+def required_imports(code: str) -> list[str]:
+    """The pip distributions a snippet needs: top-level imports, minus the stdlib.
+
+    Deterministic (a plain AST walk, no LLM). Import names are mapped to their
+    distribution name via `_IMPORT_TO_PACKAGE` where the two differ; unknown names
+    fall back to themselves. Relative imports are ignored. See the note on
+    `_IMPORT_TO_PACKAGE`: the resolve-and-install architecture is provisional.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules.add(node.module.split(".", 1)[0])
+    return sorted(
+        {_IMPORT_TO_PACKAGE.get(m, m) for m in modules if m not in sys.stdlib_module_names}
+    )
 
 
 def build_inputs(dataset: TabularDataset) -> dict[str, bytes]:
@@ -160,6 +225,7 @@ def _failed(experiment_id: str, reason: str) -> ExperimentResult:
 
 
 __all__ = [
+    "ENTRY_POINT",
     "HOLDOUT_CSV",
     "META_JSON",
     "PREDICTIONS_CSV",
@@ -167,5 +233,7 @@ __all__ = [
     "assemble_script",
     "build_inputs",
     "is_code_candidate",
+    "required_imports",
     "score_predictions",
+    "validate_train_and_predict",
 ]
