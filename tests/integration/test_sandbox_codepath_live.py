@@ -5,12 +5,11 @@ The first true sandboxed run — `SandboxExecutor(E2BCodeRunner())` runs a gener
 in real e2b and scores it through our contract. No LLM here; the CodeProposer's
 own live test (real qwen3 writing the function) is a separate, heavier check.
 
-Skips unless E2B_API_KEY is set and the `[sandbox]` extra is installed.
+Skips unless E2B_API_KEY is set (the e2b SDK ships in core).
 """
 
 from __future__ import annotations
 
-import importlib.util
 import os
 from typing import TYPE_CHECKING
 
@@ -26,7 +25,6 @@ from iterate.targets.model import ModelTarget
 if TYPE_CHECKING:
     from pathlib import Path
 
-_HAS_E2B = importlib.util.find_spec("e2b_code_interpreter") is not None
 _HAS_KEY = bool(os.environ.get("E2B_API_KEY"))
 
 # Imports xgboost — not in the base e2b image — so the run exercises install-on-demand.
@@ -42,7 +40,7 @@ def train_and_predict(X_train, y_train, X_holdout):
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not (_HAS_E2B and _HAS_KEY), reason="needs [sandbox] extra + E2B_API_KEY")
+@pytest.mark.skipif(not _HAS_KEY, reason="needs E2B_API_KEY")
 def test_code_candidate_runs_in_real_e2b(tmp_path: Path) -> None:
     n = 120
     frame = pd.DataFrame(

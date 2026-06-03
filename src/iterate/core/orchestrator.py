@@ -158,11 +158,12 @@ class Orchestrator:
                 self._memory.record(run_id, experiment)
                 last_experiment = experiment
 
+                label = candidate.changes.get("model") or candidate.description
                 if result.succeeded and result.metrics is not None:
                     log.info(
                         "orchestrator: iteration %d %s -> %s=%.4f",
                         iteration,
-                        candidate.changes.get("model"),
+                        label,
                         metric,
                         result.metrics.primary_value,
                     )
@@ -170,7 +171,7 @@ class Orchestrator:
                     log.info(
                         "orchestrator: iteration %d %s -> failed (%s)",
                         iteration,
-                        candidate.changes.get("model"),
+                        label,
                         result.error,
                     )
 

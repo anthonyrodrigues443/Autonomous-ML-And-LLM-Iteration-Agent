@@ -171,3 +171,23 @@ This is the "papers → citations" pattern that separates research engineers fro
 **How I'll verify it works:** protocol conformance tests (Day 1); a generated script that trains CatBoost (not allow-listed) runs in the sandbox and is scored through our eval, holdout labels never crossing the boundary (Day 5 integration).
 
 **Out of scope today:** the real e2b adapter (Day 2), the contract module (Day 3), the CodeProposer (Day 4). Network egress policy inside the sandbox (default deny) to be decided when the e2b adapter lands.
+
+---
+
+## 2026-06-04 — Experiment: what limits exploration depth, the prompt or the model?
+
+**Question:** On the v0.2 code path the agent kept doing the same preprocessing (impute + one-hot) and only swapped the model. Is that a weakness of the local model (`qwen3:14b`), or of our prompt? Resolve by experiment, not opinion.
+
+**Method (A/B on the same harness, churn / f1, 6 iterations, `--fresh`):** held everything constant (data, metric, compute, prompts) and varied only the backend model. Compared local `qwen3:14b` against Groq `llama-3.3-70b-versatile`, reading the deterministic component fingerprint (`codegen.components_used`) of each attempt to see what was actually tried.
+
+**Findings:**
+- **Modeling depth is model-bound.** The 70B explored far more algorithms (logistic regression — which won — gradient boosting, and an unprompted *stacking ensemble* with SVM base learners). The 14B mostly repeated RandomForest/HistGB. Better model → more algorithmic diversity and a higher score (0.604 vs 0.580).
+- **Feature-engineering depth is prompt-bound.** The 70B used the **identical preprocessing on every one of its 6 iterations** — same blind spot as the 14B. So the monotony was not a capability gap; both models default to "set up a generic pipeline once, then only change the model."
+- **Confirmation:** after rewriting the prompt to make feature engineering the primary lever, the *local 14B* engineered a new feature (`TotalCharges_per_tenure`) and reached **f1 0.6166 (+0.049 vs baseline)** — the best result across every run, beating the un-prompted 70B.
+
+**Decisions:**
+1. Make the code-proposer prompt **feature-engineering-first** (concrete technique menu), and feed a **deterministic component fingerprint** of each past attempt into history so the agent can see what it has/hasn't tried. (Shipped this session.)
+2. Recommend a **cloud backend** for real modeling depth; document the 14B as the floor (LIMITATIONS).
+3. Aggressive feature engineering by a weak model also produced silent **near-zero** scores (NaN/inf, single-class predictions) it couldn't foresee while writing the whole pipeline blind — the decisive argument for pulling **cell-by-cell execution into v0.2** (inspect-then-build catches it mid-session).
+
+**Out of scope today:** the LLM-summary version of the digest (v0.4), seeding the code path for run-to-run reproducibility (pending), and a pre-run undefined-name lint (pending).

@@ -92,6 +92,26 @@ def test_wrong_length_predictions_is_a_captured_failure(tmp_path: Path) -> None:
     assert "expected" in result.error
 
 
+def test_unscorable_predictions_are_a_captured_failure(tmp_path: Path) -> None:
+    # Garbage predictions (non-numeric for an int target) must be a captured
+    # failure, never an exception that escapes and crashes the run.
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    preds = ("notanumber\n" * ds.n_test).encode()
+    result = codegen.score_predictions(ds, preds, metric="f1", experiment_id="e")
+    assert not result.succeeded
+    assert "could not score" in (result.error or "")
+
+
+def test_string_predictions_coerce_to_match_int_target(tmp_path: Path) -> None:
+    # "0"/"1" strings vs an int 0/1 target used to raise "mix of types"; now they
+    # coerce to the target's type and score cleanly.
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    preds = "".join(f"{i % 2}\n" for i in range(ds.n_test)).encode()
+    result = codegen.score_predictions(ds, preds, metric="f1", experiment_id="e")
+    assert result.succeeded, result.error
+    assert result.metrics is not None
+
+
 def test_missing_predictions_is_a_captured_failure(tmp_path: Path) -> None:
     ds = load_csv(_classification_csv(tmp_path), target="churn")
     result = codegen.score_predictions(ds, None, metric="f1", experiment_id="e3")
@@ -119,6 +139,32 @@ def test_required_imports_ignores_relative_imports() -> None:
 
 def test_required_imports_of_unparseable_code_is_empty() -> None:
     assert codegen.required_imports("def train_and_predict(:\n") == []
+
+
+def test_components_used_lists_instantiated_classes_in_order() -> None:
+    code = (
+        "def train_and_predict(a, b, c):\n"
+        "    import pandas as pd\n"
+        "    from sklearn.impute import SimpleImputer\n"
+        "    from sklearn.preprocessing import OneHotEncoder, StandardScaler\n"
+        "    from sklearn.pipeline import Pipeline\n"
+        "    from sklearn.ensemble import HistGradientBoostingClassifier\n"
+        "    pre = Pipeline([('i', SimpleImputer()), ('s', StandardScaler())])\n"
+        "    enc = OneHotEncoder()\n"
+        "    m = HistGradientBoostingClassifier(random_state=42)\n"
+        "    return m.fit(a, b).predict(c)\n"
+    )
+    # Pipeline is plumbing (excluded); lowercase calls (fit/predict) ignored; order preserved.
+    assert codegen.components_used(code) == [
+        "SimpleImputer",
+        "StandardScaler",
+        "OneHotEncoder",
+        "HistGradientBoostingClassifier",
+    ]
+
+
+def test_components_used_handles_unparseable() -> None:
+    assert codegen.components_used("def f(:\n") == []
 
 
 def test_validate_accepts_a_well_formed_function() -> None:

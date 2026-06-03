@@ -209,6 +209,36 @@ def test_recent_run_output_and_errors_are_fed_back() -> None:
     assert "KeyError: 'age'" in sent  # traceback fed back so it can self-correct
 
 
+def test_history_shows_components_used_so_preprocessing_is_visible() -> None:
+    prior = Experiment(
+        candidate=Candidate(
+            description="HistGB attempt",
+            changes={
+                "code": (
+                    "def train_and_predict(a, b, c):\n"
+                    "    from sklearn.preprocessing import OneHotEncoder\n"
+                    "    from sklearn.ensemble import HistGradientBoostingClassifier\n"
+                    "    enc = OneHotEncoder()\n"
+                    "    model = HistGradientBoostingClassifier()\n"
+                    "    return model.fit(enc.fit_transform(a), b).predict(c)\n"
+                )
+            },
+            rationale="r",
+        ),
+        target="t",
+        hypothesis="h",
+        status="completed",
+        result=ExperimentResult(
+            experiment_id="p1",
+            metrics=Metrics(values={"f1": 0.57}, primary="f1", direction="maximize"),
+        ),
+    )
+    fake = _FakeLLM([_tool_call({"code": _GOOD_FN, "description": "d", "rationale": "r"})])
+    CodeProposer(fake).propose(data_summary="d", baseline=_baseline(), history=[prior])
+    sent = "\n".join(m.content or "" for m in fake.calls[0])
+    assert "used: OneHotEncoder, HistGradientBoostingClassifier" in sent
+
+
 def test_environment_note_is_injected() -> None:
     from iterate.core.code_proposer import ENV_NOTE_AMBIENT
 
