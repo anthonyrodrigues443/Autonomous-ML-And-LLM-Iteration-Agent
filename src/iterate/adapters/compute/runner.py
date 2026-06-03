@@ -7,10 +7,10 @@ output files. Two venues, one `CodeRunner` protocol:
 - `LocalCodeRunner` — runs the script in a subprocess on this machine (the
   `--compute local` path). No isolation: generated code runs with the user's
   permissions. Explicit opt-in only.
-- `E2BCodeRunner` — runs it in an ephemeral e2b sandbox (the safe default for
-  autonomously-generated code). `e2b_code_interpreter` is lazy-imported so this
-  module loads without the `[sandbox]` extra; the sandbox factory is injectable
-  for testing without e2b installed or a key.
+- `E2BCodeRunner` — runs it in an ephemeral e2b sandbox (isolated; needs an
+  `E2B_API_KEY`). `e2b_code_interpreter` ships in core, but is lazy-imported so the
+  rest of the module costs nothing to load; the sandbox factory is injectable for
+  testing without a key.
 
 Both place `inputs` in the script's working directory, run it, and read back the
 files named in `outputs`. The code-gen *contract* (what a training script reads
@@ -200,10 +200,9 @@ class E2BCodeRunner:
             return self._sandbox_factory(timeout)
         try:
             from e2b_code_interpreter import Sandbox
-        except ImportError as exc:  # pragma: no cover - exercised only without the extra
+        except ImportError as exc:  # pragma: no cover - e2b ships in core; defensive only
             raise RuntimeError(
-                "the e2b runner needs the sandbox extra: "
-                "pip install 'iterate-ai[sandbox]' and set E2B_API_KEY"
+                "e2b_code_interpreter failed to import; reinstall iterate-ai and set E2B_API_KEY"
             ) from exc
         # Sandbox lifetime a bit beyond the run timeout so teardown is clean.
         return Sandbox(api_key=self._api_key, timeout=int(timeout) + 5)

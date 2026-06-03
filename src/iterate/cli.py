@@ -184,6 +184,14 @@ def run(
         "--output",
         help="Where to save the best model. Default: .iterate/runs/<run_id>/best_model.joblib",
     ),
+    notebooks: str = typer.Option(
+        "best",
+        "--notebooks",
+        help=(
+            "Runnable .ipynb deliverable: best (winner only) | all (one per experiment) | none. "
+            "Saved under .iterate/runs/<run_id>/ (best.ipynb; all → notebooks/)."
+        ),
+    ),
 ) -> None:
     """Run the agent on a tabular dataset."""
     # Heavy imports live here, not at module top, so `iterate version`/`--help`
@@ -214,6 +222,9 @@ def run(
     install = install if install is not None else bool(cfg.get("install", False))
     if compute not in ("local", "e2b"):
         raise typer.BadParameter(f"--compute must be 'local' or 'e2b', got {compute!r}")
+    notebooks = notebooks.lower()
+    if notebooks not in ("best", "all", "none"):
+        raise typer.BadParameter(f"--notebooks must be best | all | none, got {notebooks!r}")
 
     # ─── Validate ──────────────────────────────────────────────────────────
     if baseline is not None and source is None:
@@ -253,8 +264,8 @@ def run(
     e2b_api_key = cfg.get("e2b_api_key") or settings.e2b_api_key
     if compute == "e2b" and not e2b_api_key:
         raise typer.BadParameter(
-            "--compute e2b needs an E2B API key (run 'iterate setup' or set E2B_API_KEY) "
-            "and the sandbox extra: pip install 'iterate-ai[sandbox]'"
+            "--compute e2b needs an E2B API key — run 'iterate setup' or set E2B_API_KEY "
+            "(get a free key at e2b.dev)."
         )
 
     # ─── Configure logging so per-iteration messages stream live. ──────────
@@ -348,11 +359,16 @@ def run(
         )
 
     # ─── Save the winning model so the user can actually use it ────────────
+    run_dir = Path(settings.iterate_runs_dir) / (result.run_id or "run")
     if result.best is not None and result.best.result is not None:
-        out_path = output or (
-            Path(settings.iterate_runs_dir) / (result.run_id or "run") / "best_model.joblib"
-        )
+        out_path = output or (run_dir / "best_model.joblib")
         _save_best_model(model_target, result, metric, out_path)
+
+    # ─── Notebook deliverable (full record is already in Memory) ───────────
+    if notebooks != "none":
+        _write_notebooks(
+            result, mode=notebooks, run_dir=run_dir, data_path=str(data), target=target, metric=metric
+        )
 
     # ─── Summary ───────────────────────────────────────────────────────────
     _render_summary(result, metric)
@@ -521,12 +537,13 @@ def _save_best_model(
     assert best_result is not None
     spec = best.candidate.changes
     score = best_result.metrics.primary_value if best_result.metrics else None
+    path.parent.mkdir(parents=True, exist_ok=True)  # the run dir (the code path skips save_model)
 
     if spec.get("code"):
-        artifact = path.with_name("best_train_and_predict.py")
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_text(str(spec["code"]).strip() + "\n", encoding="utf-8")
-        load_hint = f"the winning train_and_predict is in {artifact.name}"
+        # Code winner: the runnable artifact is best.ipynb (written by _write_notebooks);
+        # a code-gen winner returns predictions, not a pickle — by design.
+        artifact = None
+        load_hint = "the winning approach is in best.ipynb (runnable)"
     else:
         target.save_model(spec, path)
         artifact = path
@@ -544,13 +561,68 @@ def _save_best_model(
                 "rationale": best.candidate.rationale,
                 "metric": metric,
                 "score": score,
-                "artifact_path": str(artifact),
+                "artifact_path": str(artifact) if artifact else None,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    console.print(f"\n[bold]saved best approach[/bold] → {artifact}\n[dim]{load_hint}[/dim]")
+    if artifact is not None:
+        console.print(f"\n[bold]saved best model[/bold] → {artifact}\n[dim]{load_hint}[/dim]")
+    else:
+        console.print(f"\n[dim]{load_hint}[/dim]")
+
+
+def _write_notebooks(
+    result: RunResult,
+    *,
+    mode: str,
+    run_dir: Path,
+    data_path: str,
+    target: str,
+    metric: str,
+) -> None:
+    """Render the run as runnable notebooks: the winner (`best`) or one per
+    experiment (`all`). The full record is already in Memory; this just renders it."""
+    from iterate.deliver.notebook import build_notebook, save_notebook, slug
+
+    baseline_score = (
+        result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
+    )
+    written: list[Path] = []
+
+    if mode == "all":
+        for exp in result.history:
+            node = build_notebook(
+                exp,
+                data_path=data_path,
+                target=target,
+                metric=metric,
+                baseline_score=baseline_score,
+                is_best=(result.best is not None and exp.id == result.best.id),
+            )
+            name = f"iter_{exp.iteration:02d}_{slug(exp.candidate.description)}.ipynb"
+            written.append(save_notebook(node, run_dir / "notebooks" / name))
+
+    if result.best is not None:
+        best_nb = build_notebook(
+            result.best,
+            data_path=data_path,
+            target=target,
+            metric=metric,
+            baseline_score=baseline_score,
+            is_best=True,
+            leaderboard=result.history,  # the winner notebook carries the full "what was tried"
+        )
+        written.append(save_notebook(best_nb, run_dir / "best.ipynb"))
+
+    if not written:
+        return
+    if mode == "all":
+        n_journey = len([p for p in written if p.parent.name == "notebooks"])
+        console.print(f"\n[bold]notebooks[/bold] → {run_dir / 'notebooks'}/ ({n_journey} files)")
+    if result.best is not None:
+        console.print(f"[bold]best notebook[/bold] → {run_dir / 'best.ipynb'}")
 
 
 def _render_summary(result: RunResult, metric: str) -> None:

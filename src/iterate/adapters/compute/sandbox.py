@@ -63,13 +63,13 @@ class SandboxExecutor:
                 packages=job.packages,
                 timeout=self._timeout,
             )
-        except Exception as exc:  # runner couldn't boot / upload / run at all
+            result = target.score_code_job(run, candidate.id)
+        except Exception as exc:  # runner couldn't boot / upload / run, or scoring blew up
             return ExperimentResult(
                 experiment_id=candidate.id,
                 error=f"{type(exc).__name__}: {exc}",
                 duration_seconds=perf_counter() - start,
             )
-        result = target.score_code_job(run, candidate.id)
         return result.model_copy(update={"duration_seconds": perf_counter() - start})
 
 

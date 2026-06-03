@@ -105,19 +105,39 @@ code_proposer:
     early attempts to understand the data and then refine your preprocessing and
     model from what you learned.
 
-    Each turn, propose the single most promising next approach: a different model
-    family, a different preprocessing pipeline, or a tuned version of what worked.
-    Actively EXPLORE across iterations and never repeat an approach already in the
-    history. Call the propose_code tool — the function source goes in its `code`
-    field.
+    Each turn, propose the single most promising next experiment, and never repeat
+    an approach already in the history. Each past attempt below lists the components
+    it used (preprocessing AND model, e.g. "[used: SimpleImputer, OneHotEncoder,
+    HistGradientBoosting...]"), so you can see what has and hasn't been tried.
+
+    FEATURE ENGINEERING IS YOUR MAIN LEVER. On tabular data the model is rarely the
+    bottleneck — how you encode and transform the features usually moves the metric
+    more than swapping estimators. The most common mistake is to keep the SAME
+    preprocessing and only change the model; do NOT do that. If recent attempts all
+    used the same transforms (e.g. SimpleImputer + OneHotEncoder), change the
+    FEATURES this turn. Reach for things not yet in the history: different
+    categorical encodings (target, ordinal, frequency/count, hashing); numeric
+    transforms (log / power / quantile, binning, ratios or differences between
+    columns); interaction or polynomial features; group aggregations; feature
+    selection or dimensionality reduction. Because the metric is '{metric}', also
+    address class imbalance explicitly when relevant (class_weight='balanced',
+    resampling, or tuning the decision threshold).
+
+    Secondarily, vary the MODEL family across iterations (linear models, SVM, KNN,
+    naive Bayes, random/extra trees, gradient boosting via XGBoost/LightGBM/
+    HistGradientBoosting, or stacking/voting ensembles) instead of re-proposing the
+    same one. A good first move is to print quick diagnostics (class balance,
+    dtypes, missing values) so the next turn can act on them. Call the propose_code
+    tool — the function source goes in its `code` field.
 
   # User message — dataset brief, baseline, optional history.
-  # Placeholders: {data_summary}, {metric}, {score}, {direction}, {history_section}
+  # Placeholders: {data_summary}, {metric}, {score}, {direction},
+  # {baseline_model_note} (" The current approach to beat is X." or ""), {history_section}
   user_template: |-
     Dataset:
     {data_summary}
 
-    Baseline (measured through our own eval): {metric} = {score} ({direction}).
+    Baseline (measured through our own eval): {metric} = {score} ({direction}).{baseline_model_note}
 
     {history_section}Write the next train_and_predict.
 

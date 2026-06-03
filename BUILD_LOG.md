@@ -270,6 +270,34 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-06-04 | Week 4 Day 6 | Notebook deliverable + code-path hardening + prompt-vs-model
+
+**Task:** Ship the human deliverable (a runnable notebook), then harden the code path against what live runs surfaced, and settle empirically what actually limits exploration depth. Run on the real churn dataset throughout, which is how the bugs + findings came out.
+
+**What shipped:**
+- `src/iterate/deliver/notebook.py` — `build_notebook(experiment, …)` renders one experiment to a schema-valid `.ipynb` (via `nbformat`): markdown header (approach, score, Δ vs baseline, rationale), a load-data cell, the experiment's actual code (`train_and_predict` for code candidates; a `ModelTarget` rebuild for spec candidates), and a score cell. Cells load + score through iterate's own `load_csv` / `core.scoring`, so the notebook reproduces the *exact* reported number, not a lookalike (faithfulness over self-containment, on purpose). `save_notebook` + `slug` helpers.
+- CLI `--notebooks best|all|none` (default `best`): `best` writes `<run_dir>/best.ipynb`; `all` writes one notebook per experiment under `<run_dir>/notebooks/` plus the winner (the full journey); `none` skips. Code-gen winners now ship `best.ipynb` as the runnable artifact (a code-gen winner returns predictions, not a pickle — by design), dropping the bare `.py`; spec winners still pickle.
+- `nbformat` added to core deps (the notebook is a headline v0.2 deliverable). One localized mypy override for the renderer (nbformat ships no stubs).
+- Clarified split (yours): the **digest** (a compressed insight for the LLM's next iteration) and the **notebook** (full, human-facing) are different things and coexist. The backend already captures the whole experiment after every result (Memory); the digest is a v0.4 summarizer add, never the stored record.
+- Tests: code + spec notebooks are schema-valid and contain the winning code/rebuild + the score; failed experiments note the failure; `best`/`all` emit the right files; slug is filesystem-safe. **Integration (run locally, green): a rendered notebook executes top to bottom through a real Jupyter kernel and prints the score** — proves it's genuinely runnable.
+- 223 unit tests (+7); ruff + mypy --strict clean (39 src files).
+
+**Hardening + improvements (from live runs on the churn dataset):**
+- **Components-digest in proposer history (deterministic, no LLM).** `codegen.components_used` extracts the class-like components each past attempt actually instantiated (`SimpleImputer`, `OneHotEncoder`, `HistGradientBoosting…`), and the code proposer's history now shows `[used: …]` per attempt. Root-cause fix: before this the proposer only saw a one-line description + score, so it kept repeating the same impute+one-hot and only swapped the model. (The richer LLM-summary version is the v0.4 "A".)
+- **Feature-engineering-first prompt.** Reframed the code-proposer prompt so feature engineering is the *main* lever (concrete menu: target/ordinal/frequency encoding, numeric transforms, interactions, aggregations, feature selection, class-imbalance handling), model-swapping demoted to secondary. Also passes the baseline model identity into context.
+- **Two real bugs caught by running it:** (1) a code winner crashed writing `best.json` because the run dir wasn't created (the code path skips `save_model`'s mkdir); (2) bad predictions (type mismatch) let a `ValueError` escape `score_predictions` and crash the whole run instead of being a captured failure. Both fixed + regression-tested; `_coerce` now aligns prediction dtype to the holdout target.
+- **Cloud aliases supply their own base URL** (`groq`→`api.groq.com/openai/v1`, + openai/together/deepseek), so `--backend groq` (or a saved config) needs only a model + key, no hand-typed `--base-url`. Surfaced by a saved-config run that 404'd.
+- **Test isolation:** an autouse fixture points `XDG_CONFIG_HOME` at a temp dir so tests never read the developer's real `~/.config/iterate/config.toml`.
+- 233 unit tests; ruff + mypy --strict clean (39 src files).
+
+**Prompt-vs-model finding (A/B, churn / f1, logged in RESEARCH_LOG):** ran the same harness with local `qwen3:14b` vs Groq `llama-3.3-70b`. The 70B explored *models* far more (logistic regression won; it even built a stacking ensemble) but used the **identical preprocessing every iteration** — so the preprocessing monotony was **prompt-bound, not model-bound**. After the FE-first prompt, local qwen engineered a new feature (`TotalCharges_per_tenure`) and hit **f1 0.6166 (+0.049 vs baseline)** — the best result in any run, beating the un-prompted 70B. Conclusion: modeling depth scales with the model; feature-engineering depth was a prompt problem, now fixed. (Aggressive FE by a weak model also produced silent near-zero scores — strongest argument for cell-by-cell.)
+
+**Decision (yours):** pull **cell-by-cell execution** (a stateful code-interpreter session) into **v0.2** rather than deferring to v0.3 (logged in DECISIONS.md). The catastrophic blind-FE failures are exactly what looking-at-the-data-as-you-build prevents.
+
+**Known pending before v0.2 release:** seed the RNG on the code path (run-to-run variance still exceeds small deltas — reproducibility); a pre-run undefined-name lint (recurring "uses X, never imported" failures); the cell-by-cell session itself.
+
+**Next session:** lay out + build the cell-by-cell (stateful code-interpreter) session for v0.2.
+
 ### 2026-06-03 | Week 4 Day 5 | Code path goes live (executor + install + defaults + config)
 
 **Task:** Wire the code path end to end so the agent's generated `train_and_predict` actually runs, installs what it imports, and scores through the contract — and make the code path the default. Restructured per two product calls: code-gen is now the default mode, local is the default compute, and a setup wizard lets users save their own defaults.

@@ -45,8 +45,10 @@ cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 be
 |---|---|---|
 | Single-agent (one Proposer in a deterministic loop). | **v0.4** | Multi-agent: specialist agents (Researcher, Proposer, Critic) report to a supervisor. |
 | Local-model tool-calling occasionally drops a tool call (qwen3:14b). | mitigated; ~v0.4 | Mitigated with retries; cloud backend is the reliable path; multi-agent specialists reduce per-call load. |
-| Proposals come from the LLM's own knowledge, not literature retrieval. | **v0.4** | The Researcher specialist adds arxiv / papers-with-code grounding. |
-| "Auditable report" = persistent memory + run summary, not a generated report doc. | ~v0.10 | A dedicated Reporter is a later backlog item. |
+| Local 14B is unreliable at acting on its own error tracebacks (observed: claims to fix a missing import, ships the same `NameError` again). Modeling/exploration depth scales with the backend model. | use a cloud backend | A/B (2026-06-04) confirmed: a 70B explored models far more, and a feature-engineering prompt unlocked real FE. 14B is the floor; `--backend groq/openai/…` goes deeper. The v0.2 cell-by-cell session + v0.4 Critic also reduce reliance on one blind call. |
+| Proposals come from the LLM's own knowledge, not literature retrieval. | **v0.4** | The Researcher specialist adds arxiv / papers-with-code grounding, and **records its citations** (`Candidate.citations` + `source="researcher"`) so it neither re-reads papers nor re-runs the same idea. |
+| Per-iteration history fed to the proposer is description + score + recent stdout — not a distilled insight, so context grows with run length. | **v0.4** | A Summarizer/Critic digests each experiment into a compact insight **for the LLM's working context only** (never the stored record; full fidelity stays in Memory + the notebooks). |
+| "Auditable report" = persistent memory + a runnable notebook per experiment (Day 6), not a prose report doc. | ~v0.10 | The notebook deliverable covers "what it tried + a runnable winner"; a dedicated prose Reporter is a later backlog item. |
 | No `iterate history` / `best` / `why-failed` query commands. | post-v0.1 | The data is in Memory; the CLI surface is a small near-term add. |
 
 ## Execution / sandbox (v0.2)
@@ -54,10 +56,12 @@ cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 be
 | Limitation (today) | Lifted at | Notes |
 |---|---|---|
 | e2b network egress-deny not enforced (needs a custom sandbox template). | **v0.2.x** | Flagged in `compute/runner.py`. |
-| e2b path not live-verified against a real sandbox in dev (no key here). | **v0.2** | A live opt-in test now exercises the whole code path on real e2b (`tests/integration/test_sandbox_codepath_live.py`); runs green once a key is present. |
+| e2b path not live-verified against a real sandbox in dev (no key here). | **v0.2** | A live opt-in test exercises the whole code path on real e2b (`tests/integration/test_sandbox_codepath_live.py`); runs green once `E2B_API_KEY` is set. The e2b SDK ships in core, so `pip install iterate-ai` is all that's needed — `--compute e2b` then needs only the key. |
 | Import→package resolution for install-on-demand is a hand-kept alias map (`sklearn`→`scikit-learn`, …) with import-name fallback. | **TBD** | Provisional architecture — to be revisited (logged in DECISIONS.md). Backstop: a wrong/missing package fails its install → captured failure + retry, so the map only needs the common stack. |
 | Local install-on-demand requires explicit consent (`--install` / setup); without it, a missing import on `--compute local` is a captured failure. | **by-design** | `--compute local` never silently mutates your environment (typosquat / dependency-conflict risk). With consent it installs into iterate's own env; e2b always installs in its disposable sandbox. |
-| The agent prints diagnostics *inside* `train_and_predict`, so a pure "just explore the data" turn still costs one scored iteration. | **v0.4** | A dedicated inspect/EDA step (no scored run) lands with the supervisor. |
+| The agent prints diagnostics *inside* `train_and_predict`, so a pure "just explore the data" turn still costs one scored iteration. | **v0.2 (cell-by-cell) / v0.4** | The v0.2 cell-by-cell session lets it inspect-then-build within an experiment; a dedicated EDA step with the supervisor at v0.4. |
+| Code-path scores aren't seeded yet, so run-to-run variance (~0.007 on churn) can exceed small real improvements — the loop's "did it improve?" and the notebook's reproduced number are partly noisy. | **v0.2 (pending)** | Fix: seed the RNG in the harness + notebook. Spec path is already seeded (`dataset.seed`). |
+| One-shot code-gen writes the whole pipeline blind; aggressive feature engineering can silently produce near-zero scores (NaN/inf, single-class predictions) the agent can't foresee. | **v0.2 (cell-by-cell)** | Caught mid-session once the agent can inspect intermediate output instead of writing the pipeline in one shot. |
 | Code-gen winners return predictions, not a pickled model. | **permanent** | Security/portability; the readable artifact is the v0.2 notebook deliverable. |
 | No cloud-GPU compute backend (local + e2b only). | ~v0.6 | When DL / large-model training needs it. |
 

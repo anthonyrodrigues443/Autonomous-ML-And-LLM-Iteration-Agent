@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from iterate.core.codegen import validate_train_and_predict
+from iterate.core.codegen import components_used, validate_train_and_predict
 from iterate.prompts import PROMPTS
 from iterate.schemas.experiment import Candidate
 from iterate.schemas.llm import Message, ToolSpec
@@ -113,6 +113,7 @@ class CodeProposer:
             metric=baseline.metrics.primary,
             direction=baseline.metrics.direction,
             score=baseline.metrics.primary_value,
+            current_model=current_model,
             history=history or [],
             environment_note=self._environment_note,
         )
@@ -165,6 +166,7 @@ def _build_messages(
     metric: str,
     direction: str,
     score: float,
+    current_model: str,
     history: list[Experiment],
     environment_note: str,
 ) -> list[Message]:
@@ -177,11 +179,15 @@ def _build_messages(
         )
     else:
         history_section = ""
+    baseline_model_note = (
+        f" The current approach to beat is {current_model}." if current_model else ""
+    )
     user = _PROMPTS["user_template"].format(
         data_summary=data_summary,
         metric=metric,
         score=f"{score:.4f}",
         direction=direction,
+        baseline_model_note=baseline_model_note,
         history_section=history_section,
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
@@ -202,16 +208,24 @@ def _format_history(history: list[Experiment], metric: str) -> list[str]:
         desc = exp.candidate.description.strip()
         if len(desc) > _HISTORY_DESC_LIMIT:
             desc = desc[: _HISTORY_DESC_LIMIT - 3] + "..."
+        # The components it actually used (preprocessing + model) — so the next
+        # proposal can see prior preprocessing and vary it, not just the model name.
+        code = exp.candidate.changes.get("code")
+        used = ""
+        if isinstance(code, str):
+            comps = components_used(code)
+            if comps:
+                used = f" [used: {', '.join(comps)}]"
         result = exp.result
         recent = i >= cutoff
         if result is None:
-            lines.append(f"- {desc} -> not run")
+            lines.append(f"- {desc}{used} -> not run")
             continue
         if result.succeeded and result.metrics is not None:
-            lines.append(f"- {desc} -> {metric}={result.metrics.primary_value:.4f}")
+            lines.append(f"- {desc}{used} -> {metric}={result.metrics.primary_value:.4f}")
         else:
             summary = (result.error or "").splitlines()[0] if result.error else "failed"
-            lines.append(f"- {desc} -> FAILED: {summary}")
+            lines.append(f"- {desc}{used} -> FAILED: {summary}")
             if recent and result.error:
                 lines.append(_indent(result.error))
         if recent and result.logs:

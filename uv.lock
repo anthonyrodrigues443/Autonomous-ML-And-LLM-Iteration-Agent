@@ -1252,8 +1252,10 @@ name = "iterate-ai"
 version = "0.1.3"
 source = { editable = "." }
 dependencies = [
+    { name = "e2b-code-interpreter" },
     { name = "httpx" },
     { name = "lightgbm" },
+    { name = "nbformat" },
     { name = "numpy" },
     { name = "openai" },
     { name = "pandas" },
@@ -1297,15 +1299,12 @@ mcp = [
 notion = [
     { name = "notion-client" },
 ]
-sandbox = [
-    { name = "e2b-code-interpreter" },
-]
 
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.40.0" },
     { name = "datasets", marker = "extra == 'datasets'", specifier = ">=3.0.0" },
-    { name = "e2b-code-interpreter", marker = "extra == 'sandbox'", specifier = ">=1.0.0" },
+    { name = "e2b-code-interpreter", specifier = ">=1.0.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "ipykernel", marker = "extra == 'dev'", specifier = ">=6.29.0" },
     { name = "jupyter", marker = "extra == 'dev'", specifier = ">=1.1.0" },
@@ -1313,6 +1312,7 @@ requires-dist = [
     { name = "lightgbm", specifier = ">=4.5.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=0.9.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0" },
+    { name = "nbformat", specifier = ">=5.10.0" },
     { name = "notion-client", marker = "extra == 'notion'", specifier = ">=2.2.0" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "openai", specifier = ">=1.50.0" },
@@ -1335,7 +1335,7 @@ requires-dist = [
     { name = "vcrpy", marker = "extra == 'dev'", specifier = ">=6.0.0" },
     { name = "xgboost", specifier = ">=2.1.0" },
 ]
-provides-extras = ["anthropic", "sandbox", "datasets", "mcp", "notion", "dashboard", "dev"]
+provides-extras = ["anthropic", "datasets", "mcp", "notion", "dashboard", "dev"]
 
 [[package]]
 name = "itsdangerous"

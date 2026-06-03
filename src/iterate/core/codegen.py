@@ -112,6 +112,47 @@ def validate_train_and_predict(code: str) -> str | None:
     return None
 
 
+# Pure plumbing / containers — instantiated but not informative about the approach.
+_NON_COMPONENT = frozenset(
+    {"Pipeline", "ColumnTransformer", "FeatureUnion", "DataFrame", "Series", "ndarray", "array"}
+)
+
+
+def components_used(code: str) -> list[str]:
+    """The class-like components a snippet instantiates — preprocessors, encoders,
+    feature selectors, the estimator — in source order, deduped.
+
+    A deterministic fingerprint of WHAT an attempt actually did (not just the model
+    it named), so the proposer can see prior *preprocessing* and choose something
+    genuinely different instead of repeating impute+one-hot every time. Catches
+    CapWords classes (e.g. SimpleImputer, OneHotEncoder, StandardScaler,
+    TargetEncoder, HistGradientBoostingClassifier); function-style helpers like
+    ``pd.get_dummies`` are not captured (a known minor gap).
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    calls: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):  # walk is breadth-first, so re-sort by source position
+        if isinstance(node, ast.Call):
+            name = _called_name(node.func)
+            if name and name[0].isupper() and name not in _NON_COMPONENT:
+                calls.append((getattr(node, "lineno", 0), getattr(node, "col_offset", 0), name))
+    seen: dict[str, None] = {}  # source-ordered, deduped
+    for _, _, name in sorted(calls):
+        seen.setdefault(name, None)
+    return list(seen)
+
+
+def _called_name(func: ast.expr) -> str | None:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
 def required_imports(code: str) -> list[str]:
     """The pip distributions a snippet needs: top-level imports, minus the stdlib.
 
@@ -190,10 +231,17 @@ def score_predictions(
     expected = dataset.n_test
     if len(preds) != expected:
         return _failed(experiment_id, f"expected {expected} predictions, got {len(preds)}")
-    y_pred = _coerce(preds, classification=_looks_classification(dataset))
-    task = task_for_metric(metric)
+    # Coercing + scoring can fail on garbage predictions (wrong dtype, non-numeric
+    # values for a numeric target, a label the metric can't handle). That's the
+    # agent's code being wrong, not ours — capture it as a failed experiment (and
+    # feed the reason back) rather than letting it crash the loop.
+    try:
+        y_pred = _coerce(preds, target=dataset.test_target)
+        values = score(task_for_metric(metric), dataset.test_target.to_numpy(), y_pred)
+    except Exception as exc:
+        return _failed(experiment_id, f"could not score predictions ({type(exc).__name__}: {exc})")
     metrics = Metrics(
-        values=score(task, dataset.test_target.to_numpy(), y_pred),
+        values=values,
         primary=metric,
         direction=direction(metric),
         n_samples=expected,
@@ -201,23 +249,17 @@ def score_predictions(
     return ExperimentResult(experiment_id=experiment_id, metrics=metrics)
 
 
-def _coerce(preds: list[str], *, classification: bool) -> list[int | float | str]:
-    if classification:
-        # Keep labels as-is unless they're clean ints (match common 0/1 targets).
-        out: list[int | float | str] = []
-        for raw in preds:
-            value = raw.strip()
-            out.append(int(float(value)) if _is_intlike(value) else value)
-        return out
-    return [float(p) for p in preds]
-
-
-def _is_intlike(value: str) -> bool:
-    try:
-        f = float(value)
-    except ValueError:
-        return False
-    return f.is_integer()
+def _coerce(preds: list[str], *, target: object) -> list[int | float | str]:
+    """Coerce string predictions to the holdout target's own type, so labels line
+    up (e.g. int 0/1 vs string "0"/"1" would otherwise be a 'mixed types' error)."""
+    kind = getattr(getattr(target, "dtype", None), "kind", "O")
+    if kind in "iu":  # integer labels (the common 0/1 classification target)
+        return [int(float(p)) for p in preds]
+    if kind == "b":
+        return [bool(int(float(p))) for p in preds]
+    if kind == "f":  # continuous (regression) or float labels
+        return [float(p) for p in preds]
+    return [p.strip() for p in preds]  # string / categorical labels
 
 
 def _failed(experiment_id: str, reason: str) -> ExperimentResult:
@@ -232,6 +274,7 @@ __all__ = [
     "TRAIN_CSV",
     "assemble_script",
     "build_inputs",
+    "components_used",
     "is_code_candidate",
     "required_imports",
     "score_predictions",
