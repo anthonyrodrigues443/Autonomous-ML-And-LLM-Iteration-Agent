@@ -270,6 +270,25 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-06-03 | Week 4 Day 5 | Code path goes live (executor + install + defaults + config)
+
+**Task:** Wire the code path end to end so the agent's generated `train_and_predict` actually runs, installs what it imports, and scores through the contract — and make the code path the default. Restructured per two product calls: code-gen is now the default mode, local is the default compute, and a setup wizard lets users save their own defaults.
+
+**What shipped:**
+- **Execution routing.** `SandboxExecutor(code_runner)` (`adapters/compute/sandbox.py`) routes code candidates to its `CodeRunner` and runs baselines + spec candidates in-process (shared `run_in_process` helper in `local.py`). New compute contracts in `compute/base.py`: `CodeJob` (script + inputs + outputs + packages) and the `SupportsCodeGen` target capability. `ModelTarget` implements it (`build_code_job` / `score_code_job`) — the target shapes the data and scores (it owns the sealed holdout); the executor owns the venue. Every failure (runner can't boot, crash, timeout, non-codegen target) is captured, never raised.
+- **Install-on-demand.** `CodeRunner.run` gained `packages`; `required_imports` (Day 4) feeds it. `E2BCodeRunner` always installs into its disposable sandbox; `LocalCodeRunner(install=…)` installs missing imports into iterate's own env only with consent (`--install`), never silently — a missing import on local is a captured failure otherwise.
+- **Output fed back into the loop.** A run's stdout (diagnostics the agent printed) lands on `ExperimentResult.logs`; failures carry the stderr traceback. The CodeProposer history now feeds the recent runs' output + errors back, so the agent learns the data and self-corrects. Bounded (~2k chars/iteration, last few iterations) and leakage-safe (holdout labels never enter the script).
+- **Prompt rework** (nothing reads as library-limited): `code_proposer` is environment-aware (install vs ambient) and invites EDA/printing; the **Reconstructor now WRITES code** that reproduces the source faithfully (real CatBoost, custom nets — no "closest allow-listed equivalent"); the spec proposer is reframed as the fast curated fallback.
+- **Defaults + config.** `iterate run` gains `--code/--spec` (default code), `--compute local|e2b` (default local), `--install/--no-install`. New `iterate setup` wizard + persisted `~/.config/iterate/config.toml` (`userconfig.py`); precedence is flag > saved config > built-in default; first run with no config offers the wizard (skipped in non-interactive shells). Code winners save their `train_and_predict` source (a code-gen winner returns predictions, not a pickle — by design); spec winners still pickle.
+- Tests: full loop on the code path end to end (real `ModelTarget` + `SandboxExecutor(LocalCodeRunner)` + Orchestrator, no LLM); executor routing (code / spec / baseline / non-codegen target / runner-can't-boot); install passthrough + `_missing_packages`; Reconstructor-as-code; output-fed-back + env-note; setup wizard + config round-trip. Live e2b test of the whole code path (install-on-demand included), opt-in.
+- 216 unit tests (+10 net); ruff + mypy --strict clean (37 src files).
+
+**Design calls (yours, logged in DECISIONS.md):** no library boundary even by environment — install what the code imports; code + local as defaults (running generated code locally is a conscious setup choice); reconstructor emits code; feed run output back so the agent improves preprocessing.
+
+**Not in Day 5:** the notebook deliverable (Day 6) turns a winning `train_and_predict` into a runnable `.ipynb`; a dedicated inspect/EDA step that doesn't cost a scored iteration is a v0.4 (supervisor) follow-up.
+
+**Next session:** Week 4 Day 6 — notebook deliverable (B): export the winning approach as a clean, runnable notebook.
+
 ### 2026-06-02 | Week 4 Day 4 | CodeProposer (LLM writes the code)
 
 **Task:** Add the third LLM caller (sibling of the spec `Proposer` and the `Reconstructor`): instead of naming an allow-listed estimator, it WRITES a `train_and_predict` function to the Day-3 contract. Built and proven in isolation with a fake LLM; wired into the loop on Day 5.

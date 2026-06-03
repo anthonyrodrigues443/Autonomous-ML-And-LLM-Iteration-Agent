@@ -24,23 +24,33 @@ if TYPE_CHECKING:
     from iterate.targets.base import BenchmarkTarget
 
 
+def run_in_process(target: BenchmarkTarget, candidate: Candidate | None = None) -> ExperimentResult:
+    """Run one experiment on this machine, converting a crash into a failed result.
+
+    The shared in-process path: `LocalExecutor` uses it for everything, and
+    `SandboxExecutor` uses it for baselines + spec candidates (only code candidates
+    go to the sandbox runner).
+    """
+    experiment_id = candidate.id if candidate is not None else "baseline"
+    start = perf_counter()
+    try:
+        result = target.run(candidate) if candidate is not None else target.baseline()
+    except Exception as exc:
+        return ExperimentResult(
+            experiment_id=experiment_id,
+            error=f"{type(exc).__name__}: {exc}",
+            duration_seconds=perf_counter() - start,
+        )
+    return result.model_copy(update={"duration_seconds": perf_counter() - start})
+
+
 class LocalExecutor:
     """Runs one experiment in-process; converts a crash into a failed result."""
 
     def execute(
         self, target: BenchmarkTarget, candidate: Candidate | None = None
     ) -> ExperimentResult:
-        experiment_id = candidate.id if candidate is not None else "baseline"
-        start = perf_counter()
-        try:
-            result = target.run(candidate) if candidate is not None else target.baseline()
-        except Exception as exc:
-            return ExperimentResult(
-                experiment_id=experiment_id,
-                error=f"{type(exc).__name__}: {exc}",
-                duration_seconds=perf_counter() - start,
-            )
-        return result.model_copy(update={"duration_seconds": perf_counter() - start})
+        return run_in_process(target, candidate)
 
 
-__all__ = ["LocalExecutor"]
+__all__ = ["LocalExecutor", "run_in_process"]

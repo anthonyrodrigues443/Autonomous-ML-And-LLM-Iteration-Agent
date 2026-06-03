@@ -28,6 +28,7 @@ Honest scope notes:
 
 from __future__ import annotations
 
+import importlib.metadata
 import subprocess
 import sys
 import tempfile
@@ -68,18 +69,30 @@ class CodeRunner(Protocol):
         inputs: dict[str, bytes],
         outputs: list[str],
         timeout: float,
+        packages: list[str] | None = None,
     ) -> RunResult:
         """Run ``script`` with ``inputs`` available in its working directory.
 
         Reads back any file named in ``outputs`` that the script produced. Must
         not raise on a failing script — capture the failure in the `RunResult`
-        (nonzero ``exit_code`` or ``timed_out``).
+        (nonzero ``exit_code`` or ``timed_out``). ``packages`` are the pip
+        distributions the script imports; whether they get installed is the
+        runner's policy (e2b always installs; the local runner only if opted in).
         """
         ...
 
 
 class LocalCodeRunner:
-    """Runs the script in a subprocess on this machine (no isolation)."""
+    """Runs the script in a subprocess on this machine (no isolation).
+
+    ``install=True`` lets it ``pip install`` the script's missing imports into the
+    *current* interpreter's environment before running — an explicit opt-in
+    (``--install`` / setup consent), because it mutates the user's environment.
+    With ``install=False`` (default) a missing import simply fails the run.
+    """
+
+    def __init__(self, *, install: bool = False) -> None:
+        self._install = install
 
     def run(
         self,
@@ -88,7 +101,12 @@ class LocalCodeRunner:
         inputs: dict[str, bytes],
         outputs: list[str],
         timeout: float,
+        packages: list[str] | None = None,
     ) -> RunResult:
+        if self._install and packages:
+            install_log = _pip_install(_missing_packages(packages), timeout=timeout)
+        else:
+            install_log = ""
         with tempfile.TemporaryDirectory(prefix="iterate-run-") as tmp:
             workdir = Path(tmp)
             for name, content in inputs.items():
@@ -106,7 +124,7 @@ class LocalCodeRunner:
             except subprocess.TimeoutExpired as exc:
                 return RunResult(
                     stdout=_as_text(exc.stdout),
-                    stderr=_as_text(exc.stderr),
+                    stderr=install_log + _as_text(exc.stderr),
                     exit_code=-1,
                     timed_out=True,
                 )
@@ -117,7 +135,7 @@ class LocalCodeRunner:
             }
             return RunResult(
                 stdout=proc.stdout,
-                stderr=proc.stderr,
+                stderr=install_log + proc.stderr,
                 exit_code=proc.returncode,
                 outputs=collected,
             )
@@ -144,9 +162,16 @@ class E2BCodeRunner:
         inputs: dict[str, bytes],
         outputs: list[str],
         timeout: float,
+        packages: list[str] | None = None,
     ) -> RunResult:
         sandbox = self._make_sandbox(timeout)
         try:
+            install_log = ""
+            if packages:
+                # The sandbox is disposable, so installing into it is always safe.
+                quoted = " ".join(packages)
+                install = sandbox.run_code(f"!pip install -q {quoted}", timeout=timeout)
+                install_log = "".join(install.logs.stderr)
             for name, content in inputs.items():
                 sandbox.files.write(f"{self._work_dir}/{name}", content)
             execution = sandbox.run_code(script, timeout=timeout)
@@ -162,7 +187,10 @@ class E2BCodeRunner:
                 if data is not None:
                     collected[name] = data
             return RunResult(
-                stdout=stdout, stderr=stderr, exit_code=exit_code, outputs=collected
+                stdout=stdout,
+                stderr=install_log + stderr,
+                exit_code=exit_code,
+                outputs=collected,
             )
         finally:
             sandbox.kill()
@@ -185,6 +213,37 @@ def _as_text(value: str | bytes | None) -> str:
     if value is None:
         return ""
     return value if isinstance(value, str) else value.decode(errors="replace")
+
+
+def _missing_packages(packages: list[str]) -> list[str]:
+    """The subset of distributions not already importable in this environment."""
+    missing = []
+    for pkg in packages:
+        try:
+            importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            missing.append(pkg)
+    return missing
+
+
+def _pip_install(packages: list[str], *, timeout: float) -> str:
+    """Best-effort ``pip install`` into the current interpreter. Returns a log line
+    on failure (prepended to stderr so the agent sees it), "" on success/no-op."""
+    if not packages:
+        return ""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", *packages],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"[iterate] pip install timed out for {packages}\n"
+    if proc.returncode != 0:
+        return f"[iterate] pip install failed for {packages}:\n{proc.stderr}\n"
+    return ""
 
 
 def _try_read(sandbox: Any, path: str) -> bytes | None:

@@ -28,7 +28,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from threadpoolctl import threadpool_limits
 
+from iterate.adapters.compute.base import CodeJob
 from iterate.adapters.models.registry import Task, build_estimator
+from iterate.core import codegen
 from iterate.core.scoring import direction, score, task_for_metric
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
@@ -36,8 +38,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    from iterate.adapters.compute.runner import RunResult
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.schemas.experiment import Candidate
+
+# How much of a code run's stdout/stderr we keep on the result (and feed back to
+# the next proposal). Bounded so iteration output never blows the context window.
+_OUTPUT_TAIL_CHARS = 2000
 
 # Param names that mean "I need an eval set for early stopping." XGBoost uses
 # ``early_stopping_rounds`` (plural); LightGBM uses ``early_stopping_round``
@@ -160,6 +167,36 @@ class ModelTarget:
         # candidate.changes is a {"model", "params"} spec: which estimator + its params.
         return self._evaluate(candidate.changes, experiment_id=candidate.id)
 
+    # ─── code-gen path (SupportsCodeGen) ───────────────────────────────────
+    # The executor runs the script in its chosen venue; this target only shapes
+    # the data (it owns the sealed holdout) and scores the predictions, so both
+    # paths are judged by the same ruler (`core.scoring`).
+
+    def build_code_job(self, candidate: Candidate) -> CodeJob:
+        code = str(candidate.changes["code"])
+        return CodeJob(
+            script=codegen.assemble_script(code),
+            inputs=codegen.build_inputs(self._dataset),
+            outputs=[codegen.PREDICTIONS_CSV],
+            packages=codegen.required_imports(code),
+        )
+
+    def score_code_job(self, run_result: RunResult, experiment_id: str) -> ExperimentResult:
+        stdout_tail = _tail(run_result.stdout) or None
+        if not run_result.succeeded:
+            reason = "timed out" if run_result.timed_out else "script failed"
+            detail = _tail(run_result.stderr) or "(no stderr)"
+            return ExperimentResult(
+                experiment_id=experiment_id, error=f"code {reason}:\n{detail}", logs=stdout_tail
+            )
+        result = codegen.score_predictions(
+            self._dataset,
+            run_result.outputs.get(codegen.PREDICTIONS_CSV),
+            metric=self._metric,
+            experiment_id=experiment_id,
+        )
+        return result.model_copy(update={"logs": stdout_tail})
+
     def _evaluate(self, spec: dict[str, Any], *, experiment_id: str) -> ExperimentResult:
         with threadpool_limits(limits=self._max_threads):
             pipeline = self._build_and_fit(spec)
@@ -252,6 +289,14 @@ class ModelTarget:
             )
             transformers.append(("cat", encode, categorical))
         return ColumnTransformer(transformers, remainder="drop")
+
+
+def _tail(text: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
+    """The last ``limit`` chars of ``text`` (stripped), marked if truncated."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return "...(truncated)\n" + text[-limit:]
 
 
 __all__ = ["ModelTarget"]

@@ -38,6 +38,21 @@ class CodeProposerError(RuntimeError):
 
 _PROMPTS = PROMPTS["code_proposer"]
 _HISTORY_DESC_LIMIT = 120
+_HISTORY_OUTPUT_RECENT = 3  # show the printed output/errors for the last N attempts only
+
+# What the agent is told about its run environment, depending on whether we install
+# its imports on demand. The two phrasings are the only difference the code path
+# sees between "you can use anything" and "use what's already here".
+ENV_NOTE_INSTALL = (
+    "You may use any pip-installable library: import whatever you need and we "
+    "install it before running."
+)
+ENV_NOTE_AMBIENT = (
+    "Use libraries available in the run environment (the standard scientific "
+    "Python stack — pandas, numpy, scikit-learn, and commonly-installed ML "
+    "libraries). An unavailable import fails the run, so prefer widely-available "
+    "libraries."
+)
 
 
 def _build_tool() -> ToolSpec:
@@ -75,17 +90,20 @@ class CodeProposer:
         temperature: float = 0.7,
         max_tokens: int = 4096,  # larger than the spec proposer — it emits a whole function
         max_retries: int = 2,
+        environment_note: str = ENV_NOTE_INSTALL,
     ) -> None:
         self._client = client
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._max_retries = max_retries
+        self._environment_note = environment_note
 
     def propose(
         self,
         *,
         data_summary: str,
         baseline: ExperimentResult,
+        current_model: str = "",  # spec-path concept; accepted for a uniform call site, unused
         history: list[Experiment] | None = None,
     ) -> Candidate:
         if baseline.metrics is None:
@@ -96,6 +114,7 @@ class CodeProposer:
             direction=baseline.metrics.direction,
             score=baseline.metrics.primary_value,
             history=history or [],
+            environment_note=self._environment_note,
         )
         detail = ""
         for _ in range(self._max_retries + 1):
@@ -147,8 +166,11 @@ def _build_messages(
     direction: str,
     score: float,
     history: list[Experiment],
+    environment_note: str,
 ) -> list[Message]:
-    system = _PROMPTS["system"].format(metric=metric, direction=direction)
+    system = _PROMPTS["system"].format(
+        metric=metric, direction=direction, environment_note=environment_note
+    )
     if history:
         history_section = (
             _PROMPTS["history_header"] + "\n" + "\n".join(_format_history(history, metric)) + "\n\n"
@@ -166,25 +188,39 @@ def _build_messages(
 
 
 def _format_history(history: list[Experiment], metric: str) -> list[str]:
-    """Summarize past attempts by description + outcome.
+    """Summarize past attempts by description + outcome, and for the most recent
+    few, the output they printed and any error traceback.
 
     Code candidates carry their whole function source in ``changes``; echoing that
-    back would flood the prompt, so we summarize by the one-line description only.
+    back would flood the prompt, so the source is never repeated — but the run's
+    stdout (diagnostics the agent printed) and stderr (on failure) ARE fed back so
+    the agent can learn the data and self-correct on the next turn.
     """
     lines = []
-    for exp in history:
+    cutoff = len(history) - _HISTORY_OUTPUT_RECENT
+    for i, exp in enumerate(history):
         desc = exp.candidate.description.strip()
         if len(desc) > _HISTORY_DESC_LIMIT:
             desc = desc[: _HISTORY_DESC_LIMIT - 3] + "..."
         result = exp.result
+        recent = i >= cutoff
         if result is None:
-            outcome = "not run"
-        elif result.succeeded and result.metrics is not None:
-            outcome = f"{metric}={result.metrics.primary_value:.4f}"
+            lines.append(f"- {desc} -> not run")
+            continue
+        if result.succeeded and result.metrics is not None:
+            lines.append(f"- {desc} -> {metric}={result.metrics.primary_value:.4f}")
         else:
-            outcome = f"FAILED ({result.error})"
-        lines.append(f"- {desc} -> {outcome}")
+            summary = (result.error or "").splitlines()[0] if result.error else "failed"
+            lines.append(f"- {desc} -> FAILED: {summary}")
+            if recent and result.error:
+                lines.append(_indent(result.error))
+        if recent and result.logs:
+            lines.append(_indent("output:\n" + result.logs))
     return lines
+
+
+def _indent(text: str) -> str:
+    return "\n".join("    " + line for line in text.strip().splitlines())
 
 
 def _as_float(value: Any) -> float | None:
@@ -194,4 +230,10 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
-__all__ = ["PROPOSE_CODE", "CodeProposer", "CodeProposerError"]
+__all__ = [
+    "ENV_NOTE_AMBIENT",
+    "ENV_NOTE_INSTALL",
+    "PROPOSE_CODE",
+    "CodeProposer",
+    "CodeProposerError",
+]

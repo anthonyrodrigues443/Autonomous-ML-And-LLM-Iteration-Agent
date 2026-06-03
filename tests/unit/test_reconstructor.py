@@ -1,6 +1,8 @@
 """Tests for the Reconstructor — turns a source document into a baseline Candidate.
 
-Uses a deterministic fake LLM; the live integration test (real qwen3) is deferred.
+It now WRITES a train_and_predict function (the code path) rather than emitting a
+spec, so it can reproduce the source faithfully with no allow-list. Uses a
+deterministic fake LLM; the live integration test (real qwen3) is deferred.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from iterate.core import codegen
 from iterate.core.reconstructor import Reconstructor, ReconstructorError
 from iterate.llm.base import LLMClient
 from iterate.schemas.llm import ChatResponse, Message, ToolCall
@@ -38,6 +41,15 @@ class _FakeLLM:
         return self._responses.pop(0)
 
 
+_CATBOOST_FN = """
+def train_and_predict(X_train, y_train, X_holdout):
+    from catboost import CatBoostClassifier
+    m = CatBoostClassifier(depth=6, iterations=500, verbose=0)
+    m.fit(X_train, y_train)
+    return m.predict(X_holdout)
+"""
+
+
 def _tool_call(args: dict) -> ChatResponse:
     return ChatResponse(
         model="fake-model",
@@ -53,15 +65,14 @@ def test_fake_satisfies_the_llm_protocol() -> None:
     assert isinstance(_FakeLLM([]), LLMClient)
 
 
-def test_builds_candidate_from_tool_call() -> None:
+def test_builds_code_candidate_faithful_to_the_source() -> None:
     fake = _FakeLLM(
         [
             _tool_call(
                 {
-                    "model": "xgboost.XGBClassifier",
-                    "params": {"max_depth": 6, "n_estimators": 500},
-                    "description": "XGBoost mirroring the notebook's CatBoost",
-                    "rationale": "Source used CatBoost; XGBoost is the closest allow-listed equivalent.",
+                    "code": _CATBOOST_FN,
+                    "description": "CatBoost mirroring the notebook (depth=6, 500 iters)",
+                    "rationale": "Source used CatBoost; reproduced exactly, no approximation.",
                 }
             )
         ]
@@ -72,37 +83,25 @@ def test_builds_candidate_from_tool_call() -> None:
         metric="f1",
         direction="maximize",
     )
-    assert candidate.changes == {
-        "model": "xgboost.XGBClassifier",
-        "params": {"max_depth": 6, "n_estimators": 500},
-    }
+    assert codegen.is_code_candidate(candidate.changes)
+    assert "CatBoost" in candidate.changes["code"]  # the real library, not an equivalent
     assert candidate.source == "human"
-    assert "CatBoost" in candidate.rationale
-    assert candidate.description.startswith("XGBoost")
+    assert candidate.description.startswith("CatBoost")
 
 
-def test_model_only_omits_params_key() -> None:
-    fake = _FakeLLM(
-        [
-            _tool_call(
-                {
-                    "model": "sklearn.ensemble.RandomForestClassifier",
-                    "description": "RandomForest",
-                    "rationale": "source used a vanilla RF",
-                }
-            )
-        ]
-    )
-    candidate = Reconstructor(fake).reconstruct(
-        data_summary="d", source_text="s", metric="f1", direction="maximize"
-    )
-    assert candidate.changes == {"model": "sklearn.ensemble.RandomForestClassifier"}
+def test_missing_code_retries_then_raises() -> None:
+    fake = _FakeLLM([_tool_call({"description": "d", "rationale": "r"})] * 2)
+    with pytest.raises(ReconstructorError, match="no reconstruction"):
+        Reconstructor(fake, max_retries=1).reconstruct(
+            data_summary="d", source_text="s", metric="f1", direction="maximize"
+        )
 
 
-def test_missing_model_raises() -> None:
-    fake = _FakeLLM([_tool_call({"params": {"x": 1}, "description": "d", "rationale": "r"})])
-    with pytest.raises(ReconstructorError, match="missing a 'model'"):
-        Reconstructor(fake, max_retries=0).reconstruct(
+def test_unparseable_code_retries_then_raises() -> None:
+    bad = _tool_call({"code": "def train_and_predict(:\n", "description": "d", "rationale": "r"})
+    fake = _FakeLLM([bad, bad])
+    with pytest.raises(ReconstructorError):
+        Reconstructor(fake, max_retries=1).reconstruct(
             data_summary="d", source_text="s", metric="f1", direction="maximize"
         )
 
@@ -117,17 +116,7 @@ def test_no_tool_call_retries_then_raises() -> None:
 
 
 def test_prompt_carries_source_text_and_data_summary() -> None:
-    fake = _FakeLLM(
-        [
-            _tool_call(
-                {
-                    "model": "xgboost.XGBClassifier",
-                    "description": "x",
-                    "rationale": "r",
-                }
-            )
-        ]
-    )
+    fake = _FakeLLM([_tool_call({"code": _CATBOOST_FN, "description": "x", "rationale": "r"})])
     Reconstructor(fake).reconstruct(
         data_summary="DATA_BRIEF_MARKER",
         source_text="SOURCE_TEXT_MARKER",

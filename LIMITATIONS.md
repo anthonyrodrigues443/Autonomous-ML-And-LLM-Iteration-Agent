@@ -54,9 +54,10 @@ cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 be
 | Limitation (today) | Lifted at | Notes |
 |---|---|---|
 | e2b network egress-deny not enforced (needs a custom sandbox template). | **v0.2.x** | Flagged in `compute/runner.py`. |
-| e2b path not live-verified yet (no key in dev). | **v0.2** | Verified when a key is added (Day 5). |
+| e2b path not live-verified against a real sandbox in dev (no key here). | **v0.2** | A live opt-in test now exercises the whole code path on real e2b (`tests/integration/test_sandbox_codepath_live.py`); runs green once a key is present. |
 | Import→package resolution for install-on-demand is a hand-kept alias map (`sklearn`→`scikit-learn`, …) with import-name fallback. | **TBD** | Provisional architecture — to be revisited (logged in DECISIONS.md). Backstop: a wrong/missing package fails its install → captured failure + retry, so the map only needs the common stack. |
-| Auto-install of the agent's imports runs only in the disposable sandbox, never the user's local venv. | **permanent (local) / by-design** | `--compute local` will not silently mutate your environment (typosquat / dependency-conflict risk). On local, a missing import is a captured failure; install-on-demand is a sandbox feature. |
+| Local install-on-demand requires explicit consent (`--install` / setup); without it, a missing import on `--compute local` is a captured failure. | **by-design** | `--compute local` never silently mutates your environment (typosquat / dependency-conflict risk). With consent it installs into iterate's own env; e2b always installs in its disposable sandbox. |
+| The agent prints diagnostics *inside* `train_and_predict`, so a pure "just explore the data" turn still costs one scored iteration. | **v0.4** | A dedicated inspect/EDA step (no scored run) lands with the supervisor. |
 | Code-gen winners return predictions, not a pickled model. | **permanent** | Security/portability; the readable artifact is the v0.2 notebook deliverable. |
 | No cloud-GPU compute backend (local + e2b only). | ~v0.6 | When DL / large-model training needs it. |
 

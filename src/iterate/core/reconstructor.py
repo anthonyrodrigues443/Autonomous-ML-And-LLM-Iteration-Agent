@@ -1,22 +1,24 @@
 """The Reconstructor — read a user-supplied source (md / txt / notebook / .py) as
-TEXT ONLY and emit the baseline approach as a runnable `{"model","params"}` spec.
+TEXT ONLY and WRITE the baseline approach as a runnable `train_and_predict` function.
 
-Sibling of `Proposer`: same LLM/tool-calling/retry machinery, different intent
-and prompt. The Proposer picks the *next* experiment; the Reconstructor extracts
-the *user's existing* approach from their source so we can run it through our
-own eval as a comparable baseline.
+Sibling of `Proposer` / `CodeProposer`: same LLM/tool-calling/retry machinery,
+different intent and prompt. The Proposer picks the *next* experiment; the
+Reconstructor reproduces the *user's existing* approach from their source so we can
+run it through our own eval as a comparable baseline.
 
 **Hard security boundary:** user-provided source is *never* executed — not by us,
-not in the v0.2 e2b sandbox, not ever. The LLM sees it as text only and emits a
-spec the factory builds from an allow-listed library. If the source uses a model
-outside our allow-list (CatBoost, a custom architecture, …), the LLM picks the
-closest faithful equivalent and flags the approximation in its rationale.
+not in the e2b sandbox, not ever. The LLM reads it as text and WRITES new code (the
+agent's own, run on the code path like any other candidate) that reproduces the
+approach. Because it emits code rather than an allow-listed spec, it can reproduce
+the source faithfully — real CatBoost, a custom architecture — with no "closest
+equivalent" approximation.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from iterate.core.codegen import validate_train_and_predict
 from iterate.prompts import PROMPTS
 from iterate.schemas.experiment import Candidate
 from iterate.schemas.llm import Message, ToolSpec
@@ -41,16 +43,11 @@ def _build_tool() -> ToolSpec:
         parameters={
             "type": "object",
             "properties": {
-                "model": {"type": "string", "description": fields["model"]},
-                "params": {
-                    "type": "object",
-                    "description": fields["params"],
-                    "additionalProperties": True,
-                },
+                "code": {"type": "string", "description": fields["code"]},
                 "description": {"type": "string", "description": fields["description"]},
                 "rationale": {"type": "string", "description": fields["rationale"]},
             },
-            "required": ["model", "description", "rationale"],
+            "required": ["code", "description", "rationale"],
         },
     )
 
@@ -100,30 +97,34 @@ class Reconstructor:
                 (c for c in response.tool_calls if c.name == RECONSTRUCT_BASELINE.name),
                 None,
             )
-            if call is not None:
-                return _to_candidate(call.arguments)
-            detail = "model replied without calling reconstruct_baseline"
-            messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
+            if call is None:
+                detail = "model replied without calling reconstruct_baseline"
+                messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
+                continue
+            code = call.arguments.get("code")
+            if not isinstance(code, str) or not code.strip():
+                detail = "reconstruction carried no 'code'"
+                messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
+                continue
+            reason = validate_train_and_predict(code)
+            if reason is not None:
+                detail = reason
+                messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
+                continue
+            return _to_candidate(call.arguments, code)
         raise ReconstructorError(
             f"no reconstruction after {self._max_retries + 1} attempt(s): {detail}"
         )
 
 
-def _to_candidate(args: dict[str, Any]) -> Candidate:
-    model = args.get("model")
-    if not isinstance(model, str) or not model.strip():
-        raise ReconstructorError("reconstruction is missing a 'model'")
-    changes: dict[str, Any] = {"model": model.strip()}
-    params = args.get("params")
-    if isinstance(params, dict) and params:
-        changes["params"] = params
-    description = str(args.get("description") or "").strip() or f"reconstructed {model.strip()}"
+def _to_candidate(args: dict[str, object], code: str) -> Candidate:
+    description = str(args.get("description") or "").strip() or "reconstructed baseline"
     rationale = str(args.get("rationale") or "").strip() or "(no rationale given)"
     return Candidate(
         description=description,
-        changes=changes,
+        changes={"code": code.strip()},
         rationale=rationale,
-        source="human",  # the user provided the source; LLM only structured it
+        source="human",  # the user provided the source; the LLM only restructured it
     )
 
 

@@ -26,7 +26,7 @@ from iterate.schemas.experiment import Experiment
 if TYPE_CHECKING:
     from iterate.adapters.compute.base import ComputeBackend
     from iterate.core.memory import Memory
-    from iterate.core.proposer import Proposer
+    from iterate.core.proposer import SupportsPropose
     from iterate.core.terminator import Terminator
     from iterate.schemas.experiment import Candidate, ExperimentResult
     from iterate.targets.base import BenchmarkTarget
@@ -76,7 +76,7 @@ class Orchestrator:
     def __init__(
         self,
         target: BenchmarkTarget,
-        proposer: Proposer,
+        proposer: SupportsPropose,
         executor: ComputeBackend,
         terminator: Terminator,
         memory: Memory,
