@@ -1,14 +1,18 @@
 """CLI entry point.
 
-`iterate version` / `iterate config` / `iterate run`. The `run` command wires the
-agent end-to-end: load data → build target → build LLM client → reconstruct
-baseline from `--source` if given → loop via the Orchestrator → render a summary.
+`iterate version` / `iterate config` / `iterate setup` / `iterate run`. The `run`
+command wires the agent end-to-end: load data → build target → build LLM client →
+reconstruct baseline from `--source` if given → loop via the Orchestrator → render
+a summary. By default the agent WRITES model code (`--code`) and runs it locally
+(`--compute local`); `iterate setup` saves a user's preferred defaults so they
+don't repeat flags.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,7 +22,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from iterate import __version__
+from iterate import __version__, userconfig
 from iterate.config import get_settings
 
 # NOTE: the heavy stack (pandas, scikit-learn, joblib, the orchestrator/model
@@ -72,6 +76,55 @@ def config() -> None:
 
 
 @app.command()
+def setup() -> None:
+    """Save your default backend, model, keys, compute venue, and install consent.
+
+    Writes ~/.config/iterate/config.toml. Override any of it per run with a flag.
+    """
+    console.print(
+        "[bold]iterate setup[/bold] — your saved defaults "
+        "(override any of these per run with a flag).\n"
+    )
+    backend = typer.prompt(
+        "LLM backend (ollama / openai / groq / together / deepseek)", default="ollama"
+    ).strip()
+    model = typer.prompt("Model name (blank = backend default)", default="", show_default=False)
+    api_key = ""
+    if backend != "ollama":
+        api_key = typer.prompt(
+            f"API key for {backend}", default="", hide_input=True, show_default=False
+        ).strip()
+
+    compute = typer.prompt("Run generated code on (local / e2b)", default="local").strip().lower()
+    e2b_api_key = ""
+    install = False
+    if compute == "e2b":
+        e2b_api_key = typer.prompt(
+            "E2B API key", default="", hide_input=True, show_default=False
+        ).strip()
+    else:
+        console.print(
+            "[dim]On local, generated code runs on THIS machine with your "
+            "permissions.[/dim]"
+        )
+        install = typer.confirm(
+            "May iterate pip-install packages your generated code imports "
+            "(into iterate's environment)?",
+            default=False,
+        )
+
+    values: dict[str, object] = {"backend": backend, "compute": compute, "install": install}
+    if model.strip():
+        values["model"] = model.strip()
+    if api_key:
+        values["api_key"] = api_key
+    if e2b_api_key:
+        values["e2b_api_key"] = e2b_api_key
+    path = userconfig.save_user_config(values)
+    console.print(f"\n[green]saved[/green] → {path}")
+
+
+@app.command()
 def run(
     data: Path = typer.Option(
         ..., "--data", help="Path to the CSV dataset.", exists=True, dir_okay=False
@@ -90,14 +143,27 @@ def run(
         exists=True,
         dir_okay=False,
     ),
-    backend: str = typer.Option(
-        "ollama", "--backend", help="ollama | openai-compatible (or aliases: groq, together, …)"
+    backend: str | None = typer.Option(
+        None, "--backend", help="ollama | openai-compatible (or aliases: groq, together, …)"
     ),
     model: str | None = typer.Option(None, "--model", help="Override the backend's default model."),
     base_url: str | None = typer.Option(
         None, "--base-url", help="Override the backend's base URL."
     ),
     api_key: str | None = typer.Option(None, "--api-key", help="Override the backend's API key."),
+    code: bool = typer.Option(
+        True,
+        "--code/--spec",
+        help="Agent WRITES model code (default), or picks an allow-listed estimator (--spec).",
+    ),
+    compute: str | None = typer.Option(
+        None, "--compute", help="Where generated code runs: local (default) | e2b."
+    ),
+    install: bool | None = typer.Option(
+        None,
+        "--install/--no-install",
+        help="Let iterate install packages your code imports (local only; e2b always installs).",
+    ),
     max_iterations: int = typer.Option(
         10, "--max-iterations", min=1, help="Hard cap on experiments."
     ),
@@ -122,15 +188,32 @@ def run(
     """Run the agent on a tabular dataset."""
     # Heavy imports live here, not at module top, so `iterate version`/`--help`
     # don't pay the pandas + scikit-learn import cost.
-    from iterate.adapters.compute.local import LocalExecutor
+    from iterate.adapters.compute.runner import CodeRunner, E2BCodeRunner, LocalCodeRunner
+    from iterate.adapters.compute.sandbox import SandboxExecutor
     from iterate.adapters.data.tabular import load_csv
+    from iterate.core.code_proposer import ENV_NOTE_AMBIENT, ENV_NOTE_INSTALL, CodeProposer
     from iterate.core.memory import SqliteMemory
     from iterate.core.orchestrator import Orchestrator
-    from iterate.core.proposer import Proposer, summarize_dataset
+    from iterate.core.proposer import Proposer, SupportsPropose, summarize_dataset
     from iterate.core.reconstructor import Reconstructor
     from iterate.core.terminator import default_terminator
     from iterate.llm.factory import build_client
     from iterate.targets.model import ModelTarget
+
+    # ─── First run with no saved config? Offer the setup wizard. ───────────
+    if not userconfig.exists() and sys.stdin.isatty():
+        console.print("[dim]No saved config found — let's set your defaults once.[/dim]\n")
+        setup()
+        console.print()
+    cfg = userconfig.load_user_config()
+
+    # ─── Resolve: explicit flag > saved config > built-in default ──────────
+    backend = backend or cfg.get("backend") or "ollama"
+    model = model or cfg.get("model")
+    compute = (compute or cfg.get("compute") or "local").lower()
+    install = install if install is not None else bool(cfg.get("install", False))
+    if compute not in ("local", "e2b"):
+        raise typer.BadParameter(f"--compute must be 'local' or 'e2b', got {compute!r}")
 
     # ─── Validate ──────────────────────────────────────────────────────────
     if baseline is not None and source is None:
@@ -158,13 +241,21 @@ def run(
 
     # ─── Cloud backend? API key required. ──────────────────────────────────
     if backend != "ollama":
-        resolved_key = api_key or _resolved_api_key_from_env(settings, backend)
+        resolved_key = api_key or cfg.get("api_key") or _resolved_api_key_from_env(settings, backend)
         if not resolved_key:
             raise typer.BadParameter(
                 f"backend {backend!r} requires --api-key or a corresponding env var "
                 f"(ITERATE_BACKEND_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / …)"
             )
         api_key = resolved_key
+
+    # ─── e2b compute? API key required. ────────────────────────────────────
+    e2b_api_key = cfg.get("e2b_api_key") or settings.e2b_api_key
+    if compute == "e2b" and not e2b_api_key:
+        raise typer.BadParameter(
+            "--compute e2b needs an E2B API key (run 'iterate setup' or set E2B_API_KEY) "
+            "and the sandbox extra: pip install 'iterate-ai[sandbox]'"
+        )
 
     # ─── Configure logging so per-iteration messages stream live. ──────────
     _configure_logging()
@@ -191,7 +282,7 @@ def run(
             metric=metric,
             direction=direction,
         )
-        baseline_model = str(baseline_candidate.changes["model"])
+        baseline_model = _candidate_model(baseline_candidate)
         console.print(
             f"[bold]baseline from source[/bold] ({source.name}): {baseline_candidate.description}"
         )
@@ -199,7 +290,7 @@ def run(
         prior = _prior_best(memory, model_target.name, direction)
         if prior is not None and prior.result and prior.result.metrics:
             baseline_candidate = prior.candidate
-            baseline_model = str(prior.candidate.changes["model"])
+            baseline_model = _candidate_model(prior.candidate)
             console.print(
                 f"[bold]baseline from memory[/bold]: {prior.candidate.description} "
                 f"({metric}={prior.result.metrics.primary_value:.4f}); re-measuring"
@@ -211,8 +302,22 @@ def run(
         baseline_candidate = None
         baseline_model = _default_baseline_model(metric)
 
+    # ─── Proposer + executor (code path vs spec path) ──────────────────────
+    # The executor is always the sandbox executor: it runs spec candidates +
+    # baselines in-process and code candidates through the chosen runner. The
+    # --code/--spec flag only selects which proposer drives the loop.
+    proposer: SupportsPropose
+    runner: CodeRunner
+    if compute == "e2b":
+        runner = E2BCodeRunner(api_key=e2b_api_key)
+        env_note = ENV_NOTE_INSTALL
+    else:
+        runner = LocalCodeRunner(install=install)
+        env_note = ENV_NOTE_INSTALL if install else ENV_NOTE_AMBIENT
+    executor = SandboxExecutor(runner)
+    proposer = CodeProposer(client, environment_note=env_note) if code else Proposer(client)
+
     # ─── Terminator + Orchestrator ─────────────────────────────────────────
-    proposer = Proposer(client)
     deadline_seconds = _parse_duration(until) if until is not None else None
     terminator = default_terminator(
         max_iterations=max_iterations, patience=patience, deadline_seconds=deadline_seconds
@@ -221,7 +326,7 @@ def run(
     orchestrator = Orchestrator(
         model_target,
         proposer,
-        LocalExecutor(),
+        executor,
         terminator,
         memory,
         data_summary=data_summary,
@@ -229,8 +334,10 @@ def run(
         baseline_candidate=baseline_candidate,
     )
 
+    mode = "code-gen" if code else "spec"
     console.print(
-        f"\n[dim]Running on {model_target.name}; target={target!r}, metric={metric}[/dim]\n"
+        f"\n[dim]Running on {model_target.name}; target={target!r}, metric={metric}, "
+        f"mode={mode}, compute={compute}[/dim]\n"
     )
     result = orchestrator.run()
 
@@ -354,6 +461,15 @@ def _resolved_api_key_from_env(settings: object, backend: str) -> str | None:
     return None
 
 
+def _candidate_model(candidate: Candidate) -> str:
+    """A display string for a candidate's approach: the estimator name (spec path)
+    or the description (code path, where there is no single estimator name)."""
+    model = candidate.changes.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return candidate.description or "generated code"
+
+
 def _default_baseline_model(metric: str) -> str:
     """Factory default per task. Mirrors the private mapping in adapters.models.registry."""
     if metric in _CLASSIFICATION_METRICS:
@@ -392,15 +508,30 @@ def _check_baseline_divergence(
 def _save_best_model(
     target: ModelTarget, result: RunResult, metric: str, path: Path
 ) -> None:
-    """Refit + persist the winning model, plus a sidecar best.json with its config."""
+    """Persist the winning approach + a sidecar best.json.
+
+    Spec winner → refit and pickle the fitted pipeline (joblib). Code winner →
+    save the `train_and_predict` source (a code-gen winner returns predictions, not
+    a pickled model — by design; see LIMITATIONS.md). The notebook deliverable
+    (Day 6) turns that source into a runnable artifact.
+    """
     best = result.best
     assert best is not None
     best_result = best.result
     assert best_result is not None
     spec = best.candidate.changes
-    target.save_model(spec, path)
-
     score = best_result.metrics.primary_value if best_result.metrics else None
+
+    if spec.get("code"):
+        artifact = path.with_name("best_train_and_predict.py")
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(str(spec["code"]).strip() + "\n", encoding="utf-8")
+        load_hint = f"the winning train_and_predict is in {artifact.name}"
+    else:
+        target.save_model(spec, path)
+        artifact = path
+        load_hint = f"load it: joblib.load({str(path)!r}).predict(X)"
+
     sidecar = path.with_name("best.json")
     sidecar.write_text(
         json.dumps(
@@ -408,20 +539,18 @@ def _save_best_model(
                 "run_id": result.run_id,
                 "model": spec.get("model"),
                 "params": spec.get("params", {}),
+                "code": spec.get("code"),
                 "description": best.candidate.description,
                 "rationale": best.candidate.rationale,
                 "metric": metric,
                 "score": score,
-                "model_path": str(path),
+                "artifact_path": str(artifact),
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    console.print(
-        f"\n[bold]saved best model[/bold] → {path}\n"
-        f"[dim]load it: joblib.load({str(path)!r}).predict(X)[/dim]"
-    )
+    console.print(f"\n[bold]saved best approach[/bold] → {artifact}\n[dim]{load_hint}[/dim]")
 
 
 def _render_summary(result: RunResult, metric: str) -> None:
@@ -440,7 +569,7 @@ def _render_summary(result: RunResult, metric: str) -> None:
         table.add_row("base", "baseline", f"{baseline_score:.4f}", "—")
 
     for exp in result.history:
-        model_name = str(exp.candidate.changes.get("model", "?"))
+        model_name = _candidate_model(exp.candidate)
         if exp.id == best_id:
             model_name += "  [bold green]← best[/bold green]"
         if exp.result is None or exp.result.metrics is None:

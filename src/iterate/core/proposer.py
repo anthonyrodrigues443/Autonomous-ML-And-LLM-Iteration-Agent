@@ -16,7 +16,7 @@ v0.2 runs the agent's OWN generated code, never the user's.)
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from iterate.prompts import PROMPTS
 from iterate.schemas.experiment import Candidate
@@ -30,6 +30,23 @@ if TYPE_CHECKING:
 
 class ProposerError(RuntimeError):
     """The model failed to return a usable candidate after retries."""
+
+
+class SupportsPropose(Protocol):
+    """What the Orchestrator needs from any proposer (spec `Proposer` or `CodeProposer`).
+
+    ``current_model`` is meaningful only on the spec path (it names the estimator
+    in play); the code path accepts it for a uniform call site and ignores it.
+    """
+
+    def propose(
+        self,
+        *,
+        data_summary: str,
+        baseline: ExperimentResult,
+        current_model: str,
+        history: list[Experiment] | None = ...,
+    ) -> Candidate: ...
 
 
 _PROMPTS = PROMPTS["proposer"]
@@ -201,4 +218,10 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
-__all__ = ["PROPOSE_CANDIDATE", "Proposer", "ProposerError", "summarize_dataset"]
+__all__ = [
+    "PROPOSE_CANDIDATE",
+    "Proposer",
+    "ProposerError",
+    "SupportsPropose",
+    "summarize_dataset",
+]

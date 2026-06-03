@@ -16,6 +16,7 @@ from iterate.adapters.compute.runner import (
     E2BCodeRunner,
     LocalCodeRunner,
     RunResult,
+    _missing_packages,
 )
 
 # ─── LocalCodeRunner (real subprocess, offline) ──────────────────────────
@@ -170,6 +171,61 @@ def test_e2b_runner_tears_down_even_when_run_raises() -> None:
     with pytest.raises(RuntimeError, match="blew up"):
         runner.run("x", inputs={}, outputs=[], timeout=60)
     assert boom.killed
+
+
+# ─── install-on-demand (packages) ─────────────────────────────────────────
+
+
+class _RecordingSandbox:
+    """A fake sandbox that records every run_code call (install + the script)."""
+
+    def __init__(self) -> None:
+        self.files = _FakeFiles({})
+        self.ran: list[str] = []
+        self.killed = False
+
+    def run_code(self, script: str, timeout: float | None = None) -> _FakeExecution:
+        self.ran.append(script)
+        return _FakeExecution(stdout=[], stderr=[])
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_e2b_runner_installs_packages_before_running() -> None:
+    sandbox = _RecordingSandbox()
+    runner = E2BCodeRunner(sandbox_factory=lambda _timeout: sandbox)
+    runner.run(
+        "print('hi')",
+        inputs={},
+        outputs=[],
+        timeout=60,
+        packages=["xgboost", "catboost"],
+    )
+    assert sandbox.ran[0] == "!pip install -q xgboost catboost"  # install first
+    assert sandbox.ran[1] == "print('hi')"  # then the script
+
+
+def test_e2b_runner_skips_install_when_no_packages() -> None:
+    sandbox = _RecordingSandbox()
+    E2BCodeRunner(sandbox_factory=lambda _timeout: sandbox).run(
+        "print('hi')", inputs={}, outputs=[], timeout=60
+    )
+    assert sandbox.ran == ["print('hi')"]  # no install step
+
+
+def test_local_runner_ignores_packages_without_consent() -> None:
+    # install defaults to False: packages are not installed, the script just runs.
+    result = LocalCodeRunner().run(
+        "print('ok')", inputs={}, outputs=[], timeout=60, packages=["definitely-not-real-zzz"]
+    )
+    assert result.succeeded
+    assert result.stdout.strip() == "ok"
+
+
+def test_missing_packages_filters_already_installed() -> None:
+    # pytest is installed in the dev env; the bogus name is not.
+    assert _missing_packages(["pytest", "no-such-distribution-zzz"]) == ["no-such-distribution-zzz"]
 
 
 # ─── Protocol conformance ────────────────────────────────────────────────

@@ -180,6 +180,46 @@ def test_prompt_carries_data_summary_and_metric() -> None:
     assert "f1" in sent
 
 
+def test_recent_run_output_and_errors_are_fed_back() -> None:
+    # A succeeded prior attempt that printed diagnostics, and a failed one.
+    printed = Experiment(
+        candidate=Candidate(description="logreg with EDA", changes={"code": "x"}, rationale="r"),
+        target="t",
+        hypothesis="h",
+        status="completed",
+        result=ExperimentResult(
+            experiment_id="p1",
+            metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize"),
+            logs="class balance: 0.4/0.6\nmissing: none",
+        ),
+    )
+    crashed = Experiment(
+        candidate=Candidate(description="xgboost attempt", changes={"code": "y"}, rationale="r"),
+        target="t",
+        hypothesis="h",
+        status="failed",
+        result=ExperimentResult(
+            experiment_id="p2", error="code script failed:\nTraceback ...\nKeyError: 'age'"
+        ),
+    )
+    fake = _FakeLLM([_tool_call({"code": _GOOD_FN, "description": "d", "rationale": "r"})])
+    CodeProposer(fake).propose(data_summary="d", baseline=_baseline(), history=[printed, crashed])
+    sent = "\n".join(m.content or "" for m in fake.calls[0])
+    assert "class balance: 0.4/0.6" in sent  # stdout fed back so it can learn the data
+    assert "KeyError: 'age'" in sent  # traceback fed back so it can self-correct
+
+
+def test_environment_note_is_injected() -> None:
+    from iterate.core.code_proposer import ENV_NOTE_AMBIENT
+
+    fake = _FakeLLM([_tool_call({"code": _GOOD_FN, "description": "d", "rationale": "r"})])
+    CodeProposer(fake, environment_note=ENV_NOTE_AMBIENT).propose(
+        data_summary="d", baseline=_baseline()
+    )
+    sent = "\n".join(m.content or "" for m in fake.calls[0])
+    assert "available in the run environment" in sent  # the ambient phrasing, not "we install"
+
+
 def test_history_is_summarized_without_raw_code() -> None:
     prior = Experiment(
         candidate=Candidate(

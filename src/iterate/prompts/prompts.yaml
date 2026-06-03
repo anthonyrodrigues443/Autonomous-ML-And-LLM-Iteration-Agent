@@ -12,15 +12,13 @@ proposer:
     model. Optimize the primary metric '{metric}' ({direction}). The current model
     is {current_model}.
 
-    You have the FULL estimator catalogs of scikit-learn, XGBoost, and LightGBM —
-    hundreds of models, not a short list. That includes linear models
-    (LogisticRegression, RidgeClassifier, SGDClassifier, and the regression
-    equivalents), support vector machines (SVC/SVR, LinearSVC), nearest neighbours
-    (KNeighbors*), naive Bayes, discriminant analysis, single trees, and the whole
-    ensemble family (RandomForest, ExtraTrees, GradientBoosting,
-    HistGradientBoosting, AdaBoost, Bagging, Voting/Stacking), plus XGBoost and
-    LightGBM gradient boosting. Any of them is available by import path; match the
-    task (a *Classifier for classification, a *Regressor for regression).
+    This is the fast path: pick any estimator from scikit-learn, XGBoost, or
+    LightGBM by import path and we build it for you — the full catalogs, from
+    linear models, SVMs, nearest neighbours, naive Bayes and single trees through
+    the whole ensemble family (RandomForest, ExtraTrees, GradientBoosting,
+    HistGradientBoosting, AdaBoost, Bagging, Voting/Stacking) and the gradient
+    boosters. Match the task (a *Classifier for classification, a *Regressor for
+    regression).
 
     Each turn, pick the single most promising next experiment: either a different
     model family, or the current model with different hyperparameters. Actively
@@ -83,7 +81,7 @@ code_proposer:
   # System message — the code-gen path. The agent writes a function instead of
   # naming an estimator, so there is NO library allow-list: it may use whatever it
   # wants and we install what it imports before running.
-  # Placeholders: {metric}, {direction}
+  # Placeholders: {metric}, {direction}, {environment_note}
   system: >-
     You are an ML engineer improving a tabular model by WRITING CODE. Optimize the
     primary metric '{metric}' ({direction}).
@@ -96,12 +94,16 @@ code_proposer:
 
     `X_train` and `X_holdout` are pandas DataFrames of features; `y_train` is the
     training target. Return one prediction per row of `X_holdout`, in order (a list,
-    numpy array, or pandas Series). You are NOT restricted to any library list:
-    import whatever you need — we install your imports before running. Do all
-    imports inside the function. Do NOT read or write files and do NOT try to
-    access the holdout labels: a fixed harness loads the data, calls your function,
-    and scores the predictions you return. Preprocess and model however you judge
-    best.
+    numpy array, or pandas Series). {environment_note} Do all imports inside the
+    function. Do NOT read or write files and do NOT try to access the holdout
+    labels: a fixed harness loads the data, calls your function, and scores the
+    predictions you return. Preprocess and model however you judge best.
+
+    You may also INSPECT the data and print anything useful — shapes, dtypes,
+    missing-value counts, class balance, summary stats, correlations. Your printed
+    output and any error traceback are shown back to you on the next turn, so use
+    early attempts to understand the data and then refine your preprocessing and
+    model from what you learned.
 
     Each turn, propose the single most promising next approach: a different model
     family, a different preprocessing pipeline, or a tuned version of what worked.
@@ -143,7 +145,8 @@ code_proposer:
         Full Python source of a top-level function
         `def train_and_predict(X_train, y_train, X_holdout):` that returns one
         prediction per row of X_holdout (list / numpy array / pandas Series). Put
-        all imports inside the function. Use any library you need. Do no file I/O.
+        all imports inside the function. Do no file I/O. You may print diagnostics;
+        the output is fed back to you next turn.
       description: >-
         One line naming the approach and the specific change being made, e.g.
         'gradient boosting on target-encoded categoricals to capture interactions'.
@@ -156,18 +159,29 @@ code_proposer:
 
 reconstructor:
   # System prompt for source-aware baseline reconstruction. The LLM reads the
-  # source (md / txt / notebook / .py) AS TEXT ONLY and emits a runnable spec we
-  # then build through our model factory. The user's code is NEVER executed.
+  # source (md / txt / notebook / .py) AS TEXT ONLY and WRITES a train_and_predict
+  # function reproducing the user's approach. The user's code is NEVER executed;
+  # the function the LLM writes is the agent's own code, run on the code path.
   # Placeholders: {metric}, {direction}
   system: >-
     You are reading a source document the user provided so we can reproduce
-    their modeling approach as a baseline. From the source — which is provided
-    as text only and will NEVER be executed — extract the model and key
-    hyperparameters they used, and emit a runnable spec we can build through
-    our model factory (scikit-learn, XGBoost, or LightGBM only). If their model
-    is not available in those libraries (e.g. CatBoost, a custom architecture),
-    pick the closest faithful equivalent. Optimize the primary metric
-    '{metric}' ({direction}). Call the reconstruct_baseline tool.
+    their modeling approach as a baseline to improve on. The source is provided
+    as text only and will NEVER be executed.
+
+    Reconstruct their approach as a Python function with exactly this signature:
+
+        def train_and_predict(X_train, y_train, X_holdout):
+            ...
+            return predictions
+
+    Reproduce it FAITHFULLY: use the same model and library they used (real
+    CatBoost, a custom architecture, whatever the source shows) and the same key
+    hyperparameters and preprocessing — you are not limited to any fixed library
+    list. Import everything inside the function and do no file I/O; a fixed
+    harness loads the data, calls your function, and scores the predictions.
+    Return one prediction per row of `X_holdout`. Optimize the primary metric
+    '{metric}' ({direction}). Call the reconstruct_baseline tool with the source
+    in its `code` field.
 
   # User template — the data brief + source content.
   # Placeholders: {data_summary}, {metric}, {direction}, {source_text}
@@ -182,26 +196,23 @@ reconstructor:
     {source_text}
     ---
 
-    Reconstruct the baseline approach.
+    Reconstruct the baseline approach as a train_and_predict function.
 
-  retry_nudge: "You did not call the tool. Call reconstruct_baseline with the reconstructed approach now."
+  retry_nudge: "You did not call the tool with usable code. Call reconstruct_baseline now with a train_and_predict function in its `code` field."
 
   tool:
     name: reconstruct_baseline
-    description: "Emit the reconstructed baseline approach as a runnable model + params spec."
+    description: "Emit the reconstructed baseline approach as a runnable train_and_predict function."
     fields:
-      model: >-
-        Import path of the estimator that matches the source's approach, from
-        scikit-learn, XGBoost, or LightGBM (e.g. 'xgboost.XGBClassifier'). If
-        the source uses a model outside these libraries (CatBoost, a custom
-        net, etc.), pick the closest faithful equivalent.
-      params: >-
-        Hyperparameters from the source, e.g. {"max_depth": 6, "n_estimators":
-        500}. Omit any value the source doesn't specify (we'll use the model's
-        defaults).
+      code: >-
+        Full Python source of a top-level
+        `def train_and_predict(X_train, y_train, X_holdout):` that reproduces the
+        source's approach (same model + library + key hyperparameters and
+        preprocessing) and returns one prediction per row of X_holdout. Put all
+        imports inside the function. Do no file I/O.
       description: >-
-        One line naming the reconstructed approach, e.g. 'XGBoost (mirrors the
-        notebook's CatBoost setup; max_depth=6, n_estimators=500)'.
+        One line naming the reconstructed approach, e.g. 'CatBoost mirroring the
+        notebook (depth=6, 500 iters)'.
       rationale: >-
         Briefly state which parts of the source you drew from and why this is a
         faithful reconstruction (and what you approximated, if anything).

@@ -15,9 +15,11 @@ source and the terminator.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from iterate.adapters.compute.runner import RunResult
     from iterate.schemas.experiment import Candidate, ExperimentResult
     from iterate.targets.base import BenchmarkTarget
 
@@ -38,4 +40,41 @@ class ComputeBackend(Protocol):
         ...
 
 
-__all__ = ["ComputeBackend"]
+@dataclass(frozen=True)
+class CodeJob:
+    """Everything a `CodeRunner` needs to run one generated training script.
+
+    The target assembles it (it owns the data); the executor hands it to its
+    runner (it owns the venue). ``packages`` are the pip distributions the code
+    imports, for install-on-demand.
+    """
+
+    script: str
+    inputs: dict[str, bytes]
+    outputs: list[str]
+    packages: list[str] = field(default_factory=list)
+
+
+@runtime_checkable
+class SupportsCodeGen(Protocol):
+    """A target that can be evaluated on the code-gen path.
+
+    Splits the code path cleanly: the target shapes the data + scores (it knows
+    the sealed holdout); the executor owns where the script runs. Only targets
+    implementing this can take code candidates.
+    """
+
+    def build_code_job(self, candidate: Candidate) -> CodeJob:
+        """Assemble the runnable job (script + input files + needed packages)."""
+        ...
+
+    def score_code_job(self, run_result: RunResult, experiment_id: str) -> ExperimentResult:
+        """Score a finished run against the held-back holdout labels.
+
+        A failed/timed-out run is a captured failure (error set), never raised;
+        the script's stdout is surfaced on ``logs`` so the next proposal sees it.
+        """
+        ...
+
+
+__all__ = ["CodeJob", "ComputeBackend", "SupportsCodeGen"]
