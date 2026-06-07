@@ -43,12 +43,14 @@ class OllamaClient:
         model: str | None = None,
         timeout: float | None = None,
         think: bool = False,
+        num_ctx: int | None = None,
     ) -> None:
         settings = get_settings()
         self._host = (host if host is not None else settings.ollama_host).rstrip("/")
         self._model = model if model is not None else settings.iterate_model
-        self._timeout = timeout if timeout is not None else settings.iterate_backend_timeout
+        self._timeout = timeout if timeout is not None else settings.ollama_timeout
         self._think = think
+        self._num_ctx = num_ctx if num_ctx is not None else settings.ollama_num_ctx
 
     @property
     def model(self) -> str:
@@ -70,13 +72,14 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = [self._to_tool(t) for t in tools]
-        options: dict[str, Any] = {}
+        # Always pin num_ctx: Ollama's 4096 default front-truncates long sessions,
+        # silently dropping the system prompt and tool schema.
+        options: dict[str, Any] = {"num_ctx": self._num_ctx}
         if temperature is not None:
             options["temperature"] = temperature
         if max_tokens is not None:
             options["num_predict"] = max_tokens
-        if options:
-            payload["options"] = options
+        payload["options"] = options
         return self._to_chat_response(self._post(payload))
 
     @retry(

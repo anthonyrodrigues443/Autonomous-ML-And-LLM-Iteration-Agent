@@ -89,6 +89,52 @@ def assemble_script(code: str) -> str:
     return _PREAMBLE + code.strip() + "\n" + _POSTAMBLE
 
 
+def session_preamble() -> str:
+    """The first (trusted, host-authored) cell of a cell-by-cell session: loads the
+    data into ``X_train`` / ``y_train`` / ``X_holdout`` (holdout FEATURES only — the
+    labels stay host-side) and prints the shapes. The coder builds from here.
+
+    Also defines a ``finish()`` shim: models conflate the finish TOOL with a kernel
+    function and append ``finish()`` to otherwise-perfect cells. Without the shim
+    that's a NameError that marks the whole cell failed and burns turns re-running
+    it; with it, the cell completes and the printed guidance redirects the model to
+    the tool.
+
+    Finally it snapshots the inputs into ``_pristine_inputs`` so the harness can
+    restore ``X_train``/``y_train``/``X_holdout`` before every agent cell — a weak
+    model can otherwise corrupt the canonical data in place (e.g.
+    ``X_train[cols] = imputer.fit_transform(...)``) and silently poison every later
+    attempt in the session."""
+    return (
+        "import json, pandas as pd, numpy as np\n"
+        f"with open({META_JSON!r}) as _f:\n"
+        "    _meta = json.load(_f)\n"
+        "_target = _meta['target']\n"
+        f"_train = pd.read_csv({TRAIN_CSV!r})\n"
+        "X_train = _train.drop(columns=[_target])\n"
+        "y_train = _train[_target]\n"
+        f"X_holdout = pd.read_csv({HOLDOUT_CSV!r})  # FEATURES ONLY — labels held back\n"
+        "_pristine_inputs = {'X_train': X_train.copy(), 'y_train': y_train.copy(), "
+        "'X_holdout': X_holdout.copy()}\n"
+        "def finish(*args, **kwargs):\n"
+        "    print('finish is a tool call, not a Python function. This cell still ran; "
+        "now invoke the finish tool to end the session.')\n"
+        "print('loaded:', X_train.shape, 'train /', X_holdout.shape, 'holdout; target:', _target)\n"
+    )
+
+
+# Prepended to every agent cell: restores the canonical inputs from the pristine
+# snapshot taken in the preamble, so in-place mutation of X_train/y_train/X_holdout
+# in one cell cannot leak into the next. Guarded so a stray preamble failure (no
+# snapshot) degrades to a no-op instead of a NameError on every cell.
+RESET_INPUTS = (
+    "if '_pristine_inputs' in dir():\n"
+    "    X_train = _pristine_inputs['X_train'].copy(); "
+    "y_train = _pristine_inputs['y_train'].copy(); "
+    "X_holdout = _pristine_inputs['X_holdout'].copy()\n"
+)
+
+
 def validate_train_and_predict(code: str) -> str | None:
     """Static check of a generated snippet; returns an error reason or ``None`` if OK.
 
@@ -151,6 +197,12 @@ def _called_name(func: ast.expr) -> str | None:
     if isinstance(func, ast.Attribute):
         return func.attr
     return None
+
+
+def package_for_import(import_name: str) -> str:
+    """The pip distribution name for a top-level import (e.g. 'sklearn'→'scikit-learn'),
+    falling back to the import name. Used for install-on-demand of a missing module."""
+    return _IMPORT_TO_PACKAGE.get(import_name.split(".", 1)[0], import_name.split(".", 1)[0])
 
 
 def required_imports(code: str) -> list[str]:
@@ -276,7 +328,9 @@ __all__ = [
     "build_inputs",
     "components_used",
     "is_code_candidate",
+    "package_for_import",
     "required_imports",
     "score_predictions",
+    "session_preamble",
     "validate_train_and_predict",
 ]

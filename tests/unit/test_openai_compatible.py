@@ -152,6 +152,20 @@ def test_chat_handles_empty_tool_arguments(monkeypatch: pytest.MonkeyPatch) -> N
     assert resp.tool_calls[0].arguments == {}
 
 
+@pytest.mark.parametrize("raw", ["null", "[1, 2]", '"text"', "not json {"])
+def test_chat_coerces_non_dict_tool_arguments_to_empty(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    # Groq sends the string "null" for no-arg tools (crashed a live run); weak
+    # models can emit non-object or malformed JSON. All must degrade to {}.
+    client = _client()
+    _patch_create(monkeypatch, client, _completion(tool_calls=[_tool_call("finish", raw)]))
+
+    resp = client.chat([Message(role="user", content="x")])
+
+    assert resp.tool_calls[0].arguments == {}
+
+
 def test_chat_defaults_usage_to_zero_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _client()
     _patch_create(monkeypatch, client, _completion(content="ok", usage=None))

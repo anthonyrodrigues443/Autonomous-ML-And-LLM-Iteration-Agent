@@ -270,6 +270,50 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-06-07 | Week 4 Day 7 | v0.2 multi-agent cell-by-cell system + reliability hardening (coder prompt still pending the quality bar)
+
+**Task:** Build the v0.2 core decided on Day 6 — a two-agent, cell-by-cell system — and harden it against what live qwen3:14b runs surface, iterating on the real churn dataset (target `Churn`, metric `f1`) until a run works cleanly every time. Spanned several days of live iteration (2026-06-05 to 07); logged as one entry for one commit.
+
+**Status — NOT a release.** The harness, architecture, and reliability work below are settled and tested. The **coder system prompt is still pending**: it is being authored separately to reach a quality bar (consistent f1 on the floor model), so the prompt wording in `prompts.yaml` `coder:` is **provisional** and will be replaced. v0.2 does not ship until that prompt clears the bar. See "What's pending" below.
+
+**What shipped — the multi-agent cell-by-cell system (new):**
+- `src/iterate/adapters/compute/kernel.py` — `StatefulKernel` protocol + two implementations. `LocalKernel` boots a real IPython kernel (`jupyter_client`), runs a cell, captures stream/execute_result/display_data/error as nbformat-ready output dicts, interrupts on timeout, and never raises on a failing cell (errors are feedback). `E2BKernel` reuses one e2b sandbox across cells for the same state-persistence. Both expose `start(inputs)`, `run_cell`, `install`, `namespace_summary`, `read_output`, `close`.
+- `src/iterate/core/coder.py` — `CodingAgent`: drives ONE experiment as a live kernel session (write a cell → see its real output + the live variable list → write the next), ending on a VERIFIED finish tool that only accepts when valid predictions exist. Holdout labels never enter the kernel; predictions are scored host-side, so the sealed-holdout guarantee is unchanged.
+- `src/iterate/core/supervisor.py` — `Supervisor`: the across-experiments strategist. Reads run history, compresses it, and hands the coder a brief; decides stop. One LLM via a `plan_next` tool (the tool boundary is where the v0.4 specialists graduate).
+- `src/iterate/core/agent_loop.py` — `run_supervised`: the supervised loop (Supervisor briefs → Coder runs a session → scored result → Memory), returning the same `RunResult` so the CLI treats both paths uniformly. CLI `--code` now routes here (the one-shot path stays under `--spec`).
+- Same-model-different-roles is legitimately multi-agent: roles, prompts, tools, and isolated contexts distinguish the agents; the backend model identity does not.
+
+**What shipped — reliability hardening (each fix traced to a real failure on a live run):**
+- **num_ctx fix (the big one).** `OllamaClient` never set `num_ctx`, so Ollama ran qwen at its 4096 default and silently FRONT-truncated the growing session — dropping the system prompt + tool schema mid-run (confirmed in the server log: `truncating input prompt limit=4096 keep=4`). Now pinned (default 16384, env-overridable) plus a prompt-side `context_budget` that elides the OLDEST observations first so the system prompt is never what truncates. The full-context design only actually reached the model after this.
+- **Auto-install fixed for uv venvs.** `python -m pip` fails in uv venvs (no pip); install fell through silently and the agent looped on an import that could never resolve. Now falls back `pip` → `uv pip --python <kernel>` → `ensurepip`, and the outcome is made VISIBLE to the agent (installed-and-re-ran, or FAILED-so-switch-libraries) instead of a silent no-op.
+- **Deadline charges KERNEL-execution seconds only**, not LLM latency — a slow local model gets the same working budget as a fast cloud one (`--until` now bounds the whole run via the terminator, not a single experiment).
+- **Verified finish + improve nudge:** a session cannot end on a hallucinated "done"; a first valid finish with most of the budget unspent is met once with a nudge to make one more measured improvement.
+- **Repeated-cell breaker** (refuses an identical re-submitted cell) and **same-error breaker** (escalates when one error signature recurs across cosmetically-different cells, naming the cause and forbidding cosmetic retries) — both kill the perseveration loops a 14B falls into.
+- **`finish()` shim** in the trusted preamble: the conflated `finish()`-as-code call prints guidance instead of NameError-ing an otherwise-good cell.
+- **Input protection:** the preamble snapshots `X_train`/`y_train`/`X_holdout` and the harness restores them before every agent cell, so in-place mutation in one cell cannot poison later attempts.
+- **Crash containment:** one coder session raising (backend timeout, kernel death) is recorded as a failed iteration and the run survives, instead of taking down the whole loop. Ollama client timeout raised to 600s (local prefill is genuinely slow on a long session).
+- Actual-run notebooks: the kernel's captured outputs are attached to the notebook cells (`build_session_notebook`), so the deliverable shows real execution results, not synthesized ones.
+
+**What shipped — cross-experiment knowledge transfer (first leg, v0.2):**
+- **Host-computed data profile** in `summarize_dataset` — cardinalities, missing counts, skew, class balance, and top numeric-target correlations, computed once from the training split and handed to BOTH the supervisor and every coder session. Established facts no session has to re-derive.
+- **Within-session validation trail** in the supervisor's history view — `(val tries: 0.58 -> 0.61 -> 0.59)` per experiment, so attempts that LOST inside a session inform the next brief, not just the final score.
+
+**Empirical findings (live churn / f1 runs, qwen3:14b):**
+- Best clean run reached **f1 0.6353, 5/5 experiments succeeding** with the harness fixes + monolithic cells (a new local-qwen high; baseline 0.5676). The harness lifts the floor model on SCORE and RELIABILITY.
+- **Staged-cells-vs-monolithic-script is MODEL-bound, not harness-bound** (RESEARCH_LOG 2026-06-07). A 14B defaults to writing a complete script and reverts to one big cell whenever handed a working blob to edit (every improve iteration); prompt wording reliably stages only the from-scratch iteration. Forcing staging on the floor model regressed reliability (0.5813, 2/5). Conclusion: lift the floor model on score/reliability via the harness; if staged R&D *notebooks* are wanted, do it at the deliverable layer, not by constraining a weak driver. The coder prompt's cell-structure target is therefore being settled out-of-band (see status).
+
+**What's pending (before v0.2 release):**
+- **The coder system prompt** — authored separately to reach the quality bar; the in-tree wording is provisional and will be replaced. This is the gating item.
+- Seed the code-path RNG for run-to-run reproducibility (still carried from Day 6).
+- The carry-forward (`_winning_code`) hands the next experiment a concatenated blob; if the finalized prompt assumes staged cells, revisit this.
+- Live e2b verification of the cell-by-cell path with a real key; one clean demo run; version bump to 0.2.0; publish.
+
+**Tests:** 282 unit tests; ruff + mypy --strict clean (43 src files). New suites: `test_kernel.py` (real-kernel state/error/timeout/outputs/namespace), `test_coder.py` (end-to-end through a real `LocalKernel` + real scoring with a scripted fake LLM; verified-finish, auto-install, breakers, input-reset, deadline accounting), `test_supervisor.py`, `test_agent_loop.py` (carry-forward, crash containment, history dedupe).
+
+**Decisions (yours, logged in DECISIONS.md):** cells always on (no flag); supervisor + coder both land in v0.2 (coder-first); no per-cell cap (time/turns are the bound); full context to the coder; deadline charges kernel time not LLM latency; protect the canonical inputs in the harness; the coder prompt's writing-style target is model-bound and owned out-of-band.
+
+**Next session:** integrate the finalized coder prompt when it arrives (preserving the placeholder contract + reliability guardrails), then the v0.2 release wrap-up (seed fix, live e2b, demo run, version bump, publish).
+
 ### 2026-06-04 | Week 4 Day 6 | Notebook deliverable + code-path hardening + prompt-vs-model
 
 **Task:** Ship the human deliverable (a runnable notebook), then harden the code path against what live runs surfaced, and settle empirically what actually limits exploration depth. Run on the real churn dataset throughout, which is how the bugs + findings came out.

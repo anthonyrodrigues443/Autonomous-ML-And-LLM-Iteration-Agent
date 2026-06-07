@@ -13,10 +13,10 @@ it. A run can emit the winner only (`best`) or one notebook per experiment (`all
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import nbformat
-from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
+from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook, new_output
 
 from iterate.core.codegen import is_code_candidate
 
@@ -58,6 +58,66 @@ def build_notebook(
         nb.cells.append(new_code_cell(_spec_cell(candidate, metric)))
     nb.cells.append(new_markdown_cell(_rationale_md(candidate)))
     return nb
+
+
+def build_session_notebook(
+    cells: list[Any],
+    *,
+    title: str,
+    metric: str,
+    score: float | None = None,
+    baseline_score: float | None = None,
+) -> NotebookNode:
+    """Render a cell-by-cell coding session as a runnable notebook.
+
+    Each `Cell` (code + captured stdout/error) becomes a code cell, with a short
+    markdown note showing what it printed or the error — so the notebook *is* the
+    session: the data inspection, the feature engineering, the dead ends, in order.
+    """
+    nb = new_notebook()
+    head = [f"# {title}", ""]
+    if score is not None:
+        line = f"**{metric} = {score:.4f}**"
+        if baseline_score is not None:
+            line += f"  ({score - baseline_score:+.4f} vs baseline {baseline_score:.4f})"
+        head.append(line)
+    head.append("\n_cell-by-cell session — outputs are the actual execution results_")
+    nb.cells = [new_markdown_cell("\n".join(head))]
+    for count, cell in enumerate(cells, start=1):
+        node = new_code_cell(_cell_get(cell, "code").strip())
+        node.execution_count = count
+        node.outputs = _cell_outputs(cell)
+        nb.cells.append(node)
+    return nb
+
+
+def _cell_outputs(cell: Any) -> list[Any]:
+    """Build the code cell's outputs: the real captured outputs if present, else
+    synthesize from the captured stdout/error strings (older cells / fallback)."""
+    captured = cell.get("outputs") if isinstance(cell, dict) else getattr(cell, "outputs", None)
+    if captured:
+        return [_to_nb_output(o) for o in captured]
+    error = _cell_get(cell, "error")
+    if error:
+        return [new_output("error", ename="Error", evalue=_error_oneline(error),
+                           traceback=error.splitlines())]
+    stdout = _cell_get(cell, "stdout")
+    if stdout.strip():
+        return [new_output("stream", name="stdout", text=stdout)]
+    return []
+
+
+def _to_nb_output(captured: dict[str, Any]) -> Any:
+    """Convert a captured output dict (from a kernel) to an nbformat output."""
+    kind = captured.get("type", "stream")
+    rest = {k: v for k, v in captured.items() if k != "type"}
+    return new_output(kind, **rest)
+
+
+def _cell_get(cell: Any, key: str) -> str:
+    """Read a string cell field whether it's a `Cell` object or a dict."""
+    value = cell.get(key) if isinstance(cell, dict) else getattr(cell, key, None)
+    return value or ""
 
 
 def save_notebook(node: NotebookNode, path: Path) -> Path:
@@ -159,4 +219,4 @@ def _rationale_md(candidate: Candidate) -> str:
     return f"### Rationale\n\n{candidate.rationale.strip() or '(none given)'}"
 
 
-__all__ = ["build_notebook", "save_notebook", "slug"]
+__all__ = ["build_notebook", "build_session_notebook", "save_notebook", "slug"]

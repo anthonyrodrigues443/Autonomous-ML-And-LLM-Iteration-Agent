@@ -15,7 +15,7 @@ import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import typer
 from rich.console import Console
@@ -196,14 +196,16 @@ def run(
     """Run the agent on a tabular dataset."""
     # Heavy imports live here, not at module top, so `iterate version`/`--help`
     # don't pay the pandas + scikit-learn import cost.
-    from iterate.adapters.compute.runner import CodeRunner, E2BCodeRunner, LocalCodeRunner
-    from iterate.adapters.compute.sandbox import SandboxExecutor
+    from iterate.adapters.compute.kernel import E2BKernel, LocalKernel, StatefulKernel
+    from iterate.adapters.compute.local import LocalExecutor
     from iterate.adapters.data.tabular import load_csv
-    from iterate.core.code_proposer import ENV_NOTE_AMBIENT, ENV_NOTE_INSTALL, CodeProposer
+    from iterate.core.agent_loop import run_supervised
+    from iterate.core.coder import CodingAgent
     from iterate.core.memory import SqliteMemory
     from iterate.core.orchestrator import Orchestrator
-    from iterate.core.proposer import Proposer, SupportsPropose, summarize_dataset
+    from iterate.core.proposer import Proposer, summarize_dataset
     from iterate.core.reconstructor import Reconstructor
+    from iterate.core.supervisor import Supervisor
     from iterate.core.terminator import default_terminator
     from iterate.llm.factory import build_client
     from iterate.targets.model import ModelTarget
@@ -281,25 +283,60 @@ def run(
     client = build_client(backend, model=model, base_url=base_url, api_key=api_key)
     memory: Memory = SqliteMemory(resolved_memory_path)
 
-    # ─── Baseline selection (the precedence we locked) ─────────────────────
-    baseline_candidate: Candidate | None
-    baseline_model: str
+    # ─── Terminator ────────────────────────────────────────────────────────
+    deadline_seconds = _parse_duration(until) if until is not None else None
+    terminator = default_terminator(
+        max_iterations=max_iterations, patience=patience, deadline_seconds=deadline_seconds
+    )
 
-    if source is not None:
-        source_text = _read_source(source)
-        baseline_candidate = Reconstructor(client).reconstruct(
+    mode = "cell-by-cell" if code else "spec"
+    console.print(
+        f"\n[dim]Running on {model_target.name}; target={target!r}, metric={metric}, "
+        f"mode={mode}, compute={compute}[/dim]\n"
+    )
+
+    if code:
+        # ─── Cell-by-cell: Supervisor briefs → Coding agent runs a kernel session ──
+        # Each session gets a fixed kernel-execution budget (no cell cap; LLM latency
+        # is not charged). --until bounds the WHOLE run via the terminator above —
+        # it is not a single experiment's budget.
+        supervisor = Supervisor(client, metric=metric)
+        # Local models live in a small context window (num_ctx); cap the coder's
+        # prompt well under it so the system prompt is never what truncates.
+        context_budget = 48_000 if backend == "ollama" else 400_000
+
+        def make_coder() -> CodingAgent:
+            kernel: StatefulKernel = (
+                E2BKernel(api_key=e2b_api_key) if compute == "e2b" else LocalKernel()
+            )
+            return CodingAgent(
+                client, kernel, metric=metric,
+                install=(install or compute == "e2b"),
+                context_budget_chars=context_budget,
+            )
+
+        result = run_supervised(
+            target=model_target, dataset=dataset, supervisor=supervisor,
+            make_coder=make_coder, terminator=terminator, memory=memory,
             data_summary=data_summary,
-            source_text=source_text,
-            metric=metric,
-            direction=direction,
         )
-        baseline_model = _candidate_model(baseline_candidate)
-        console.print(
-            f"[bold]baseline from source[/bold] ({source.name}): {baseline_candidate.description}"
-        )
-    elif not fresh:
-        prior = _prior_best(memory, model_target.name, direction)
-        if prior is not None and prior.result and prior.result.metrics:
+    else:
+        # ─── Spec path (allow-listed estimators) + the baseline precedence ─────
+        baseline_candidate: Candidate | None
+        baseline_model: str
+        if source is not None:
+            baseline_candidate = Reconstructor(client).reconstruct(
+                data_summary=data_summary, source_text=_read_source(source),
+                metric=metric, direction=direction,
+            )
+            baseline_model = _candidate_model(baseline_candidate)
+            console.print(
+                f"[bold]baseline from source[/bold] ({source.name}): "
+                f"{baseline_candidate.description}"
+            )
+        elif not fresh and (prior := _prior_best(memory, model_target.name, direction)) is not None:
+            assert prior.result is not None
+            assert prior.result.metrics is not None
             baseline_candidate = prior.candidate
             baseline_model = _candidate_model(prior.candidate)
             console.print(
@@ -309,48 +346,13 @@ def run(
         else:
             baseline_candidate = None
             baseline_model = _default_baseline_model(metric)
-    else:
-        baseline_candidate = None
-        baseline_model = _default_baseline_model(metric)
 
-    # ─── Proposer + executor (code path vs spec path) ──────────────────────
-    # The executor is always the sandbox executor: it runs spec candidates +
-    # baselines in-process and code candidates through the chosen runner. The
-    # --code/--spec flag only selects which proposer drives the loop.
-    proposer: SupportsPropose
-    runner: CodeRunner
-    if compute == "e2b":
-        runner = E2BCodeRunner(api_key=e2b_api_key)
-        env_note = ENV_NOTE_INSTALL
-    else:
-        runner = LocalCodeRunner(install=install)
-        env_note = ENV_NOTE_INSTALL if install else ENV_NOTE_AMBIENT
-    executor = SandboxExecutor(runner)
-    proposer = CodeProposer(client, environment_note=env_note) if code else Proposer(client)
-
-    # ─── Terminator + Orchestrator ─────────────────────────────────────────
-    deadline_seconds = _parse_duration(until) if until is not None else None
-    terminator = default_terminator(
-        max_iterations=max_iterations, patience=patience, deadline_seconds=deadline_seconds
-    )
-
-    orchestrator = Orchestrator(
-        model_target,
-        proposer,
-        executor,
-        terminator,
-        memory,
-        data_summary=data_summary,
-        baseline_model=baseline_model,
-        baseline_candidate=baseline_candidate,
-    )
-
-    mode = "code-gen" if code else "spec"
-    console.print(
-        f"\n[dim]Running on {model_target.name}; target={target!r}, metric={metric}, "
-        f"mode={mode}, compute={compute}[/dim]\n"
-    )
-    result = orchestrator.run()
+        orchestrator = Orchestrator(
+            model_target, Proposer(client), LocalExecutor(), terminator, memory,
+            data_summary=data_summary, baseline_model=baseline_model,
+            baseline_candidate=baseline_candidate,
+        )
+        result = orchestrator.run()
 
     # ─── Sanity check on user-reported baseline ────────────────────────────
     if baseline is not None and result.baseline.metrics is not None:
@@ -584,37 +586,37 @@ def _write_notebooks(
 ) -> None:
     """Render the run as runnable notebooks: the winner (`best`) or one per
     experiment (`all`). The full record is already in Memory; this just renders it."""
-    from iterate.deliver.notebook import build_notebook, save_notebook, slug
+    from iterate.deliver.notebook import build_notebook, build_session_notebook, save_notebook, slug
 
     baseline_score = (
         result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
     )
-    written: list[Path] = []
 
+    def _render(exp: Experiment, *, is_best: bool) -> Any:
+        # Cell-by-cell experiments carry their session ("cells"); render the real
+        # session. Spec / one-shot experiments render through the contract.
+        cells = exp.candidate.changes.get("cells")
+        if isinstance(cells, list):
+            score = exp.result.metrics.primary_value if exp.result and exp.result.metrics else None
+            title = ("🏆 best — " if is_best else "") + exp.candidate.description
+            return build_session_notebook(
+                cells, title=title, metric=metric, score=score, baseline_score=baseline_score
+            )
+        return build_notebook(
+            exp, data_path=data_path, target=target, metric=metric,
+            baseline_score=baseline_score, is_best=is_best,
+            leaderboard=result.history if is_best else None,
+        )
+
+    written: list[Path] = []
     if mode == "all":
         for exp in result.history:
-            node = build_notebook(
-                exp,
-                data_path=data_path,
-                target=target,
-                metric=metric,
-                baseline_score=baseline_score,
-                is_best=(result.best is not None and exp.id == result.best.id),
-            )
+            is_best = result.best is not None and exp.id == result.best.id
             name = f"iter_{exp.iteration:02d}_{slug(exp.candidate.description)}.ipynb"
-            written.append(save_notebook(node, run_dir / "notebooks" / name))
+            written.append(save_notebook(_render(exp, is_best=is_best), run_dir / "notebooks" / name))
 
     if result.best is not None:
-        best_nb = build_notebook(
-            result.best,
-            data_path=data_path,
-            target=target,
-            metric=metric,
-            baseline_score=baseline_score,
-            is_best=True,
-            leaderboard=result.history,  # the winner notebook carries the full "what was tried"
-        )
-        written.append(save_notebook(best_nb, run_dir / "best.ipynb"))
+        written.append(save_notebook(_render(result.best, is_best=True), run_dir / "best.ipynb"))
 
     if not written:
         return

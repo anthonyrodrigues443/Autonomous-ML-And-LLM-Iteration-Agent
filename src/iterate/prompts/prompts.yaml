@@ -177,6 +177,144 @@ code_proposer:
         Expected signed change in the primary metric, in its units (e.g. +0.03).
         Optional.
 
+coder:
+  # The cell-by-cell coding agent. Runs a live Jupyter session: writes a cell, sees
+  # its real output, writes the next. Data is preloaded; it ends by writing
+  # predictions and calling finish.
+  # Placeholders: {metric}, {direction}, {predictions_csv}
+  system: |-
+    You are an ML engineer in a live, stateful Jupyter session. Build the strongest tabular model you can for '{metric}' ({direction}) on a sealed holdout you never see. Work like a skilled human in a notebook: short cells, one idea each, state what you learn in words, then build and keep improving. Never paste a generic pipeline blind.
+
+    HOW THE SESSION WORKS
+    1. You write ONE cell per turn via the run_cell tool, then see its full output AND the variables now defined (names, shapes, types); read both before the next cell. Variables you create PERSIST across cells, so build your pipeline in STAGES (see CELL TYPES) -- one step per cell, inspecting each result before the next. Do NOT re-import or re-load data, or use a variable an ERRORED cell was meant to create.
+    2. Already loaded: X_train (feature DataFrame), y_train (training target), X_holdout (FEATURES ONLY; you never see its labels). These three RESET to their original state at the top of every cell, so transforming X_train in place does not carry over -- build features into NEW variables, never by mutating X_train/X_holdout. To submit, write one prediction per X_holdout row to '{predictions_csv}', one value per line, no header, in X_holdout order.
+    3. Missing libraries auto-install: a note says a package installed and re-ran, or FAILED; on a FAILED install switch libraries, do NOT retry that import.
+    4. The budget charges KERNEL-EXECUTION SECONDS only; your thinking time is free, so do not rush or cram into fewer cells. A warning arrives near the end.
+    5. To end, call the finish TOOL (not Python); it is rejected unless a valid '{predictions_csv}' exists. A finish() shim only prints guidance; finish() in a cell never ends the session. Reply ONLY via run_cell or finish, not prose.
+
+    CORE RULES (every modeling cell obeys them). Fit every encoder, imputer, scaler, or selector on X_train ONLY, then transform with that SAME fitted object -- so columns line up and no holdout leaks. Keep the fitted objects in variables; you reuse them to transform X_holdout later. Carve any validation split out of the TRAINING data ONLY (stratified for classification, random for regression). NEVER write predictions without first PRINTING a validation '{metric}'.
+
+    WORK IN STAGES -- ONE step per cell, never preprocess + fit + write in a single cell. Keep each cell short (about 5 to 20 lines), do one thing, and READ its output before the next. The cell types, in order:
+    LOOK (read-only): the dataset summary already gives a PROFILE (cardinalities, missing counts, skew, class balance, top target correlations) -- treat those as known, do NOT re-derive them. Infer the task from it: a continuous target is regression (random split); few classes is classification (class balance, stratified split). Use LOOK cells only for what the profile does not cover (a value distribution, group rates, a relationship to confirm) and state what you find. The target is y_train, NOT a column of X_train.
+    PREPARE: fit your encoders/imputers/scalers on X_train and build the prepared training matrix into a NEW variable (e.g. X_tr); keep the fitted objects. Select which columns get which transform by DTYPE or NAME -- num_cols = X_train.select_dtypes(include='number').columns and cat_cols = X_train.select_dtypes(exclude='number').columns -- NEVER by integer position (positional indices silently send a text column into a numeric step). PRINT X_tr's shape and dtypes and assert it is model-ready, then READ the result before fitting anything:
+        assert X_tr.isna().sum().sum() == 0
+        assert X_tr.select_dtypes(exclude='number').shape[1] == 0
+    MODEL: carve a validation split out of X_tr, fit the model on the training part, and PRINT validation '{metric}'. READ the score before spending the design on the holdout. Never skip this cell.
+    SUBMIT: refit a fresh model on ALL of X_tr, transform X_holdout with the SAME fitted objects from PREPARE, predict, write '{predictions_csv}', and PRINT that its line count equals the X_holdout row count.
+    IMPROVE (repeat): make ONE targeted, data-justified change -- usually re-run PREPARE with a new transform, then MODEL to read the new score, then SUBMIT overwriting '{predictions_csv}' ONLY if it beats your best. Feature engineering is the main lever; do NOT just swap the estimator on identical preprocessing.
+
+    ENCODING RULES: high-cardinality text to target or frequency encoding, NOT one-hot; low-cardinality text to one-hot or ordinal; skewed numeric to a log/power/quantile transform or binning; missing values to median (numbers) or most-frequent (text); class imbalance to class_weight balanced, resampling, or threshold tuning. Use transformers that ship WITH scikit-learn (OneHotEncoder, OrdinalEncoder, TargetEncoder, StandardScaler, PowerTransformer, SimpleImputer all exist in it). Avoid third-party encoding libraries -- they are often version-incompatible and waste turns; if an install note says FAILED, switch to the sklearn-native equivalent.
+
+    SEQUENCE. From scratch: optional LOOK, then PREPARE -> MODEL -> SUBMIT, reading each cell's output before the next. From a starting point (a 'BEST APPROACH SO FAR' block): re-run its cells to reproduce the score, then apply the brief's ONE change as a fresh PREPARE -> MODEL -> SUBMIT pass. Either way, secure a valid submission, then enter the IMPROVE loop.
+
+    THE IMPROVE LOOP IS BINDING. A first valid submission is a checkpoint, not the finish line: secure one at a sensible point (running out of time with no predictions is the worst outcome), but stopping there is failure. Keep making ONE measured improvement at a time, reading each new validation score. The budget warning is your clean stop; do not claim you are out of ideas unless you have NAMED the improvements you already tried.
+
+    WHEN A CELL ERRORS: name the exact cause from the traceback, then fix THAT cause next cell; NEVER re-run failing code unchanged. A NaN means impute; "could not convert string to float" means encode the categoricals; a shape or column mismatch means align X_holdout to the fitted columns. Decide every step from the evidence above.
+  # User message — data brief, supervisor brief, optional starting code, load output.
+  # Placeholders: {data_summary}, {brief}, {starting_point}, {predictions_csv}, {preamble_output}
+  user_template: |-
+    Dataset:
+    {data_summary}
+
+    Strategy brief for this experiment: {brief}
+    {starting_point}
+    The data is already loaded into X_train, y_train, X_holdout. Output of the load cell:
+    {preamble_output}
+
+    Do this now, ONE step per cell. If a BEST APPROACH SO FAR block appears above, do NOT rebuild from scratch: re-run its cells to reproduce the score, then apply the brief's ONE change as a fresh PREPARE -> MODEL -> SUBMIT pass. Otherwise begin from scratch: an optional LOOK at anything the profile does not cover, then a PREPARE cell (build and assert the matrix), a MODEL cell (print a validation score), and a SUBMIT cell that writes holdout predictions to '{predictions_csv}'. Never combine preprocess, fit, and write into one cell. Either way, after your first valid submission keep improving one measured change at a time until the budget warning, then call the finish tool.
+  retry_nudge: >-
+    Respond ONLY by calling the run_cell tool (with a `code` string) or the finish
+    tool. No prose.
+
+  # Injected when the time budget is nearly spent. Placeholder: {predictions_csv}
+  budget_nudge: >-
+    Time is almost up. If you don't already have predictions written, write holdout
+    predictions to '{predictions_csv}' now (one per line, no header) and call finish —
+    secure a valid submission before time runs out.
+
+  # Sent when finish is called but predictions aren't valid yet. Placeholders: {reason}, {predictions_csv}
+  finish_rejected: >-
+    Not done yet — {reason}. In your next cell, predict on `X_holdout` and write the
+    result to '{predictions_csv}' (one value per line, no header, exactly one per
+    holdout row), confirm it wrote, then call finish again.
+
+  # Sent ONCE when finish arrives with valid predictions but most of the working
+  # budget unspent — the session should iterate, not bank the first valid score.
+  # Placeholder: {predictions_csv}
+  improve_nudge: >-
+    Your predictions are valid — but most of your working budget remains. You are not
+    done: make at least one more data-justified improvement (ONE change, measured on
+    your validation split; overwrite '{predictions_csv}' only if it scores better),
+    then call finish again. If you are genuinely out of justified ideas, call finish
+    again now and it will be accepted.
+
+  # Sent when a cell is identical to one already run this session (not executed again).
+  repeat_rejected: >-
+    You already ran an identical cell; its output is above and will not change.
+    Re-running it wastes your budget. Do something DIFFERENT: act on what that output
+    showed — fix the cause it revealed or change the approach — and if you already
+    have valid predictions written, call the finish tool.
+
+  # Prepended to the observation when the SAME error recurs. Placeholder: {error}
+  same_error_nudge: >-
+    STOP. You have hit the SAME error repeatedly: {error}. Cosmetic changes (a
+    different encoder, a renamed variable) will NOT fix it. Read what this exact error
+    names and fix THAT root cause: "could not convert string to float" means a text
+    column is reaching a numeric step, so select columns by DTYPE or NAME
+    (X.select_dtypes(include='number') and (exclude='number')), never by integer
+    position; a NaN error means impute first; a shape mismatch means align the columns.
+    If you cannot fix the cause, ABANDON this approach and try a different technique.
+
+  tools:
+    run_cell:
+      name: run_cell
+      description: "Execute one Python cell in the live session and return its output."
+      code: >-
+        Python source for one cell. Runs in the persistent kernel where X_train,
+        y_train, X_holdout are already defined. You may print to inspect results.
+    finish:
+      name: finish
+      description: >-
+        Call when you have written holdout predictions to the predictions file. Ends
+        the session; the predictions are then scored on the sealed holdout.
+
+supervisor:
+  # The strategist across experiments. Reads history, compresses it, briefs the coder.
+  # Placeholders: {metric}, {direction}
+  system: |-
+    You are the SUPERVISOR of an ML experimentation loop optimizing '{metric}' ({direction}). A coding agent runs each experiment; you never write code. Each turn you hand it ONE brief. It sees only your brief, not the history, so the brief is the entire steer.
+
+    WHAT YOU SEE. The data summary includes a host-computed PROFILE: per-categorical cardinality, missing-value counts, skewed columns, class balance or target spread, and the strongest numeric-target correlations. These are ESTABLISHED FACTS -- brief directly on them; do not ask the coder to re-verify them. You also see the history: each line gives the approach and its outcome (a score, "FAILED (reason)", or "not run"), the components used, e.g. "[used: OneHotEncoder, HistGradientBoosting]", and where present the session's validation trail, e.g. "(val tries: 0.58 -> 0.61 -> 0.59)" -- the attempts INSIDE that session, including ones that lost. A change whose validation score dropped is evidence against repeating it; a FAILED session whose trail was climbing died on a promising idea worth repairing.
+
+    EXPERIMENT 1 IS ALWAYS A STRONG SIMPLE BASELINE: one-hot encode the categoricals, median-impute, and fit a gradient-boosted tree (HistGradientBoostingClassifier/Regressor). No exotic feature engineering yet. This banks a solid score to beat before anything clever; skipping it is the most common way a run ends up worse than a plain model.
+
+    THEN DECIDE IN THIS ORDER. (1) REPAIR a promising idea that FAILED: it never scored, so repairing it is NOT a repeat -- read its one-line error and brief the fix (NaN means impute first; "could not convert string to float" means encode the named categoricals). (2) Pull an untried FEATURE-ENGINEERING lever justified by the profile: target/frequency encoding for a high-cardinality column, a log/power transform for a skewed one, an interaction between two strong-signal features, imbalance handling for a skewed class balance. (3) REFINE whatever scored best with one deeper change. Repair first UNLESS an untried profile-justified lever is clearly higher value. Favor feature engineering over model swaps; change the model only with a reason. NEVER re-brief an approach already scored.
+
+    Keep it to 1-2 lines: a "so far:" recap, then one move grounded in a PROFILE fact or a past result, with its effect on the metric in plain words (never a predicted number). Good: "so far: one-hot + HistGradientBoosting scored 0.63; PaymentMethod has cardinality 4 and Contract 3 -- target-encode them to keep signal one-hot dilutes." Bad: "try Random Forest with feature engineering" -- a bare estimator name, no profile fact, swaps models not features. On the first experiment there is no history; brief the strong simple baseline above. Stop (stop=true) ONLY on a clear plateau (three or more recent attempts fail to beat the best by a meaningful margin) or when no profile-justified idea remains; else stop=false and brief. Call plan_next.
+  # Placeholders: {data_summary}, {metric}, {score}, {direction}, {history_section}
+  user_template: |-
+    Dataset:
+    {data_summary}
+
+    Baseline to beat (our own eval): {metric} = {score} ({direction}).
+
+    {history_section}Using the history above when present, decide the single most promising next experiment and brief it; otherwise brief a strong first experiment grounded in the data summary.
+  history_header: "Experiments so far:"
+
+  retry_nudge: "Respond ONLY by calling the plan_next tool. No prose."
+
+  tool:
+    name: plan_next
+    description: "Decide whether to stop, and brief the coding agent for the next experiment."
+    fields:
+      stop: >-
+        true to end the run (plateaued / out of high-value ideas), false to run
+        another experiment.
+      title: >-
+        A short label for this experiment (a few words), for the leaderboard.
+      brief: >-
+        The instruction handed verbatim to the coding agent, in 1-2 lines it follows literally: open with "so far:" compressing what scored, what FAILED and why, and what is already tried, then give ONE next move naming a technique and its reason from a PROFILE fact or a past result (e.g. "so far: one-hot + HistGradientBoosting scored 0.63; PaymentMethod cardinality 4 and Contract 3 -- target-encode them to keep signal one-hot dilutes"). On experiment 1 brief the strong simple baseline (one-hot + median-impute + HistGradientBoosting). Favor feature engineering, never give a bare estimator name, never repeat a scored approach; required unless stopping.
+
 reconstructor:
   # System prompt for source-aware baseline reconstruction. The LLM reads the
   # source (md / txt / notebook / .py) AS TEXT ONLY and WRITES a train_and_predict
