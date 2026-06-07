@@ -102,6 +102,40 @@ def test_slug_is_filesystem_safe() -> None:
     assert slug("") == "experiment"
 
 
+def test_session_notebook_attaches_real_outputs_to_cells() -> None:
+    from iterate.deliver.notebook import build_session_notebook
+
+    cells = [
+        # a cell with REAL captured outputs (a stream + an execute_result)
+        {
+            "code": "print('hi'); 6*7",
+            "stdout": "hi\n",
+            "error": None,
+            "source": "agent",
+            "outputs": [
+                {"type": "stream", "name": "stdout", "text": "hi\n"},
+                {"type": "execute_result", "data": {"text/plain": "42"}, "execution_count": 1},
+            ],
+        },
+        # a cell with only an error string (no structured outputs) → fallback
+        {"code": "boom()", "stdout": "", "error": "NameError: name 'boom' is not defined",
+         "source": "agent", "outputs": []},
+    ]
+    nb = build_session_notebook(cells, title="logreg session", metric="f1", score=0.61, baseline_score=0.57)
+    nbformat.validate(nb)  # schema-valid executed notebook
+    assert "f1 = 0.6100" in nb.cells[0].source  # header
+    code_cells = [c for c in nb.cells if c.cell_type == "code"]
+    assert len(code_cells) == 2
+    assert code_cells[0].execution_count == 1
+    # the real captured outputs are attached to the cell (not markdown notes)
+    kinds = [o.output_type for o in code_cells[0].outputs]
+    assert "stream" in kinds
+    assert "execute_result" in kinds
+    # the error cell falls back to a synthesized error output
+    assert code_cells[1].outputs[0].output_type == "error"
+    assert "boom" in "\n".join(code_cells[1].outputs[0].traceback)
+
+
 def test_save_round_trips(tmp_path: Path) -> None:
     nb = build_notebook(_experiment(code=_FN), data_path="d.csv", target="y", metric="f1")
     path = save_notebook(nb, tmp_path / "sub" / "best.ipynb")

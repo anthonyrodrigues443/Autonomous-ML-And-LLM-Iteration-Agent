@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     # OpenAI-compatible /v1 layer above cannot disable qwen3 thinking (think:false works
     # only here): ~20s vs ~128s per tool call.
     ollama_host: str = "http://localhost:11434"
+    # Context window to request from Ollama. Its server default (4096) silently
+    # FRONT-truncates a growing cell-by-cell session — dropping the system prompt and
+    # tool schema first (confirmed live: "truncating input prompt" limit=4096 keep=4).
+    # qwen3:14b supports 40960; 16384 balances that against laptop KV-cache memory.
+    ollama_num_ctx: int = 16384
+    # Local models legitimately take minutes per call once the session transcript
+    # grows (prefill is compute-bound on a laptop) — far past the cloud default.
+    ollama_timeout: float = 600.0
 
     # ─── Sandbox + dataset access ──────────────────────────────────
     e2b_api_key: str | None = None

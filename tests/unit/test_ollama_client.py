@@ -102,6 +102,18 @@ def test_temperature_and_max_tokens_map_to_options(monkeypatch: pytest.MonkeyPat
     assert captured["payload"]["options"]["num_predict"] == 256
 
 
+def test_num_ctx_is_always_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Ollama's 4096 default front-truncates long sessions (system prompt + tools
+    # dropped first) — the client must always request a real context window.
+    captured: dict[str, Any] = {}
+    _patch_post(monkeypatch, _NATIVE_TOOL_REPLY, captured)
+    OllamaClient().chat([Message(role="user", content="hi")])
+    assert captured["payload"]["options"]["num_ctx"] == 16384
+
+    OllamaClient(num_ctx=8192).chat([Message(role="user", content="hi")])
+    assert captured["payload"]["options"]["num_ctx"] == 8192
+
+
 def test_plain_content_no_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
     reply = {
         "model": "qwen3:14b",

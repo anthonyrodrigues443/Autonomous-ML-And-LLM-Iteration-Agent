@@ -33,6 +33,19 @@ if TYPE_CHECKING:
 _RETRYABLE = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
 
 
+def _parse_arguments(raw: str | None) -> dict[str, Any]:
+    """Tool-call arguments as a dict, whatever the backend sent. Groq emits the
+    string "null" for no-arg tools; weak models can emit malformed JSON — both
+    must degrade to {} (the loop nudges a retry), never crash the run."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 class OpenAICompatibleClient:
     """Calls an OpenAI-compatible chat endpoint. Defaults come from config (local Ollama).
 
@@ -136,12 +149,11 @@ class OpenAICompatibleClient:
         for tc in message.tool_calls or []:
             if tc.type != "function":  # ignore non-function tool calls (e.g. custom)
                 continue
-            raw = tc.function.arguments
             tool_calls.append(
                 ToolCall(
                     id=tc.id,
                     name=tc.function.name,
-                    arguments=json.loads(raw) if raw else {},
+                    arguments=_parse_arguments(tc.function.arguments),
                 )
             )
         usage = Usage()

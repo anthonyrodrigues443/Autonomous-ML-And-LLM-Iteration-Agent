@@ -201,3 +201,25 @@ def test_summarize_dataset_describes_shape_and_target(tmp_path: Path) -> None:
     assert "train" in summary
     assert "numeric" in summary
     assert "categorical" in summary
+
+
+def test_summarize_dataset_includes_a_profile(tmp_path: Path) -> None:
+    n = 80
+    frame = pd.DataFrame(
+        {
+            "age": list(range(n)),
+            "city": [f"c{i % 12}" for i in range(n)],  # high-cardinality categorical
+            "plan": (["a", "b"] * (n // 2)),  # low-cardinality categorical
+            "churn": [i % 2 for i in range(n)],
+        }
+    )
+    frame.loc[0:6, "age"] = None  # introduce missing values
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / "d.csv"
+    frame.to_csv(path, index=False)
+    summary = summarize_dataset(load_csv(path, target="churn"))
+    # the host-computed profile facts the supervisor and coder now rely on
+    assert "cardinality" in summary.lower()
+    assert "city=" in summary  # per-categorical cardinality is reported
+    assert "Missing values:" in summary
+    assert "Class balance:" in summary

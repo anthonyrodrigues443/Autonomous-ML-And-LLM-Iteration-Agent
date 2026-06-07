@@ -84,8 +84,18 @@ PROPOSE_CANDIDATE = _build_tool()
 
 
 def summarize_dataset(dataset: TabularDataset) -> str:
-    """A compact, LLM-facing brief of a tabular dataset."""
-    numeric = dataset.train_features.select_dtypes(include="number").columns.tolist()
+    """A compact, LLM-facing brief of a tabular dataset, including a host-computed
+    PROFILE (cardinalities, missingness, skew, class balance, target signal).
+
+    Computed once from the TRAINING split only, and reaching both the supervisor and
+    every coder session via the `data_summary` placeholder — the first leg of
+    cross-experiment knowledge transfer: established dataset facts no session should
+    re-derive (and the supervisor should never have to guess at)."""
+    import pandas as pd
+
+    feats = dataset.train_features
+    target = dataset.train_target
+    numeric = feats.select_dtypes(include="number").columns.tolist()
     categorical = [c for c in dataset.features if c not in numeric]
     lines = [
         f"Rows: {dataset.n_train} train / {dataset.n_test} test (sealed holdout).",
@@ -95,7 +105,40 @@ def summarize_dataset(dataset: TabularDataset) -> str:
     if numeric:
         lines.append(f"Numeric: {', '.join(numeric[:20])}.")
     if categorical:
-        lines.append(f"Categorical: {', '.join(categorical[:20])}.")
+        cards = sorted(((c, int(feats[c].nunique())) for c in categorical[:30]), key=lambda kv: -kv[1])
+        lines.append("Categorical (cardinality): " + ", ".join(f"{c}={n}" for c, n in cards[:15]) + ".")
+    missing = feats.isna().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+    lines.append(
+        "Missing values: "
+        + (", ".join(f"{c}={int(n)}" for c, n in missing.head(10).items()) or "none")
+        + "."
+    )
+    if numeric:
+        skews = feats[numeric].skew(numeric_only=True).abs().sort_values(ascending=False)
+        skewed = skews[skews > 1.0]
+        if not skewed.empty:
+            lines.append(f"Skewed numeric (|skew|>1): {', '.join(skewed.head(8).index)}.")
+    if target.nunique() <= 20:  # classification: balance + a numeric code for signal
+        counts = target.value_counts(normalize=True)
+        lines.append(
+            "Class balance: " + ", ".join(f"{v!r}: {p:.0%}" for v, p in counts.head(6).items()) + "."
+        )
+        codes = pd.Series(pd.factorize(target)[0], index=target.index)
+    else:  # regression: spread
+        lines.append(
+            f"Target spread: mean={target.mean():.4g}, std={target.std():.4g}, "
+            f"min={target.min():.4g}, max={target.max():.4g}."
+        )
+        codes = target
+    if numeric:
+        corr = feats[numeric].corrwith(codes).abs().sort_values(ascending=False).dropna().head(5)
+        if not corr.empty:
+            lines.append(
+                "Strongest numeric-target signal (|corr|): "
+                + ", ".join(f"{c}={v:.2f}" for c, v in corr.items())
+                + "."
+            )
     return "\n".join(lines)
 
 

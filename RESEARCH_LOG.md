@@ -191,3 +191,25 @@ This is the "papers → citations" pattern that separates research engineers fro
 3. Aggressive feature engineering by a weak model also produced silent **near-zero** scores (NaN/inf, single-class predictions) it couldn't foresee while writing the whole pipeline blind — the decisive argument for pulling **cell-by-cell execution into v0.2** (inspect-then-build catches it mid-session).
 
 **Out of scope today:** the LLM-summary version of the digest (v0.4), seeding the code path for run-to-run reproducibility (pending), and a pre-run undefined-name lint (pending).
+
+## 2026-06-07 — Experiment: making a weak local model reliable cell-by-cell, and where the harness ends
+
+**Question:** With the v0.2 cell-by-cell system built, what actually makes a weak driver (`qwen3:14b`) reliable across a multi-experiment run, and is "writes clean stepwise cells" something the harness can deliver or is it model-bound? Resolved by repeated live runs on churn / f1 (`--fresh`, max-iter 5, patience 3), reading every cell of every notebook.
+
+**Method:** iterated the harness against real qwen runs, each time root-causing failures from the captured notebooks + the Ollama server log rather than guessing, then fixing the harness (not the model) and re-running. Held the dataset, metric, and backend constant.
+
+**Findings (each fix traced to an observed failure):**
+- **The full-context design wasn't reaching the model.** The Ollama client never set `num_ctx`, so the server ran at its 4096 default and FRONT-truncated the growing session — the system prompt + tool schema were the first thing dropped (server log: `truncating input prompt limit=4096 keep=4`). Pinning `num_ctx` (16384) + a prompt-side budget that elides oldest observations first was the single highest-leverage fix.
+- **Silent broken affordances cause loops, not the model.** Auto-install was a no-op in uv venvs (no `pip`) and failed silently, so the agent re-tried an import that could never resolve; the `finish()` tool conflated with a `finish()` Python call NameError-ed otherwise-good cells. Making each affordance either work (pip→uv→ensurepip fallback) or VISIBLY report failure converted loops into course-corrections.
+- **Weak models perseverate; bound it structurally.** Two breakers — refuse an identical re-submitted cell (repeated-cell), and escalate when the SAME error signature recurs across cosmetically-different cells (same-error) — kill the 14B's characteristic thrash (e.g. swapping the encoder five times while the real cause, a string column reaching a numeric step, is unchanged).
+- **Charge the budget in kernel-seconds, not wall-clock.** Local thinking latency (~1-2 min/turn) would otherwise starve a weak driver of the turns a fast cloud model gets free; bounding by kernel-execution time gives any backend the same working budget.
+- **Result:** with these fixes (and monolithic cells), local qwen reached **f1 0.6353 with 5/5 experiments succeeding** (baseline 0.5676) — a new local-qwen high, and the whole curve above baseline. The harness lifts the floor model on **score and reliability**, the infra-over-model thesis holding on the failure axis, not just the score axis.
+
+- **The one thing the harness could NOT deliver: stepwise writing style.** A 14B's default output is a complete script; it stages only when there is nothing to anchor to (the from-scratch iteration). The moment it is handed a working pipeline to edit (every improve iteration), it reverts to one monolithic cell, regardless of prompt wording. Forcing staging via the prompt regressed reliability to **0.5813, 2/5** (the extra cells gave the weak model more rope: positional-index bugs, then thrash). Conclusion: **staged-vs-monolithic is model-bound, not harness-bound** — a stronger backend stages naturally. This is the boundary of "lift the weak model by harness": we can make it *perform* like a strong model (score, reliability), not *write* like one.
+
+**Decisions:**
+1. Ship the reliability fixes (num_ctx + budget, install fallback + visibility, verified-finish, improve-nudge, both breakers, finish-shim, input-protection, kernel-time budget, crash-containment) as the v0.2 harness. (Shipped this session; 282 unit tests.)
+2. Add the first leg of cross-experiment knowledge transfer: a host-computed data profile + the within-session validation trail in the supervisor's view. (Shipped.)
+3. Stop prompt-tuning the coder for cell structure in-session; author the prompt out-of-band to reach the quality bar. If staged R&D *notebooks* are wanted, do it at the deliverable layer (split the winning pipeline into labeled sections), not by constraining the driver. (DECISIONS.md 2026-06-07.)
+
+**Out of scope / pending:** the finalized coder prompt (gating v0.2); seeding the code path for reproducibility; revisiting the concatenated carry-forward if the finalized prompt assumes staged cells; the LLM-summarizer + Critic specialists (v0.4).
