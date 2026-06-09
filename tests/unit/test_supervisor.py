@@ -134,6 +134,42 @@ def test_history_renders_digests_and_a_technique_scoreboard() -> None:
     assert "TargetEncoder 0.6100" in sent
 
 
+def test_lever_ledger_lists_tried_and_untried_classes() -> None:
+    # one experiment used one-hot + class_weight + an interaction column; the ledger
+    # must mark those classes tried and surface the rest as NOT yet tried.
+    prior = Experiment(
+        candidate=Candidate(
+            description="baseline plus imbalance",
+            changes={
+                "code": (
+                    "from sklearn.preprocessing import OneHotEncoder\n"
+                    "model = RandomForestClassifier(class_weight='balanced')\n"
+                    "X['tenure_per_charge'] = X['tenure'] / X['MonthlyCharges']\n"
+                )
+            },
+            rationale="r",
+        ),
+        target="t",
+        hypothesis="h",
+        status="completed",
+        result=ExperimentResult(
+            experiment_id="e",
+            metrics=Metrics(values={"f1": 0.6}, primary="f1", direction="maximize"),
+        ),
+    )
+    fake = _FakeLLM([_plan(False, "next", "pull an untried lever")])
+    Supervisor(fake, metric="f1").decide(data_summary="d", baseline=_baseline(), history=[prior])
+    sent = "\n".join(m.content or "" for m in fake.calls[0])
+    assert "Levers tried:" in sent
+    tried_line = next(ln for ln in sent.splitlines() if ln.startswith("Levers tried:"))
+    tried, untried = tried_line.split("| Levers NOT yet tried:")
+    assert "categorical-encoding" in tried
+    assert "imbalance-or-threshold" in tried
+    assert "interactions-or-ratios" in tried
+    assert "numeric-transform" in untried  # never touched -> explicitly surfaced
+    assert "ensembling" in untried
+
+
 def test_history_shows_within_session_validation_trail() -> None:
     # a session that printed several validation scores as it iterated — the supervisor
     # must see the trail (incl. the attempts that lost), not just the final score.

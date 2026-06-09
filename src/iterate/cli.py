@@ -628,9 +628,10 @@ def _render_experiment(
     cells = exp.candidate.changes.get("cells")
     if isinstance(cells, list):
         score = exp.result.metrics.primary_value if exp.result and exp.result.metrics else None
-        title = ("🏆 best — " if is_best else "") + exp.candidate.description
+        title = ("best: " if is_best else "") + exp.candidate.description
         return build_session_notebook(
-            cells, title=title, metric=metric, score=score, baseline_score=baseline_score
+            cells, title=title, metric=metric, score=score, baseline_score=baseline_score,
+            hypothesis=exp.hypothesis, findings=exp.digest,
         )
     return build_notebook(
         exp, data_path=data_path, target=target, metric=metric,

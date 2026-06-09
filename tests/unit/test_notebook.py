@@ -167,6 +167,48 @@ def test_session_notebook_renders_thinking_as_markdown_before_the_cell() -> None
     assert "prepare(X_train)" in nb.cells[idx + 1].source
 
 
+def test_session_notebook_renders_hypothesis_and_findings() -> None:
+    from iterate.deliver.notebook import build_session_notebook
+
+    cells = [{"code": "x=1", "stdout": "ok", "error": None, "source": "agent", "outputs": []}]
+    digest = {
+        "what_helped": ["target encoding: 0.55 -> 0.61"],
+        "what_hurt": ["power transform: no change"],
+        "data_insights": ["27% positive class"],
+        "val_trail": "0.55 -> 0.61",
+        "takeaway": "Add threshold tuning next.",
+    }
+    nb = build_session_notebook(
+        cells, title="t", metric="f1", score=0.61,
+        hypothesis="so far: one-hot scored 0.55; target-encode the high-cardinality columns",
+        findings=digest,
+    )
+    nbformat.validate(nb)
+    md = [c.source for c in nb.cells if c.cell_type == "markdown"]
+    # hypothesis right after the header, carrying the supervisor brief verbatim
+    assert "## Hypothesis" in md[1]
+    assert "target-encode the high-cardinality columns" in md[1]
+    # findings is the LAST cell: helped/hurt/insights/trail/takeaway all rendered
+    assert nb.cells[-1].cell_type == "markdown"
+    last = nb.cells[-1].source
+    assert "## Findings" in last
+    assert "target encoding: 0.55 -> 0.61" in last
+    assert "power transform: no change" in last
+    assert "27% positive class" in last
+    assert "**Takeaway:** Add threshold tuning next." in last
+
+
+def test_session_notebook_skips_hypothesis_and_findings_when_absent() -> None:
+    from iterate.deliver.notebook import build_session_notebook
+
+    cells = [{"code": "x=1", "stdout": "", "error": None, "source": "agent", "outputs": []}]
+    nb = build_session_notebook(cells, title="t", metric="f1")
+    nbformat.validate(nb)
+    text = "\n".join(c.source for c in nb.cells if c.cell_type == "markdown")
+    assert "## Hypothesis" not in text
+    assert "## Findings" not in text
+
+
 def test_save_round_trips(tmp_path: Path) -> None:
     nb = build_notebook(_experiment(code=_FN), data_path="d.csv", target="y", metric="f1")
     path = save_notebook(nb, tmp_path / "sub" / "best.ipynb")

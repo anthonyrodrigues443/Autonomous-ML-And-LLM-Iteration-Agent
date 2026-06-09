@@ -126,11 +126,14 @@ def _build_messages(
     if history:
         recent = history[-_HISTORY_LIMIT:]
         lines = _format_history(recent, metric)
-        table = _technique_table(recent, metric)
-        table_block = (table + "\n\n") if table else ""
-        history_section = (
-            _PROMPTS["history_header"] + "\n" + "\n".join(lines) + "\n\n" + table_block
+        # the ledger scans the FULL history: a lever tried before the display
+        # window is still tried.
+        extras = "".join(
+            block + "\n\n"
+            for block in (_technique_table(recent, metric), _lever_ledger(history))
+            if block
         )
+        history_section = _PROMPTS["history_header"] + "\n" + "\n".join(lines) + "\n\n" + extras
     else:
         history_section = "No experiments yet — brief the first one.\n\n"
     user = _PROMPTS["user_template"].format(
@@ -201,6 +204,43 @@ def _format_history(history: list[Experiment], metric: str) -> list[str]:
             if exp.digest.takeaway:
                 lines.append(f"    next-idea: {exp.digest.takeaway}")
     return lines
+
+
+# Technique LEVER classes, each detected by deterministic code markers. The ledger
+# built from these makes coverage explicit ("what is done and what is not") — run
+# c7ddda92 left the imbalance lever untouched for 9 of 10 experiments while the
+# supervisor orbited model swaps, because nothing surfaced the untried classes.
+# Markers are matched case-insensitively against each experiment's full code.
+_LEVER_MARKERS: dict[str, tuple[str, ...]] = {
+    "categorical-encoding": ("onehotencoder", "targetencoder", "ordinalencoder", "get_dummies"),
+    "numeric-transform": ("powertransformer", "quantiletransformer", "log1p", "np.log"),
+    "imbalance-or-threshold": ("class_weight", "scale_pos_weight", "smote", "threshold"),
+    "interactions-or-ratios": ("polynomialfeatures", "interaction", "ratio", "_per_"),
+    "feature-selection": ("selectkbest", "selectfrommodel", "rfe(", "feature_importances"),
+    "ensembling": ("votingclassifier", "stackingclassifier", "votingregressor", "stackingregressor"),
+    "hyperparameter-search": ("gridsearchcv", "randomizedsearchcv", "halvinggridsearchcv"),
+}
+
+
+def _lever_ledger(history: list[Experiment]) -> str:
+    """One explicit done/not-done line across the technique lever classes, scanned
+    from every experiment's code (full history, not just the display window). The
+    supervisor should pull from the NOT-yet-tried side instead of re-orbiting the
+    tried side."""
+    if not history:
+        return ""
+    tried: set[str] = set()
+    for exp in history:
+        code = exp.candidate.changes.get("code")
+        if not isinstance(code, str):
+            continue
+        low = code.lower()
+        for lever, markers in _LEVER_MARKERS.items():
+            if lever not in tried and any(m in low for m in markers):
+                tried.add(lever)
+    tried_s = ", ".join(lv for lv in _LEVER_MARKERS if lv in tried) or "none"
+    untried_s = ", ".join(lv for lv in _LEVER_MARKERS if lv not in tried) or "none"
+    return f"Levers tried: {tried_s} | Levers NOT yet tried: {untried_s}"
 
 
 def _technique_table(history: list[Experiment], metric: str) -> str:
