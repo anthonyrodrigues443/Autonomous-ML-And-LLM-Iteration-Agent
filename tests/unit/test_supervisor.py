@@ -98,6 +98,42 @@ def test_history_shows_components_to_the_supervisor() -> None:
     assert "f1=0.5500" in sent
 
 
+def test_history_renders_digests_and_a_technique_scoreboard() -> None:
+    from iterate.schemas.experiment import ExperimentDigest
+
+    def _exp(desc: str, score: float, techs: list[str], digest: ExperimentDigest) -> Experiment:
+        return Experiment(
+            candidate=Candidate(description=desc, changes={"code": "x=1"}, rationale="r"),
+            target="t", hypothesis="h", status="completed",
+            result=ExperimentResult(
+                experiment_id=desc,
+                metrics=Metrics(values={"f1": score}, primary="f1", direction="maximize"),
+            ),
+            digest=digest,
+        )
+
+    hist = [
+        _exp("one-hot baseline", 0.55, ["OneHotEncoder"], ExperimentDigest(
+            techniques=["OneHotEncoder", "HistGradientBoosting"], score=0.55,
+            data_insights=["27% positive class"], what_helped=[], what_hurt=[],
+            takeaway="Try target encoding on PaymentMethod.")),
+        _exp("target encoding", 0.61, ["TargetEncoder"], ExperimentDigest(
+            techniques=["TargetEncoder", "HistGradientBoosting"], score=0.61,
+            what_helped=["target encoding: 0.55 -> 0.61"], what_hurt=[],
+            data_insights=[], takeaway="Add an interaction feature.")),
+    ]
+    fake = _FakeLLM([_plan(False, "next", "build on target encoding")])
+    Supervisor(fake, metric="f1").decide(data_summary="d", baseline=_baseline(), history=hist)
+    sent = "\n".join(m.content or "" for m in fake.calls[0])
+    # the digests' insight reaches the supervisor
+    assert "target encoding: 0.55 -> 0.61" in sent
+    assert "next-idea: Add an interaction feature." in sent
+    assert "27% positive class" in sent
+    # the technique scoreboard surfaces the best score per technique
+    assert "Technique scoreboard" in sent
+    assert "TargetEncoder 0.6100" in sent
+
+
 def test_history_shows_within_session_validation_trail() -> None:
     # a session that printed several validation scores as it iterated — the supervisor
     # must see the trail (incl. the attempts that lost), not just the final score.

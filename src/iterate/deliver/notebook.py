@@ -73,6 +73,9 @@ def build_session_notebook(
     Each `Cell` (code + captured stdout/error) becomes a code cell, with a short
     markdown note showing what it printed or the error — so the notebook *is* the
     session: the data inspection, the feature engineering, the dead ends, in order.
+    When a cell carries the model's `thinking` (think mode), it is rendered as a
+    markdown reasoning block right above the code it produced — the model's own
+    "why" narrating the session, and the raw material for debugging the prompt.
     """
     nb = new_notebook()
     head = [f"# {title}", ""]
@@ -84,11 +87,21 @@ def build_session_notebook(
     head.append("\n_cell-by-cell session — outputs are the actual execution results_")
     nb.cells = [new_markdown_cell("\n".join(head))]
     for count, cell in enumerate(cells, start=1):
+        thinking = _cell_get(cell, "thinking").strip()
+        if thinking:
+            nb.cells.append(new_markdown_cell(_thinking_markdown(thinking)))
         node = new_code_cell(_cell_get(cell, "code").strip())
         node.execution_count = count
         node.outputs = _cell_outputs(cell)
         nb.cells.append(node)
     return nb
+
+
+def _thinking_markdown(thinking: str) -> str:
+    """The model's reasoning as a quoted markdown block (full text — it exists to
+    debug what the prompt made the model think, so nothing is trimmed)."""
+    quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in thinking.splitlines())
+    return "**Model reasoning**\n\n" + quoted
 
 
 def _cell_outputs(cell: Any) -> list[Any]:

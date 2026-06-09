@@ -161,3 +161,29 @@ def test_sqlite_roundtrip_preserves_experiment_shape(tmp_path: Path) -> None:
     assert loaded.result.metrics is not None
     assert loaded.result.metrics.primary_value == pytest.approx(0.78)
     assert loaded.status == "completed"
+
+
+def test_sqlite_roundtrips_the_experiment_digest(tmp_path: Path) -> None:
+    from iterate.schemas.experiment import ExperimentDigest
+
+    memory = SqliteMemory(tmp_path / "memory.db")
+    run_id = memory.start_run("t", _baseline())
+    exp = _experiment("xgboost.XGBClassifier", 0.78).model_copy(
+        update={
+            "digest": ExperimentDigest(
+                techniques=["OneHotEncoder", "XGBClassifier"],
+                data_insights=["27% positive class"],
+                what_helped=["target encoding: 0.55 -> 0.61"],
+                score=0.78,
+                val_trail="0.55 -> 0.61",
+                takeaway="add an interaction feature",
+            )
+        }
+    )
+    memory.record(run_id, exp)
+
+    loaded = memory.history("t")[0]
+    assert loaded.digest is not None  # the digest survives the JSON roundtrip
+    assert loaded.digest.what_helped == ["target encoding: 0.55 -> 0.61"]
+    assert loaded.digest.takeaway == "add an interaction feature"
+    assert loaded.digest.score == pytest.approx(0.78)

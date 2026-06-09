@@ -52,7 +52,8 @@ class _FakeCoder:
         return CodingResult(result=self._result, cells=cells)
 
 
-def _loop(supervisor: object, coders: list[_FakeCoder], terminator: object):
+def _loop(supervisor: object, coders: list[_FakeCoder], terminator: object,
+          on_experiment=None, summarizer=None, memory=None):
     it = iter(coders)
     return run_supervised(
         target=_FakeTarget(),  # type: ignore[arg-type]
@@ -60,8 +61,10 @@ def _loop(supervisor: object, coders: list[_FakeCoder], terminator: object):
         supervisor=supervisor,  # type: ignore[arg-type]
         make_coder=lambda: next(it),  # type: ignore[arg-type,return-value]
         terminator=terminator,  # type: ignore[arg-type]
-        memory=InMemoryMemory(),
+        memory=memory if memory is not None else InMemoryMemory(),
         data_summary="d",
+        summarizer=summarizer,
+        on_experiment=on_experiment,
     )
 
 
@@ -96,6 +99,72 @@ def test_a_crashing_coder_fails_the_iteration_not_the_run() -> None:
     assert result.stopped_because == "max_iterations"
     assert result.best is not None
     assert result.best.result.metrics.primary_value == 0.60
+
+
+def test_on_experiment_hook_fires_per_finished_experiment() -> None:
+    sup = _FakeSupervisor(
+        [SupervisorDecision(False, "a", "try a"), SupervisorDecision(False, "b", "try b")]
+    )
+    seen: list[tuple[bool, str]] = []
+
+    def hook(*, experiment, baseline, is_best, run_id) -> None:  # type: ignore[no-untyped-def]
+        assert baseline.metrics is not None  # the bar is handed along
+        seen.append((is_best, run_id))
+
+    _loop(sup, [_FakeCoder(_result(0.60)), _FakeCoder(_result(0.55))], MaxIterations(2), hook)
+    # called once per experiment, the moment it finished; only the winner is best
+    assert [b for b, _ in seen] == [True, False]
+    assert len({rid for _, rid in seen}) == 1  # both carry the same run id
+
+
+def test_a_failing_on_experiment_hook_does_not_kill_the_run() -> None:
+    sup = _FakeSupervisor(
+        [SupervisorDecision(False, "a", "try a"), SupervisorDecision(False, "b", "try b")]
+    )
+
+    def hook(**kwargs) -> None:  # type: ignore[no-untyped-def]
+        raise OSError("disk full")  # a deliverable write failing mid-run
+
+    result = _loop(sup, [_FakeCoder(_result(0.60)), _FakeCoder(_result(0.55))], MaxIterations(2), hook)
+    assert result.stopped_because == "max_iterations"  # the run survived both failures
+    assert len(result.history) == 2
+
+
+def test_summarizer_digest_is_attached_to_recorded_experiments() -> None:
+    from iterate.core.memory import InMemoryMemory
+    from iterate.schemas.experiment import ExperimentDigest
+
+    class _FakeSummarizer:
+        def __init__(self) -> None:
+            self.seen = 0
+
+        def summarize(self, experiment) -> ExperimentDigest:  # type: ignore[no-untyped-def]
+            self.seen += 1
+            return ExperimentDigest(techniques=["OneHotEncoder"], score=0.60,
+                                    takeaway="try target encoding")
+
+    sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
+    summ = _FakeSummarizer()
+    mem = InMemoryMemory()
+    result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1),
+                   summarizer=summ, memory=mem)
+    assert summ.seen == 1  # the finished experiment was summarized once
+    assert result.best is not None
+    assert result.best.digest is not None
+    assert result.best.digest.takeaway == "try target encoding"
+    # and it persisted into memory, so the NEXT supervisor would read it
+    assert mem.history("tabular-model")[0].digest is not None
+
+
+def test_a_failing_summarizer_does_not_kill_the_run() -> None:
+    class _BoomSummarizer:
+        def summarize(self, experiment) -> object:  # type: ignore[no-untyped-def]
+            raise RuntimeError("summarizer exploded")
+
+    sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
+    result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), summarizer=_BoomSummarizer())
+    assert result.best is not None  # run survived; experiment recorded without a digest
+    assert result.best.digest is None
 
 
 def test_supervisor_stop_ends_the_loop_immediately() -> None:

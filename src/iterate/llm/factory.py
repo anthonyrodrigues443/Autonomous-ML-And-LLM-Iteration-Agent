@@ -7,6 +7,7 @@ downstream notices which one came back.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from iterate.llm.ollama_client import OllamaClient
@@ -14,6 +15,8 @@ from iterate.llm.openai_compatible import OpenAICompatibleClient
 
 if TYPE_CHECKING:
     from iterate.llm.base import LLMClient
+
+logger = logging.getLogger(__name__)
 
 
 # Cloud aliases → their OpenAI-compatible base URL, so `--backend groq` (or a saved
@@ -50,19 +53,28 @@ def build_client(
     model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
+    think: bool = False,
 ) -> LLMClient:
     """Build an `LLMClient` for a named backend.
 
-    - ``"ollama"`` (default) → `OllamaClient` (native ``/api/chat`` with ``think=False``).
-    - ``"openai-compatible"`` (or any of the cloud aliases) → `OpenAICompatibleClient`.
+    - ``"ollama"`` (default) → `OllamaClient` (native ``/api/chat``; ``think`` is
+      forwarded, default ``False``).
+    - ``"openai-compatible"`` (or any of the cloud aliases) → `OpenAICompatibleClient`
+      (``think`` does not apply — the `/v1` layer can't control it).
 
     Any of `model`/`base_url`/`api_key` left ``None`` falls through to the client's
     own defaults (which read the central `Settings` / `.env`). API-key validation
     is the CLI layer's job — this factory just dispatches.
     """
     if name == "ollama":
-        return OllamaClient(host=base_url, model=model)
+        return OllamaClient(host=base_url, model=model, think=think)
     if name in _OPENAI_COMPATIBLE_ALIASES:
+        if think:
+            logger.warning(
+                "think=True only applies to the ollama backend (native /api/chat); "
+                "ignored for %r",
+                name,
+            )
         return OpenAICompatibleClient(
             base_url=resolve_base_url(name, base_url), model=model, api_key=api_key
         )

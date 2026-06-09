@@ -136,6 +136,37 @@ def test_session_notebook_attaches_real_outputs_to_cells() -> None:
     assert "boom" in "\n".join(code_cells[1].outputs[0].traceback)
 
 
+def test_session_notebook_renders_thinking_as_markdown_before_the_cell() -> None:
+    from iterate.deliver.notebook import build_session_notebook
+
+    cells = [
+        # preamble-style cell without thinking → no reasoning block
+        {"code": "load()", "stdout": "ok", "error": None, "source": "preamble", "outputs": []},
+        # an agent cell carrying the model's reasoning trace
+        {
+            "code": "X_tr = prepare(X_train)",
+            "stdout": "",
+            "error": None,
+            "source": "agent",
+            "outputs": [],
+            "thinking": "The profile shows skew in tenure.\n\nI will log-transform it first.",
+        },
+    ]
+    nb = build_session_notebook(cells, title="t", metric="f1")
+    nbformat.validate(nb)
+    md = [c.source for c in nb.cells if c.cell_type == "markdown"]
+    # header + exactly ONE reasoning block (the no-thinking cell adds none)
+    reasoning = [m for m in md if "Model reasoning" in m]
+    assert len(reasoning) == 1
+    assert "> The profile shows skew in tenure." in reasoning[0]
+    assert "> I will log-transform it first." in reasoning[0]
+    # the reasoning block sits immediately BEFORE the code cell it produced
+    kinds = [(c.cell_type, "Model reasoning" in c.source) for c in nb.cells]
+    idx = kinds.index(("markdown", True))
+    assert nb.cells[idx + 1].cell_type == "code"
+    assert "prepare(X_train)" in nb.cells[idx + 1].source
+
+
 def test_save_round_trips(tmp_path: Path) -> None:
     nb = build_notebook(_experiment(code=_FN), data_path="d.csv", target="y", metric="f1")
     path = save_notebook(nb, tmp_path / "sub" / "best.ipynb")

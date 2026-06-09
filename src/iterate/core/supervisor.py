@@ -124,8 +124,13 @@ def _build_messages(
 ) -> list[Message]:
     system = _PROMPTS["system"].format(metric=metric, direction=direction)
     if history:
-        lines = _format_history(history[-_HISTORY_LIMIT:], metric)
-        history_section = _PROMPTS["history_header"] + "\n" + "\n".join(lines) + "\n\n"
+        recent = history[-_HISTORY_LIMIT:]
+        lines = _format_history(recent, metric)
+        table = _technique_table(recent, metric)
+        table_block = (table + "\n\n") if table else ""
+        history_section = (
+            _PROMPTS["history_header"] + "\n" + "\n".join(lines) + "\n\n" + table_block
+        )
     else:
         history_section = "No experiments yet — brief the first one.\n\n"
     user = _PROMPTS["user_template"].format(
@@ -183,7 +188,40 @@ def _format_history(history: list[Experiment], metric: str) -> list[str]:
         else:
             outcome = "not run"
         lines.append(f"- {desc}{used} -> {outcome}{_validation_trail(exp)}")
+        # The Summarizer's digest is the cross-notebook knowledge: what the data
+        # showed and what helped or hurt, so the supervisor can compound winners.
+        if exp.digest is not None:
+            for label, items in (
+                ("data", exp.digest.data_insights),
+                ("helped", exp.digest.what_helped),
+                ("hurt", exp.digest.what_hurt),
+            ):
+                if items:
+                    lines.append(f"    {label}: " + "; ".join(items[:4]))
+            if exp.digest.takeaway:
+                lines.append(f"    next-idea: {exp.digest.takeaway}")
     return lines
+
+
+def _technique_table(history: list[Experiment], metric: str) -> str:
+    """Best score reached whenever each technique appeared, aggregated across all
+    digests, so the pattern 'this technique tends to score well' is explicit rather
+    than left for the model to infer from scattered lines."""
+    best: dict[str, float] = {}
+    seen: dict[str, int] = {}
+    for exp in history:
+        if exp.digest is None or exp.digest.score is None:
+            continue
+        score = exp.digest.score
+        for tech in exp.digest.techniques:
+            seen[tech] = seen.get(tech, 0) + 1
+            if tech not in best or score > best[tech]:
+                best[tech] = score
+    if not best:
+        return ""
+    ranked = sorted(best.items(), key=lambda kv: -kv[1])
+    cells = [f"{t} {best[t]:.4f} (x{seen[t]})" for t, _ in ranked]
+    return f"Technique scoreboard (best {metric} when each appeared): " + " | ".join(cells)
 
 
 __all__ = ["PLAN_NEXT", "Supervisor", "SupervisorDecision", "SupervisorError"]

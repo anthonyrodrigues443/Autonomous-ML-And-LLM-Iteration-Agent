@@ -135,6 +135,7 @@ class OllamaClient:
         )
         return ChatResponse(
             content=message.get("content") or None,
+            thinking=message.get("thinking") or None,
             tool_calls=tool_calls,
             usage=usage,
             model=str(data.get("model") or ""),

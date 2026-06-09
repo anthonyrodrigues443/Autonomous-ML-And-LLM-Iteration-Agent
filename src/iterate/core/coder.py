@@ -98,6 +98,7 @@ class Cell:
     error: str | None
     source: str  # "preamble" (trusted host cell) | "agent"
     outputs: list[dict[str, Any]] = field(default_factory=list)  # nbformat-ready cell outputs
+    thinking: str | None = None  # the model's reasoning that produced this cell (think mode)
 
 
 @dataclass(frozen=True)
@@ -271,7 +272,7 @@ class CodingAgent:
             del recent_cells[:-_REPEAT_WINDOW]
             cell_result, note, spent = self._run_with_autoinstall(code)
             work += spent
-            cells.append(_cell(code, cell_result, "agent"))
+            cells.append(_cell(code, cell_result, "agent", thinking=response.thinking))
             obs = _observation(cell_result)
             if note:
                 obs = note + "\n\n" + obs
@@ -411,10 +412,10 @@ def _observation(result: CellResult) -> str:
     return _tail("\n".join(parts)) or "(no output)"
 
 
-def _cell(code: str, result: CellResult, source: str) -> Cell:
+def _cell(code: str, result: CellResult, source: str, *, thinking: str | None = None) -> Cell:
     return Cell(
         code=code, stdout=result.stdout, stderr=result.stderr, error=result.error,
-        source=source, outputs=list(result.outputs),
+        source=source, outputs=list(result.outputs), thinking=thinking,
     )
 
 

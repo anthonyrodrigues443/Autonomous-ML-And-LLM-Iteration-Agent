@@ -437,6 +437,26 @@ def test_inputs_reset_to_pristine_before_each_cell(tmp_path: Path) -> None:
     assert "next-cell cols: 2" in agent_cells[1].stdout  # but reset for the next cell
 
 
+def test_thinking_is_attached_to_the_cell_it_produced(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    thought = ChatResponse(
+        model="fake-model",
+        thinking="Look at dtypes first, then build X_tr.",
+        tool_calls=[ToolCall(id="c", name="run_cell", arguments={"code": "x = 1"})],
+    )
+    kernel = _FakeKernel(
+        [CellResult("loaded", ""), CellResult("ok", "")], predictions=b"0\n" * ds.n_test
+    )
+    fake = _FakeLLM([thought, _finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=4).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="ethink"
+    )
+    agent_cells = [c for c in out.cells if c.source == "agent"]
+    assert agent_cells[0].thinking == "Look at dtypes first, then build X_tr."
+    preamble = [c for c in out.cells if c.source == "preamble"]
+    assert preamble[0].thinking is None  # host cells never carry model reasoning
+
+
 def test_session_without_predictions_is_a_captured_failure(tmp_path: Path) -> None:
     ds = _dataset(tmp_path)
     # the agent never writes predictions.csv and burns its budget.

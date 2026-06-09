@@ -128,6 +128,25 @@ class ExperimentResult(BaseModel):
         return self.error is None
 
 
+class ExperimentDigest(BaseModel):
+    """A compact, structured summary of ONE finished experiment notebook, produced
+    by the Summarizer so the Supervisor can reason over many experiments without
+    ever holding the raw notebooks (which would bloat context and induce
+    hallucination by mid-run). The digest is the unit of cross-notebook knowledge
+    transfer: what was tried, what the data showed, what helped or hurt, and the
+    score it reached."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    techniques: list[str] = Field(default_factory=list)  # preprocessing + encoders + model + params
+    data_insights: list[str] = Field(default_factory=list)  # facts learned about the data this run
+    what_helped: list[str] = Field(default_factory=list)  # technique -> positive score effect
+    what_hurt: list[str] = Field(default_factory=list)  # technique -> negative / no effect
+    score: float | None = None  # the experiment's holdout score (None if it failed)
+    val_trail: str = ""  # within-session validation scores in order, e.g. "0.55 -> 0.58"
+    takeaway: str = ""  # one line: what this suggests trying next
+
+
 class Experiment(BaseModel):
     """A committed run that wraps a Candidate against a target.
 
@@ -144,6 +163,7 @@ class Experiment(BaseModel):
     status: Literal["pending", "running", "completed", "failed", "aborted"] = "pending"
     iteration: int = 0
     result: ExperimentResult | None = None
+    digest: ExperimentDigest | None = None  # Summarizer's compact summary, for the next Supervisor
     parent_id: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
     started_at: datetime | None = None
@@ -159,6 +179,7 @@ class Experiment(BaseModel):
 __all__ = [
     "Candidate",
     "Experiment",
+    "ExperimentDigest",
     "ExperimentResult",
     "FailureCase",
     "Metrics",

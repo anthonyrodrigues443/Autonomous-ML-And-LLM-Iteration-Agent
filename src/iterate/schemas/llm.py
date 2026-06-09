@@ -63,11 +63,14 @@ class ChatResponse(BaseModel):
     """A normalized reply from any LLM backend.
 
     ``content`` is ``None`` when the model replied purely with ``tool_calls``.
+    ``thinking`` is the model's reasoning trace when thinking mode is on; backends
+    that don't expose one (or runs with thinking off) leave it ``None``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     content: str | None = None
+    thinking: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
     model: str

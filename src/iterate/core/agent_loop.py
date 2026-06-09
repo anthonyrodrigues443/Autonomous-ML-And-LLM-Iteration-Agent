@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.core.coder import CodingAgent
     from iterate.core.memory import Memory
+    from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor, SupervisorDecision
     from iterate.core.terminator import Terminator
     from iterate.schemas.experiment import ExperimentResult
@@ -66,8 +67,21 @@ def run_supervised(
     terminator: Terminator,
     memory: Memory,
     data_summary: str,
+    summarizer: Summarizer | None = None,
+    on_experiment: Callable[..., None] | None = None,
 ) -> RunResult:
-    """Run the Supervisor + Coder loop until the terminator (or supervisor) stops."""
+    """Run the Supervisor + Coder loop until the terminator (or supervisor) stops.
+
+    ``summarizer`` (optional) distills each finished experiment into a compact
+    `ExperimentDigest` attached to the experiment before it is recorded, so the next
+    Supervisor reasons over digests instead of raw notebooks (cross-notebook
+    knowledge transfer). It never raises; a failed digest is simply absent.
+
+    ``on_experiment`` (optional) is invoked after EVERY completed experiment —
+    success or failure — with ``experiment=, baseline=, is_best=, run_id=`` keyword
+    arguments. The CLI uses it to save each iteration's notebook the moment it
+    finishes, so a crash or Ctrl-C mid-run still leaves every finished iteration's
+    deliverable on disk. A failing hook is logged and never kills the run."""
     baseline = run_in_process(target)  # spec default = the bar to beat
     if not baseline.succeeded or baseline.metrics is None:
         log.warning("agent loop: baseline failed (%s); aborting", baseline.error)
@@ -118,6 +132,8 @@ def run_supervised(
                 memory.record_proposer_failure(run_id, iteration, "coder", str(exc))
                 outcome = "proposer_error"
             else:
+                if summarizer is not None:
+                    experiment = _digest(summarizer, experiment, iteration)
                 current_run.append(experiment)
                 memory.record(run_id, experiment)
                 last_experiment = experiment
@@ -137,6 +153,14 @@ def run_supervised(
                     outcome = "improved"
                 else:
                     outcome = "no_improvement"
+                if on_experiment is not None:
+                    try:
+                        on_experiment(
+                            experiment=experiment, baseline=baseline,
+                            is_best=(best is experiment), run_id=run_id,
+                        )
+                    except Exception:  # a deliverable hook must never kill the run
+                        log.warning("agent loop: on_experiment hook failed", exc_info=True)
 
         state = LoopState(
             iteration=iteration,
@@ -156,6 +180,17 @@ def run_supervised(
         baseline=baseline, history=current_run, best=best,
         stopped_because=stopped_because, run_id=run_id,
     )
+
+
+def _digest(summarizer: Summarizer, experiment: Experiment, iteration: int) -> Experiment:
+    """Attach the Summarizer's digest to the experiment. Never raises: a digest is
+    a nice-to-have for the next Supervisor, not worth failing a recorded run over."""
+    try:
+        digest = summarizer.summarize(experiment)
+    except Exception:  # the Summarizer already guards internally; this is belt-and-braces
+        log.warning("agent loop: iteration %d summarizer failed", iteration, exc_info=True)
+        return experiment
+    return experiment.model_copy(update={"digest": digest})
 
 
 def _winning_code(best: Experiment | None) -> str | None:
@@ -195,7 +230,7 @@ def _run_experiment(
     )
     cells = [
         {"code": c.code, "stdout": c.stdout, "error": c.error, "source": c.source,
-         "outputs": c.outputs}
+         "outputs": c.outputs, "thinking": c.thinking}
         for c in coding.cells
     ]
     code = "\n\n".join(c.code for c in coding.cells if c.source == "agent") or "# (no code)"

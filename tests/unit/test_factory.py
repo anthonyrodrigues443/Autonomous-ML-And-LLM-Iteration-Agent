@@ -52,3 +52,17 @@ def test_unknown_backend_raises() -> None:
 def test_model_override_threads_through_to_ollama() -> None:
     client = build_client("ollama", model="qwen3:8b")
     assert client.model == "qwen3:8b"
+
+
+def test_think_defaults_off_and_threads_through_to_ollama() -> None:
+    assert build_client("ollama")._think is False
+    assert build_client("ollama", think=True)._think is True
+
+
+def test_think_warns_and_is_ignored_for_openai_compatible(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="iterate.llm.factory"):
+        client = build_client("groq", api_key="sk-fake", think=True)
+    assert isinstance(client, OpenAICompatibleClient)
+    assert "only applies to the ollama backend" in caplog.text
