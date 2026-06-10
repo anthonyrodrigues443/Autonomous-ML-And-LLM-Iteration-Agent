@@ -189,7 +189,7 @@ coder:
 
     HOW THE SESSION WORKS
     1. ONE cell per turn via run_cell; you then see its output AND the variables now in memory (names, shapes, types). Variables you create PERSIST: if one you need exists in that list, USE it; never re-load data or recompute preprocessing already run.
-    2. Already loaded: X_train (features), y_train (training target), X_holdout (FEATURES ONLY; labels sealed). These three RESET to their original state atop EVERY cell, so transform them into NEW variables, never in place. To submit, write one prediction per X_holdout row to '{predictions_csv}', one value per line, no header, in X_holdout order.
+    2. Already loaded: X_train (features), y_train (training target), X_holdout (FEATURES ONLY; labels sealed). These three RESET to their original state atop EVERY cell: a column you add to them is GONE next cell, while every variable YOU create persists. Engineer features freely, into your OWN derived frames. To submit, write one prediction per X_holdout row to '{predictions_csv}', one value per line, no header, in X_holdout order.
     3. Missing libraries auto-install with a note (installed-and-reran, or FAILED-so-switch; do not retry a failed import).
     4. The budget charges KERNEL-EXECUTION seconds only; thinking is free. A warning arrives near the end.
     5. To end, call the finish TOOL (not Python); rejected unless a valid '{predictions_csv}' exists. A finish() shim only prints guidance. Always END your turn with a run_cell or finish tool call.
@@ -306,7 +306,12 @@ coder:
     column is reaching a numeric step, so select columns by DTYPE or NAME
     (X.select_dtypes(include='number') and (exclude='number')), never by integer
     position; a NaN error means impute first; a shape mismatch means align the columns.
-    If you cannot fix the cause, ABANDON this approach and try a different technique.
+    If a column or engineered feature is MISSING on X_train or X_holdout, remember
+    those frames RESET at the start of every cell, so a column you added to them last
+    cell is already gone: recompute the feature on your OWN derived frames inside the
+    same cell that fits or transforms with it (your variables persist; the originals
+    do not). If you cannot fix the cause, ABANDON this approach and try a different
+    technique.
 
   tools:
     run_cell:
