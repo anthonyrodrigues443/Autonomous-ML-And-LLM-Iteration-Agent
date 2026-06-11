@@ -33,7 +33,7 @@ from iterate.config import get_settings
 if TYPE_CHECKING:
     from iterate.core.memory import Memory
     from iterate.core.orchestrator import RunResult
-    from iterate.schemas.experiment import Candidate, Experiment
+    from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult
     from iterate.targets.model import ModelTarget
 
 app = typer.Typer(
@@ -151,6 +151,13 @@ def run(
         None, "--base-url", help="Override the backend's base URL."
     ),
     api_key: str | None = typer.Option(None, "--api-key", help="Override the backend's API key."),
+    think: bool = typer.Option(
+        False,
+        "--think/--no-think",
+        help="Enable thinking mode for the CODING agent (ollama only; slower per call). "
+        "The supervisor always runs with thinking off — its reply must be a single "
+        "tool call, and a long thinking trace crowds that call out.",
+    ),
     code: bool = typer.Option(
         True,
         "--code/--spec",
@@ -205,6 +212,7 @@ def run(
     from iterate.core.orchestrator import Orchestrator
     from iterate.core.proposer import Proposer, summarize_dataset
     from iterate.core.reconstructor import Reconstructor
+    from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor
     from iterate.core.terminator import default_terminator
     from iterate.llm.factory import build_client
@@ -279,8 +287,17 @@ def run(
     data_summary = summarize_dataset(dataset)
     direction = "minimize" if metric in _REGRESSION_METRICS else "maximize"
 
-    # ─── LLM client + memory ───────────────────────────────────────────────
+    # ─── LLM clients + memory ──────────────────────────────────────────────
+    # Two clients on purpose: thinking applies to the CODER only. The supervisor
+    # (and every other tool-only role) must answer with a single structured tool
+    # call, and a thinking trace eats the reply budget before the call is emitted —
+    # observed live: every supervisor turn failed with "no plan" under thinking.
     client = build_client(backend, model=model, base_url=base_url, api_key=api_key)
+    coder_client = (
+        build_client(backend, model=model, base_url=base_url, api_key=api_key, think=True)
+        if think
+        else client
+    )
     memory: Memory = SqliteMemory(resolved_memory_path)
 
     # ─── Terminator ────────────────────────────────────────────────────────
@@ -300,7 +317,10 @@ def run(
         # Each session gets a fixed kernel-execution budget (no cell cap; LLM latency
         # is not charged). --until bounds the WHOLE run via the terminator above —
         # it is not a single experiment's budget.
+        # Supervisor and Summarizer are tool-only structured-output roles, so they use
+        # the no-think client even when --think is set (thinking crowds out the call).
         supervisor = Supervisor(client, metric=metric)
+        summarizer = Summarizer(client, metric=metric)
         # Local models live in a small context window (num_ctx); cap the coder's
         # prompt well under it so the system prompt is never what truncates.
         context_budget = 48_000 if backend == "ollama" else 400_000
@@ -310,15 +330,29 @@ def run(
                 E2BKernel(api_key=e2b_api_key) if compute == "e2b" else LocalKernel()
             )
             return CodingAgent(
-                client, kernel, metric=metric,
+                coder_client, kernel, metric=metric,
                 install=(install or compute == "e2b"),
                 context_budget_chars=context_budget,
+            )
+
+        def on_experiment(
+            *, experiment: Experiment, baseline: ExperimentResult, is_best: bool, run_id: str
+        ) -> None:
+            # Incremental deliverable: each finished iteration's notebook is saved
+            # NOW (and best.ipynb tracks the best-so-far), so a crash or Ctrl-C
+            # mid-run still leaves everything finished on disk.
+            if notebooks == "none":
+                return
+            _write_experiment_notebook(
+                experiment, baseline=baseline, is_best=is_best,
+                run_dir=Path(settings.iterate_runs_dir) / run_id, mode=notebooks,
+                data_path=str(data), target=target, metric=metric,
             )
 
         result = run_supervised(
             target=model_target, dataset=dataset, supervisor=supervisor,
             make_coder=make_coder, terminator=terminator, memory=memory,
-            data_summary=data_summary,
+            data_summary=data_summary, summarizer=summarizer, on_experiment=on_experiment,
         )
     else:
         # ─── Spec path (allow-listed estimators) + the baseline precedence ─────
@@ -575,6 +609,73 @@ def _save_best_model(
         console.print(f"\n[dim]{load_hint}[/dim]")
 
 
+def _render_experiment(
+    exp: Experiment,
+    *,
+    is_best: bool,
+    baseline_score: float | None,
+    metric: str,
+    data_path: str,
+    target: str,
+    leaderboard: list[Experiment] | None = None,
+) -> Any:
+    """Render ONE experiment to a notebook node — shared by the incremental
+    per-iteration save and the end-of-run write, so both produce identical files.
+    Cell-by-cell experiments carry their session ("cells"); render the real
+    session. Spec / one-shot experiments render through the contract."""
+    from iterate.deliver.notebook import build_notebook, build_session_notebook
+
+    cells = exp.candidate.changes.get("cells")
+    if isinstance(cells, list):
+        score = exp.result.metrics.primary_value if exp.result and exp.result.metrics else None
+        title = ("best: " if is_best else "") + exp.candidate.description
+        return build_session_notebook(
+            cells, title=title, metric=metric, score=score, baseline_score=baseline_score,
+            hypothesis=exp.hypothesis, findings=exp.digest,
+        )
+    return build_notebook(
+        exp, data_path=data_path, target=target, metric=metric,
+        baseline_score=baseline_score, is_best=is_best, leaderboard=leaderboard,
+    )
+
+
+def _write_experiment_notebook(
+    exp: Experiment,
+    *,
+    baseline: ExperimentResult,
+    is_best: bool,
+    run_dir: Path,
+    mode: str,
+    data_path: str,
+    target: str,
+    metric: str,
+) -> None:
+    """Save one finished iteration's notebook the moment it completes (and keep
+    best.ipynb pointing at the best-so-far), so a crash or Ctrl-C mid-run still
+    leaves every finished deliverable on disk. The end-of-run `_write_notebooks`
+    rewrite is idempotent on top of these."""
+    from iterate.deliver.notebook import save_notebook, slug
+
+    baseline_score = baseline.metrics.primary_value if baseline.metrics is not None else None
+    if mode == "all":
+        name = f"iter_{exp.iteration:02d}_{slug(exp.candidate.description)}.ipynb"
+        save_notebook(
+            _render_experiment(
+                exp, is_best=False, baseline_score=baseline_score,
+                metric=metric, data_path=data_path, target=target,
+            ),
+            run_dir / "notebooks" / name,
+        )
+    if is_best and exp.result is not None and exp.result.succeeded:
+        save_notebook(
+            _render_experiment(
+                exp, is_best=True, baseline_score=baseline_score,
+                metric=metric, data_path=data_path, target=target,
+            ),
+            run_dir / "best.ipynb",
+        )
+
+
 def _write_notebooks(
     result: RunResult,
     *,
@@ -586,37 +687,38 @@ def _write_notebooks(
 ) -> None:
     """Render the run as runnable notebooks: the winner (`best`) or one per
     experiment (`all`). The full record is already in Memory; this just renders it."""
-    from iterate.deliver.notebook import build_notebook, build_session_notebook, save_notebook, slug
+    from iterate.deliver.notebook import save_notebook, slug
 
     baseline_score = (
         result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
     )
-
-    def _render(exp: Experiment, *, is_best: bool) -> Any:
-        # Cell-by-cell experiments carry their session ("cells"); render the real
-        # session. Spec / one-shot experiments render through the contract.
-        cells = exp.candidate.changes.get("cells")
-        if isinstance(cells, list):
-            score = exp.result.metrics.primary_value if exp.result and exp.result.metrics else None
-            title = ("🏆 best — " if is_best else "") + exp.candidate.description
-            return build_session_notebook(
-                cells, title=title, metric=metric, score=score, baseline_score=baseline_score
-            )
-        return build_notebook(
-            exp, data_path=data_path, target=target, metric=metric,
-            baseline_score=baseline_score, is_best=is_best,
-            leaderboard=result.history if is_best else None,
-        )
 
     written: list[Path] = []
     if mode == "all":
         for exp in result.history:
             is_best = result.best is not None and exp.id == result.best.id
             name = f"iter_{exp.iteration:02d}_{slug(exp.candidate.description)}.ipynb"
-            written.append(save_notebook(_render(exp, is_best=is_best), run_dir / "notebooks" / name))
+            written.append(
+                save_notebook(
+                    _render_experiment(
+                        exp, is_best=is_best, baseline_score=baseline_score,
+                        metric=metric, data_path=data_path, target=target,
+                    ),
+                    run_dir / "notebooks" / name,
+                )
+            )
 
     if result.best is not None:
-        written.append(save_notebook(_render(result.best, is_best=True), run_dir / "best.ipynb"))
+        written.append(
+            save_notebook(
+                _render_experiment(
+                    result.best, is_best=True, baseline_score=baseline_score,
+                    metric=metric, data_path=data_path, target=target,
+                    leaderboard=result.history,
+                ),
+                run_dir / "best.ipynb",
+            )
+        )
 
     if not written:
         return

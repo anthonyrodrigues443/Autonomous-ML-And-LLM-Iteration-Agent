@@ -114,6 +114,26 @@ def test_num_ctx_is_always_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["payload"]["options"]["num_ctx"] == 8192
 
 
+def test_thinking_trace_is_captured_from_the_native_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reply = {
+        "model": "gemma4:12b",
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "thinking": "First inspect the dtypes, then encode.",
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "run_cell", "arguments": {"code": "x=1"}}}
+            ],
+        },
+    }
+    _patch_post(monkeypatch, reply, {})
+    resp = OllamaClient().chat([Message(role="user", content="go")])
+    assert resp.thinking == "First inspect the dtypes, then encode."
+    assert resp.has_tool_calls  # thinking rides alongside the tool call, not instead of it
+
+
 def test_plain_content_no_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
     reply = {
         "model": "qwen3:14b",

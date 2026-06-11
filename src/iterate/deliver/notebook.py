@@ -67,12 +67,23 @@ def build_session_notebook(
     metric: str,
     score: float | None = None,
     baseline_score: float | None = None,
+    hypothesis: str | None = None,
+    findings: Any = None,
 ) -> NotebookNode:
     """Render a cell-by-cell coding session as a runnable notebook.
 
     Each `Cell` (code + captured stdout/error) becomes a code cell, with a short
     markdown note showing what it printed or the error — so the notebook *is* the
     session: the data inspection, the feature engineering, the dead ends, in order.
+    When a cell carries the model's `thinking` (think mode), it is rendered as a
+    markdown reasoning block right above the code it produced — the model's own
+    "why" narrating the session, and the raw material for debugging the prompt.
+
+    ``hypothesis`` (the supervisor's brief, which opens with the run's so-far
+    knowledge) renders as a Hypothesis cell up top; ``findings`` (the Summarizer's
+    digest, dict or `ExperimentDigest`) renders as a Findings cell at the end — so
+    every notebook reads as hypothesis -> staged work -> findings, and the
+    knowledge each notebook inherits and hands on is visible in the artifact.
     """
     nb = new_notebook()
     head = [f"# {title}", ""]
@@ -83,12 +94,60 @@ def build_session_notebook(
         head.append(line)
     head.append("\n_cell-by-cell session — outputs are the actual execution results_")
     nb.cells = [new_markdown_cell("\n".join(head))]
+    if hypothesis and hypothesis.strip():
+        nb.cells.append(
+            new_markdown_cell(
+                "## Hypothesis\n\n_The supervisor's brief for this experiment (the run's"
+                " findings so far, then the move under test):_\n\n> "
+                + hypothesis.strip().replace("\n", "\n> ")
+            )
+        )
     for count, cell in enumerate(cells, start=1):
+        thinking = _cell_get(cell, "thinking").strip()
+        if thinking:
+            nb.cells.append(new_markdown_cell(_thinking_markdown(thinking)))
         node = new_code_cell(_cell_get(cell, "code").strip())
         node.execution_count = count
         node.outputs = _cell_outputs(cell)
         nb.cells.append(node)
+    findings_md = _findings_markdown(findings)
+    if findings_md:
+        nb.cells.append(new_markdown_cell(findings_md))
     return nb
+
+
+def _findings_markdown(digest: Any) -> str | None:
+    """The Summarizer's digest as a Findings cell (dict or `ExperimentDigest`).
+    Returns None when there is nothing worth rendering."""
+    if digest is None:
+        return None
+
+    def get(key: str) -> Any:
+        return digest.get(key) if isinstance(digest, dict) else getattr(digest, key, None)
+
+    parts = ["## Findings"]
+    for label, key in (
+        ("What helped", "what_helped"),
+        ("What hurt or did nothing", "what_hurt"),
+        ("Data insights", "data_insights"),
+    ):
+        items = get(key) or []
+        if items:
+            parts.append(f"**{label}**\n" + "\n".join(f"- {item}" for item in items))
+    trail = get("val_trail")
+    if trail:
+        parts.append(f"**Validation trail:** {trail}")
+    takeaway = get("takeaway")
+    if takeaway:
+        parts.append(f"**Takeaway:** {takeaway}")
+    return "\n\n".join(parts) if len(parts) > 1 else None
+
+
+def _thinking_markdown(thinking: str) -> str:
+    """The model's reasoning as a quoted markdown block (full text — it exists to
+    debug what the prompt made the model think, so nothing is trimmed)."""
+    quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in thinking.splitlines())
+    return "**Model reasoning**\n\n" + quoted
 
 
 def _cell_outputs(cell: Any) -> list[Any]:
@@ -143,7 +202,7 @@ def _header_md(
 ) -> str:
     result = experiment.result
     title = experiment.candidate.description.strip() or "experiment"
-    lines = [f"# {'🏆 best — ' if is_best else ''}{title}", ""]
+    lines = [f"# {'best: ' if is_best else ''}{title}", ""]
     if result is not None and result.succeeded and result.metrics is not None:
         score = result.metrics.primary_value
         line = f"**{metric} = {score:.4f}**"

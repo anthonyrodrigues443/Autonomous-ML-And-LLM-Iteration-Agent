@@ -442,3 +442,136 @@ def test_run_saves_best_model_and_sidecar(tmp_path: Path, monkeypatch: pytest.Mo
     # The saved artifact is a usable fitted pipeline.
     pipeline = joblib.load(out)
     assert hasattr(pipeline, "predict")
+
+
+# ─── Code-path wiring: --think applies to the coder only ─────────────────
+
+
+def _stub_run_supervised(
+    monkeypatch: pytest.MonkeyPatch, *, invoke_hook: bool = False
+) -> dict[str, Any]:
+    """Stub the code path's heavy bits; capture which client each agent received.
+
+    With ``invoke_hook``, the fake loop calls ``on_experiment`` once with a finished
+    cells-experiment and returns an EMPTY history — so any notebook on disk can only
+    have come from the incremental hook, never the end-of-run writer."""
+    captured: dict[str, Any] = {}
+
+    class _FakeClient:
+        def __init__(self, think: bool) -> None:
+            self.think = think
+
+        @property
+        def model(self) -> str:
+            return "fake"
+
+        def chat(self, *a: Any, **kw: Any) -> Any:
+            raise AssertionError("LLM client should not be invoked in this test")
+
+    def _fake_build_client(name: str, **kw: Any) -> _FakeClient:
+        return _FakeClient(think=kw.get("think", False))
+
+    def _fake_run_supervised(
+        *, target: Any, dataset: Any, supervisor: Any, make_coder: Any,
+        terminator: Any, memory: Any, data_summary: str, summarizer: Any = None,
+        on_experiment: Any = None,
+    ) -> Any:
+        from iterate.core.orchestrator import RunResult
+        from iterate.schemas.experiment import Candidate, Experiment
+
+        coder = make_coder()
+        captured["supervisor_client"] = supervisor._client
+        captured["coder_client"] = coder._client
+        baseline = ExperimentResult(
+            experiment_id="b",
+            metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize", n_samples=100),
+        )
+        if invoke_hook and on_experiment is not None:
+            exp = Experiment(
+                candidate=Candidate(
+                    description="probe attempt",
+                    changes={"cells": [{"code": "x=1", "stdout": "ok", "error": None,
+                                        "source": "agent", "outputs": [], "thinking": None}]},
+                    rationale="r",
+                ),
+                target="tabular-model", hypothesis="h", status="completed", iteration=1,
+                result=ExperimentResult(
+                    experiment_id="e",
+                    metrics=Metrics(
+                        values={"f1": 0.8}, primary="f1", direction="maximize", n_samples=100
+                    ),
+                ),
+            )
+            on_experiment(experiment=exp, baseline=baseline, is_best=True, run_id="t")
+        return RunResult(
+            baseline=baseline, history=[], best=None,
+            stopped_because="max_iterations", run_id="t",
+        )
+
+    # run() imports these lazily — patch at the source modules.
+    import iterate.core.agent_loop as loop_module
+    import iterate.llm.factory as factory_module
+
+    monkeypatch.setattr(factory_module, "build_client", _fake_build_client)
+    monkeypatch.setattr(loop_module, "run_supervised", _fake_run_supervised)
+    return captured
+
+
+def test_think_applies_to_the_coder_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    captured = _stub_run_supervised(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
+         "--code", "--think", "--memory", str(tmp_path / "m.db")],
+    )
+    assert result.exit_code == 0, result.stdout
+    # the supervisor must NEVER think (single-tool-call role); only the coder does
+    assert captured["supervisor_client"].think is False
+    assert captured["coder_client"].think is True
+    assert captured["supervisor_client"] is not captured["coder_client"]
+
+
+def test_without_think_both_agents_share_one_no_think_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    captured = _stub_run_supervised(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
+         "--code", "--memory", str(tmp_path / "m.db")],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["coder_client"] is captured["supervisor_client"]  # same instance
+    assert captured["coder_client"].think is False
+
+
+def test_each_iteration_notebook_is_saved_the_moment_it_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.config import get_settings
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "runs"))
+    get_settings.cache_clear()
+    _stub_run_supervised(monkeypatch, invoke_hook=True)
+    try:
+        result = runner.invoke(
+            app,
+            ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
+             "--code", "--notebooks", "all", "--memory", str(tmp_path / "m.db")],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code == 0, result.stdout
+    run_dir = tmp_path / "runs" / "t"
+    # the stubbed loop returned an EMPTY history, so these files can only have been
+    # written by the per-iteration hook — i.e. while the run was still going.
+    assert list((run_dir / "notebooks").glob("iter_01_*.ipynb")), "incremental save missing"
+    assert (run_dir / "best.ipynb").exists()  # best.ipynb tracks the best-so-far
