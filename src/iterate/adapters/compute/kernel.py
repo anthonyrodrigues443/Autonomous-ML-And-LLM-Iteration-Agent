@@ -23,6 +23,7 @@ kernel's working dir — only holdout features cross in. Scoring stays host-side
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import re
 import tempfile
@@ -237,21 +238,43 @@ class E2BKernel:
         *,
         api_key: str | None = None,
         work_dir: str = "/home/user",
+        lease_seconds: float = 900.0,
         sandbox_factory: Callable[[], Any] | None = None,
     ) -> None:
         self._api_key = api_key
         self._work_dir = work_dir
+        # e2b sandboxes default to a 300s lifetime; a cell-by-cell session (LLM
+        # latency between cells is NOT sandbox-execution time) easily outlives that
+        # and the sandbox would die mid-session. We renew a sliding lease on every
+        # cell instead — alive while the session works, auto-reaped ~lease_seconds
+        # after the last activity (so a crash leaves at most one lease of orphan
+        # cost, not hours). 900s comfortably exceeds any single cell + think-gap and
+        # stays under the 3600s Hobby-plan cap.
+        self._lease_seconds = lease_seconds
         self._sandbox_factory = sandbox_factory
         self._sandbox: Any = None
 
     def start(self, inputs: dict[str, bytes]) -> None:
         self._sandbox = self._make_sandbox()
+        self._renew_lease()  # bump off the 300s default before any think-gap
         for name, content in inputs.items():
             self._sandbox.files.write(f"{self._work_dir}/{name}", content)
+
+    def _renew_lease(self) -> None:
+        """Slide the sandbox's expiry to now + lease_seconds. Best-effort: a dead
+        sandbox surfaces on the next run_code, not here, so never fail a cell over
+        a keepalive hiccup."""
+        if self._sandbox is None:
+            return
+        setter = getattr(self._sandbox, "set_timeout", None)
+        if callable(setter):
+            with contextlib.suppress(Exception):
+                setter(int(self._lease_seconds))
 
     def run_cell(self, code: str, *, timeout: float) -> CellResult:
         if self._sandbox is None:
             raise RuntimeError("kernel not started")
+        self._renew_lease()
         execution = self._sandbox.run_code(code, timeout=timeout)
         stdout = "".join(execution.logs.stdout)
         stderr = "".join(execution.logs.stderr)
@@ -282,6 +305,7 @@ class E2BKernel:
     def install(self, packages: list[str]) -> str:
         if self._sandbox is None or not packages:
             return ""
+        self._renew_lease()  # a cold wheel install can be slow; don't let the lease lapse
         execution = self._sandbox.run_code(f"!pip install -q {' '.join(packages)}")
         return "".join(execution.logs.stderr)
 

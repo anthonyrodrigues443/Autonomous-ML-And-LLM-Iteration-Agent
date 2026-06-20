@@ -119,6 +119,28 @@ def test_missing_predictions_is_a_captured_failure(tmp_path: Path) -> None:
     assert "no predictions" in (result.error or "")
 
 
+def test_session_preamble_seeds_the_kernel_rng_reproducibly(tmp_path: Path) -> None:
+    # The preamble seeds random + numpy so a rendered notebook re-executes to the
+    # SAME score it reported. Run the real preamble in two fresh LocalKernels and
+    # confirm numpy's global RNG draws are identical.
+    from iterate.adapters.compute.kernel import LocalKernel
+
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    inputs = codegen.build_inputs(ds)
+    pre = codegen.session_preamble()
+
+    def first_draw() -> str:
+        k = LocalKernel()
+        k.start(inputs)
+        try:
+            assert k.run_cell(pre, timeout=30).ok
+            return k.run_cell("print(np.random.rand(3))", timeout=30).stdout.strip()
+        finally:
+            k.close()
+
+    assert first_draw() == first_draw()  # seeded: deterministic across sessions
+
+
 def test_required_imports_maps_and_filters_stdlib() -> None:
     code = (
         "def train_and_predict(a, b, c):\n"

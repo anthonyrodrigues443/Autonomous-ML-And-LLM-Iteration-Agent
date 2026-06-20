@@ -104,9 +104,15 @@ def session_preamble() -> str:
     restore ``X_train``/``y_train``/``X_holdout`` before every agent cell — a weak
     model can otherwise corrupt the canonical data in place (e.g.
     ``X_train[cols] = imputer.fit_transform(...)``) and silently poison every later
-    attempt in the session."""
+    attempt in the session.
+
+    It also seeds the global RNGs (``random`` + ``numpy``). Estimators left at
+    ``random_state=None`` draw from numpy's global RNG, so seeding once here makes a
+    session reproducible: the rendered notebook re-executes to the SAME score the
+    run reported, instead of drifting by the model's run-to-run variance."""
     return (
-        "import json, pandas as pd, numpy as np\n"
+        "import json, random, pandas as pd, numpy as np\n"
+        "random.seed(42); np.random.seed(42)\n"
         f"with open({META_JSON!r}) as _f:\n"
         "    _meta = json.load(_f)\n"
         "_target = _meta['target']\n"

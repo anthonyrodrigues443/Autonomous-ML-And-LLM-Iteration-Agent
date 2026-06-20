@@ -18,6 +18,7 @@ will produce it from run history next.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,8 @@ if TYPE_CHECKING:
 class CodingAgentError(RuntimeError):
     """The coding session failed irrecoverably (e.g. the LLM backend errored)."""
 
+
+log = logging.getLogger(__name__)
 
 _PROMPTS = PROMPTS["coder"]
 # Feed the agent the FULL cell output (EDA tables, value_counts, etc.) — modern
@@ -177,7 +180,7 @@ class CodingAgent:
                 starting_code=starting_code,
                 starting_score=starting_score,
             )
-            self._drive(messages, cells, n_test=dataset.n_test)
+            self._drive(messages, cells, n_test=dataset.n_test, experiment_id=experiment_id)
 
             preds = self._kernel.read_output(codegen.PREDICTIONS_CSV)
             result = codegen.score_predictions(
@@ -188,7 +191,9 @@ class CodingAgent:
         finally:
             self._kernel.close()
 
-    def _drive(self, messages: list[Message], cells: list[Cell], *, n_test: int) -> None:
+    def _drive(
+        self, messages: list[Message], cells: list[Cell], *, n_test: int, experiment_id: str
+    ) -> None:
         """The tool loop: run_cell → feed output back → repeat, until a VERIFIED finish
         or the deadline. The deadline charges KERNEL-EXECUTION seconds only — LLM
         latency is free, so a slow local model gets the same working budget as a fast
@@ -273,6 +278,20 @@ class CodingAgent:
             cell_result, note, spent = self._run_with_autoinstall(code)
             work += spent
             cells.append(_cell(code, cell_result, "agent", thinking=response.thinking))
+            # Per-cell progress: a long local-model session is otherwise silent for
+            # minutes. One line per executed cell shows it IS moving — which cell, how
+            # it landed, and how much of the kernel-time budget is gone.
+            n_agent_cells = sum(1 for c in cells if c.source == "agent")
+            if cell_result.timed_out:
+                status = "timed out"
+            elif cell_result.error:
+                status = f"error: {_error_signature(cell_result.error)}"
+            else:
+                status = "ok"
+            log.info(
+                "coder[%s]: cell %d %s (%.1fs, %.0f/%.0fs budget)",
+                experiment_id, n_agent_cells, status, spent, work, self._deadline_seconds,
+            )
             obs = _observation(cell_result)
             if note:
                 obs = note + "\n\n" + obs

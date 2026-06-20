@@ -95,85 +95,93 @@ def run_supervised(
     stopped_because = "exhausted"
     iteration = 0
 
-    while True:
-        iteration += 1
-        outcome: AttemptOutcome
-        last_experiment: Experiment | None = None
-        try:
-            # Memory already holds every recorded experiment (line below records each
-            # one) — adding current_run would feed this run's experiments in twice.
-            decision = supervisor.decide(
-                data_summary=data_summary,
-                baseline=baseline,
-                history=memory.history(target.name),
-            )
-        except SupervisorError as exc:
-            log.warning("agent loop: iteration %d supervisor failed: %s", iteration, exc)
-            memory.record_proposer_failure(run_id, iteration, "supervisor", str(exc))
-            outcome = "proposer_error"
-        else:
-            if decision.stop:
-                stopped_because = "supervisor"
-                break
-            start_code = _winning_code(best)  # carry the best working code forward
-            start_score = (
-                best.result.metrics.primary_value
-                if best is not None and best.result is not None and best.result.metrics is not None
-                else None
-            )
+    try:
+        while True:
+            iteration += 1
+            outcome: AttemptOutcome
+            last_experiment: Experiment | None = None
             try:
-                experiment = _run_experiment(
-                    make_coder(), dataset, decision, iteration, target.name, start_code, start_score
+                # Memory already holds every recorded experiment (line below records each
+                # one) — adding current_run would feed this run's experiments in twice.
+                decision = supervisor.decide(
+                    data_summary=data_summary,
+                    baseline=baseline,
+                    history=memory.history(target.name),
                 )
-            except Exception as exc:  # one bad experiment must not kill the run
-                # e.g. the LLM backend timing out after retries, or a kernel dying.
-                # Record it and let the terminator (patience) decide, like a failed cell.
-                log.warning("agent loop: iteration %d coder failed: %s", iteration, exc)
-                memory.record_proposer_failure(run_id, iteration, "coder", str(exc))
+            except SupervisorError as exc:
+                log.warning("agent loop: iteration %d supervisor failed: %s", iteration, exc)
+                memory.record_proposer_failure(run_id, iteration, "supervisor", str(exc))
                 outcome = "proposer_error"
             else:
-                if summarizer is not None:
-                    experiment = _digest(summarizer, experiment, iteration)
-                current_run.append(experiment)
-                memory.record(run_id, experiment)
-                last_experiment = experiment
-                result = experiment.result
-                assert result is not None
-                if result.succeeded and result.metrics is not None:
-                    log.info(
-                        "agent loop: iteration %d %r -> %s=%.4f",
-                        iteration, decision.title, result.metrics.primary,
-                        result.metrics.primary_value,
+                if decision.stop:
+                    stopped_because = "supervisor"
+                    break
+                start_code = _winning_code(best)  # carry the best working code forward
+                start_score = (
+                    best.result.metrics.primary_value
+                    if best is not None and best.result is not None and best.result.metrics is not None
+                    else None
+                )
+                try:
+                    experiment = _run_experiment(
+                        make_coder(), dataset, decision, iteration, target.name, start_code, start_score
                     )
+                except Exception as exc:  # one bad experiment must not kill the run
+                    # e.g. the LLM backend timing out after retries, or a kernel dying.
+                    # Record it and let the terminator (patience) decide, like a failed cell.
+                    log.warning("agent loop: iteration %d coder failed: %s", iteration, exc)
+                    memory.record_proposer_failure(run_id, iteration, "coder", str(exc))
+                    outcome = "proposer_error"
                 else:
-                    log.info("agent loop: iteration %d %r -> failed (%s)", iteration,
-                             decision.title, result.error)
-                if result.succeeded and _improves(result, best, baseline, direction):
-                    best = experiment
-                    outcome = "improved"
-                else:
-                    outcome = "no_improvement"
-                if on_experiment is not None:
-                    try:
-                        on_experiment(
-                            experiment=experiment, baseline=baseline,
-                            is_best=(best is experiment), run_id=run_id,
+                    if summarizer is not None:
+                        experiment = _digest(summarizer, experiment, iteration)
+                    current_run.append(experiment)
+                    memory.record(run_id, experiment)
+                    last_experiment = experiment
+                    result = experiment.result
+                    assert result is not None
+                    if result.succeeded and result.metrics is not None:
+                        log.info(
+                            "agent loop: iteration %d %r -> %s=%.4f",
+                            iteration, decision.title, result.metrics.primary,
+                            result.metrics.primary_value,
                         )
-                    except Exception:  # a deliverable hook must never kill the run
-                        log.warning("agent loop: on_experiment hook failed", exc_info=True)
+                    else:
+                        log.info("agent loop: iteration %d %r -> failed (%s)", iteration,
+                                 decision.title, result.error)
+                    if result.succeeded and _improves(result, best, baseline, direction):
+                        best = experiment
+                        outcome = "improved"
+                    else:
+                        outcome = "no_improvement"
+                    if on_experiment is not None:
+                        try:
+                            on_experiment(
+                                experiment=experiment, baseline=baseline,
+                                is_best=(best is experiment), run_id=run_id,
+                            )
+                        except Exception:  # a deliverable hook must never kill the run
+                            log.warning("agent loop: on_experiment hook failed", exc_info=True)
 
-        state = LoopState(
-            iteration=iteration,
-            baseline=baseline,
-            best=best,
-            last_experiment=last_experiment,
-            last_attempt_outcome=outcome,
-            elapsed_seconds=perf_counter() - started_at,
-        )
-        reason = terminator.update_and_check(state)
-        if reason is not None:
-            stopped_because = reason
-            break
+            state = LoopState(
+                iteration=iteration,
+                baseline=baseline,
+                best=best,
+                last_experiment=last_experiment,
+                last_attempt_outcome=outcome,
+                elapsed_seconds=perf_counter() - started_at,
+            )
+            reason = terminator.update_and_check(state)
+            if reason is not None:
+                stopped_because = reason
+                break
+
+    except KeyboardInterrupt:
+        # Ctrl-C: keep what the run already earned. Memory still gets finalized and the
+        # best-so-far notebook is already on disk (on_experiment saves per iteration), so
+        # an interrupt exits like a short run, not a stack trace.
+        log.warning("agent loop: interrupted; finalizing with %d kept experiment(s)", len(current_run))
+        stopped_because = "interrupted"
 
     memory.finish_run(run_id, stopped_because)
     return RunResult(

@@ -101,6 +101,47 @@ def test_a_crashing_coder_fails_the_iteration_not_the_run() -> None:
     assert result.best.result.metrics.primary_value == 0.60
 
 
+class _InterruptingSupervisor:
+    """Briefs once, then raises Ctrl-C on the next decision — like a user hitting
+    Ctrl-C after the first experiment finished."""
+
+    def __init__(self, first: SupervisorDecision) -> None:
+        self._first = first
+        self._calls = 0
+
+    def decide(self, *, data_summary: str, baseline: object, history: list) -> SupervisorDecision:
+        self._calls += 1
+        if self._calls == 1:
+            return self._first
+        raise KeyboardInterrupt
+
+
+def test_ctrl_c_finalizes_the_run_and_keeps_what_it_earned() -> None:
+    mem = InMemoryMemory()
+    sup = _InterruptingSupervisor(SupervisorDecision(False, "a", "try a"))
+    result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(5), memory=mem)
+    # the interrupt exits cleanly, not as a stack trace
+    assert result.stopped_because == "interrupted"
+    # the one experiment that finished before Ctrl-C is kept, with its best tracked
+    assert len(result.history) == 1
+    assert result.best is not None
+    assert result.best.result.metrics.primary_value == 0.60
+    # memory is finalized (not left dangling) so the run reads as "interrupted" on disk
+    assert mem._runs[result.run_id]["stopped_because"] == "interrupted"
+
+
+def test_ctrl_c_during_the_very_first_decision_still_finalizes() -> None:
+    # Ctrl-C before any experiment finished: empty history, run still finalized.
+    mem = InMemoryMemory()
+    sup = _InterruptingSupervisor(SupervisorDecision(False, "a", "try a"))
+    sup._calls = 1  # force the next decide() to interrupt immediately
+    result = _loop(sup, [], MaxIterations(5), memory=mem)
+    assert result.stopped_because == "interrupted"
+    assert result.history == []
+    assert result.best is None
+    assert mem._runs[result.run_id]["stopped_because"] == "interrupted"
+
+
 def test_on_experiment_hook_fires_per_finished_experiment() -> None:
     sup = _FakeSupervisor(
         [SupervisorDecision(False, "a", "try a"), SupervisorDecision(False, "b", "try b")]
