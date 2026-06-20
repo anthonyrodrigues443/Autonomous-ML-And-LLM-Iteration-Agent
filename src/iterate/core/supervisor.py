@@ -98,10 +98,19 @@ class Supervisor:
         )
         detail = ""
         for _ in range(self._max_retries + 1):
-            response = self._client.chat(
-                messages, tools=[PLAN_NEXT], temperature=self._temperature,
-                max_tokens=self._max_tokens,
-            )
+            try:
+                response = self._client.chat(
+                    messages, tools=[PLAN_NEXT], temperature=self._temperature,
+                    max_tokens=self._max_tokens,
+                )
+            except Exception as exc:  # the backend is an I/O boundary; never fatal here
+                # A backend reject (e.g. groq's tool_use_failed when a weak model emits
+                # `stop` as the string "false") must NOT crash the whole run: nudge a
+                # well-formed retry, and if it never lands, fall through to a graceful
+                # SupervisorError that the agent loop records as a proposer failure.
+                detail = f"backend error: {type(exc).__name__}: {exc}"
+                messages.append(Message(role="user", content=_PROMPTS["tool_error_nudge"]))
+                continue
             call = next((c for c in response.tool_calls if c.name == PLAN_NEXT.name), None)
             if call is not None:
                 return _to_decision(call.arguments)
@@ -110,8 +119,19 @@ class Supervisor:
         raise SupervisorError(f"no plan after {self._max_retries + 1} attempt(s): {detail}")
 
 
+def _coerce_bool(value: Any) -> bool:
+    """A weak model often emits `stop` as the STRING "false"/"true" rather than a JSON
+    boolean. `bool("false")` is True — the dangerous default that would silently STOP a
+    run — so coerce textual booleans by meaning, not truthiness."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
 def _to_decision(args: dict[str, Any]) -> SupervisorDecision:
-    stop = bool(args.get("stop"))
+    stop = _coerce_bool(args.get("stop"))
     brief = str(args.get("brief") or "").strip()
     title = str(args.get("title") or "").strip() or (brief[:60] or "experiment")
     if not stop and not brief:

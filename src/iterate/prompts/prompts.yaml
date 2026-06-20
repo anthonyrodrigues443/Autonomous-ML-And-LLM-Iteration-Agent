@@ -198,53 +198,50 @@ coder:
 
     THE READ-DECIDE RHYTHM (imitate this shape, all the way to a prediction):
 
-    Cell A, inspect: split columns by dtype into variables.
+    Cell A, set up column groups by dtype. The profile already lists these columns with their cardinality and missingness; this cell only creates the num_cols/cat_cols variables your later cells reuse. It is setup, NOT re-exploration: no nunique(), value_counts(), or isnull() cell to re-confirm what the profile already states.
         num_cols = X_train.select_dtypes(include='number').columns.tolist()
         cat_cols = X_train.select_dtypes(exclude='number').columns.tolist()
-        print(len(num_cols), 'numeric', len(cat_cols), 'categorical'); print(cat_cols)
+        print(len(num_cols), 'numeric', len(cat_cols), 'categorical')
 
-    Cell B reads level counts and DECIDES the encoder from that evidence.
-        print(X_train[cat_cols].nunique().sort_values())
-
-    Cell C imputes ONLY the numeric group; it does not encode or scale.
+    Cell B imputes ONLY the numeric group; it does not encode or scale.
         from sklearn.impute import SimpleImputer
         num_imputer = SimpleImputer(strategy='median')
         X_num = pd.DataFrame(num_imputer.fit_transform(X_train[num_cols]), columns=num_cols, index=X_train.index)
         print(X_num.shape, X_num.isna().sum().sum())
 
-    Cell D, the numbers now clean, encodes ONLY cat_cols.
+    Cell C, the numbers now clean, encodes ONLY cat_cols — choose the encoder from the profile's cardinalities (low-cardinality to one-hot), no separate inspection cell needed.
         from sklearn.preprocessing import OneHotEncoder
         enc = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
         X_cat = pd.DataFrame(enc.fit_transform(X_train[cat_cols]), columns=enc.get_feature_names_out(cat_cols), index=X_train.index)
         print(X_cat.shape)
 
-    Cell E combines both groups into ONE named matrix, aligned by index.
+    Cell D combines both groups into ONE named matrix, aligned by index.
         X_tr = pd.concat([X_num, X_cat], axis=1)
         print(X_tr.shape, X_tr.isna().sum().sum())
 
-    Cell F carves a validation split from training data.
+    Cell E carves a validation split from training data.
         from sklearn.model_selection import train_test_split
         Xa, Xb, ya, yb = train_test_split(X_tr, y_train, test_size=0.2, stratify=y_train, random_state=0)
         print(Xa.shape, Xb.shape)
 
-    Cell G fits one model and prints validation '{metric}'.
+    Cell F fits one model and prints validation '{metric}'.
         from sklearn.ensemble import HistGradientBoostingClassifier
         from sklearn.metrics import f1_score
         model = HistGradientBoostingClassifier().fit(Xa, ya)
         print('val', f1_score(yb, model.predict(Xb)))
 
-    Cell H transforms X_holdout with the SAME fitted objects (never refit), then writes:
+    Cell G transforms X_holdout with the SAME fitted objects (never refit), then writes:
         Xh_num = pd.DataFrame(num_imputer.transform(X_holdout[num_cols]), columns=num_cols, index=X_holdout.index)
         Xh_cat = pd.DataFrame(enc.transform(X_holdout[cat_cols]), columns=enc.get_feature_names_out(cat_cols), index=X_holdout.index)
         pd.Series(model.predict(pd.concat([Xh_num, Xh_cat], axis=1))).to_csv('{predictions_csv}', index=False, header=False)
 
-    None bundled impute, encode, fit, and write together. Your FIRST GOAL is a WRITTEN '{predictions_csv}' for the holdout, NOT a validation score: build the baseline cell by cell, RUN the submit cell (Cell H) that writes the file, and bank it before any further work. A run that prints a score but never writes predictions has produced nothing and fails, so reach Cell H early and never call finish until the file exists.
+    None bundled impute, encode, fit, and write together. Your FIRST GOAL is a WRITTEN '{predictions_csv}' for the holdout, NOT a validation score: build the baseline cell by cell, RUN the submit cell (Cell G) that writes the file, and bank it before any further work. A run that prints a score but never writes predictions has produced nothing and fails, so reach Cell G early and never call finish until the file exists.
 
     CORE RULES (every modeling cell). Fit each encoder, imputer, scaler, or selector on X_train and reuse that SAME fitted object on X_holdout, so columns align and no holdout leaks. Any feature you build BY HAND (an interaction, ratio, or log column) must be computed the IDENTICAL way on X_train and X_holdout, via one function called on both, never edit just one frame, or the holdout loses columns and the submit fails with a KeyError or shape mismatch. Carve the validation split from TRAINING data only (stratified for classification, random for regression). Imputers, scalers, and OneHotEncoder may be fit on full X_train before the carve, but TargetEncoder, frequency encoding, and quantile transforms learn from the target or value distribution, so fit them INSIDE the split or they inflate your score. A validation score is not a submission: NEVER stop after printing it, and never write predictions before printing it.
 
     ENCODING MENU. High-cardinality text to target or frequency encoding, not one-hot; low-cardinality to one-hot or ordinal; skewed numeric to log, power, or quantile transform; missing to median (numbers) or most-frequent (text); class imbalance to class_weight balanced, resampling, or threshold tuning. Keep threshold tuning SIMPLE: pick the threshold on your existing validation split and apply it to the holdout in the same submit cell; do not add extra splits, cross-val folds, or index re-alignment for it. Gradient-boosted trees (HistGradientBoosting, XGBoost, LightGBM) need NO feature scaling, never add StandardScaler or RobustScaler to one. Use sklearn-native transformers only (OneHotEncoder, OrdinalEncoder, TargetEncoder, StandardScaler, PowerTransformer, SimpleImputer); on a FAILED install switch to the sklearn equivalent, not a version-clashing third-party library.
 
-    THE PROFILE IS DONE. The data summary already gives cardinalities, missing counts, skew, class balance or target spread, and top correlations; treat these as known. Inspect only what it omits, or to decide a transform from real data. The target is y_train, never a column of X_train.
+    THE PROFILE IS DONE. The data summary already gives cardinalities, missing counts, skew, class balance or target spread, and top correlations; treat these as established fact. Do NOT spend a cell re-deriving them: no nunique(), value_counts(), describe(), or isnull() cell to re-confirm cardinality, class balance, or missingness the profile already states. Spend an inspection cell ONLY on a NEW question the profile does not answer (how a specific feature relates to the target, whether an interaction or transform is worth trying), then act on it; otherwise go straight to building the baseline. The target is y_train, never a column of X_train.
 
     A STARTING POINT IS REFERENCE ONLY. If a 'BEST APPROACH SO FAR' block appears in your task message, do NOT paste it into one cell: read it, find its score, rebuild it as the same small cells reading each output, then beat it with the brief's ONE change.
 
@@ -262,7 +259,7 @@ coder:
     The data is already loaded into X_train, y_train, X_holdout. Output of the load cell:
     {preamble_output}
 
-    Do this now, ONE action per cell, printing the one result each cell produces and reading it before the next. Begin with a dtype-split inspect cell that computes num_cols and cat_cols and prints both. If a 'BEST APPROACH SO FAR' block appears above, do NOT paste it as one cell: find its score line, then rebuild it incrementally as separate cells (reproduce each step and read its output), then apply the brief's ONE change to beat that score. Otherwise build the strong simple baseline (one-hot, median-impute, a gradient-boosted tree) one small cell at a time: inspect, transform each column-group into a NEW variable, combine into one named matrix, fit and score one model on a validation split carved from the training data, transform X_holdout with the SAME fitted objects, then write holdout predictions to '{predictions_csv}'. Never bundle transform, fit, and write into one cell. After your first valid submission, keep improving one measured change at a time, reusing the variables already in memory, until the budget warning, then call the finish tool.
+    Do this now, ONE action per cell, printing the one result each cell produces and reading it before the next. Begin with a dtype-split SETUP cell that computes num_cols and cat_cols in one cell — the profile already gives their cardinality, class balance, and missingness, so do NOT add a cell to re-derive those. If a 'BEST APPROACH SO FAR' block appears above, do NOT paste it as one cell: find its score line, then rebuild it incrementally as separate cells (reproduce each step and read its output), then apply the brief's ONE change to beat that score. Otherwise build the strong simple baseline (one-hot, median-impute, a gradient-boosted tree) one small cell at a time: inspect, transform each column-group into a NEW variable, combine into one named matrix, fit and score one model on a validation split carved from the training data, transform X_holdout with the SAME fitted objects, then write holdout predictions to '{predictions_csv}'. Never bundle transform, fit, and write into one cell. After your first valid submission, keep improving one measured change at a time, reusing the variables already in memory, until the budget warning, then call the finish tool.
   retry_nudge: >-
     Respond ONLY by calling the run_cell tool (with a `code` string) or the finish
     tool. No prose.
@@ -357,6 +354,9 @@ supervisor:
 
     {history_section}Walk the ladder top to bottom honoring the PIVOT rule, act on the first rung whose trigger fires, and brief that one move; on experiment 1 this is the baseline rung. Call plan_next.
   history_header: "Experiments so far:"
+  # Sent after a backend rejects a malformed tool call (e.g. groq's tool_use_failed when
+  # 'stop' arrives as the string "false"); asks for a well-formed retry.
+  tool_error_nudge: "Your last tool call was rejected as malformed. Call plan_next again with valid JSON: 'stop' MUST be a boolean (true or false), not a string, and 'brief' a plain string."
 
   retry_nudge: "Respond ONLY by calling the plan_next tool. No prose."
 

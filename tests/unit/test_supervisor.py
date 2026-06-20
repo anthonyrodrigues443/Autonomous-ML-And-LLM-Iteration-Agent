@@ -76,6 +76,65 @@ def test_no_tool_call_retries_then_raises() -> None:
     assert len(fake.calls) == 2
 
 
+class _ErroringThenPlanLLM:
+    """First chat() raises a backend reject (like groq's tool_use_failed 400); the
+    retry returns a valid plan."""
+
+    def __init__(self, plan: ChatResponse) -> None:
+        self._plan = plan
+        self.calls = 0
+
+    @property
+    def model(self) -> str:
+        return "fake-model"
+
+    def chat(self, messages, *, tools=None, temperature=None, max_tokens=None):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("400 tool_use_failed: /stop expected boolean, got string")
+        return self._plan
+
+
+def test_backend_reject_is_retried_not_fatal() -> None:
+    # a malformed-tool-call 400 must not crash the run: nudge, retry, recover.
+    fake = _ErroringThenPlanLLM(_plan(False, "ok", "so far: x. next: y"))
+    d = Supervisor(fake, metric="f1", max_retries=1).decide(
+        data_summary="d", baseline=_baseline(), history=[]
+    )
+    assert fake.calls == 2  # first errored, second succeeded
+    assert d.brief == "so far: x. next: y"
+
+
+def test_persistent_backend_error_degrades_to_supervisor_error() -> None:
+    class _AlwaysErrors:
+        @property
+        def model(self) -> str:
+            return "fake-model"
+
+        def chat(self, messages, *, tools=None, temperature=None, max_tokens=None):  # type: ignore[no-untyped-def]
+            raise RuntimeError("400 tool_use_failed")
+
+    with pytest.raises(SupervisorError, match="backend error"):
+        Supervisor(_AlwaysErrors(), metric="f1", max_retries=1).decide(
+            data_summary="d", baseline=_baseline(), history=[]
+        )
+
+
+def test_stop_as_the_string_false_does_not_stop_the_run() -> None:
+    # bool("false") is True — a weak model emitting the STRING "false" must not be read
+    # as a request to stop. The brief is what matters; coerce by meaning.
+    fake = _FakeLLM([
+        ChatResponse(
+            model="fake-model",
+            tool_calls=[ToolCall(id="p", name="plan_next",
+                                 arguments={"stop": "false", "title": "go", "brief": "next: try x"})],
+        )
+    ])
+    d = Supervisor(fake, metric="f1").decide(data_summary="d", baseline=_baseline(), history=[])
+    assert d.stop is False
+    assert d.brief == "next: try x"
+
+
 def test_history_shows_components_to_the_supervisor() -> None:
     prior = Experiment(
         candidate=Candidate(
