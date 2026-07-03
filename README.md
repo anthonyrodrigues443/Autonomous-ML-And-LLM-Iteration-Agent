@@ -2,11 +2,41 @@
 
 **Autonomous research-aware iteration agent for ML models and LLM prompts.**
 
+[![PyPI](https://img.shields.io/pypi/v/iterate-ai)](https://pypi.org/project/iterate-ai/)
+[![CI](https://github.com/anthonyrodrigues443/Autonomous-ML-And-LLM-Iteration-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/anthonyrodrigues443/Autonomous-ML-And-LLM-Iteration-Agent/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/pypi/pyversions/iterate-ai)](https://pypi.org/project/iterate-ai/)
+[![License](https://img.shields.io/github/license/anthonyrodrigues443/Autonomous-ML-And-LLM-Iteration-Agent)](LICENSE)
+
+```bash
+pip install iterate-ai
+
+# your CSV, your target column, your metric. LLM runs on local Ollama ($0)
+# or any OpenAI-compatible endpoint. Full setup: Quick start below.
+iterate run --data examples/churn_tabular/data.clean.csv --target Churn --metric f1
+```
+
+`iterate` runs an autonomous propose-run-score-remember loop on your ML problem. An LLM proposes a model and hyperparameters, the framework trains it leakage-safe, scores it on a sealed holdout, records the attempt in persistent memory, and keeps going until a deadline, patience, or plateau gate stops it. 304 unit tests across 30 files run in CI on every push.
+
+| v0.1 today | On the roadmap |
+|---|---|
+| Autonomous model + hyperparameter iteration on tabular data (scikit-learn, XGBoost, LightGBM) | Sandboxed LLM code-gen for arbitrary models (v0.2) |
+| Persistent memory in `.iterate/memory.db`; every run builds on the last | Interactive CLI: pause, mid-run chat, resume (v0.3) |
+| Any OpenAI-compatible LLM backend; local Ollama by default, no API keys | LLM prompt iteration (v0.5), vision transfer learning (v0.6) |
+| Best model saved as joblib; bounded loop with deadline / patience / plateau gates | Cost-to-serve recommendations (v0.7), MCP auto-discovery of data + context (v0.9) |
+
+## Why I built this
+
+I kept seeing the same failure mode on small AI teams. A model or a prompt ships, and under delivery pressure nobody iterates on it again, so it sits in production for months while baselines move on. Experiments get re-run because nobody wrote down why they failed the first time. Teams pay frontier-model prices because nobody checked whether a cheaper model with a better prompt would do the job. `iterate` is the institutional memory, research desk, and experiment runner those teams don't have time to build.
+
+> **How this gets built:** [WORKFLOW.md](WORKFLOW.md) (the method) · [DECISIONS.md](DECISIONS.md) (every call I made against the AI's default) · [BUILD_LOG.md](BUILD_LOG.md) (the daily trail)
+
+---
+
+## The full pitch
+
 > Every YC batch ships 200+ AI startups with 2-3 engineer teams. Under shipping pressure, two things break: nobody re-iterates models against new baselines, and LLM prompts sit in production for months untouched. Engineers re-run failed experiments because nobody logged why. Teams pay GPT-5 prices because nobody tested whether Haiku + better prompting would do the job at 1/50th the cost.
 >
 > AutoML brute-forces. Experiment trackers only log. Prompt evals only evaluate. AIDE iterates Kaggle problems once. `iterate` is the only system that runs an autonomous, literature-aware, memory-persistent improvement loop on **ML models, DL/vision models, AND LLM prompts** in production — optimizing for the best model you can actually **afford to serve** (cheapest cloud, cost/month, requests/hour) — pulling its own training data + context from your DBs, files, and docs (via MCP) — with human-approval safety gates and append-only reasoning logs to wherever your team reads.
-
-> **How this gets built:** [WORKFLOW.md](WORKFLOW.md) (the method) · [DECISIONS.md](DECISIONS.md) (every call I made against the AI's default)
 
 ---
 
@@ -35,7 +65,7 @@
 
 ---
 
-## What it does
+## What it does (the v1.0 vision)
 
 **You give it one input. It figures out the rest.**
 
@@ -271,15 +301,9 @@ Week 12 will ship the head-to-head matrix on identical tasks — scored on quali
 
 ---
 
-## Why this exists
-
-Production AI teams forget what they've tried. So they keep retrying it. `iterate` is the institutional memory + research desk + experiment runner those teams don't have time to build.
-
----
-
 ## License
 
-MIT (planned). The framework is open-source. Adapters for proprietary data sources can be built on top.
+MIT. The framework is open-source. Adapters for proprietary data sources can be built on top.
 
 ---
 
