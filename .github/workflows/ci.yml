@@ -25,4 +25,6 @@ jobs:
       - name: Unit tests
         env:
           OMP_NUM_THREADS: "1"
-        run: pytest tests/unit -q
+        # env -u GITHUB_ACTIONS: typer forces color output when GITHUB_ACTIONS is
+        # set, and the ANSI escape codes break the CLI help-text assertions.
+        run: env -u GITHUB_ACTIONS pytest tests/unit -q
