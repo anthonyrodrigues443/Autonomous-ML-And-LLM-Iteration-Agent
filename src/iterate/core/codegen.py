@@ -141,6 +141,30 @@ RESET_INPUTS = (
 )
 
 
+def fallback_baseline(task: str) -> str:
+    """A host-authored, deterministic floor submission for the cell-by-cell path.
+
+    Run as a last-resort cell when a session ends without a valid predictions file
+    (a heavy lever ate the whole budget, or the approach was abandoned), so the
+    iteration degrades to a floor score instead of a total loss. Kept minimal on
+    purpose: one-hot via get_dummies (holdout reindexed to the train columns) into
+    a NaN-native gradient-boosted tree, seeded for reproducibility."""
+    estimator = (
+        "HistGradientBoostingClassifier" if task == "classification"
+        else "HistGradientBoostingRegressor"
+    )
+    return (
+        "import pandas as pd\n"
+        f"from sklearn.ensemble import {estimator}\n"
+        "_fb_cats = X_train.select_dtypes(exclude='number').columns.tolist()\n"
+        "_fb_Xt = pd.get_dummies(X_train, columns=_fb_cats)\n"
+        "_fb_Xh = pd.get_dummies(X_holdout, columns=_fb_cats).reindex(columns=_fb_Xt.columns, fill_value=0)\n"
+        f"_fb_model = {estimator}(random_state=42).fit(_fb_Xt, y_train)\n"
+        f"pd.Series(_fb_model.predict(_fb_Xh)).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
+        "print('fallback baseline banked', len(_fb_Xh), 'predictions')\n"
+    )
+
+
 def validate_train_and_predict(code: str) -> str | None:
     """Static check of a generated snippet; returns an error reason or ``None`` if OK.
 
@@ -333,6 +357,7 @@ __all__ = [
     "assemble_script",
     "build_inputs",
     "components_used",
+    "fallback_baseline",
     "is_code_candidate",
     "package_for_import",
     "required_imports",

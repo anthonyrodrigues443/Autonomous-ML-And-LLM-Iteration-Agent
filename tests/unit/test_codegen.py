@@ -189,6 +189,19 @@ def test_components_used_handles_unparseable() -> None:
     assert codegen.components_used("def f(:\n") == []
 
 
+def test_fallback_baseline_matches_the_task_and_parses() -> None:
+    import ast
+
+    clf = codegen.fallback_baseline("classification")
+    reg = codegen.fallback_baseline("regression")
+    ast.parse(clf)
+    ast.parse(reg)
+    assert "HistGradientBoostingClassifier" in clf
+    assert "HistGradientBoostingRegressor" in reg
+    assert codegen.PREDICTIONS_CSV in clf
+    assert "random_state=42" in clf  # deterministic floor
+
+
 def test_validate_accepts_a_well_formed_function() -> None:
     assert codegen.validate_train_and_predict(_GOOD_FN) is None
 
