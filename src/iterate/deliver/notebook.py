@@ -69,6 +69,7 @@ def build_session_notebook(
     baseline_score: float | None = None,
     hypothesis: str | None = None,
     findings: Any = None,
+    honesty_note: str | None = None,
 ) -> NotebookNode:
     """Render a cell-by-cell coding session as a runnable notebook.
 
@@ -92,6 +93,10 @@ def build_session_notebook(
         if baseline_score is not None:
             line += f"  ({score - baseline_score:+.4f} vs baseline {baseline_score:.4f})"
         head.append(line)
+    if honesty_note:
+        # The score alone can mislead (a duplicate submission still shows a
+        # positive delta vs baseline) — the machine verdict rides the header.
+        head.append(f"\n**Note:** _{honesty_note}_")
     head.append("\n_cell-by-cell session — outputs are the actual execution results_")
     nb.cells = [new_markdown_cell("\n".join(head))]
     if hypothesis and hypothesis.strip():
@@ -106,6 +111,21 @@ def build_session_notebook(
         thinking = _cell_get(cell, "thinking").strip()
         if thinking:
             nb.cells.append(new_markdown_cell(_thinking_markdown(thinking)))
+        if _cell_get(cell, "source") == "fallback":
+            # Honesty marker: this submission was banked by the harness, not the coder.
+            nb.cells.append(
+                new_markdown_cell(
+                    "## Harness fallback\n\n_The session ended without a valid submission,"
+                    " so the harness banked this floor submission (not written by the"
+                    " coding agent this iteration)._"
+                )
+            )
+        elif _cell_get(cell, "error"):
+            # A dead end in the R&D journey — annotated so a reader of the deliverable
+            # sees it was part of the process, not an unnoticed failure.
+            nb.cells.append(
+                new_markdown_cell("_(dead end — this cell errored; kept for the record)_")
+            )
         node = new_code_cell(_cell_get(cell, "code").strip())
         node.execution_count = count
         node.outputs = _cell_outputs(cell)

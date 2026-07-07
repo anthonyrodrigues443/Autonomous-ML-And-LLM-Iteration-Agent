@@ -102,6 +102,24 @@ def test_slug_is_filesystem_safe() -> None:
     assert slug("") == "experiment"
 
 
+def test_session_notebook_carries_the_honesty_note_in_the_header() -> None:
+    # run 20 i3: a duplicate's header read "+0.0321 vs baseline" although the
+    # submission was byte-identical to an earlier one — the machine verdict must
+    # ride the header so the delta cannot mislead.
+    from iterate.deliver.notebook import build_session_notebook
+
+    cells = [{"code": "x = 1", "stdout": "", "error": None, "source": "agent", "outputs": []}]
+    nb = build_session_notebook(
+        cells, title="dup", metric="f1", score=0.5997, baseline_score=0.5676,
+        honesty_note="this submission is byte-identical to an earlier experiment's",
+    )
+    nbformat.validate(nb)
+    assert "byte-identical to an earlier experiment" in nb.cells[0].source
+    # without a note the header stays as before
+    plain = build_session_notebook(cells, title="t", metric="f1", score=0.6)
+    assert "Note:" not in plain.cells[0].source
+
+
 def test_session_notebook_attaches_real_outputs_to_cells() -> None:
     from iterate.deliver.notebook import build_session_notebook
 
