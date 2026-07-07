@@ -203,11 +203,11 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 | 1 | **`ComputeBackend` protocol** — extract the execution seam from `LocalExecutor` (it conforms; Orchestrator depends on the protocol); `SandboxExecutor` stub raising NotImplementedError. Settle the two design forks; RESEARCH_LOG entry on the code-gen contract + sandbox choice | `adapters/compute/base.py` + tests | done |
 | 2 | **Code runner primitive** — `CodeRunner` protocol + `LocalCodeRunner` (subprocess) + `E2BCodeRunner` (e2b, lazy-imported, injectable sandbox); run a script with input files under a mandatory timeout, capture stdout/exit/outputs, teardown. The `ComputeBackend.execute` integration lands Day 5 (needs candidates) | `adapters/compute/runner.py` + tests | done |
 | 3 | **Code-gen contract** — fill-in-a-function harness (LLM writes `train_and_predict`; we own the I/O); inputs = train + holdout FEATURES + meta (labels held back); script writes `predictions.csv`; we score through the shared `core.scoring`. Code-candidate = `{"code": ...}`. Proven end-to-end through `LocalCodeRunner` with a canned function (no LLM/e2b) | `core/codegen.py` + `core/scoring.py` + tests | done |
-| 4 | **CodeProposer** — the LLM writes a training script to the contract (new prompt in `prompts.yaml` + tool). Coexists with the spec Proposer (option a). Conformance checks; failures captured, not crashed | `core/code_proposer.py` + tests | todo |
-| 5 | **Wire end-to-end + safety** — Orchestrator runs code-candidates through the sandbox executor; resource caps, timeout, no-network default, "own code only" enforced. First real sandboxed run on churn with a non-allow-listed model (e.g. CatBoost) | orchestrator wiring + integration test | todo |
-| 6 | **Notebook deliverable (B)** — export the winning experiment as a runnable, annotated `.ipynb` (a spec winner rebuilt as cells, or the generated-code winner wrapped with a markdown rationale); execute it to populate outputs (e2b's Jupyter kernel, or papermill/nbconvert on the local path); save next to `best_model.joblib`. The portfolio-worthy "here's exactly what the agent found, runnable" artifact | `core/notebook.py` (+ `nbformat`) + tests | todo |
-| 7 | **Cheap interactive wins** — live progress display (rich `Live`: iteration / model / score / best updating in place), streaming LLM responses (client stream path), graceful Ctrl-C (finish or abort current iteration, persist state, clean exit) | `llm/*` stream methods + CLI live view + tests | todo |
-| 8 | Polish + Week 4 retro + release **v0.2.0** (tag + PyPI) | wrap-up | todo |
+| 4 | **CodeProposer** — the LLM writes a training script to the contract (new prompt in `prompts.yaml` + tool). Coexists with the spec Proposer (option a). Conformance checks; failures captured, not crashed | `core/code_proposer.py` + tests | done |
+| 5 | **Wire end-to-end + safety** — Orchestrator runs code-candidates through the sandbox executor; resource caps, timeout, no-network default, "own code only" enforced. First real sandboxed run on churn with a non-allow-listed model (e.g. CatBoost) | orchestrator wiring + integration test | done |
+| 6 | **Notebook deliverable (B)** — export the winning experiment as a runnable, annotated `.ipynb` (a spec winner rebuilt as cells, or the generated-code winner wrapped with a markdown rationale); execute it to populate outputs (e2b's Jupyter kernel, or papermill/nbconvert on the local path); save next to `best_model.joblib`. The portfolio-worthy "here's exactly what the agent found, runnable" artifact | `deliver/notebook.py` (+ `nbformat`) + tests | done |
+| 7 | **Cheap interactive wins** — live progress display (rich `Live`: iteration / model / score / best updating in place), streaming LLM responses (client stream path), graceful Ctrl-C (finish or abort current iteration, persist state, clean exit) | `llm/*` stream methods + CLI live view + tests | done (streaming re-scoped to v0.3, DECISIONS 2026-06-13) |
+| 8 | Polish + Week 4 retro + release **v0.2.0** (tag + PyPI) | wrap-up | in progress (expanded: the release was gated on a quality bar, see the 2026-07 entries) |
 
 **Slack:** 1 day (likely needed — sandbox infra + code-gen reliability are the riskiest work so far). v0.2 is now 8 days (added the notebook deliverable), so it runs into early Week 5.
 
@@ -269,6 +269,52 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-07-07 | Week 4 Day 8 | Quality bar CERTIFIED; release prep (README rewrite, v0.2.0 bump, sdist trim)
+
+**Task:** Close the quality-bar loop with a certified run, then execute the release mechanics.
+
+**Certification (runs 20 + 21, gemma4:12b, churn/f1):** run 20 passed all 7 bar criteria: staged R&D (0 monoliths in 116 cells, first fully-clean run), pickup (digit-identical rebuilds of the carried best), progression (0.5620 -> 0.5997 -> 0.6333, ties the all-time record), failure-knowledge transfer (dead-ends lines rode every brief and were honored), exactly 1 process-failure duplicate (bar: <=2; honest measured nulls excluded), zero FAILED, and every residual flaw named with a reproduced root cause. Run 21 confirmed the three fast-follow fixes with no regression: 2 duplicates, zero FAILED, best 0.6312 via an XGBoost swap, honesty notes rendering in duplicate notebooks. The certified capability floor: 1-2 honestly-labeled duplicate/null iterations per run is the 12B being a 12B; the harness detects it (byte hashes, marker checks), labels it (stamps in memory + notebook headers), and converts it (guard rejections, fallback briefs, floor submissions).
+
+**Release prep shipped:** the quality-bar workstream committed as three logical commits (supervisor grounding + brief guards; coder gates + submission floor + thrash guards; loop verdicts + honest deliverables; 387 unit tests green). README rewritten for v0.2 (multi-agent story, real run transcript, honest shipped-vs-planned tables, architecture diagram matching the actual tree); examples/ READMEs de-ghosted (PromptTarget placeholders labeled as v0.5); LIMITATIONS rows updated (multi-agent core shipped, seeding shipped, capability-floor row added). Version 0.2.0 in pyproject + __init__ + lockfile; PyPI description rewritten to what v0.2 actually does; sdist trimmed from the whole repo (~2MB) to package + docs (120K); make build/publish targets added so the release process stops living in memory.
+
+**Next:** live e2b verification with a real key, the official demo run, merge call, tag + publish, launch post.
+
+### 2026-07-05 | Week 4 Day 8 (cont) | The dedup guard stack: forensics-fix-rerun, runs 8-19
+
+**Task:** Kill the remaining waste class: iterations whose submission is byte-identical to an earlier one.
+
+**The loop that did it (each run's forensics named ONE dominant mechanism; each got a deterministic guard + regression test; then rerun):**
+- runs 8-10: identical-submission gate now hashes against EVERY prior submission (sibling duplicates evaded a best-only check); duplicate iterations stamped in history so the scoreboard stops re-crediting orbited levers; baseline re-briefs rejected in code.
+- runs 11-13: pre-issue novelty guard (a brief re-commissioning work the carried best already contains: class_weight set, grid searched, feature built, is rejected before dispatch); the "so far:" slot composed by code from the loop's carried best, killing hallucinated facts structurally; recurrence-ranked dead-ends line carries failure knowledge to the coder (blind re-probes of one pet idea: 8/10 notebooks -> ~0).
+- runs 14-17: guard precision round: technique-level marker matching (the class NAME contains 'threshold'; only technique mentions count), threshold-retune guard (re-tuning an already-tuned banked threshold deterministically reproduces the incumbent), measured-lost guard (a technique that lost fairly this run cannot be silently re-briefed), move lint (fused lever tags, phantom scores), digest sanitization (a duplicate keeps no what-helped claims; fabricated wins about never-executed levers are machine-stripped).
+- runs 18-19: when a guard violation persists through its one corrective retry, the harness now composes a deterministic fallback brief from the first untried lever class (novel by construction; both live firings converted to real measured experiments). Plus the one FAILED iteration in 121: predictions written with an index column (to_csv without index=False) passed the line-count check and died at scoring; the finish gate now catches the format in-session.
+
+**Trajectory across the stack:** wasted iterations 4-6/run -> 1-2; supervisor-fault duplicates -> 0 in the certified run; zero FAILED in 120 of 121 iterations; two runs got their best score directly off a guard forcing a novel lever.
+
+### 2026-07-04 | Week 4 Day 8 (cont) | Quality bar gates the release; supervisor grounding + coder no-op gates + submission floor
+
+**Task:** The user's call (DECISIONS 2026-07-04): the v0.2 release is GATED on a quality bar defined as trajectory, not score: staged R&D notebooks, pickup of the carried best, progression across notebooks, failure-knowledge transfer, no silent process waste. Iterate on the current architecture until it holds; no new roadmap features.
+
+**What shipped (first tranche):**
+- **Grounded briefs**: the brief's "so far:" facts are composed by CODE from the recorded history (real best score, its components, the applied decision threshold), never LLM recall. Live forensics had caught the supervisor citing scores that never existed on the holdout.
+- **Coder no-op gates at finish time**: the lever gate (briefed change absent from every NEW code line, diff-scoped against the carried code) and the identical gate (submission byte-identical to the carried best), each a one-shot corrective nudge. The lever gate converted ~5/5 live and twice produced the run best.
+- **Submission guarantee**: a session that dies without a valid predictions file banks a floor (re-run the carried best, else a canned seeded baseline) as a labeled fallback cell; total-loss iterations (2/10 in the worst pre-fix run) went to zero.
+- **Thrash guards**: 6-consecutive-errors breaker + a 30-minute session wall ceiling (kernel-time budgets deliberately do not charge LLM latency, which left a thrashing session unbounded in wall-clock); truncated cells (mid-token cutoffs) rejected unexecuted with a precise retry message.
+- **Split-first hygiene in the coder's worked example**: fit-before-split leakage in the coder's own validation split went from 5/5 notebooks to 0 across every run since; the like-for-like rule (same decision threshold on both sides of any comparison) killed the false-kill pattern.
+
+**Also:** the pre-release audit (4-agent workflow over plan/docs/packaging/logs) that scoped the release wrap-up, and the run-forensics workflows (10 parallel notebook readers + adversarial verify) that became the standing certification instrument.
+
+### 2026-06-20 | Week 5 Day 4-5 | Pre-release hardening; the EDA-ledger regression + revert; coder forensics overturn a comfortable assumption
+
+**Task:** Land the last pre-release hardening items, then chase the observed cross-notebook EDA repetition.
+
+**Hardening shipped (commit b9b5943):** session RNG seeded in the preamble (the rendered notebook re-executes to the SAME score the run reported); e2b keepalive; graceful Ctrl-C (finalize memory, keep every earned notebook, no stack trace); per-cell progress line. Plus supervisor backend-error resilience (commit 5e43dcb): a groq tool_use_failed 400 (the model emitting stop as the STRING "false"; bool("false") is True) no longer crashes a run, and the coder prompt stopped re-deriving the host profile (nunique re-derivation 10/10 notebooks -> 0).
+
+**The regression story (kept honest because it is the method):** a 3-part cross-notebook EDA-transfer feature was built, tested, and then REVERTED. Same-model before/after runs showed the additive context (a supervisor status line + an EDA ledger) regressed gemma4:12b: best 0.6325 -> ~0.61 with the supervisor collapsing onto one lever 5-6/10 iterations. More context a frontier model digests, a 12B chokes on; a post-revert run restored lever diversity, confirming causation. Kept: the robustness fix + the prompt de-dup. Lesson banked: deterministic guards over prompt nudges, lean context always.
+
+**Forensics overturned "the coder is fine":** a 10-reader workflow over every notebook of a fresh run showed the CODER was the primary quality-bar blocker on the weak model (2/10 no-submission iterations, a hard-coded threshold carried for 6 iterations, leakage in its own derived split). That verdict re-sequenced everything that followed: coder reliability first, supervisor compounding second.
+
 
 ### 2026-06-10 | Week 5 Day 3 | Supervisor priority ladder + lever ledger + Hypothesis/Findings notebooks → first 10/10-above-0.60 run (documented 2026-06-11)
 

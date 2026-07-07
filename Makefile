@@ -1,4 +1,4 @@
-.PHONY: help install install-dev test test-unit test-integration lint format typecheck clean demo
+.PHONY: help install install-dev test test-unit test-integration lint format typecheck clean demo build publish
 
 help:
 	@echo "iterate — Makefile targets"
@@ -44,5 +44,14 @@ clean:
 	find . -type f -name '*.pyc' -delete
 
 demo:
-	uv run iterate init --target examples/churn_tabular
-	uv run iterate run
+	uv run iterate run --data examples/churn_tabular/data.clean.csv --target Churn --metric f1
+
+# Release: verify, build fresh artifacts, publish (publish prompts for the PyPI token).
+build: clean
+	uv run pytest -m "not integration" -q
+	uv run ruff check .
+	uv run mypy src/iterate
+	uv build
+
+publish: build
+	uv publish
