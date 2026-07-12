@@ -322,7 +322,12 @@ class E2BKernel:
             data = self._sandbox.files.read(f"{self._work_dir}/{name}", format="bytes")
         except Exception:
             return None
-        return data if isinstance(data, bytes) else str(data).encode()
+        # e2b SDK v2 returns a bytearray for format="bytes"; a bytearray is NOT
+        # bytes, and str(bytearray(...)).encode() collapses a whole predictions
+        # file into one literal line (caught live 2026-07-12).
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        return str(data).encode()
 
     def close(self) -> None:
         if self._sandbox is not None:
@@ -336,7 +341,8 @@ class E2BKernel:
             from e2b_code_interpreter import Sandbox
         except ImportError as exc:  # pragma: no cover - e2b ships in core; defensive only
             raise RuntimeError("e2b_code_interpreter failed to import; reinstall iterate-ai") from exc
-        return Sandbox(api_key=self._api_key)
+        # e2b SDK v2: Sandbox.create(), not the constructor (see runner.py note).
+        return Sandbox.create(api_key=self._api_key)
 
 
 __all__ = ["CellResult", "E2BKernel", "LocalKernel", "StatefulKernel"]

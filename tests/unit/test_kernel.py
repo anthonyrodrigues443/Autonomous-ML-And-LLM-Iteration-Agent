@@ -195,6 +195,18 @@ class _FakeSandbox:
         self.killed = True
 
 
+def test_e2b_bytearray_reads_come_back_as_real_bytes() -> None:
+    # e2b SDK v2 returns a bytearray for format="bytes"; a bytearray is NOT bytes,
+    # and the old str(data).encode() fallback collapsed a whole predictions file
+    # into one literal "bytearray(b'...')" line (caught on the first live run).
+    sandbox = _FakeSandbox(store={"/home/user/preds.csv": bytearray(b"0\n1\n0\n")})  # type: ignore[dict-item]
+    k = E2BKernel(sandbox_factory=lambda: sandbox)
+    k.start({"train.csv": b"x,y"})
+    data = k.read_output("preds.csv")
+    assert data == b"0\n1\n0\n"
+    assert isinstance(data, bytes)
+
+
 def test_e2b_kernel_reuses_one_sandbox_across_cells() -> None:
     sandbox = _FakeSandbox(store={"/home/user/preds.csv": b"0\n1\n"})
     k = E2BKernel(sandbox_factory=lambda: sandbox)

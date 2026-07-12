@@ -205,7 +205,9 @@ class E2BCodeRunner:
                 "e2b_code_interpreter failed to import; reinstall iterate-ai and set E2B_API_KEY"
             ) from exc
         # Sandbox lifetime a bit beyond the run timeout so teardown is clean.
-        return Sandbox(api_key=self._api_key, timeout=int(timeout) + 5)
+        # e2b SDK v2: instances come from Sandbox.create(), not the constructor
+        # (confirmed live 2026-07-12 -- v1's Sandbox(api_key=...) raises TypeError).
+        return Sandbox.create(api_key=self._api_key, timeout=int(timeout) + 5)
 
 
 def _as_text(value: str | bytes | None) -> str:
@@ -250,7 +252,12 @@ def _try_read(sandbox: Any, path: str) -> bytes | None:
         data = sandbox.files.read(path, format="bytes")
     except Exception:  # a missing output file is expected, not an error
         return None
-    return data if isinstance(data, bytes) else str(data).encode()
+    # e2b SDK v2 returns a bytearray for format="bytes"; a bytearray is NOT
+    # bytes, and str(bytearray(...)).encode() collapses a whole predictions
+    # file into one literal line (caught live 2026-07-12).
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    return str(data).encode()
 
 
 __all__ = ["CodeRunner", "E2BCodeRunner", "LocalCodeRunner", "RunResult"]
