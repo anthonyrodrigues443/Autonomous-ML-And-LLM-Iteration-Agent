@@ -2,17 +2,47 @@
 
 **Autonomous research-aware iteration agent for ML models and LLM prompts.**
 
-> Every YC batch ships 200+ AI startups with 2-3 engineer teams. Under shipping pressure, two things break: nobody re-iterates models against new baselines, and LLM prompts sit in production for months untouched. Engineers re-run failed experiments because nobody logged why. Teams pay GPT-5 prices because nobody tested whether Haiku + better prompting would do the job at 1/50th the cost.
->
-> AutoML brute-forces. Experiment trackers only log. Prompt evals only evaluate. AIDE iterates Kaggle problems once. `iterate` is being built as the system that runs an autonomous, literature-aware, memory-persistent improvement loop on **ML models, DL/vision models, AND LLM prompts** in production, optimizing for the best model you can actually **afford to serve**. That is the v1.0 vision; the releases below get there one dial at a time.
+[![PyPI](https://img.shields.io/pypi/v/iterate-ai)](https://pypi.org/project/iterate-ai/)
+[![CI](https://github.com/anthonyrodrigues443/Autonomous-ML-And-LLM-Iteration-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/anthonyrodrigues443/Autonomous-ML-And-LLM-Iteration-Agent/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/pypi/pyversions/iterate-ai)](https://pypi.org/project/iterate-ai/)
+[![License](https://img.shields.io/github/license/anthonyrodrigues443/Autonomous-ML-And-LLM-Iteration-Agent)](LICENSE)
+
+```bash
+pip install iterate-ai
+
+# your CSV, your target column, your metric. LLM runs on local Ollama ($0)
+# or any OpenAI-compatible endpoint. Full setup: Quick start below.
+iterate run --data examples/churn_tabular/data.clean.csv --target Churn --metric f1
+```
+
+`iterate` runs an autonomous experiment loop on your ML problem. In v0.2 the agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 391 unit tests across 31 files run in CI on every push.
+
+| v0.2 today | On the roadmap |
+|---|---|
+| The agent writes + runs its own training code (any model, any preprocessing) in a local kernel or an isolated e2b sandbox | Interactive CLI: pause, mid-run chat, resume, token streaming (v0.3) |
+| Multi-agent core: Supervisor briefs, coding agent executes cell by cell, Summarizer carries knowledge across notebooks | Researcher + Critic specialists; agent picks the metric + starting model (v0.4) |
+| A deterministic guard stack converts weak-model waste: grounded briefs, duplicate hashing, dead-end transfer, floor submissions | LLM prompt iteration (v0.5), vision transfer learning (v0.6) |
+| Winner ships as a runnable notebook (hypothesis, staged cells, real outputs, dead ends labeled, findings); persistent memory across runs | Cost-to-serve recommendations (v0.7), MCP auto-discovery of data + context (v0.9) |
+
+## Why I built this
+
+I kept seeing the same failure mode on small AI teams. A model or a prompt ships, and under delivery pressure nobody iterates on it again, so it sits in production for months while baselines move on. Experiments get re-run because nobody wrote down why they failed the first time. Teams pay frontier-model prices because nobody checked whether a cheaper model with a better prompt would do the job. `iterate` is the institutional memory, research desk, and experiment runner those teams don't have time to build.
 
 > **How this gets built:** [WORKFLOW.md](WORKFLOW.md) (the method) · [DECISIONS.md](DECISIONS.md) (every call I made against the AI's default) · [BUILD_LOG.md](BUILD_LOG.md) (the daily trail)
 
 ---
 
+## The full pitch
+
+> Every YC batch ships 200+ AI startups with 2-3 engineer teams. Under shipping pressure, two things break: nobody re-iterates models against new baselines, and LLM prompts sit in production for months untouched. Engineers re-run failed experiments because nobody logged why. Teams pay GPT-5 prices because nobody tested whether Haiku + better prompting would do the job at 1/50th the cost.
+>
+> AutoML brute-forces. Experiment trackers only log. Prompt evals only evaluate. AIDE iterates Kaggle problems once. `iterate` is being built as the system that runs an autonomous, literature-aware, memory-persistent improvement loop on **ML models, DL/vision models, AND LLM prompts** in production, optimizing for the best model you can actually **afford to serve**. That is the v1.0 vision; the releases below get there one dial at a time.
+
+---
+
 ## Status
 
-**v0.2 released: the agent writes and runs its own training code.** Install with `pip install iterate-ai`. In v0.1 the agent picked estimators from an allow-list; in v0.2 it works like an engineer in a notebook. A **Supervisor** reads the run history and briefs one experiment. A **coding agent** executes that brief cell by cell in a live Jupyter kernel: inspect, transform, fit, validate, submit, reading each cell's real output before writing the next. A **Summarizer** distills every finished experiment so the next one inherits what worked, what failed, and why. The winner ships as a runnable notebook.
+**v0.2 released: the agent writes and runs its own training code.** In v0.1 the agent picked estimators from an allow-list; in v0.2 it works like an engineer in a notebook, and the winner ships as one.
 
 **Agent-first:** the autonomous loop landed at v0.1 (Week 3), not as a late-stage add-on. Two dials turn release to release: the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular, then prompts, then DL/vision).
 
@@ -38,10 +68,6 @@
 ## What v0.2 does
 
 You give it a prepared CSV, the target column, and a metric. The agent does the rest: builds its own baseline, then runs one briefed experiment per iteration, cell by cell, against a sealed holdout it never sees.
-
-```bash
-iterate run --data churn.clean.csv --target Churn --metric f1
-```
 
 What a live run looks like:
 
@@ -190,12 +216,6 @@ src/iterate/
 | Cost-to-serve-aware optimization | ✗ | ✗ | ✗ | ✗ | planned v0.7 |
 | Auto-discovers data + context (MCP) | ✗ | ✗ | ✗ | partial | planned v0.9 |
 | Open-source | mostly ✗ | MLflow yes | ✗ | ✓ | ✓ |
-
----
-
-## Why this exists
-
-Production AI teams forget what they've tried. So they keep retrying it. `iterate` is the institutional memory + research desk + experiment runner those teams don't have time to build.
 
 Known limits are documented honestly in [LIMITATIONS.md](LIMITATIONS.md); the evaluation trail lives in [EVAL_LOG.md](EVAL_LOG.md).
 
