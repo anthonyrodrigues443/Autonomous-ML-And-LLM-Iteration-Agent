@@ -166,6 +166,10 @@ class _FakeSandbox:
         self.written: dict[str, bytes] = {}
         self.ran: list[str] = []
         self.killed = False
+        self.timeouts: list[int] = []  # records every set_timeout (lease renewal)
+
+    def set_timeout(self, timeout: int) -> None:
+        self.timeouts.append(timeout)
 
     class _Files:
         def __init__(self, outer: _FakeSandbox) -> None:
@@ -191,6 +195,44 @@ class _FakeSandbox:
         self.killed = True
 
 
+def test_e2b_string_traceback_is_normalized_to_lines() -> None:
+    # e2b SDK v2 ships err.traceback as ONE string (v1 was a list): joining it
+    # newlined every character, and the stored string traceback failed notebook
+    # validation, crashing rendering at the end of the first live e2b run.
+    class _Err:
+        name = "ValueError"
+        value = "inconsistent numbers of samples"
+        traceback = "Traceback (most recent call last)\nValueError: inconsistent numbers of samples"
+
+    class _ErroringSandbox(_FakeSandbox):
+        def run_code(self, code: str, timeout: float | None = None) -> _FakeExecution:
+            self.ran.append(code)
+            return _FakeExecution(stdout=[], error=_Err())
+
+    sandbox = _ErroringSandbox(store={})
+    k = E2BKernel(sandbox_factory=lambda: sandbox)
+    k.start({})
+    result = k.run_cell("boom()", timeout=30)
+    assert result.error is not None
+    assert "ValueError: inconsistent numbers of samples" in result.error
+    assert "\nV\na\nl" not in result.error  # not newlined per character
+    error_outputs = [o for o in result.outputs if o["type"] == "error"]
+    assert isinstance(error_outputs[0]["traceback"], list)
+    assert len(error_outputs[0]["traceback"]) == 2
+
+
+def test_e2b_bytearray_reads_come_back_as_real_bytes() -> None:
+    # e2b SDK v2 returns a bytearray for format="bytes"; a bytearray is NOT bytes,
+    # and the old str(data).encode() fallback collapsed a whole predictions file
+    # into one literal "bytearray(b'...')" line (caught on the first live run).
+    sandbox = _FakeSandbox(store={"/home/user/preds.csv": bytearray(b"0\n1\n0\n")})  # type: ignore[dict-item]
+    k = E2BKernel(sandbox_factory=lambda: sandbox)
+    k.start({"train.csv": b"x,y"})
+    data = k.read_output("preds.csv")
+    assert data == b"0\n1\n0\n"
+    assert isinstance(data, bytes)
+
+
 def test_e2b_kernel_reuses_one_sandbox_across_cells() -> None:
     sandbox = _FakeSandbox(store={"/home/user/preds.csv": b"0\n1\n"})
     k = E2BKernel(sandbox_factory=lambda: sandbox)
@@ -202,6 +244,30 @@ def test_e2b_kernel_reuses_one_sandbox_across_cells() -> None:
     assert k.read_output("preds.csv") == b"0\n1\n"
     k.close()
     assert sandbox.killed
+
+
+def test_e2b_kernel_renews_the_lease_on_start_and_every_cell() -> None:
+    # e2b's 300s default would kill a long session mid-run; the kernel slides the
+    # lease on start and before each cell/install so it lives while the work does.
+    sandbox = _FakeSandbox(store={})
+    k = E2BKernel(lease_seconds=900.0, sandbox_factory=lambda: sandbox)
+    k.start({"train.csv": b"x,y"})  # renew #1, off the 300s default immediately
+    k.run_cell("a = 1", timeout=30)  # renew #2
+    k.install(["xgboost"])  # renew #3 (a cold wheel install must not let it lapse)
+    assert sandbox.timeouts == [900, 900, 900]  # always slid to the full lease
+
+
+def test_e2b_lease_renewal_is_best_effort_and_never_breaks_a_cell() -> None:
+    # a keepalive hiccup must not fail the cell; a truly dead sandbox surfaces on
+    # run_code, not on set_timeout.
+    class _FlakyTimeout(_FakeSandbox):
+        def set_timeout(self, timeout: int) -> None:
+            raise RuntimeError("transient keepalive failure")
+
+    sandbox = _FlakyTimeout(store={})
+    k = E2BKernel(sandbox_factory=lambda: sandbox)
+    k.start({})
+    assert k.run_cell("a = 1", timeout=30).ok  # cell still runs despite set_timeout raising
 
 
 def test_both_kernels_satisfy_the_protocol() -> None:

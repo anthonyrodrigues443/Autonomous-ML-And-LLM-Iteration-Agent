@@ -135,6 +135,19 @@ def test_e2b_runner_uploads_runs_reads_and_tears_down() -> None:
     assert sandbox.killed  # torn down even on the happy path
 
 
+def test_e2b_runner_reads_bytearray_outputs_as_real_bytes() -> None:
+    # e2b SDK v2 returns bytearray for format="bytes"; the old str().encode()
+    # fallback turned a 24-line predictions file into one "bytearray(b'...')" line.
+    sandbox = _FakeSandbox(
+        outputs={"/home/user/preds.csv": bytearray(b"0\n1\n0\n")},  # type: ignore[dict-item]
+        execution=_FakeExecution(stdout=["done\n"], stderr=[]),
+    )
+    runner = E2BCodeRunner(sandbox_factory=lambda _timeout: sandbox)
+    result = runner.run("x", inputs={}, outputs=["preds.csv"], timeout=60)
+    assert result.outputs["preds.csv"] == b"0\n1\n0\n"
+    assert isinstance(result.outputs["preds.csv"], bytes)
+
+
 def test_e2b_runner_reports_execution_error() -> None:
     class _Err:
         name = "ValueError"

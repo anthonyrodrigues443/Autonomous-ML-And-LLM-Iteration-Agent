@@ -629,9 +629,21 @@ def _render_experiment(
     if isinstance(cells, list):
         score = exp.result.metrics.primary_value if exp.result and exp.result.metrics else None
         title = ("best: " if is_best else "") + exp.candidate.description
+        if exp.candidate.changes.get("duplicate_submission"):
+            note = (
+                "this submission is byte-identical to an earlier experiment's — "
+                "the score adds no new information beyond it"
+            )
+        elif exp.candidate.changes.get("lever_unmeasured"):
+            note = (
+                "the briefed change never executed successfully — "
+                "the score belongs to the carried pipeline, not the briefed idea"
+            )
+        else:
+            note = None
         return build_session_notebook(
             cells, title=title, metric=metric, score=score, baseline_score=baseline_score,
-            hypothesis=exp.hypothesis, findings=exp.digest,
+            hypothesis=exp.hypothesis, findings=exp.digest, honesty_note=note,
         )
     return build_notebook(
         exp, data_path=data_path, target=target, metric=metric,

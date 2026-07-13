@@ -23,6 +23,7 @@ kernel's working dir — only holdout features cross in. Scoring stays host-side
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import re
 import tempfile
@@ -237,21 +238,43 @@ class E2BKernel:
         *,
         api_key: str | None = None,
         work_dir: str = "/home/user",
+        lease_seconds: float = 900.0,
         sandbox_factory: Callable[[], Any] | None = None,
     ) -> None:
         self._api_key = api_key
         self._work_dir = work_dir
+        # e2b sandboxes default to a 300s lifetime; a cell-by-cell session (LLM
+        # latency between cells is NOT sandbox-execution time) easily outlives that
+        # and the sandbox would die mid-session. We renew a sliding lease on every
+        # cell instead — alive while the session works, auto-reaped ~lease_seconds
+        # after the last activity (so a crash leaves at most one lease of orphan
+        # cost, not hours). 900s comfortably exceeds any single cell + think-gap and
+        # stays under the 3600s Hobby-plan cap.
+        self._lease_seconds = lease_seconds
         self._sandbox_factory = sandbox_factory
         self._sandbox: Any = None
 
     def start(self, inputs: dict[str, bytes]) -> None:
         self._sandbox = self._make_sandbox()
+        self._renew_lease()  # bump off the 300s default before any think-gap
         for name, content in inputs.items():
             self._sandbox.files.write(f"{self._work_dir}/{name}", content)
+
+    def _renew_lease(self) -> None:
+        """Slide the sandbox's expiry to now + lease_seconds. Best-effort: a dead
+        sandbox surfaces on the next run_code, not here, so never fail a cell over
+        a keepalive hiccup."""
+        if self._sandbox is None:
+            return
+        setter = getattr(self._sandbox, "set_timeout", None)
+        if callable(setter):
+            with contextlib.suppress(Exception):
+                setter(int(self._lease_seconds))
 
     def run_cell(self, code: str, *, timeout: float) -> CellResult:
         if self._sandbox is None:
             raise RuntimeError("kernel not started")
+        self._renew_lease()
         execution = self._sandbox.run_code(code, timeout=timeout)
         stdout = "".join(execution.logs.stdout)
         stderr = "".join(execution.logs.stderr)
@@ -271,17 +294,28 @@ class E2BKernel:
         err = getattr(execution, "error", None)
         error = None
         if err is not None:
-            traceback = getattr(err, "traceback", None) or [str(getattr(err, "value", err))]
-            error = _strip_ansi("\n".join(traceback)) or f"{getattr(err, 'name', 'Error')}"
+            # e2b SDK v2 ships the traceback as ONE string (v1 was a list). Joining
+            # a string newlines every character, garbling the feedback the agent
+            # debugs from, and a string traceback fails the notebook schema (both
+            # caught on the first live cell-by-cell e2b run, 2026-07-12).
+            tb = getattr(err, "traceback", None)
+            if isinstance(tb, str):
+                tb_lines = tb.splitlines()
+            elif tb:
+                tb_lines = [str(line) for line in tb]
+            else:
+                tb_lines = [str(getattr(err, "value", err))]
+            error = _strip_ansi("\n".join(tb_lines)) or f"{getattr(err, 'name', 'Error')}"
             outputs.append(
                 {"type": "error", "ename": getattr(err, "name", "Error"),
-                 "evalue": str(getattr(err, "value", "")), "traceback": traceback}
+                 "evalue": str(getattr(err, "value", "")), "traceback": tb_lines}
             )
         return CellResult(stdout, stderr, error=error, outputs=outputs)
 
     def install(self, packages: list[str]) -> str:
         if self._sandbox is None or not packages:
             return ""
+        self._renew_lease()  # a cold wheel install can be slow; don't let the lease lapse
         execution = self._sandbox.run_code(f"!pip install -q {' '.join(packages)}")
         return "".join(execution.logs.stderr)
 
@@ -298,7 +332,12 @@ class E2BKernel:
             data = self._sandbox.files.read(f"{self._work_dir}/{name}", format="bytes")
         except Exception:
             return None
-        return data if isinstance(data, bytes) else str(data).encode()
+        # e2b SDK v2 returns a bytearray for format="bytes"; a bytearray is NOT
+        # bytes, and str(bytearray(...)).encode() collapses a whole predictions
+        # file into one literal line (caught live 2026-07-12).
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        return str(data).encode()
 
     def close(self) -> None:
         if self._sandbox is not None:
@@ -312,7 +351,8 @@ class E2BKernel:
             from e2b_code_interpreter import Sandbox
         except ImportError as exc:  # pragma: no cover - e2b ships in core; defensive only
             raise RuntimeError("e2b_code_interpreter failed to import; reinstall iterate-ai") from exc
-        return Sandbox(api_key=self._api_key)
+        # e2b SDK v2: Sandbox.create(), not the constructor (see runner.py note).
+        return Sandbox.create(api_key=self._api_key)
 
 
 __all__ = ["CellResult", "E2BKernel", "LocalKernel", "StatefulKernel"]

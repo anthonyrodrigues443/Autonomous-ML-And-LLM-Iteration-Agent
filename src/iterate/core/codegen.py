@@ -104,9 +104,15 @@ def session_preamble() -> str:
     restore ``X_train``/``y_train``/``X_holdout`` before every agent cell — a weak
     model can otherwise corrupt the canonical data in place (e.g.
     ``X_train[cols] = imputer.fit_transform(...)``) and silently poison every later
-    attempt in the session."""
+    attempt in the session.
+
+    It also seeds the global RNGs (``random`` + ``numpy``). Estimators left at
+    ``random_state=None`` draw from numpy's global RNG, so seeding once here makes a
+    session reproducible: the rendered notebook re-executes to the SAME score the
+    run reported, instead of drifting by the model's run-to-run variance."""
     return (
-        "import json, pandas as pd, numpy as np\n"
+        "import json, random, pandas as pd, numpy as np\n"
+        "random.seed(42); np.random.seed(42)\n"
         f"with open({META_JSON!r}) as _f:\n"
         "    _meta = json.load(_f)\n"
         "_target = _meta['target']\n"
@@ -133,6 +139,30 @@ RESET_INPUTS = (
     "y_train = _pristine_inputs['y_train'].copy(); "
     "X_holdout = _pristine_inputs['X_holdout'].copy()\n"
 )
+
+
+def fallback_baseline(task: str) -> str:
+    """A host-authored, deterministic floor submission for the cell-by-cell path.
+
+    Run as a last-resort cell when a session ends without a valid predictions file
+    (a heavy lever ate the whole budget, or the approach was abandoned), so the
+    iteration degrades to a floor score instead of a total loss. Kept minimal on
+    purpose: one-hot via get_dummies (holdout reindexed to the train columns) into
+    a NaN-native gradient-boosted tree, seeded for reproducibility."""
+    estimator = (
+        "HistGradientBoostingClassifier" if task == "classification"
+        else "HistGradientBoostingRegressor"
+    )
+    return (
+        "import pandas as pd\n"
+        f"from sklearn.ensemble import {estimator}\n"
+        "_fb_cats = X_train.select_dtypes(exclude='number').columns.tolist()\n"
+        "_fb_Xt = pd.get_dummies(X_train, columns=_fb_cats)\n"
+        "_fb_Xh = pd.get_dummies(X_holdout, columns=_fb_cats).reindex(columns=_fb_Xt.columns, fill_value=0)\n"
+        f"_fb_model = {estimator}(random_state=42).fit(_fb_Xt, y_train)\n"
+        f"pd.Series(_fb_model.predict(_fb_Xh)).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
+        "print('fallback baseline banked', len(_fb_Xh), 'predictions')\n"
+    )
 
 
 def validate_train_and_predict(code: str) -> str | None:
@@ -327,6 +357,7 @@ __all__ = [
     "assemble_script",
     "build_inputs",
     "components_used",
+    "fallback_baseline",
     "is_code_candidate",
     "package_for_import",
     "required_imports",

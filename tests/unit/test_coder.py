@@ -271,6 +271,23 @@ def test_starting_code_seeds_the_prompt(tmp_path: Path) -> None:
     assert "0.5500" in sent
 
 
+def test_predictions_with_an_index_column_are_rejected_at_finish(tmp_path: Path) -> None:
+    # run 18 iter 3: to_csv without index=False shipped "0,0" lines — right line
+    # count, unscorable values, the only FAILED iteration in 100+. The finish gate
+    # must catch it in-session with the precise fix named.
+    from iterate.core.coder import _validate_predictions
+
+    n = 5
+    indexed = "\n".join(f"{i},1" for i in range(n)).encode()
+    reason = _validate_predictions(indexed, n)
+    assert reason is not None
+    assert "index=False" in reason
+    # a clean single-column file still passes
+    assert _validate_predictions(b"1\n0\n1\n0\n1\n", n) is None
+    # string labels containing commas but NOT an index pattern also pass
+    assert _validate_predictions(b"a,b\nc,d\nx\ny\nz\n", n) is None
+
+
 def test_finish_is_rejected_until_valid_predictions_exist(tmp_path: Path) -> None:
     ds = _dataset(tmp_path)
     # 1st finish has no predictions yet -> rejected; then it writes them; 2nd finish -> ends.
@@ -457,12 +474,229 @@ def test_thinking_is_attached_to_the_cell_it_produced(tmp_path: Path) -> None:
     assert preamble[0].thinking is None  # host cells never carry model reasoning
 
 
-def test_session_without_predictions_is_a_captured_failure(tmp_path: Path) -> None:
+def test_session_without_predictions_banks_the_fallback_floor(tmp_path: Path) -> None:
+    # The submission guarantee: the agent never writes predictions.csv and burns its
+    # budget — the harness banks the canned baseline as a floor instead of a total loss.
     ds = _dataset(tmp_path)
-    # the agent never writes predictions.csv and burns its budget.
     fake = _FakeLLM([_run("x = 1"), _run("y = 2")])
     out = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=2).run(
         dataset=ds, brief="b", experiment_id="e3"
     )
+    assert out.result.succeeded, out.result.error
+    fallback = [c for c in out.cells if c.source == "fallback"]
+    assert len(fallback) == 1
+    assert "HistGradientBoostingClassifier" in fallback[0].code
+    assert "fallback baseline banked" in fallback[0].stdout
+
+
+def test_fallback_banks_the_carried_best_before_the_canned_baseline(tmp_path: Path) -> None:
+    # With carried-forward best code available, a failed session degrades to roughly
+    # the best score (re-run the carried code), not all the way down to the baseline.
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([_run("x = 1")])
+    out = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=1).run(
+        dataset=ds, brief="b", experiment_id="e3b",
+        starting_code=_FIT_AND_WRITE, starting_score=0.6,
+    )
+    assert out.result.succeeded, out.result.error
+    fallback = [c for c in out.cells if c.source == "fallback"]
+    assert len(fallback) == 1
+    assert "LogisticRegression" in fallback[0].code  # the carried code, not the canned HGB
+
+
+def test_fallback_falls_through_to_the_canned_baseline_when_carried_code_errors(
+    tmp_path: Path,
+) -> None:
+    # the carried-forward best can itself be broken (e.g. it depended on session
+    # state); the guarantee must then bank the canned baseline, not give up.
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([_run("x = 1")])
+    out = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=1).run(
+        dataset=ds, brief="b", experiment_id="e3d",
+        starting_code="raise RuntimeError('carried code broken')", starting_score=0.6,
+    )
+    assert out.result.succeeded, out.result.error
+    fallback = [c for c in out.cells if c.source == "fallback"]
+    assert len(fallback) == 2  # carried attempt (errored) + canned baseline (banked)
+    assert fallback[0].error is not None
+    assert "HistGradientBoostingClassifier" in fallback[1].code
+    assert "fallback baseline banked" in fallback[1].stdout
+
+
+def test_a_valid_submission_is_never_clobbered_by_the_floor(tmp_path: Path) -> None:
+    # the session DID submit validly; the fallback must not run at all.
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([_run(_FIT_AND_WRITE), _finish()])
+    out = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=2).run(
+        dataset=ds, brief="b", experiment_id="e3e"
+    )
+    assert out.result.succeeded, out.result.error
+    assert not [c for c in out.cells if c.source == "fallback"]
+
+
+def test_identical_submission_gets_one_corrective_nudge_then_accepts(tmp_path: Path) -> None:
+    # live run: six byte-identical submissions in a row. A finish whose predictions
+    # hash to ANY earlier experiment's digest gets ONE corrective message; the next
+    # finish is accepted (a nudge, not a wall — a proven-worse lever may
+    # legitimately end with the carried best re-submitted).
+    import hashlib as _hashlib
+
+    ds = _dataset(tmp_path)
+    preds = b"0\n" * ds.n_test
+    kernel = _FakeKernel([CellResult("loaded", ""), CellResult("ok", "")], predictions=preds)
+    fake = _FakeLLM([_run("x = 1"), _finish(), _finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="g1",
+        # the matching digest is a NON-best sibling's — the gate must still fire
+        seen_digests={"unrelated-digest", _hashlib.sha256(preds).hexdigest()},
+    )
+    assert out.result.succeeded, out.result.error
+    final_conversation = "\n".join(m.content or "" for m in fake.calls[-1])
+    assert final_conversation.count("byte-identical to an earlier experiment") == 1  # fired once
+
+
+def test_briefed_lever_missing_from_code_gets_one_corrective_nudge(tmp_path: Path) -> None:
+    # live run: class_weight was briefed three times and never appeared in a single
+    # cell. A finish without any lever marker in executed code gets ONE corrective.
+    ds = _dataset(tmp_path)
+    kernel = _FakeKernel(
+        [CellResult("loaded", ""), CellResult("ok", "")], predictions=b"0\n" * ds.n_test
+    )
+    fake = _FakeLLM([_run("x = 1"), _finish(), _finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="g2",
+        brief_markers=("class_weight", "scale_pos_weight", "smote", "threshold"),
+    )
+    assert out.result.succeeded, out.result.error
+    final_conversation = "\n".join(m.content or "" for m in fake.calls[-1])
+    assert final_conversation.count("does not appear in any cell") == 1
+
+
+def test_lever_gate_ignores_markers_inherited_from_the_carried_code(tmp_path: Path) -> None:
+    # run-5 false-pass: 'imbalance-or-threshold' was briefed (class_weight), the coder
+    # only rebuilt the carried pipeline — whose inherited line contains 'threshold' —
+    # and the gate stayed silent. Markers must count on NEW lines only.
+    ds = _dataset(tmp_path)
+    carried = "model = HGB().fit(Xa, ya)\npreds = (proba >= 0.4)  # threshold write"
+    kernel = _FakeKernel(
+        [CellResult("loaded", ""), CellResult("ok", "")], predictions=b"0\n" * ds.n_test
+    )
+    # the coder byte-copies the carried threshold line and adds nothing lever-shaped
+    fake = _FakeLLM([_run("preds = (proba >= 0.4)  # threshold write"), _finish(), _finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="g4",
+        starting_code=carried,
+        brief_markers=("class_weight", "scale_pos_weight", "smote", "threshold"),
+    )
+    assert out.result.succeeded, out.result.error
+    final_conversation = "\n".join(m.content or "" for m in fake.calls[-1])
+    assert final_conversation.count("does not appear in any cell") == 1  # gate FIRED
+
+
+def test_lever_gate_accepts_a_new_line_bearing_the_marker(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    carried = "preds = (proba >= 0.4)  # threshold write"
+    kernel = _FakeKernel(
+        [CellResult("loaded", ""), CellResult("ok", "")], predictions=b"0\n" * ds.n_test
+    )
+    # a genuinely NEW threshold sweep line — the lever was pulled this session
+    fake = _FakeLLM([_run("best_threshold = sweep(0.2, 0.6)"), _finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="g5",
+        starting_code=carried,
+        brief_markers=("class_weight", "scale_pos_weight", "smote", "threshold"),
+    )
+    assert out.result.succeeded, out.result.error
+    final_conversation = "\n".join(m.content or "" for m in fake.calls[-1])
+    assert "does not appear in any cell" not in final_conversation
+
+
+def test_gates_stay_quiet_when_the_lever_landed_and_predictions_differ(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _FakeKernel(
+        [CellResult("loaded", ""), CellResult("ok", "")], predictions=b"0\n" * ds.n_test
+    )
+    fake = _FakeLLM([_run("model = HGB(class_weight='balanced')"), _finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="g3",
+        brief_markers=("class_weight",), seen_digests={"some-other-digest"},
+    )
+    assert out.result.succeeded, out.result.error
+    sent = "\n".join(m.content or "" for call in fake.calls for m in call)
+    assert "byte-identical" not in sent
+    assert "does not appear in any cell" not in sent
+
+
+def test_truncated_cell_is_rejected_unexecuted_and_the_retry_runs(tmp_path: Path) -> None:
+    # live runs: cells arrived cut mid-token and died as 'unexpected EOF' — the
+    # guard must reject them for free (no kernel time) and let the full cell run.
+    ds = _dataset(tmp_path)
+    kernel = _CountingKernel(
+        [CellResult("loaded", ""), CellResult("ok", "")], predictions=b"0\n" * ds.n_test
+    )
+    truncated = "Xa_cat = pd.DataFrame(enc.fit_transform(Xa_raw[cat_cols]"  # never closed
+    fake = _FakeLLM([_run(truncated), _run("x = 1"), _finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="t1"
+    )
+    assert out.result.succeeded, out.result.error
+    assert len(kernel.executed) == 2  # preamble + the retry; the chopped cell never ran
+    sent = "\n".join(m.content or "" for m in fake.calls[-1])
+    assert "arrived INCOMPLETE" in sent
+    # the truncated cell is not recorded as an executed (errored) cell
+    assert all("fit_transform(Xa_raw" not in c.code for c in out.cells)
+
+
+def test_ordinary_syntax_errors_still_execute_for_the_real_traceback(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([_run("def broken(:\n    pass"), _run(_FIT_AND_WRITE), _finish(), _finish()])
+    out = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=8).run(
+        dataset=ds, brief="b", experiment_id="t2"
+    )
+    assert out.result.succeeded, out.result.error
+    errored = [c for c in out.cells if c.error]
+    assert len(errored) == 1  # the bad-syntax cell executed and its traceback was shown
+
+
+def test_wall_clock_ceiling_ends_the_session_before_any_llm_call(tmp_path: Path) -> None:
+    # The kernel-time deadline does not charge LLM latency, so a thrashing session
+    # is otherwise unbounded in wall-clock. A spent ceiling ends it; the floor banks.
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([])  # any chat would raise IndexError — proves none happens
+    out = CodingAgent(fake, LocalKernel(), metric="f1", wall_ceiling_seconds=0.0).run(
+        dataset=ds, brief="b", experiment_id="e11"
+    )
+    assert fake.calls == []
+    assert out.result.succeeded, out.result.error  # the floor was still banked
+    assert [c.source for c in out.cells].count("fallback") == 1
+
+
+def test_consecutive_distinct_errors_end_the_session_early(tmp_path: Path) -> None:
+    # A different typo each cell evades the repeat and same-error breakers (live:
+    # 'X_holdut', a truncated cell, a bad column name — 32 cells, 8s kernel time).
+    # Six errored cells with no success in between must end the session.
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([_run(f"broken_name_{i}()") for i in range(6)])
+    out = CodingAgent(fake, LocalKernel(), metric="f1").run(
+        dataset=ds, brief="b", experiment_id="e12"
+    )
+    agent_cells = [c for c in out.cells if c.source == "agent"]
+    assert len(agent_cells) == 6  # ended exactly at the breaker, no further turns
+    assert all(c.error for c in agent_cells)
+    assert out.result.succeeded, out.result.error  # floor banked by the guarantee
+    assert [c.source for c in out.cells].count("fallback") == 1
+
+
+def test_a_failed_fallback_stays_a_captured_failure(tmp_path: Path) -> None:
+    # If even the fallback cannot produce predictions (kernel serves none), the
+    # iteration is still a captured failure, never a crash.
+    ds = _dataset(tmp_path)
+    kernel = _FakeKernel([CellResult("loaded", "")], predictions=None)
+    fake = _FakeLLM([_run("x = 1")])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=1).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="e3c"
+    )
     assert not out.result.succeeded
     assert "no predictions" in (out.result.error or "")
+    # the fallback WAS attempted (canned baseline; no carried code) and recorded
+    assert [c.source for c in out.cells].count("fallback") == 1

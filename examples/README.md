@@ -1,46 +1,40 @@
 # Examples
 
-Public-dataset demos that ship with `iterate`. Each is a self-contained `BenchmarkTarget` implementation that anyone can clone and run.
+Public-dataset demos that ship with `iterate`.
 
-These show how to plug your own ML problem or LLM prompt into the framework. **Copy the closest example and adapt.**
-
-| Example | Target family | Dataset | Demonstrates |
+| Example | Target family | Dataset | Status |
 |---|---|---|---|
-| `churn_tabular/` | `ModelTarget` | Public Kaggle churn dataset (Telco) | Tabular classification: sklearn/XGBoost/LightGBM iteration against a re-measured baseline |
-| `toxicity_jigsaw/` | `PromptTarget` | Jigsaw Toxic Comment Classification (public) | LLM prompt iteration via LLM-as-judge eval |
-| `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | Multi-class prompt iteration; proves the framework generalizes beyond binary |
+| `churn_tabular/` | `ModelTarget` | Public Kaggle churn dataset (Telco) | **working, the headline demo** |
+| `toxicity_jigsaw/` | `PromptTarget` | Jigsaw Toxic Comment Classification (public) | placeholder, lands with v0.5 (prompt iteration) |
+| `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | placeholder, lands with v0.5 |
 
-Each example ships a per-example README with the `iterate run` command to drive it, any dataset-specific prep (e.g. `prepare.py` for `ModelTarget`), and example data or a `golden_set.jsonl`.
+The two `PromptTarget` directories are intentionally empty for now: `PromptTarget`
+does not exist yet (roadmap v0.5, Week 8). They mark where the pluggability proof
+will live so the layout does not churn later.
 
----
-
-## Adding your own target
-
-```python
-# my_company/spam_appeals/target.py
-from iterate.targets import PromptTarget
-
-class SpamAppealsTarget(PromptTarget):
-    def get_current_prompt(self) -> str: ...
-    def fetch_failures(self, window_days: int) -> list: ...
-    def get_golden_set(self) -> list: ...
-    def get_recent_sample(self, n: int) -> list: ...
-    def score(self, prompt: str, sample) -> Metrics: ...
-    def get_guards(self) -> list: ...
-```
-
-Then:
+## Running the working example
 
 ```bash
-iterate run --target my_company/spam_appeals/target.py
+cd examples/churn_tabular
+python prepare.py                 # one-time: cleans the raw Kaggle CSV
+iterate run --data data.clean.csv --target Churn --metric f1
 ```
 
-The framework handles the rest.
+See `churn_tabular/README.md` for what the run produces and what to expect.
 
----
+## Bringing your own tabular problem
 
-**Examples land progressively:**
+No code needed: any prepared CSV works directly.
 
-- Week 2: `churn_tabular/` skeleton + a working baseline notebook
-- Week 3: `toxicity_jigsaw/` with current prompt + golden set
-- Week 5: `intent_clinc150/` (pluggability proof)
+```bash
+iterate run --data your_data.clean.csv --target <label_column> --metric f1
+```
+
+Requirements: one row per sample, the target as a column, categoricals as strings,
+and the usual cleaning done (the agent iterates models, it does not clean data for
+you). Classification metrics: `f1`, `accuracy`, `precision`, `recall`. Regression:
+`rmse`, `mae`, `mse`, `r2`.
+
+Custom `BenchmarkTarget` implementations in your own package (for problems that are
+not a flat CSV) are supported at the protocol level (`iterate.targets.base`), but the
+CSV path is the supported public interface until the target families grow at v0.5/v0.6.

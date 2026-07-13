@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from iterate.adapters.compute.local import run_in_process
 from iterate.core.orchestrator import RunResult
-from iterate.core.supervisor import SupervisorError
+from iterate.core.supervisor import SupervisorError, lever_markers_for_brief
 from iterate.core.terminator import AttemptOutcome, LoopState
 from iterate.schemas.experiment import Candidate, Experiment
 
@@ -91,94 +91,149 @@ def run_supervised(
     direction = baseline.metrics.direction
     current_run: list[Experiment] = []
     best: Experiment | None = None
+    seen_digests: set[str] = set()  # sha256 of EVERY submission so far, for the no-op gate
     started_at = perf_counter()
     stopped_because = "exhausted"
     iteration = 0
 
-    while True:
-        iteration += 1
-        outcome: AttemptOutcome
-        last_experiment: Experiment | None = None
-        try:
-            # Memory already holds every recorded experiment (line below records each
-            # one) — adding current_run would feed this run's experiments in twice.
-            decision = supervisor.decide(
-                data_summary=data_summary,
-                baseline=baseline,
-                history=memory.history(target.name),
-            )
-        except SupervisorError as exc:
-            log.warning("agent loop: iteration %d supervisor failed: %s", iteration, exc)
-            memory.record_proposer_failure(run_id, iteration, "supervisor", str(exc))
-            outcome = "proposer_error"
-        else:
-            if decision.stop:
-                stopped_because = "supervisor"
-                break
-            start_code = _winning_code(best)  # carry the best working code forward
-            start_score = (
-                best.result.metrics.primary_value
-                if best is not None and best.result is not None and best.result.metrics is not None
-                else None
-            )
+    try:
+        while True:
+            iteration += 1
+            outcome: AttemptOutcome
+            last_experiment: Experiment | None = None
             try:
-                experiment = _run_experiment(
-                    make_coder(), dataset, decision, iteration, target.name, start_code, start_score
+                # Memory already holds every recorded experiment (line below records each
+                # one) — adding current_run would feed this run's experiments in twice.
+                decision = supervisor.decide(
+                    data_summary=data_summary,
+                    baseline=baseline,
+                    history=memory.history(target.name),
+                    # the loop's ACTUAL carried best — the brief's "so far:" slot is
+                    # grounded on this so it describes the code the coder receives,
+                    # never a cross-run best the coder does not hold.
+                    carried_best=best,
                 )
-            except Exception as exc:  # one bad experiment must not kill the run
-                # e.g. the LLM backend timing out after retries, or a kernel dying.
-                # Record it and let the terminator (patience) decide, like a failed cell.
-                log.warning("agent loop: iteration %d coder failed: %s", iteration, exc)
-                memory.record_proposer_failure(run_id, iteration, "coder", str(exc))
+            except SupervisorError as exc:
+                log.warning("agent loop: iteration %d supervisor failed: %s", iteration, exc)
+                memory.record_proposer_failure(run_id, iteration, "supervisor", str(exc))
                 outcome = "proposer_error"
             else:
-                if summarizer is not None:
-                    experiment = _digest(summarizer, experiment, iteration)
-                current_run.append(experiment)
-                memory.record(run_id, experiment)
-                last_experiment = experiment
-                result = experiment.result
-                assert result is not None
-                if result.succeeded and result.metrics is not None:
-                    log.info(
-                        "agent loop: iteration %d %r -> %s=%.4f",
-                        iteration, decision.title, result.metrics.primary,
-                        result.metrics.primary_value,
+                if decision.stop:
+                    stopped_because = "supervisor"
+                    break
+                start_code = _winning_code(best)  # carry the best working code forward
+                start_score = (
+                    best.result.metrics.primary_value
+                    if best is not None and best.result is not None and best.result.metrics is not None
+                    else None
+                )
+                try:
+                    experiment, preds_digest = _run_experiment(
+                        make_coder(), dataset, decision, iteration, target.name,
+                        start_code, start_score, seen_digests=frozenset(seen_digests),
                     )
+                except Exception as exc:  # one bad experiment must not kill the run
+                    # e.g. the LLM backend timing out after retries, or a kernel dying.
+                    # Record it and let the terminator (patience) decide, like a failed cell.
+                    log.warning("agent loop: iteration %d coder failed: %s", iteration, exc)
+                    memory.record_proposer_failure(run_id, iteration, "coder", str(exc))
+                    outcome = "proposer_error"
                 else:
-                    log.info("agent loop: iteration %d %r -> failed (%s)", iteration,
-                             decision.title, result.error)
-                if result.succeeded and _improves(result, best, baseline, direction):
-                    best = experiment
-                    outcome = "improved"
-                else:
-                    outcome = "no_improvement"
-                if on_experiment is not None:
-                    try:
-                        on_experiment(
-                            experiment=experiment, baseline=baseline,
-                            is_best=(best is experiment), run_id=run_id,
+                    if preds_digest and preds_digest in seen_digests:
+                        # Byte-identical to an earlier submission: stamp it so the
+                        # supervisor's history shows a re-run, not a fresh result.
+                        experiment.candidate.changes["duplicate_submission"] = True
+                        log.info(
+                            "agent loop: iteration %d submission duplicates an earlier experiment",
+                            iteration,
                         )
-                    except Exception:  # a deliverable hook must never kill the run
-                        log.warning("agent loop: on_experiment hook failed", exc_info=True)
+                    elif preds_digest:
+                        seen_digests.add(preds_digest)
+                    if summarizer is not None:
+                        experiment = _digest(summarizer, experiment, iteration)
+                    experiment = _sanitize_unmeasured_digest(experiment, decision.brief)
+                    current_run.append(experiment)
+                    memory.record(run_id, experiment)
+                    last_experiment = experiment
+                    result = experiment.result
+                    assert result is not None
+                    if result.succeeded and result.metrics is not None:
+                        log.info(
+                            "agent loop: iteration %d %r -> %s=%.4f",
+                            iteration, decision.title, result.metrics.primary,
+                            result.metrics.primary_value,
+                        )
+                    else:
+                        log.info("agent loop: iteration %d %r -> failed (%s)", iteration,
+                                 decision.title, result.error)
+                    if result.succeeded and _improves(result, best, baseline, direction):
+                        best = experiment
+                        outcome = "improved"
+                    else:
+                        outcome = "no_improvement"
+                    if on_experiment is not None:
+                        try:
+                            on_experiment(
+                                experiment=experiment, baseline=baseline,
+                                is_best=(best is experiment), run_id=run_id,
+                            )
+                        except Exception:  # a deliverable hook must never kill the run
+                            log.warning("agent loop: on_experiment hook failed", exc_info=True)
 
-        state = LoopState(
-            iteration=iteration,
-            baseline=baseline,
-            best=best,
-            last_experiment=last_experiment,
-            last_attempt_outcome=outcome,
-            elapsed_seconds=perf_counter() - started_at,
-        )
-        reason = terminator.update_and_check(state)
-        if reason is not None:
-            stopped_because = reason
-            break
+            state = LoopState(
+                iteration=iteration,
+                baseline=baseline,
+                best=best,
+                last_experiment=last_experiment,
+                last_attempt_outcome=outcome,
+                elapsed_seconds=perf_counter() - started_at,
+            )
+            reason = terminator.update_and_check(state)
+            if reason is not None:
+                stopped_because = reason
+                break
+
+    except KeyboardInterrupt:
+        # Ctrl-C: keep what the run already earned. Memory still gets finalized and the
+        # best-so-far notebook is already on disk (on_experiment saves per iteration), so
+        # an interrupt exits like a short run, not a stack trace.
+        log.warning("agent loop: interrupted; finalizing with %d kept experiment(s)", len(current_run))
+        stopped_because = "interrupted"
 
     memory.finish_run(run_id, stopped_because)
     return RunResult(
         baseline=baseline, history=current_run, best=best,
         stopped_because=stopped_because, run_id=run_id,
+    )
+
+
+def _sanitize_unmeasured_digest(experiment: Experiment, brief: str) -> Experiment:
+    """Strip digest claims the machine verdict contradicts. Two live failure modes:
+    a session that never executed its lever fabricated an 'implied weighting' win;
+    a byte-duplicate submission's Findings claimed a settled optimization as the
+    session's own win. Nothing RAISED a score in either case — so a duplicate keeps
+    no what_helped at all, and an unexecuted lever keeps no claims naming it. The
+    what_hurt channel (the valuable measured losses) survives untouched."""
+    if experiment.digest is None:
+        return experiment
+    changes = experiment.candidate.changes
+    if changes.get("duplicate_submission"):
+        kept: list[str] = []
+    elif changes.get("lever_unmeasured"):
+        markers = lever_markers_for_brief(brief)
+        if not markers:
+            return experiment
+        kept = [
+            item for item in experiment.digest.what_helped
+            if not any(m in item.lower() for m in markers)
+        ]
+    else:
+        return experiment
+    if len(kept) == len(experiment.digest.what_helped):
+        return experiment
+    log.info("agent loop: dropped what-helped claims contradicted by the machine verdict")
+    return experiment.model_copy(
+        update={"digest": experiment.digest.model_copy(update={"what_helped": kept})}
     )
 
 
@@ -199,7 +254,10 @@ def _winning_code(best: Experiment | None) -> str | None:
     (PREPARE -> MODEL -> SUBMIT), so no single cell is self-contained — the pipeline
     lives across cells, and re-running the successful ones in order reproduces it.
     Errored cells are dropped so a fixed-after-failure step doesn't carry the broken
-    attempt forward."""
+    attempt forward. A "fallback" cell (the harness's floor submit) is kept: when a
+    session's submission came from the fallback, that cell IS the pipeline that
+    produced the recorded score — it is self-contained and runs last, so appending
+    it keeps the carried code reproducing what was actually scored."""
     if best is None:
         return None
     cells = best.candidate.changes.get("cells")
@@ -207,7 +265,9 @@ def _winning_code(best: Experiment | None) -> str | None:
         good = [
             str(cell["code"])
             for cell in cells
-            if cell.get("source") == "agent" and not cell.get("error") and cell.get("code")
+            if cell.get("source") in ("agent", "fallback")
+            and not cell.get("error")
+            and cell.get("code")
         ]
         if good:
             return "\n\n".join(good)
@@ -223,20 +283,41 @@ def _run_experiment(
     target_name: str,
     starting_code: str | None,
     starting_score: float | None,
-) -> Experiment:
+    *,
+    seen_digests: frozenset[str] = frozenset(),
+) -> tuple[Experiment, str | None]:
+    """Run one briefed session; returns the experiment and the sha256 of its
+    submitted predictions (for later sessions' identical-submission gate)."""
+    from iterate.core.coder import lever_executed
+
+    markers = lever_markers_for_brief(decision.brief)
     coding = coder.run(
-        dataset=dataset, brief=decision.brief, experiment_id="pending",
+        dataset=dataset, brief=decision.brief, experiment_id=f"iter-{iteration:02d}",
         starting_code=starting_code, starting_score=starting_score,
+        brief_markers=markers,
+        seen_digests=seen_digests,
     )
     cells = [
         {"code": c.code, "stdout": c.stdout, "error": c.error, "source": c.source,
          "outputs": c.outputs, "thinking": c.thinking}
         for c in coding.cells
     ]
-    code = "\n\n".join(c.code for c in coding.cells if c.source == "agent") or "# (no code)"
+    # The code fingerprint includes fallback cells: when the submission came from the
+    # harness floor, the score-bearing pipeline must be what the lever ledger, the
+    # technique scoreboard, and the grounded brief attribute — not the dead-end agent
+    # cells alone. Agent cells stay too (errored or not): they are what was TRIED.
+    code = (
+        "\n\n".join(c.code for c in coding.cells if c.source in ("agent", "fallback"))
+        or "# (no code)"
+    )
+    changes: dict[str, object] = {"code": code, "cells": cells}
+    if markers and not lever_executed(coding.cells, markers, starting_code):
+        # The commissioned lever never ran successfully — the score is the carried
+        # pipeline's, not the lever's, and the supervisor must not credit it.
+        changes["lever_unmeasured"] = True
     candidate = Candidate(
         description=decision.title,
-        changes={"code": code, "cells": cells},
+        changes=changes,
         rationale=decision.brief,
         source="proposer",
     )
@@ -252,7 +333,7 @@ def _run_experiment(
     )
     # link the result back to this experiment's id
     linked = coding.result.model_copy(update={"experiment_id": experiment.id})
-    return experiment.model_copy(update={"result": linked})
+    return experiment.model_copy(update={"result": linked}), coding.predictions_sha256
 
 
 __all__ = ["run_supervised"]

@@ -198,57 +198,56 @@ coder:
 
     THE READ-DECIDE RHYTHM (imitate this shape, all the way to a prediction):
 
-    Cell A, inspect: split columns by dtype into variables.
+    Cell A, set up column groups by dtype. The profile already lists these columns with their cardinality and missingness; this cell only creates the num_cols/cat_cols variables your later cells reuse. It is setup, NOT re-exploration: no nunique(), value_counts(), or isnull() cell to re-confirm what the profile already states.
         num_cols = X_train.select_dtypes(include='number').columns.tolist()
         cat_cols = X_train.select_dtypes(exclude='number').columns.tolist()
-        print(len(num_cols), 'numeric', len(cat_cols), 'categorical'); print(cat_cols)
+        print(len(num_cols), 'numeric', len(cat_cols), 'categorical')
 
-    Cell B reads level counts and DECIDES the encoder from that evidence.
-        print(X_train[cat_cols].nunique().sort_values())
+    Cell B carves the validation split FIRST, on the raw training frame, so every later fit sees only the training fold.
+        from sklearn.model_selection import train_test_split
+        Xa_raw, Xb_raw, ya, yb = train_test_split(X_train, y_train, test_size=0.2, stratify=y_train, random_state=0)
+        print(Xa_raw.shape, Xb_raw.shape)
 
-    Cell C imputes ONLY the numeric group; it does not encode or scale.
+    Cell C imputes ONLY the numeric group: fit on the training fold, transform BOTH folds; it does not encode or scale.
         from sklearn.impute import SimpleImputer
         num_imputer = SimpleImputer(strategy='median')
-        X_num = pd.DataFrame(num_imputer.fit_transform(X_train[num_cols]), columns=num_cols, index=X_train.index)
-        print(X_num.shape, X_num.isna().sum().sum())
+        Xa_num = pd.DataFrame(num_imputer.fit_transform(Xa_raw[num_cols]), columns=num_cols, index=Xa_raw.index)
+        Xb_num = pd.DataFrame(num_imputer.transform(Xb_raw[num_cols]), columns=num_cols, index=Xb_raw.index)
+        print(Xa_num.shape, Xb_num.shape)
 
-    Cell D, the numbers now clean, encodes ONLY cat_cols.
+    Cell D, the numbers now clean, encodes ONLY cat_cols the same way — choose the encoder from the profile's cardinalities (low-cardinality to one-hot), no separate inspection cell needed.
         from sklearn.preprocessing import OneHotEncoder
         enc = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
-        X_cat = pd.DataFrame(enc.fit_transform(X_train[cat_cols]), columns=enc.get_feature_names_out(cat_cols), index=X_train.index)
-        print(X_cat.shape)
+        Xa_cat = pd.DataFrame(enc.fit_transform(Xa_raw[cat_cols]), columns=enc.get_feature_names_out(cat_cols), index=Xa_raw.index)
+        Xb_cat = pd.DataFrame(enc.transform(Xb_raw[cat_cols]), columns=enc.get_feature_names_out(cat_cols), index=Xb_raw.index)
+        print(Xa_cat.shape)
 
-    Cell E combines both groups into ONE named matrix, aligned by index.
-        X_tr = pd.concat([X_num, X_cat], axis=1)
-        print(X_tr.shape, X_tr.isna().sum().sum())
-
-    Cell F carves a validation split from training data.
-        from sklearn.model_selection import train_test_split
-        Xa, Xb, ya, yb = train_test_split(X_tr, y_train, test_size=0.2, stratify=y_train, random_state=0)
+    Cell E combines each fold's groups into ONE named matrix per fold, aligned by index.
+        Xa = pd.concat([Xa_num, Xa_cat], axis=1); Xb = pd.concat([Xb_num, Xb_cat], axis=1)
         print(Xa.shape, Xb.shape)
 
-    Cell G fits one model and prints validation '{metric}'.
+    Cell F fits one model and prints validation '{metric}'.
         from sklearn.ensemble import HistGradientBoostingClassifier
         from sklearn.metrics import f1_score
         model = HistGradientBoostingClassifier().fit(Xa, ya)
         print('val', f1_score(yb, model.predict(Xb)))
 
-    Cell H transforms X_holdout with the SAME fitted objects (never refit), then writes:
+    Cell G transforms X_holdout with the SAME fitted objects (never refit), then writes:
         Xh_num = pd.DataFrame(num_imputer.transform(X_holdout[num_cols]), columns=num_cols, index=X_holdout.index)
         Xh_cat = pd.DataFrame(enc.transform(X_holdout[cat_cols]), columns=enc.get_feature_names_out(cat_cols), index=X_holdout.index)
         pd.Series(model.predict(pd.concat([Xh_num, Xh_cat], axis=1))).to_csv('{predictions_csv}', index=False, header=False)
 
-    None bundled impute, encode, fit, and write together. Your FIRST GOAL is a WRITTEN '{predictions_csv}' for the holdout, NOT a validation score: build the baseline cell by cell, RUN the submit cell (Cell H) that writes the file, and bank it before any further work. A run that prints a score but never writes predictions has produced nothing and fails, so reach Cell H early and never call finish until the file exists.
+    None bundled impute, encode, fit, and write together. Your FIRST GOAL is a WRITTEN '{predictions_csv}' for the holdout, NOT a validation score: build the baseline cell by cell, RUN the submit cell (Cell G) that writes the file, and bank it before any further work. A run that prints a score but never writes predictions has produced nothing and fails, so reach Cell G early and never call finish until the file exists.
 
-    CORE RULES (every modeling cell). Fit each encoder, imputer, scaler, or selector on X_train and reuse that SAME fitted object on X_holdout, so columns align and no holdout leaks. Any feature you build BY HAND (an interaction, ratio, or log column) must be computed the IDENTICAL way on X_train and X_holdout, via one function called on both, never edit just one frame, or the holdout loses columns and the submit fails with a KeyError or shape mismatch. Carve the validation split from TRAINING data only (stratified for classification, random for regression). Imputers, scalers, and OneHotEncoder may be fit on full X_train before the carve, but TargetEncoder, frequency encoding, and quantile transforms learn from the target or value distribution, so fit them INSIDE the split or they inflate your score. A validation score is not a submission: NEVER stop after printing it, and never write predictions before printing it.
+    CORE RULES (every modeling cell). Set random_state=42 on EVERY estimator and search you construct, so the rendered notebook re-executes to the same numbers. Carve the validation split from TRAINING data only (stratified for classification, random for regression), and carve it FIRST: fit every encoder, imputer, scaler, or selector on the training fold ONLY, then transform the validation fold and X_holdout with that SAME fitted object (never refit), so columns align, no holdout leaks, and no validation row leaks into a fit — a transform fit on rows you then validate on inflates the score you steer by. Any feature you build BY HAND (an interaction, ratio, or log column) must be computed the IDENTICAL way on every frame, via one function called on each, never edit just one frame, or the holdout loses columns and the submit fails with a KeyError or shape mismatch. A validation score is not a submission: NEVER stop after printing it, and never write predictions before printing it.
 
-    ENCODING MENU. High-cardinality text to target or frequency encoding, not one-hot; low-cardinality to one-hot or ordinal; skewed numeric to log, power, or quantile transform; missing to median (numbers) or most-frequent (text); class imbalance to class_weight balanced, resampling, or threshold tuning. Keep threshold tuning SIMPLE: pick the threshold on your existing validation split and apply it to the holdout in the same submit cell; do not add extra splits, cross-val folds, or index re-alignment for it. Gradient-boosted trees (HistGradientBoosting, XGBoost, LightGBM) need NO feature scaling, never add StandardScaler or RobustScaler to one. Use sklearn-native transformers only (OneHotEncoder, OrdinalEncoder, TargetEncoder, StandardScaler, PowerTransformer, SimpleImputer); on a FAILED install switch to the sklearn equivalent, not a version-clashing third-party library.
+    ENCODING MENU. High-cardinality text to target or frequency encoding, not one-hot; low-cardinality to one-hot or ordinal; skewed numeric to log, power, or quantile transform; missing to median (numbers) or most-frequent (text); class imbalance to class_weight='balanced' (this environment's scikit-learn is >=1.2, where HistGradientBoostingClassifier DOES accept class_weight — do not claim otherwise; sample_weight in .fit also works), resampling, or threshold tuning. Keep threshold tuning SIMPLE: pick the threshold on your existing validation split and apply it to the holdout in the same submit cell; do not add extra splits, cross-val folds, or index re-alignment for it. Gradient-boosted trees (HistGradientBoosting, XGBoost, LightGBM) need NO feature scaling, never add StandardScaler or RobustScaler to one. Use sklearn-native transformers only (OneHotEncoder, OrdinalEncoder, TargetEncoder, StandardScaler, PowerTransformer, SimpleImputer); on a FAILED install switch to the sklearn equivalent, not a version-clashing third-party library.
 
-    THE PROFILE IS DONE. The data summary already gives cardinalities, missing counts, skew, class balance or target spread, and top correlations; treat these as known. Inspect only what it omits, or to decide a transform from real data. The target is y_train, never a column of X_train.
+    THE PROFILE IS DONE. The data summary already gives cardinalities, missing counts, skew, class balance or target spread, and top correlations; treat these as established fact. Do NOT spend a cell re-deriving them: no nunique(), value_counts(), describe(), or isnull() cell to re-confirm cardinality, class balance, or missingness the profile already states. Spend an inspection cell ONLY on a NEW question the profile does not answer (how a specific feature relates to the target, whether an interaction or transform is worth trying), then act on it; otherwise go straight to building the baseline. The target is y_train, never a column of X_train.
 
     A STARTING POINT IS REFERENCE ONLY. If a 'BEST APPROACH SO FAR' block appears in your task message, do NOT paste it into one cell: read it, find its score, rebuild it as the same small cells reading each output, then beat it with the brief's ONE change.
 
-    THE IMPROVE LOOP IS BINDING. A first valid submission is a checkpoint, not the finish line. Make ONE measured, data-justified change at a time, reading each new validation score; feature engineering is your main lever, so do NOT just swap the estimator on identical preprocessing. To change one transform, refit ONLY that transform and derive a new matrix from the existing X_tr, reusing the other fitted objects. The budget warning is your stop; do not claim you are out of ideas without naming what you tried.
+    THE IMPROVE LOOP IS BINDING. A first valid submission is a checkpoint, not the finish line. Make ONE measured, data-justified change at a time, reading each new validation score; feature engineering is your main lever, so do NOT just swap the estimator on identical preprocessing. To change one transform, refit ONLY that transform on the training fold and derive new fold matrices from the existing ones, reusing the other fitted objects. Compare LIKE-FOR-LIKE: if the best pipeline applies a decision threshold or other post-processing, apply the SAME one when scoring any candidate change — a score measured without it cannot be compared against one measured with it, and rejecting (or accepting) a change on that mismatch wastes the experiment. The budget warning is your stop; do not claim you are out of ideas without naming what you tried.
 
     WHEN A CELL ERRORS, name the cause from the traceback and fix THAT next cell; never re-run failing code unchanged. A NaN means impute; "could not convert string to float" means encode the categoricals selected by dtype; a shape mismatch means align X_holdout to the fitted columns. ONE action per cell, print its result, read it before the next.
   # User message — data brief, supervisor brief, optional starting code, load output.
@@ -262,7 +261,7 @@ coder:
     The data is already loaded into X_train, y_train, X_holdout. Output of the load cell:
     {preamble_output}
 
-    Do this now, ONE action per cell, printing the one result each cell produces and reading it before the next. Begin with a dtype-split inspect cell that computes num_cols and cat_cols and prints both. If a 'BEST APPROACH SO FAR' block appears above, do NOT paste it as one cell: find its score line, then rebuild it incrementally as separate cells (reproduce each step and read its output), then apply the brief's ONE change to beat that score. Otherwise build the strong simple baseline (one-hot, median-impute, a gradient-boosted tree) one small cell at a time: inspect, transform each column-group into a NEW variable, combine into one named matrix, fit and score one model on a validation split carved from the training data, transform X_holdout with the SAME fitted objects, then write holdout predictions to '{predictions_csv}'. Never bundle transform, fit, and write into one cell. After your first valid submission, keep improving one measured change at a time, reusing the variables already in memory, until the budget warning, then call the finish tool.
+    Do this now, ONE action per cell, printing the one result each cell produces and reading it before the next. Begin with a dtype-split SETUP cell that computes num_cols and cat_cols in one cell — the profile already gives their cardinality, class balance, and missingness, so do NOT add a cell to re-derive those. If a 'BEST APPROACH SO FAR' block appears above, do NOT paste it as one cell: find its score line, then rebuild it incrementally as separate cells (reproduce each step and read its output), then apply the brief's ONE change to beat that score. Otherwise build the strong simple baseline (one-hot, median-impute, a gradient-boosted tree) one small cell at a time: carve the validation split from the training data FIRST, fit each transform on the training fold only and transform both folds into NEW variables, combine each fold into one named matrix, fit and score one model, transform X_holdout with the SAME fitted objects, then write holdout predictions to '{predictions_csv}'. Never bundle transform, fit, and write into one cell. After your first valid submission, keep improving one measured change at a time, reusing the variables already in memory, until the budget warning, then call the finish tool.
   retry_nudge: >-
     Respond ONLY by calling the run_cell tool (with a `code` string) or the finish
     tool. No prose.
@@ -290,6 +289,37 @@ coder:
     your validation split; overwrite '{predictions_csv}' only if it scores better),
     then call finish again. If you are genuinely out of justified ideas, call finish
     again now and it will be accepted.
+
+  # Sent ONCE when finish arrives with valid predictions but none of the brief's
+  # lever-class markers appear in any executed cell. Placeholders: {lever}, {predictions_csv}
+  lever_missing_nudge: >-
+    Not done: the briefed change (markers like {lever}) does not appear in any cell you
+    have run — a submission without the brief's ONE change is not this experiment.
+    Implement the briefed change now, measure it like-for-like on your validation split
+    (the SAME decision threshold on both sides), keep the better version in
+    '{predictions_csv}', then call finish again.
+
+  # Sent ONCE when finish arrives with predictions byte-identical to an EARLIER
+  # experiment's submission (any prior iteration, not just the best).
+  # Placeholder: {predictions_csv}
+  identical_submission_nudge: >-
+    Your '{predictions_csv}' was written correctly — this is NOT a file or write error,
+    do NOT re-run the write cell. The problem: its contents are byte-identical to an
+    earlier experiment's submission, so this experiment has added no new information.
+    If the brief's ONE change never reached the final pipeline, apply it now, measure
+    it like-for-like (same threshold both sides), and overwrite '{predictions_csv}'
+    with the version WITH the change if it is at least as good. If you ALREADY measured
+    the change fairly and it lost, you are done: call finish again and the identical
+    file will be accepted — a measured loss with the best re-submitted is a valid
+    result. NEVER manufacture an arbitrary variant (a thrown-together ensemble, a
+    tweaked seed, a re-fit of the same model) just to make the file differ.
+
+  # Sent when a cell arrives visibly truncated (mid-token cutoff); not executed.
+  # Placeholder: {error}
+  truncated_cell_nudge: >-
+    Your cell arrived INCOMPLETE and was not executed ({error}) — it ends mid-token,
+    which means your message was cut off. Re-send the COMPLETE cell; if it was long,
+    split it into two smaller cells.
 
   # Sent when a cell is identical to one already run this session (not executed again).
   repeat_rejected: >-
@@ -345,7 +375,7 @@ supervisor:
 
     COMPOUND. Every brief after experiment 1 KEEPS the best-scoring configuration and ADDS exactly one named change: never a from-scratch pipeline, never two levers bundled, never re-brief an approach already scored (kept winners are not re-briefs).
 
-    THE BRIEF. 1-2 lines, two labeled slots: a falsifiable hypothesis the next digest confirms or refutes. Slot 1 "so far:": the best score and which levers scored, failed, or did nothing. Slot 2 "next:": exactly ONE move naming the technique and its lever class, one reason citing a profile fact or a past number, effect in plain words, never a predicted number. Experiment 1 has no so far slot. Good: "so far: one-hot + HistGradientBoosting scored 0.58. next: imbalance-or-threshold: class balance 73/27, metric f1, keep the baseline pipeline and train with class_weight balanced so the majority class stops dominating." Bad: "try Random Forest with feature engineering" (bare estimator, no slots).
+    THE BRIEF. Your brief is the "next:" slot ONLY: 1-2 lines opening "next:", a falsifiable hypothesis the next digest confirms or refutes — exactly ONE move naming the technique and its lever class, one reason citing a profile fact or a past number, effect in plain words, never a predicted number. The harness prepends the factual "so far:" slot (real best score, its components, the baseline) from the recorded history; never write your own "so far:" — anything before "next:" is discarded. Good: "next: imbalance-or-threshold: class balance 73/27, metric f1, keep the best pipeline and train with class_weight balanced so the majority class stops dominating." Bad: "try Random Forest with feature engineering" (bare estimator, no lever class, no reason).
 
     STOP. stop=true ONLY if three or more recent experiments fail to beat the best by a meaningful margin AND Levers NOT yet tried is empty or holds nothing a profile fact or a past result justifies; else stop=false and brief. Call plan_next.
   # Placeholders: {data_summary}, {metric}, {score}, {direction}, {history_section}
@@ -357,6 +387,44 @@ supervisor:
 
     {history_section}Walk the ladder top to bottom honoring the PIVOT rule, act on the first rung whose trigger fires, and brief that one move; on experiment 1 this is the baseline rung. Call plan_next.
   history_header: "Experiments so far:"
+  # Sent after a backend rejects a malformed tool call (e.g. groq's tool_use_failed when
+  # 'stop' arrives as the string "false"); asks for a well-formed retry.
+  tool_error_nudge: "Your last tool call was rejected as malformed. Call plan_next again with valid JSON: 'stop' MUST be a boolean (true or false), not a string, and 'brief' a plain string."
+
+  # Sent ONCE when a brief re-commissions work the carried best already contains
+  # (class_weight set, grid searched, feature built). Placeholder: {reason}
+  banked_rebrief_nudge: >-
+    Rejected: {reason}. The so-far facts list what the carried best ALREADY contains;
+    briefing it again deterministically re-produces the same submission and wastes the
+    experiment. Walk the ladder again and brief a genuinely NEW move — a different
+    lever class, or a new dimension not yet tried — and call plan_next with that ONE
+    move (name its lever class in the brief).
+
+  # Sent ONCE when the move is ill-formed (fused lever tags, or a claimed
+  # best/previous score that matches neither the banked best nor the baseline).
+  # Placeholder: {reason}
+  move_lint_nudge: >-
+    Rejected: {reason}. The so-far facts state the ONLY real scores (the banked best
+    and the baseline) — do not invent others. Call plan_next again with ONE move:
+    exactly one lever class, one reason citing a profile fact or a REAL past number.
+
+  # Sent ONCE when a brief re-names the lever class of the immediately-previous
+  # experiment although that experiment's submission was a stamped duplicate.
+  duplicate_class_rebrief_nudge: >-
+    Rejected: the previous experiment pulled that SAME lever class and its submission
+    was a DUPLICATE — no new information. Briefing the class again right away just
+    produces the next duplicate. Walk the ladder again and brief a move from a
+    DIFFERENT class, preferring Levers NOT yet tried; call plan_next with that ONE
+    move (name its lever class in the brief).
+
+  # Sent ONCE when a brief reads as a baseline rebuild although history is non-empty
+  # (rung 1's trigger is "no history" — a rebuild duplicates a scored experiment).
+  baseline_rebrief_nudge: >-
+    Rejected: experiments are already on record, so the BASELINE rung must NOT fire —
+    rebuilding the baseline duplicates an already-scored experiment and wastes the
+    iteration. Walk the ladder again from rung 2: act on the first rung whose trigger
+    fires, preferring Levers NOT yet tried, and call plan_next with that ONE move
+    (name its lever class in the brief).
 
   retry_nudge: "Respond ONLY by calling the plan_next tool. No prose."
 
@@ -370,7 +438,7 @@ supervisor:
       title: >-
         A short label for this experiment (a few words), for the leaderboard.
       brief: |-
-        The instruction handed verbatim to the coding agent: 1-2 lines, two labeled slots it follows literally. Slot 1 opens "so far:" and compresses outcomes (best score; which levers scored, failed, or did nothing); this plus the best working code is all the coder inherits. Slot 2 opens "next:" and gives exactly ONE move naming the technique and its lever class, with one reason citing a profile fact or a past number; effect in plain words, never a predicted number. Example: so far: one-hot + HistGradientBoosting scored 0.58. next: imbalance-or-threshold: class balance 73/27, metric f1, keep the baseline pipeline and train with class_weight balanced so the majority class stops dominating. On experiment 1 there is no so far slot: brief the plain baseline only (one-hot, median-impute, HistGradientBoosting), nothing else: no extra models, features, or tuning. After experiment 1, keep the best configuration and add exactly one change; never repeat a scored approach. Required unless stopping.
+        The "next:" move handed to the coding agent: 1-2 lines opening "next:", exactly ONE move naming the technique and its lever class, with one reason citing a profile fact or a past number; effect in plain words, never a predicted number. Do NOT write a "so far:" summary — the harness composes that slot from the recorded history and discards anything you write before "next:". Example: next: imbalance-or-threshold: class balance 73/27, metric f1, keep the best pipeline and train with class_weight balanced so the majority class stops dominating. On experiment 1 brief the plain baseline only (one-hot, median-impute, HistGradientBoosting), nothing else: no extra models, features, or tuning. After experiment 1, keep the best configuration and add exactly one change; never repeat a scored approach. Required unless stopping.
 
 summarizer:
   # Distills ONE finished experiment notebook into a structured digest for the
@@ -417,7 +485,10 @@ summarizer:
         (e.g. "target encoding: 0.55 -> 0.58"). Empty list if none.
       what_hurt: >-
         Techniques that LOWERED the score, did nothing, or errored, with the reason
-        if visible. Empty list if none.
+        if visible. Name the EXACT formula or parameters, not just the technique
+        family — "ratio tenure/MonthlyCharges: 0.62 -> 0.53" not "a ratio feature
+        hurt" — so a later experiment can tell a dead variant from an untried one.
+        Empty list if none.
       takeaway: >-
         ONE sentence: the single most promising concrete next move given this run.
 
