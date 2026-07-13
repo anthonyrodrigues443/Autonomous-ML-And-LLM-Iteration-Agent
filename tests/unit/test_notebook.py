@@ -102,6 +102,27 @@ def test_slug_is_filesystem_safe() -> None:
     assert slug("") == "experiment"
 
 
+def test_string_traceback_in_captured_outputs_renders_and_validates() -> None:
+    # cells recorded before the e2b traceback normalization carry the traceback as
+    # ONE string; the schema wants an array, and rendering a finished run must not
+    # crash on it (it did, at the end of the first live e2b run).
+    from iterate.deliver.notebook import build_session_notebook
+
+    cells = [{
+        "code": "boom()", "stdout": "", "error": "ValueError: bad", "source": "agent",
+        "outputs": [{
+            "type": "error", "ename": "ValueError", "evalue": "bad",
+            "traceback": "Traceback (most recent call last)\nValueError: bad",
+        }],
+    }]
+    nb = build_session_notebook(cells, title="t", metric="f1", score=0.6)
+    nbformat.validate(nb)  # would raise without the coercion
+    code_cells = [c for c in nb.cells if c.cell_type == "code"]
+    assert code_cells[0].outputs[0].traceback == [
+        "Traceback (most recent call last)", "ValueError: bad",
+    ]
+
+
 def test_session_notebook_carries_the_honesty_note_in_the_header() -> None:
     # run 20 i3: a duplicate's header read "+0.0321 vs baseline" although the
     # submission was byte-identical to an earlier one — the machine verdict must

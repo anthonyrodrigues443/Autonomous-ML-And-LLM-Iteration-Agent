@@ -294,11 +294,21 @@ class E2BKernel:
         err = getattr(execution, "error", None)
         error = None
         if err is not None:
-            traceback = getattr(err, "traceback", None) or [str(getattr(err, "value", err))]
-            error = _strip_ansi("\n".join(traceback)) or f"{getattr(err, 'name', 'Error')}"
+            # e2b SDK v2 ships the traceback as ONE string (v1 was a list). Joining
+            # a string newlines every character, garbling the feedback the agent
+            # debugs from, and a string traceback fails the notebook schema (both
+            # caught on the first live cell-by-cell e2b run, 2026-07-12).
+            tb = getattr(err, "traceback", None)
+            if isinstance(tb, str):
+                tb_lines = tb.splitlines()
+            elif tb:
+                tb_lines = [str(line) for line in tb]
+            else:
+                tb_lines = [str(getattr(err, "value", err))]
+            error = _strip_ansi("\n".join(tb_lines)) or f"{getattr(err, 'name', 'Error')}"
             outputs.append(
                 {"type": "error", "ename": getattr(err, "name", "Error"),
-                 "evalue": str(getattr(err, "value", "")), "traceback": traceback}
+                 "evalue": str(getattr(err, "value", "")), "traceback": tb_lines}
             )
         return CellResult(stdout, stderr, error=error, outputs=outputs)
 

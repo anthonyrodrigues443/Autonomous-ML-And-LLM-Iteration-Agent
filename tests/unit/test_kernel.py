@@ -195,6 +195,32 @@ class _FakeSandbox:
         self.killed = True
 
 
+def test_e2b_string_traceback_is_normalized_to_lines() -> None:
+    # e2b SDK v2 ships err.traceback as ONE string (v1 was a list): joining it
+    # newlined every character, and the stored string traceback failed notebook
+    # validation, crashing rendering at the end of the first live e2b run.
+    class _Err:
+        name = "ValueError"
+        value = "inconsistent numbers of samples"
+        traceback = "Traceback (most recent call last)\nValueError: inconsistent numbers of samples"
+
+    class _ErroringSandbox(_FakeSandbox):
+        def run_code(self, code: str, timeout: float | None = None) -> _FakeExecution:
+            self.ran.append(code)
+            return _FakeExecution(stdout=[], error=_Err())
+
+    sandbox = _ErroringSandbox(store={})
+    k = E2BKernel(sandbox_factory=lambda: sandbox)
+    k.start({})
+    result = k.run_cell("boom()", timeout=30)
+    assert result.error is not None
+    assert "ValueError: inconsistent numbers of samples" in result.error
+    assert "\nV\na\nl" not in result.error  # not newlined per character
+    error_outputs = [o for o in result.outputs if o["type"] == "error"]
+    assert isinstance(error_outputs[0]["traceback"], list)
+    assert len(error_outputs[0]["traceback"]) == 2
+
+
 def test_e2b_bytearray_reads_come_back_as_real_bytes() -> None:
     # e2b SDK v2 returns a bytearray for format="bytes"; a bytearray is NOT bytes,
     # and the old str(data).encode() fallback collapsed a whole predictions file

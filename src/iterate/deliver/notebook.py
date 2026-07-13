@@ -190,6 +190,11 @@ def _to_nb_output(captured: dict[str, Any]) -> Any:
     """Convert a captured output dict (from a kernel) to an nbformat output."""
     kind = captured.get("type", "stream")
     rest = {k: v for k, v in captured.items() if k != "type"}
+    # Defensive: cells recorded before the e2b traceback normalization (or by any
+    # future kernel drift) may carry the traceback as ONE string; the notebook
+    # schema requires an array and rendering must not crash a finished run.
+    if kind == "error" and isinstance(rest.get("traceback"), str):
+        rest["traceback"] = rest["traceback"].splitlines()
     return new_output(kind, **rest)
 
 
