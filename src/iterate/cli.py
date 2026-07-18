@@ -430,6 +430,10 @@ def _configure_logging() -> None:
         datefmt="[%X]",
         handlers=[RichHandler(console=console, show_path=False, markup=False)],
     )
+    # Third-party HTTP chatter (one line per LLM call, plus e2b keepalive/execute
+    # pairs around every cell) drowns the run's own progress; keep it debug-only.
+    for name in ("httpx", "httpcore", "e2b"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _read_source(path: Path) -> str:
