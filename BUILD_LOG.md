@@ -270,6 +270,18 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-07-18 | Week 4 Day 8 (close) | v0.2.0 SHIPPED: PyPI + tag + GitHub release; both compute paths verified on the published package; new-dataset generalization run
+
+**Task:** Execute the release and prove the published artifact does what the repo claims.
+
+**Shipped:** PR #44 squash-merged to main (26 files, +3331/-424, first run of the new CI green), `iterate-ai 0.2.0` published to PyPI, tag + GitHub release out ("v0.2.0: the agent writes its own training code"). Release notes lead with the R&D-session story and the honest capability floor, not just numbers. A 0.2.1 patch followed the same day: third-party HTTP request logs (one line per LLM call, plus e2b keepalive/execute pairs around every cell) demoted to debug so a run's console shows only its own progress lines.
+
+**Verification on the published package, not the repo checkout:** a 3-iteration e2b run on merged main saved every notebook live including two iterations with errored cells (the exact case that used to crash rendering: e2b's SDK v2 ships tracebacks as one string; fixed in #44 and now regression-proven on real sandbox traffic). Then a generalization run on a dataset the agent had never seen: UCI Adult income, 26.9k rows, 13 mixed features, 25.6% positive. Fresh chapter, f1 0.7187 baseline -> 0.7310 best, and the winning lever was class-weight balancing: the right move for an imbalanced target, picked without any churn-chapter memory to lean on. Digests came out dataset-specific (target-encode native_country, education x capital-gain interactions), and the run stopped itself on patience after three non-improving iterations. One labeled duplicate + one labeled unmeasured lever: inside the certified 1-2 floor band.
+
+**Also caught in live use:** passing --compute twice (muscle memory) silently uses the last one, standard CLI behavior but worth knowing; and a fresh chapter is mandatory when switching datasets, because memory chapters key on the target family, not the file.
+
+**Next:** demo video + launch posts (drafted, feature-first per the v0.1 post's structure), then v0.3 scoping (interactive CLI: pause, mid-run chat, resume).
+
 ### 2026-07-07 | Week 4 Day 8 | Quality bar CERTIFIED; release prep (README rewrite, v0.2.0 bump, sdist trim)
 
 **Task:** Close the quality-bar loop with a certified run, then execute the release mechanics.
