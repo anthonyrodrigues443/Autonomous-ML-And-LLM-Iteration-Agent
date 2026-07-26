@@ -497,6 +497,8 @@ The discovery agent is what makes the demo wow. It does:
 
 **Deeper fix unchanged:** cross-iteration timeout knowledge (digest/dossier carrying "this model class stalls here") is sprint-2 work as planned.
 
+**Launch complete (same day):** `iterate-ai 0.3.1` published to PyPI and verified from a fresh venv (`iterate version` → 0.3.1 from the pip install); feature-first launch posts (7-tweet X thread + LinkedIn, mirroring the v0.1/v0.2 structure) scheduled. Sprint 1 shipped on its Sunday: built Saturday, released Sunday, with the same-day patch for the live-found timeout class. Sprint 2 (v0.4) opens Monday.
+
 ### 2026-07-26 | Sprint 1 | v0.3.0: interactive runs (TUI + chat + pause/resume + hard stop)
 
 **Task:** Build and ship v0.3 in one day per the sprint re-plan: talk to the run while it runs.
