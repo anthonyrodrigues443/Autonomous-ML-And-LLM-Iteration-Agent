@@ -6,10 +6,11 @@
 > (security policy), and are marked as such rather than scheduled for removal.
 
 Version map (from the roadmap): v0.2 sandboxed code-gen + the multi-agent cell-by-cell
-core (Supervisor, coding agent, Summarizer) · v0.3 interactive CLI · v0.4 Researcher +
-Critic specialists + agent picks metric/model · v0.5 prompts · v0.6 DL/vision · v0.7
-cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 benchmark + UI
-· v1.0 one-sentence input.
+core (Supervisor, coding agent, Summarizer) · v0.3 interactive runs (terminal UI, chat,
+pause/resume/stop, notebook Q&A, standing rules) · v0.4 Researcher + Critic specialists +
+agent picks metric/model · v0.5 prompts · v0.6 DL/vision · v0.7 cost-constrained · v0.9
+infer features/target + MCP discovery (absorbs v0.8) · v1.0 one-sentence input + benchmark
++ dashboard (absorbs v0.10). "backlog" below = tracked for after v1.0.
 
 ## Metrics & evaluation
 
@@ -18,7 +19,7 @@ cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 be
 | Fixed 8-metric panel only: `accuracy, f1, precision, recall` / `rmse, mae, mse, r2` (`core/scoring.py`). Anything else raises "unknown metric". | **v0.4** | Pairs with "agent picks the metric." The `Metrics` schema is already generic (values dict + primary + direction); only `score()` is capped. |
 | No probability-based metrics (ROC-AUC, log-loss, PR-AUC). We score predicted **labels** (`predict`), not probabilities (`predict_proba`). | **v0.4** | The most notable gap: AUC/PR-AUC are the standard metrics for imbalanced problems like churn. Needs probability capture, not just a longer list. |
 | `f1`/`precision`/`recall` averaging hardcoded (binary if ≤2 classes, else macro). No weighted/micro. | **v0.4** | |
-| Single train/holdout split; no cross-validation. The same holdout is reused to select across all iterations (mild selection bias). | **v0.4** | The Critic agent + eval hardening land here; nested/CV selection vs final-test split. |
+| Single train/holdout split; no cross-validation. The same holdout is reused to select across all iterations (mild selection bias). | Critic **v0.4**; CV backlog | The Critic agent (suspicious-win flags, selection-bias watch) lands at v0.4; a k-fold/CV selection option is tracked on the backlog. |
 | Single primary metric (single-objective); no multi-objective trade-offs. | **v0.7** | Cost-constrained optimization: best score within a serving budget. |
 
 ## Models & preprocessing
@@ -34,10 +35,10 @@ cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 be
 |---|---|---|
 | Tabular CSV only as input. | **v0.5 / v0.6** | Prompts (v0.5), vision/DL (v0.6). |
 | Classification + regression tasks only. | **v0.5 / v0.6** | Expands with prompt + vision targets. |
-| Single local CSV (`load_csv`); no Kaggle / HuggingFace / DB / MCP sources. | **v0.9** | MCP discovery finds the data itself. |
+| Single local CSV (`load_csv`); no Kaggle / HuggingFace / DB / MCP sources. | **v0.9** (partial) | v0.9 ships MCP discovery over filesystem + Postgres; Kaggle/HuggingFace loaders and the Notion/github servers are tracked on the backlog. |
 | Single target column; no multi-target / multi-label. | TBD | When needed; not scheduled. |
 | `--metric` must be given explicitly. | **v0.4** | Agent picks the metric. |
-| `--target` + features must be given. | **v0.8** | Infer from the data + a one-line description. |
+| `--target` + features must be given. | **v0.9** | Infer from the data + a one-line description (the v0.8 milestone, shipping inside the v0.9 release). |
 | Full one-sentence input not yet possible. | **v1.0** | Autonomous discovery. |
 
 ## Agent architecture
@@ -54,20 +55,33 @@ cost-constrained · v0.8 infer features/target · v0.9 MCP discovery · v0.10 be
 | Per-iteration history fed to the proposer is description + score + recent stdout — not a distilled insight, so context grows with run length. | **lifted in v0.2** (cell-by-cell path) | The Summarizer (pulled forward from v0.4) digests each finished experiment once (~150 tokens: techniques, data insights, what helped/hurt, takeaway); the supervisor reads all digests + a technique scoreboard + a lever ledger, never the notebooks. The one-shot `--spec` path keeps the old shape. The Critic remains v0.4. |
 | The Summarizer costs one extra LLM call per finished experiment, and a failed call silently degrades the digest to its deterministic skeleton (components + score + validation trail, no insight fields). | **by-design** | Degrading beats crashing: a digest is a nice-to-have for the next brief, never worth failing a recorded run. Observed once live (1/10 digests skeleton-only); a deterministic takeaway is now synthesized so the field is never empty. |
 | "Auditable report" = persistent memory + a runnable notebook per experiment (Day 6), not a prose report doc. | ~v0.10 | The notebook deliverable covers "what it tried + a runnable winner"; a dedicated prose Reporter is a later backlog item. |
-| No `iterate history` / `best` / `why-failed` query commands. | post-v0.1 | The data is in Memory; the CLI surface is a small near-term add. |
+| No `iterate history` / `best` / `why-failed` query commands. | backlog | The data is in Memory, and v0.3's in-run Q&A covers the live case; the offline CLI surface is a small add tracked on the backlog. |
 
 ## Execution / sandbox (v0.2)
 
 | Limitation (today) | Lifted at | Notes |
 |---|---|---|
-| e2b network egress-deny not enforced (needs a custom sandbox template). | **v0.2.x** | Flagged in `compute/runner.py`. |
+| e2b network egress-deny not enforced (needs a custom sandbox template). | backlog | Flagged in `compute/runner.py`; the sandbox still isolates the host, this hardens what the sandbox itself can reach. |
 | Import→package resolution for install-on-demand is a hand-kept alias map (`sklearn`→`scikit-learn`, …) with import-name fallback. | **TBD** | Provisional architecture — to be revisited (logged in DECISIONS.md). Backstop: a wrong/missing package fails its install → captured failure + retry, so the map only needs the common stack. |
 | Local install-on-demand requires explicit consent (`--install` / setup); without it, a missing import on `--compute local` is a captured failure. | **by-design** | `--compute local` never silently mutates your environment (typosquat / dependency-conflict risk). With consent it installs into iterate's own env; e2b always installs in its disposable sandbox. |
 | The agent prints diagnostics *inside* `train_and_predict` on the one-shot (`--spec`-adjacent) path, so a pure "just explore the data" turn there still costs one scored iteration. | **addressed in v0.2 cell-by-cell** | The v0.2 cell-by-cell session (`--code`, default) lets it inspect-then-build within an experiment for free (kernel-time budget); the one-shot path keeps the old behavior. |
 | One-shot code-gen writes the whole pipeline blind; aggressive feature engineering can silently produce near-zero scores (NaN/inf, single-class predictions) the agent can't foresee. | **addressed in v0.2 cell-by-cell** | The cell-by-cell session catches it mid-session (the agent inspects intermediate output + a model-ready assert runs before `.fit()`), instead of writing the pipeline in one shot. |
-| The cell-by-cell carry-forward hands the next experiment a concatenated blob of the winning session's cells (not a labeled, staged pipeline). | **works; typed handoff at v0.4** | The staged coder prompt treats the starting point as REFERENCE ONLY (find its score, rebuild as small cells, beat it), which the validation runs show working. A typed `Session` handoff replaces the blob when the v0.4 specialists need structured access. |
+| The cell-by-cell carry-forward hands the next experiment a concatenated blob of the winning session's cells (not a labeled, staged pipeline). | **works; typed handoff on the backlog** | The staged coder prompt treats the starting point as REFERENCE ONLY (find its score, rebuild as small cells, beat it), which the validation runs show working. A typed `Session` handoff is tracked on the backlog. |
 | Code-gen winners return predictions, not a pickled model. | **permanent** | Security/portability; the readable artifact is the v0.2 notebook deliverable. |
 | No cloud-GPU compute backend (local + e2b only). | ~v0.6 | When DL / large-model training needs it. |
+
+## Interactive runs (v0.3)
+
+| Limitation (today) | Lifted at | Notes |
+|---|---|---|
+| Messages take effect at the next safe boundary (a cell finishing, or just before planning), never mid-cell. The ack is instant; delivery can lag a slow cell or a slow LLM turn. | **by-design** | An interrupt is a kill, not a pause; the cell boundary is where state is coherent, gates run, and the kernel survives. |
+| Only the bare words `pause` / `resume` / `stop` are controls (trailing punctuation tolerated). "please stop the run" routes as guidance, with only the ack text hinting otherwise. | monitor | The intent router deliberately has no stop authority: a misclassified sentence must never be able to end a run. |
+| Message intent is classified by the same (possibly small, local) model that supervises. A failed or garbled classification defaults to the least-destructive route: a steer for the work in front of us, and the console says so. | **by-design** | Interpretation degrades, it never crashes or blocks the run. |
+| Standing rules are run-scoped (they do not survive a restart) and lean-capped: 3 rules, 90 chars each; steers cap at 200 chars per message. | persistence: backlog | Dense injected context measurably regresses small models (the reverted EDA-ledger experiment); the caps are a feature. |
+| In-run Q&A answers from the CURRENT run's experiments only; it cannot answer about previous runs. | TBD | Deliberate: iteration numbers restart every run, and cross-run answers were confidently wrong. An offline query surface is on the backlog. |
+| Token-level streaming of the model's output did not ship (planned for v0.3, cut for the release). | backlog | The transcript streams per cell and per event, not per token. |
+| The `--spec` fast lane stays non-interactive. | **by-design** | The frozen v0.1 path is kept cheap and predictable. |
+| The interactive UI needs a foreground terminal; piped, scripted, CI, and backgrounded (`... &`) runs are plain and non-interactive. | **by-design** | A backgrounded process reading its terminal would be suspended by the OS; iterate detects this and stays hands-off. |
 
 ## Permanent by design (not limitations to remove)
 
