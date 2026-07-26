@@ -15,11 +15,11 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from iterate.adapters.compute.local import run_in_process
 from iterate.core.orchestrator import RunResult
-from iterate.core.supervisor import SupervisorError, lever_markers_for_brief
+from iterate.core.supervisor import SupervisorError, lever_markers_for_brief, render_live_cells
 from iterate.core.terminator import AttemptOutcome, LoopState
 from iterate.schemas.experiment import Candidate, Experiment
 
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.core.coder import CodingAgent
+    from iterate.core.interactive import RunController
     from iterate.core.memory import Memory
     from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor, SupervisorDecision
@@ -69,6 +70,7 @@ def run_supervised(
     data_summary: str,
     summarizer: Summarizer | None = None,
     on_experiment: Callable[..., None] | None = None,
+    controller: RunController | None = None,
 ) -> RunResult:
     """Run the Supervisor + Coder loop until the terminator (or supervisor) stops.
 
@@ -81,7 +83,13 @@ def run_supervised(
     success or failure — with ``experiment=, baseline=, is_best=, run_id=`` keyword
     arguments. The CLI uses it to save each iteration's notebook the moment it
     finishes, so a crash or Ctrl-C mid-run still leaves every finished iteration's
-    deliverable on disk. A failing hook is logged and never kills the run."""
+    deliverable on disk. A failing hook is logged and never kills the run.
+
+    ``controller`` (optional) is the interactive seam: the loop binds the message
+    interpreter onto it (the Supervisor classifies each typed line; the harness
+    routes it), checkpoints at every iteration boundary (pause/resume/stop, with
+    the run deadline suspended while paused), and folds drained guidance + standing
+    rules into ``decide``. ``None`` keeps today's non-interactive behavior."""
     baseline = run_in_process(target)  # spec default = the bar to beat
     if not baseline.succeeded or baseline.metrics is None:
         log.warning("agent loop: baseline failed (%s); aborting", baseline.error)
@@ -95,13 +103,48 @@ def run_supervised(
     started_at = perf_counter()
     stopped_because = "exhausted"
     iteration = 0
+    if controller is not None:
+        # Q&A is scoped to THIS run: current_run is appended in place below, so
+        # the closure always sees exactly the experiments the user is watching —
+        # never a prior run's iteration 3 answering for this run's iteration 3.
+        controller.interpreter = _make_interpreter(
+            controller=controller, supervisor=supervisor,
+            experiments=current_run, baseline=baseline, data_summary=data_summary,
+        )
+
+        def _snapshot() -> RunResult:
+            # The hard quit renders the summary from whatever has FINISHED at
+            # this instant; the loop itself may still be blocked inside a cell.
+            return RunResult(
+                baseline=baseline, history=list(current_run), best=best,
+                stopped_because="stopped-by-user", run_id=run_id,
+            )
+
+        controller.snapshot = _snapshot
 
     try:
         while True:
             iteration += 1
+            guidance: list[str] = []
+            rules: tuple[str, ...] = ()
+            if controller is not None:
+                controller.status = "between experiments"
+                controller.checkpoint(None)
+                if controller.abort_requested:
+                    stopped_because = "stopped-by-user"
+                    break
+                guidance = controller.take_brief_notes()
+                rules = controller.rules
             outcome: AttemptOutcome
             last_experiment: Experiment | None = None
             try:
+                # Only pass the interactive kwargs when there is something to say, so
+                # a controller-less run calls decide exactly as before.
+                extra: dict[str, Any] = {}
+                if guidance:
+                    extra["user_guidance"] = "; ".join(guidance)
+                if rules:
+                    extra["standing_rules"] = rules
                 # Memory already holds every recorded experiment (line below records each
                 # one) — adding current_run would feed this run's experiments in twice.
                 decision = supervisor.decide(
@@ -112,15 +155,23 @@ def run_supervised(
                     # grounded on this so it describes the code the coder receives,
                     # never a cross-run best the coder does not hold.
                     carried_best=best,
+                    **extra,
                 )
             except SupervisorError as exc:
                 log.warning("agent loop: iteration %d supervisor failed: %s", iteration, exc)
                 memory.record_proposer_failure(run_id, iteration, "supervisor", str(exc))
                 outcome = "proposer_error"
+                if controller is not None:  # the drained steers must survive the retry
+                    for note in guidance:
+                        controller.add_brief_note(note)
             else:
                 if decision.stop:
                     stopped_because = "supervisor"
                     break
+                if controller is not None:
+                    controller.emit(
+                        "brief", iteration=iteration, title=decision.title, brief=decision.brief
+                    )
                 start_code = _winning_code(best)  # carry the best working code forward
                 start_score = (
                     best.result.metrics.primary_value
@@ -149,6 +200,12 @@ def run_supervised(
                         )
                     elif preds_digest:
                         seen_digests.add(preds_digest)
+                    # Audit trail: which human words shaped this experiment (the
+                    # same post-hoc stamp pattern as duplicate_submission above).
+                    if guidance:
+                        experiment.candidate.changes["user_guidance"] = "; ".join(guidance)
+                    if rules:
+                        experiment.candidate.changes["user_rules"] = list(rules)
                     if summarizer is not None:
                         experiment = _digest(summarizer, experiment, iteration)
                     experiment = _sanitize_unmeasured_digest(experiment, decision.brief)
@@ -171,6 +228,13 @@ def run_supervised(
                         outcome = "improved"
                     else:
                         outcome = "no_improvement"
+                    if controller is not None:
+                        controller.emit(
+                            "score", iteration=iteration,
+                            score=(result.metrics.primary_value
+                                   if result.metrics is not None else None),
+                            error=result.error, is_best=(best is experiment),
+                        )
                     if on_experiment is not None:
                         try:
                             on_experiment(
@@ -180,14 +244,23 @@ def run_supervised(
                         except Exception:  # a deliverable hook must never kill the run
                             log.warning("agent loop: on_experiment hook failed", exc_info=True)
 
+            paused_total = controller.paused_seconds_total if controller is not None else 0.0
             state = LoopState(
                 iteration=iteration,
                 baseline=baseline,
                 best=best,
                 last_experiment=last_experiment,
                 last_attempt_outcome=outcome,
-                elapsed_seconds=perf_counter() - started_at,
+                # The --until deadline measures WORKING time: paused time (accrued at
+                # any checkpoint, including inside a coding session) is subtracted.
+                elapsed_seconds=max(0.0, perf_counter() - started_at - paused_total),
             )
+            # The user's stop outranks the terminator's label: a stop typed during
+            # the session must read "stopped-by-user", not whatever patience or the
+            # deadline happens to conclude from the wound-down iteration.
+            if controller is not None and controller.abort_requested:
+                stopped_because = "stopped-by-user"
+                break
             reason = terminator.update_and_check(state)
             if reason is not None:
                 stopped_because = reason
@@ -205,6 +278,70 @@ def run_supervised(
         baseline=baseline, history=current_run, best=best,
         stopped_because=stopped_because, run_id=run_id,
     )
+
+
+def _make_interpreter(
+    *,
+    controller: RunController,
+    supervisor: Supervisor,
+    experiments: list[Experiment],
+    baseline: ExperimentResult,
+    data_summary: str,
+) -> Callable[[list[str], bool], None]:
+    """The plain-English message interpreter the controller calls at boundaries.
+
+    The Supervisor labels each line's intent (it is the role that knows the run);
+    THIS closure executes the routing deterministically. ``experiments`` is the
+    loop's live current-run list (appended in place), so Q&A always answers about
+    THIS run. Duck-typed lookups keep old fakes and the frozen spec path working:
+    a supervisor without ``route_message`` just means every line is a steer."""
+    route = getattr(supervisor, "route_message", None)
+    answer = getattr(supervisor, "answer", None)
+
+    def interpret(batch: list[str], live_session: bool) -> None:
+        for text in batch:
+            kind = "steer_now"
+            if callable(route):
+                try:
+                    kind = route(text, live_session=live_session)
+                except Exception:  # classification degrades, never crashes
+                    log.warning("agent loop: route_message failed; treating as a steer",
+                                exc_info=True)
+            if kind == "question":
+                if callable(answer):
+                    try:
+                        live = (
+                            render_live_cells(controller.live_cells)
+                            if controller.live_cells
+                            else None
+                        )
+                        reply = answer(
+                            text, history=experiments, baseline=baseline,
+                            data_summary=data_summary, live_session=live,
+                        )
+                    except Exception as exc:
+                        reply = f"(could not answer: {exc})"
+                else:
+                    reply = "(questions are not supported on this run)"
+                controller.reply(reply)
+            elif kind == "rule":
+                controller.add_rule(text)
+                controller.reply("standing rule added — every future brief will carry it")
+            elif kind == "steer_later":
+                controller.add_brief_note(text)
+                controller.reply("noted for the NEXT experiment's brief")
+            else:  # steer_now, or any fallback: the least-destructive route
+                controller.add_brief_note(text)
+                if live_session:
+                    controller.add_session_note(text)
+                    controller.reply(
+                        "delivering to the running session at its next cell "
+                        "(also visible when the next experiment is planned)"
+                    )
+                else:
+                    controller.reply("folding into the next experiment's brief")
+
+    return interpret
 
 
 def _sanitize_unmeasured_digest(experiment: Experiment, brief: str) -> Experiment:

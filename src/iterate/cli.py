@@ -10,12 +10,15 @@ don't repeat flags.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import signal
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import typer
 from rich.console import Console
@@ -31,6 +34,7 @@ from iterate.config import get_settings
 # sklearn+pandas import cost on every invocation.
 
 if TYPE_CHECKING:
+    from iterate.core.interactive import RunController
     from iterate.core.memory import Memory
     from iterate.core.orchestrator import RunResult
     from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult
@@ -199,6 +203,15 @@ def run(
             "Saved under .iterate/runs/<run_id>/ (best.ipynb; all → notebooks/)."
         ),
     ),
+    plain: bool = typer.Option(
+        False,
+        "--plain",
+        help=(
+            "Plain terminal output instead of the interactive UI (log pane + input box). "
+            "Chat still works on a terminal: type a line and press Enter. Non-tty runs "
+            "are always plain and non-interactive."
+        ),
+    ),
 ) -> None:
     """Run the agent on a tabular dataset."""
     # Heavy imports live here, not at module top, so `iterate version`/`--help`
@@ -279,7 +292,15 @@ def run(
         )
 
     # ─── Configure logging so per-iteration messages stream live. ──────────
-    _configure_logging()
+    # The TUI owns logging for its lifetime (a stdout handler would vanish into
+    # the alternate screen); it installs its own pane handler in run_in_tui.
+    # Interactivity needs FOREGROUND tty ownership, not just a tty: a
+    # backgrounded job (`iterate run ... &`) that reads its controlling tty gets
+    # SIGTTIN and the OS suspends the whole process — the run itself.
+    interactive_tty = _stdin_owns_tty()
+    use_tui = code and not plain and interactive_tty and sys.stdout.isatty()
+    if not use_tui:
+        _configure_logging()
 
     # ─── Load data + build target ──────────────────────────────────────────
     dataset = load_csv(data, target=target)
@@ -298,7 +319,10 @@ def run(
         if think
         else client
     )
-    memory: Memory = SqliteMemory(resolved_memory_path)
+    # NOTE: the sqlite Memory is deliberately NOT constructed here. A sqlite
+    # connection can only be used on the thread that created it, and in TUI mode
+    # the supervised loop runs on a worker thread — each branch below constructs
+    # its Memory on the thread that will actually use it.
 
     # ─── Terminator ────────────────────────────────────────────────────────
     deadline_seconds = _parse_duration(until) if until is not None else None
@@ -325,6 +349,79 @@ def run(
         # prompt well under it so the system prompt is never what truncates.
         context_budget = 48_000 if backend == "ollama" else 400_000
 
+        # ─── Interactive chat (v0.3): type anything, anytime ──────────────────
+        # Default face on a terminal: the TUI (scrollable log pane + pinned input
+        # box), where the Input widget feeds the controller. With --plain (or a
+        # tty stdin but piped stdout), a daemon thread reads stdin lines instead.
+        # Control words act immediately; other messages queue with a timing-only
+        # ack and are interpreted at the next safe boundary (the loop binds the
+        # interpreter). Non-tty (scripts/CI) keeps exactly the old behavior.
+        controller: RunController | None = None
+        if interactive_tty:
+            from iterate.core.interactive import RunController as _RunController
+
+            controller = _RunController()
+            if not use_tui:
+                import threading
+
+                # Replies carry user/LLM text with brackets (code, lists) — print
+                # them literally, never through rich markup (which would eat
+                # "df[cols]" or raise on a stray closing tag).
+                controller.bind_reply(
+                    lambda text: console.print(f">> {text}", style="cyan", markup=False)
+                )
+                # If the run is later backgrounded (Ctrl-Z + bg), the listener's
+                # tty read must fail with EIO (ending the thread quietly) instead
+                # of SIGTTIN-stopping the whole process mid-run.
+                with contextlib.suppress(ValueError, OSError):
+                    signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+
+                def _listen(ctrl: RunController = controller) -> None:
+                    try:
+                        for line in sys.stdin:
+                            ctrl.submit_line(line)
+                    except Exception:  # a dying listener must never touch the run
+                        pass
+
+                threading.Thread(target=_listen, daemon=True, name="iterate-chat").start()
+                console.print(
+                    "[dim]interactive: type anything, anytime — pause / resume work as plain "
+                    "words, stop (or /stop) quits now; messages reach the agent at the next "
+                    "safe point[/dim]"
+                )
+
+                def _stop_now(ctrl: RunController = controller) -> None:
+                    # A typed stop quits NOW but still shows the scoreboard:
+                    # render whatever the loop finished, then leave. os._exit,
+                    # deliberately — the main thread is blocked inside the loop
+                    # and cannot be joined; notebooks + memory are already on
+                    # disk, and orphaned kernels self-reap.
+                    snap = ctrl.snapshot
+                    result = snap() if callable(snap) else None
+                    if result is not None:
+                        with contextlib.suppress(Exception):
+                            _render_summary(cast("RunResult", result), metric)
+                    console.print(
+                        ">> stopped — everything already saved is under .iterate/",
+                        style="cyan", markup=False,
+                    )
+                    os._exit(0)
+
+                controller.on_stop_now = _stop_now
+
+                _sigint_presses: list[int] = []
+
+                def _sigint(signum: int, frame: object) -> None:
+                    # First Ctrl-C: the existing graceful interrupt (floor banked,
+                    # memory finalized). Second Ctrl-C: quit immediately.
+                    if _sigint_presses:
+                        _stop_now()
+                    _sigint_presses.append(1)
+                    raise KeyboardInterrupt
+
+                with contextlib.suppress(ValueError, OSError):
+                    signal.signal(signal.SIGINT, _sigint)
+
         def make_coder() -> CodingAgent:
             kernel: StatefulKernel = (
                 E2BKernel(api_key=e2b_api_key) if compute == "e2b" else LocalKernel()
@@ -333,6 +430,7 @@ def run(
                 coder_client, kernel, metric=metric,
                 install=(install or compute == "e2b"),
                 context_budget_chars=context_budget,
+                controller=controller,
             )
 
         def on_experiment(
@@ -349,13 +447,38 @@ def run(
                 data_path=str(data), target=target, metric=metric,
             )
 
-        result = run_supervised(
-            target=model_target, dataset=dataset, supervisor=supervisor,
-            make_coder=make_coder, terminator=terminator, memory=memory,
-            data_summary=data_summary, summarizer=summarizer, on_experiment=on_experiment,
-        )
+        def _run_loop() -> RunResult:
+            # The Memory is born HERE so its sqlite connection lives on the
+            # thread that runs the loop (the TUI's worker, or the main thread
+            # in plain mode) — sqlite objects are single-thread by design.
+            loop_memory: Memory = SqliteMemory(resolved_memory_path)
+            return run_supervised(
+                target=model_target, dataset=dataset, supervisor=supervisor,
+                make_coder=make_coder, terminator=terminator, memory=loop_memory,
+                data_summary=data_summary, summarizer=summarizer,
+                on_experiment=on_experiment, controller=controller,
+            )
+
+        if use_tui and controller is not None:
+            from iterate.ui.tui import run_in_tui
+
+            result = run_in_tui(
+                _run_loop, controller,
+                title=(
+                    f"iterate · {model_target.name} · target={target} · {metric} · "
+                    f"{mode} · {compute} — type below; / for commands"
+                ),
+                configure_logging=_configure_logging,
+            )
+            if result is None:
+                # Hard stop before the loop recorded anything: nothing to show.
+                console.print("stopped — the run ended before anything finished.")
+                raise typer.Exit(0)
+        else:
+            result = _run_loop()
     else:
         # ─── Spec path (allow-listed estimators) + the baseline precedence ─────
+        memory: Memory = SqliteMemory(resolved_memory_path)  # main thread creates + uses
         baseline_candidate: Candidate | None
         baseline_model: str
         if source is not None:
@@ -419,17 +542,35 @@ def _mask(secret: str) -> str:
     return f"{secret[:2]}…{secret[-2:]}"
 
 
-def _configure_logging() -> None:
-    """Stream orchestrator INFO logs to the console via rich, once."""
+def _stdin_owns_tty() -> bool:
+    """True only when stdin is a tty AND this process owns it (foreground job).
+
+    `isatty()` alone is not enough: a backgrounded job still has a tty stdin,
+    and reading it raises SIGTTIN, which by default STOPS the entire process —
+    the run would silently freeze until foregrounded."""
+    try:
+        return sys.stdin.isatty() and os.tcgetpgrp(sys.stdin.fileno()) == os.getpgrp()
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _configure_logging(handler: logging.Handler | None = None) -> None:
+    """Stream orchestrator INFO logs to the console via rich, once — or into
+    ``handler`` (the TUI's log pane) when one is given."""
     root = logging.getLogger()
-    if root.handlers:
+    if handler is not None:
+        root.addHandler(handler)
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
+    elif root.handlers:
         return  # something already configured (likely a test)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[RichHandler(console=console, show_path=False, markup=False)],
-    )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            datefmt="[%X]",
+            handlers=[RichHandler(console=console, show_path=False, markup=False)],
+        )
     # Third-party HTTP chatter (one line per LLM call, plus e2b keepalive/execute
     # pairs around every cell) drowns the run's own progress; keep it debug-only.
     for name in ("httpx", "httpcore", "e2b"):

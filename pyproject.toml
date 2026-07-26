@@ -2,7 +2,7 @@
 # Distribution name on PyPI ("iterate" is taken). The import package + CLI
 # command are both still `iterate` (like scikit-learn → import sklearn).
 name = "iterate-ai"
-version = "0.2.1"
+version = "0.3.0"
 description = "Autonomous ML iteration agent: a Supervisor briefs experiments, a coding agent writes and runs real notebook cells against your data, and the winner ships as a runnable notebook. Multi-LLM backend (local Ollama to cloud), persistent memory, bounded autonomy."
 authors = [
     { name = "Anthony Rodrigues", email = "anthonyrodrigues443@users.noreply.github.com" },
@@ -43,6 +43,9 @@ dependencies = [
     # CLI + output
     "typer>=0.12.0",
     "rich>=13.9.0",
+    # Interactive terminal UI for supervised runs (scrollable log + input box);
+    # --plain opts out, non-tty runs never load it.
+    "textual>=1.0.0",
     # Data
     "pandas>=2.2.0",
     "numpy>=1.26.0",
@@ -156,7 +159,7 @@ disallow_untyped_defs = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-module = ["kaggle.*", "lightgbm.*", "xgboost.*", "sklearn.*", "e2b_code_interpreter.*", "pandas", "pandas.*", "threadpoolctl", "yaml", "joblib", "nbformat", "nbformat.*", "jupyter_client", "jupyter_client.*"]
+module = ["kaggle.*", "lightgbm.*", "xgboost.*", "sklearn.*", "e2b_code_interpreter.*", "pandas", "pandas.*", "threadpoolctl", "yaml", "joblib", "nbformat", "nbformat.*", "jupyter_client", "jupyter_client.*", "pygments.*"]
 ignore_missing_imports = true
 
 # nbformat ships no type stubs, so its constructors read as untyped calls / Any

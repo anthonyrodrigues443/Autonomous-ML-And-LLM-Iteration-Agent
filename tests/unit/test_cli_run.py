@@ -474,7 +474,7 @@ def _stub_run_supervised(
     def _fake_run_supervised(
         *, target: Any, dataset: Any, supervisor: Any, make_coder: Any,
         terminator: Any, memory: Any, data_summary: str, summarizer: Any = None,
-        on_experiment: Any = None,
+        on_experiment: Any = None, controller: Any = None,
     ) -> Any:
         from iterate.core.orchestrator import RunResult
         from iterate.schemas.experiment import Candidate, Experiment
@@ -482,6 +482,7 @@ def _stub_run_supervised(
         coder = make_coder()
         captured["supervisor_client"] = supervisor._client
         captured["coder_client"] = coder._client
+        captured["controller"] = controller
         baseline = ExperimentResult(
             experiment_id="b",
             metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize", n_samples=100),
@@ -532,6 +533,8 @@ def test_think_applies_to_the_coder_only(tmp_path: Path, monkeypatch: pytest.Mon
     assert captured["supervisor_client"].think is False
     assert captured["coder_client"].think is True
     assert captured["supervisor_client"] is not captured["coder_client"]
+    # no terminal attached under the test runner -> no interactive controller
+    assert captured["controller"] is None
 
 
 def test_without_think_both_agents_share_one_no_think_client(

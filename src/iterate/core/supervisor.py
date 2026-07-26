@@ -25,6 +25,8 @@ from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from iterate.llm.base import LLMClient
     from iterate.schemas.experiment import Experiment, ExperimentResult
 
@@ -94,11 +96,19 @@ class Supervisor:
         baseline: ExperimentResult,
         history: list[Experiment],
         carried_best: Experiment | None = None,
+        user_guidance: str | None = None,
+        standing_rules: Sequence[str] = (),
     ) -> SupervisorDecision:
         """Plan the next experiment. ``carried_best`` is the loop's CURRENT best —
         the experiment whose code the coder will actually receive as its starting
         point — so the grounded "so far:" slot describes exactly that pipeline and
-        never a cross-run best the coder does not hold."""
+        never a cross-run best the coder does not hold.
+
+        ``user_guidance`` (a one-shot steer the human typed mid-run) and
+        ``standing_rules`` (instructions that hold for every remaining experiment)
+        enter as ONE lean appended message; the guards below judge the decision
+        AFTER the model has read them, so guidance can steer a brief but can never
+        re-commission banked work or bypass a gate."""
         if baseline.metrics is None:
             raise SupervisorError("baseline has no metrics")
         messages = _build_messages(
@@ -108,6 +118,9 @@ class Supervisor:
             score=baseline.metrics.primary_value,
             history=history,
         )
+        guidance = _guidance_message(user_guidance, standing_rules)
+        if guidance is not None:
+            messages.append(Message(role="user", content=guidance))
         detail = ""
         rebrief_nudged = False
         dup_class_nudged = False
@@ -211,6 +224,251 @@ class Supervisor:
             detail = "model replied without calling plan_next"
             messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
         raise SupervisorError(f"no plan after {self._max_retries + 1} attempt(s): {detail}")
+
+    def route_message(self, text: str, *, live_session: bool) -> str:
+        """Classify ONE line the human typed mid-run: ``question`` | ``steer_now``
+        | ``steer_later`` | ``rule``. The harness executes the routing; this only
+        labels intent. Never raises — the safest default is a steer for the work
+        in front of us (plus next-brief visibility, applied by the caller)."""
+        situation = (
+            "An experiment session is RUNNING right now."
+            if live_session
+            else "The loop is BETWEEN experiments right now."
+        )
+        messages = [
+            Message(role="system", content=_PROMPTS["route_system"]),
+            # Concatenation, not str.format — the user's text may contain braces.
+            Message(role="user", content=situation + "\n\nThe message:\n" + text.strip()),
+        ]
+        for _ in range(2):
+            try:
+                response = self._client.chat(
+                    messages, tools=[ROUTE_MESSAGE], temperature=0.0, max_tokens=256,
+                )
+            except Exception as exc:  # never let a chat line hurt the run
+                log.warning("supervisor: route_message backend error: %s", exc)
+                return "steer_now"
+            call = next((c for c in response.tool_calls if c.name == ROUTE_MESSAGE.name), None)
+            if call is not None:
+                kind = str(call.arguments.get("kind") or "").strip().lower()
+                if kind in _ROUTE_KINDS:
+                    return kind
+            messages.append(Message(role="user", content=_PROMPTS["route_retry_nudge"]))
+        log.info("supervisor: route_message unusable after retry; defaulting to a steer")
+        return "steer_now"
+
+    def answer(
+        self,
+        question: str,
+        *,
+        history: list[Experiment],
+        baseline: ExperimentResult,
+        data_summary: str = "",
+        live_session: str | None = None,
+    ) -> str:
+        """Answer a user question from the recorded run: the dataset profile,
+        the code-composed experiment index, the RUNNING session's cells so far
+        (an in-flight experiment is not in Memory yet, and questions asked
+        mid-run are usually about the work on screen), plus at most two
+        ``read_notebook`` fetches (backed by Memory's stored cells and digests —
+        the agent never re-parses .ipynb files). Degrades to a plain
+        could-not-answer, never raises, and none of this context ever enters
+        ``plan_next``."""
+        base = (
+            f"{baseline.metrics.primary_value:.4f}" if baseline.metrics is not None else "unknown"
+        )
+        parts = [
+            "Question from the human watching the run:\n" + question.strip(),
+            f"Baseline ({self._metric}, our own eval): {base}",
+        ]
+        if data_summary.strip():
+            parts.append("Dataset profile (established facts):\n" + data_summary.strip())
+        parts.append("Experiment index (finished experiments):\n" + _experiment_index(history))
+        if live_session:
+            parts.append(
+                "Experiment RUNNING RIGHT NOW (unfinished, not in the index — its cells so far):\n"
+                + live_session
+            )
+        messages = [
+            Message(role="system", content=_PROMPTS["qa_system"].format(metric=self._metric)),
+            Message(role="user", content="\n\n".join(parts)),
+        ]
+        reads = 0
+        for _ in range(4):
+            try:
+                response = self._client.chat(
+                    messages, tools=[READ_NOTEBOOK], temperature=self._temperature,
+                    max_tokens=self._max_tokens,
+                )
+            except Exception as exc:
+                log.warning("supervisor: answer backend error: %s", exc)
+                return f"(could not answer: backend error: {type(exc).__name__})"
+            call = next((c for c in response.tool_calls if c.name == READ_NOTEBOOK.name), None)
+            if call is not None and reads < 2:
+                reads += 1
+                messages.append(Message(role="assistant", tool_calls=[call]))
+                messages.append(
+                    Message(
+                        role="tool", name=call.name, tool_call_id=call.id,
+                        content=_render_experiment(history, call.arguments.get("iteration")),
+                    )
+                )
+                continue
+            if response.content and response.content.strip():
+                return response.content.strip()
+            if call is not None:  # tool budget spent but the model keeps reading
+                messages.append(Message(role="assistant", tool_calls=[call]))
+                messages.append(
+                    Message(
+                        role="tool", name=call.name, tool_call_id=call.id,
+                        content="(tool budget spent — answer now in plain text)",
+                    )
+                )
+            else:
+                messages.append(Message(role="user", content=_PROMPTS["qa_answer_nudge"]))
+        return "(no answer — the model did not produce one)"
+
+
+_ROUTE_KINDS = frozenset({"question", "steer_now", "steer_later", "rule"})
+# The controller clips each note to 200 chars and each rule to 90 BEFORE they
+# arrive here; these ceilings only bound the joined lines (3 notes / 3 rules)
+# so what the user was acked is exactly what the model sees — never a re-cut.
+_GUIDANCE_CHARS = 620
+_RULE_CHARS = 90
+_RULES_SHOWN = 3
+
+
+def _build_route_tool() -> ToolSpec:
+    tool = _PROMPTS["route_tool"]
+    return ToolSpec(
+        name=tool["name"],
+        description=tool["description"],
+        parameters={
+            "type": "object",
+            "properties": {"kind": {"type": "string", "description": tool["fields"]["kind"]}},
+            "required": ["kind"],
+        },
+    )
+
+
+def _build_qa_tool() -> ToolSpec:
+    tool = _PROMPTS["qa_tool"]
+    return ToolSpec(
+        name=tool["name"],
+        description=tool["description"],
+        parameters={
+            "type": "object",
+            "properties": {
+                "iteration": {"type": "integer", "description": tool["fields"]["iteration"]}
+            },
+            "required": ["iteration"],
+        },
+    )
+
+
+ROUTE_MESSAGE = _build_route_tool()
+READ_NOTEBOOK = _build_qa_tool()
+
+
+def _guidance_message(guidance: str | None, rules: Sequence[str]) -> str | None:
+    """The human's steer + standing rules as ONE lean appended message. Built by
+    concatenation (user text may contain braces) and hard-capped — dense added
+    context is what regressed the weak model in the EDA-ledger incident."""
+    parts: list[str] = []
+    if guidance and guidance.strip():
+        parts.append(_PROMPTS["guidance_prefix"] + _word_cut(guidance.strip(), _GUIDANCE_CHARS))
+    kept = [r.strip() for r in rules if r.strip()][-_RULES_SHOWN:]
+    if kept:
+        parts.append(
+            _PROMPTS["rules_prefix"] + "; ".join(_word_cut(r, _RULE_CHARS) for r in kept)
+        )
+    return "\n".join(parts) or None
+
+
+_QA_CELL_CODE_CHARS = 700
+_QA_CELL_OUTPUT_CHARS = 300
+_QA_RENDER_CHARS = 5000
+
+
+def _experiment_index(history: list[Experiment]) -> str:
+    """One line per recorded experiment — code-composed, so the Q&A turn starts
+    from facts (real scores, real flags), not recall."""
+    if not history:
+        return "(no experiments recorded yet)"
+    lines = []
+    for exp in history:
+        score = _holdout_score(exp)
+        shown = f"{score:.4f}" if score is not None else "FAILED"
+        flags = []
+        if exp.candidate.changes.get("duplicate_submission"):
+            flags.append("duplicate submission")
+        if exp.candidate.changes.get("lever_unmeasured"):
+            flags.append("lever unmeasured")
+        note = f" ({', '.join(flags)})" if flags else ""
+        lines.append(f"iter {exp.iteration}: {exp.candidate.description!r} -> {shown}{note}")
+    return "\n".join(lines)
+
+
+def render_live_cells(cells: Sequence[object]) -> str:
+    """The in-flight session's cells as capped Q&A text (duck-typed: the coder's
+    ``Cell`` objects, shared live by reference through the controller). Newest
+    cells survive truncation — a mid-run question is about the recent work."""
+    parts: list[str] = []
+    for i, cell in enumerate(cells, start=1):
+        code = str(getattr(cell, "code", ""))[:_QA_CELL_CODE_CHARS]
+        parts.append(f"--- cell {i} ({getattr(cell, 'source', 'agent')}) ---\n{code}")
+        error = getattr(cell, "error", None)
+        stdout = str(getattr(cell, "stdout", "") or "").strip()
+        if error:
+            parts.append(f"ERROR: {str(error)[:_QA_CELL_OUTPUT_CHARS]}")
+        elif stdout:
+            parts.append(f"output: {stdout[-_QA_CELL_OUTPUT_CHARS:]}")
+    rendered = "\n".join(parts)
+    if len(rendered) > _QA_RENDER_CHARS:
+        rendered = "...(older cells truncated)\n" + rendered[-_QA_RENDER_CHARS:]
+    return rendered
+
+
+def _render_experiment(history: list[Experiment], iteration: object) -> str:
+    """One experiment's notebook record (cells + digest) as capped text — the
+    ``read_notebook`` tool's result, served from Memory's stored cells."""
+    try:
+        n = int(iteration)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return "error: read_notebook needs an integer 'iteration' from the index"
+    # Newest first: if a caller ever hands cross-run history, the current run's
+    # iteration N must win over an older run's (iteration numbers restart at 1).
+    exp = next((e for e in reversed(history) if e.iteration == n), None)
+    if exp is None:
+        return f"error: no experiment with iteration {n}; pick one from the index"
+    parts = [
+        f"iteration {n}: {exp.candidate.description}",
+        f"brief: {exp.hypothesis or '(none)'}",
+    ]
+    if exp.digest is not None:
+        d = exp.digest
+        parts.append(
+            "digest: helped=" + ("; ".join(d.what_helped) or "-")
+            + " | hurt=" + ("; ".join(d.what_hurt) or "-")
+            + " | takeaway=" + (d.takeaway or "-")
+        )
+    cells = exp.candidate.changes.get("cells")
+    if isinstance(cells, list):
+        for i, cell in enumerate(cells, start=1):
+            if not isinstance(cell, dict):
+                continue
+            code = str(cell.get("code") or "")[:_QA_CELL_CODE_CHARS]
+            parts.append(f"--- cell {i} ({cell.get('source')}) ---\n{code}")
+            error = cell.get("error")
+            stdout = str(cell.get("stdout") or "").strip()
+            if error:
+                parts.append(f"ERROR: {str(error)[:_QA_CELL_OUTPUT_CHARS]}")
+            elif stdout:
+                parts.append(f"output: {stdout[-_QA_CELL_OUTPUT_CHARS:]}")
+    rendered = "\n".join(parts)
+    if len(rendered) > _QA_RENDER_CHARS:
+        rendered = rendered[:_QA_RENDER_CHARS] + "\n...(truncated)"
+    return rendered
 
 
 _NEXT_SLOT = re.compile(r"\bnext\s*:", re.IGNORECASE)

@@ -116,6 +116,11 @@ class StatefulKernel(Protocol):
         """Read a file the session wrote (e.g. predictions.csv), or None if absent."""
         ...
 
+    def keepalive(self) -> None:
+        """Keep an idle kernel from being reaped (a paused session runs no cells,
+        so a leased sandbox would expire mid-pause). Best-effort; local no-op."""
+        ...
+
     def close(self) -> None:
         """Tear the kernel down and clean up."""
         ...
@@ -215,6 +220,9 @@ class LocalKernel:
             return None
         path = self._workdir / name
         return path.read_bytes() if path.exists() else None
+
+    def keepalive(self) -> None:
+        """No-op: a local kernel subprocess survives idle time indefinitely."""
 
     def close(self) -> None:
         if self._kc is not None:
@@ -318,6 +326,11 @@ class E2BKernel:
         self._renew_lease()  # a cold wheel install can be slow; don't let the lease lapse
         execution = self._sandbox.run_code(f"!pip install -q {' '.join(packages)}")
         return "".join(execution.logs.stderr)
+
+    def keepalive(self) -> None:
+        """A paused session runs no cells, so the sliding lease (renewed only on
+        activity) would reap the sandbox mid-pause; the pause loop ticks this."""
+        self._renew_lease()
 
     def namespace_summary(self) -> str:
         if self._sandbox is None:

@@ -272,6 +272,11 @@ coder:
     predictions to '{predictions_csv}' now (one per line, no header) and call finish —
     secure a valid submission before time runs out.
 
+  # Injected at a cell boundary when the human watching the run sent an
+  # instruction. A prefix, not a template — the user's text is concatenated after
+  # it (it may contain braces).
+  user_note_prefix: "USER NOTE (from the human watching this run — apply it to the remaining work if it still applies; the brief's required change still stands): "
+
   # Sent when finish is called but predictions aren't valid yet. Placeholders: {reason}, {predictions_csv}
   finish_rejected: >-
     Not done: {reason}. A validation score is NOT a submission. Do NOT call finish
@@ -427,6 +432,38 @@ supervisor:
     (name its lever class in the brief).
 
   retry_nudge: "Respond ONLY by calling the plan_next tool. No prose."
+
+  # ── interactive (v0.3): the human mid-run ────────────────────────────────
+  # Prefixes, not templates — the user's text is concatenated after them (it may
+  # contain braces). Both are hard-capped by the caller; lean context always.
+  guidance_prefix: "USER GUIDANCE (from the human watching the run — prefer it when it names a legal move, but the ladder, PIVOT, and the never-re-brief rules still outrank it): "
+  rules_prefix: "USER RULES (standing instructions from the human — every brief must respect them): "
+
+  # Classifies ONE chat line; the harness executes the routing.
+  route_system: |-
+    You route ONE message a human typed into a live ML iteration run. Decide what it is and call route_message with exactly one kind:
+    - question: asks about results, notebooks, scores, or why something happened (e.g. "which iteration won?", "why did lightgbm fail?").
+    - steer_now: an instruction meant for the experiment running RIGHT NOW (e.g. "use a smaller learning rate", "try class weights here"). If the loop is between experiments, an immediate instruction still routes here.
+    - steer_later: explicitly for AFTER the current experiment (e.g. "next run, try catboost", "after this one, focus on features").
+    - rule: a standing instruction for ALL future experiments (e.g. "never use lightgbm", "always keep the threshold at 0.28", "from now on skip deep models").
+    Judge by the message's own words. Call route_message; no prose.
+  route_retry_nudge: "Respond ONLY by calling the route_message tool with a 'kind' of question, steer_now, steer_later, or rule. No prose."
+  route_tool:
+    name: route_message
+    description: "Classify one human chat message from a live run so the harness can route it."
+    fields:
+      kind: "One of: question | steer_now | steer_later | rule."
+
+  # Answers ONE user question from the recorded run; read_notebook is backed by
+  # Memory's stored cells + digests. Placeholder: {metric}
+  qa_system: |-
+    You answer ONE question from the human watching this ML iteration run, optimizing '{metric}'. Ground every claim ONLY in what is below: the dataset profile (established facts about the data), the experiment index (finished experiments), the RUNNING experiment's cells if shown (the work currently on screen — questions often refer to it), and anything you fetch with the read_notebook tool (at most two fetches — pick the most relevant iterations from the index). Cite iteration numbers and real scores; read cell outputs literally (printed shapes, counts, and scores are answers). If none of it can answer the question, say so plainly. When you are ready, answer in a few plain-text sentences; do NOT call a tool for the final answer.
+  qa_answer_nudge: "Answer now in plain text (a few sentences, grounded in what you have seen). Do not call any tool."
+  qa_tool:
+    name: read_notebook
+    description: "Fetch one experiment's full notebook record (its cells' code, output tails, and digest) by iteration number from the index."
+    fields:
+      iteration: "The iteration number, exactly as shown in the experiment index."
 
   tool:
     name: plan_next

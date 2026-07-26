@@ -700,3 +700,93 @@ def test_a_failed_fallback_stays_a_captured_failure(tmp_path: Path) -> None:
     assert "no predictions" in (out.result.error or "")
     # the fallback WAS attempted (canned baseline; no carried code) and recorded
     assert [c.source for c in out.cells].count("fallback") == 1
+
+
+# ─── Interactive controller: user notes, pause, stop (v0.3) ──────────────────
+
+
+def test_user_note_is_injected_at_the_cell_boundary(tmp_path: Path) -> None:
+    from iterate.core.interactive import RunController
+
+    fake = _FakeLLM([_run(_FIT_AND_WRITE), _finish(), _finish()])
+    ctrl = RunController()
+    ctrl.add_session_note("try a smaller learning rate")
+    agent = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=8, controller=ctrl)
+    coding = agent.run(dataset=_dataset(tmp_path), brief="b", experiment_id="note-test")
+    assert coding.result.succeeded
+    flat = "\n".join(m.content or "" for call in fake.calls for m in call)
+    assert "USER NOTE" in flat
+    assert "smaller learning rate" in flat
+
+
+def test_pause_suspends_the_wall_ceiling(tmp_path: Path) -> None:
+    import threading
+
+    from iterate.core.interactive import RunController
+
+    write_floor = (
+        "import pandas as pd\n"
+        "pd.Series([0]*len(X_holdout)).to_csv('predictions.csv', index=False, header=False)\n"
+        "print('ok')\n"
+    )
+    fake = _FakeLLM([_run(write_floor), _finish(), _finish()])
+    ctrl = RunController()
+    ctrl.submit_line("pause")
+    threading.Timer(1.2, lambda: ctrl.submit_line("resume")).start()
+    agent = CodingAgent(
+        fake, LocalKernel(), metric="f1", max_cells=8, controller=ctrl,
+        wall_ceiling_seconds=0.8,  # smaller than the pause: fires unless suspended
+    )
+    coding = agent.run(dataset=_dataset(tmp_path), brief="b", experiment_id="pause-test")
+    # Without the pause credit, iteration 2's ceiling check sees the 1.2s pause and
+    # ends the session before the finish turn; with it, the scripted finish runs.
+    assert len(fake.calls) >= 2, "the ceiling fired during the pause — no credit applied"
+    assert coding.result.succeeded
+
+
+def test_stop_ends_the_session_before_any_llm_turn_and_banks_a_floor(tmp_path: Path) -> None:
+    from iterate.core.interactive import RunController
+
+    fake = _FakeLLM([])  # the model must never be consulted
+    ctrl = RunController()
+    ctrl.submit_line("stop")
+    agent = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=8, controller=ctrl)
+    coding = agent.run(dataset=_dataset(tmp_path), brief="b", experiment_id="stop-test")
+    assert fake.calls == []
+    assert any(c.source == "fallback" for c in coding.cells)
+    assert coding.result.succeeded  # the canned baseline floor was banked
+
+
+def test_cell_events_carry_the_code_for_the_ui(tmp_path: Path) -> None:
+    from iterate.core.interactive import RunController
+
+    fake = _FakeLLM([_run(_FIT_AND_WRITE), _finish(), _finish()])
+    ctrl = RunController()
+    events: list[tuple[str, dict]] = []
+    ctrl.on_event = lambda kind, payload: events.append((kind, payload))
+    agent = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=8, controller=ctrl)
+    agent.run(dataset=_dataset(tmp_path), brief="b", experiment_id="ui-test")
+    cell_events = [p for k, p in events if k == "cell"]
+    assert len(cell_events) == 1
+    assert "LogisticRegression" in str(cell_events[0]["code"])
+    assert cell_events[0]["ok"] is True
+    assert cell_events[0]["index"] == 1
+
+
+def test_live_cells_are_shared_during_the_session_and_cleared_after(tmp_path: Path) -> None:
+    from iterate.core.interactive import RunController
+
+    fake = _FakeLLM([_run(_FIT_AND_WRITE), _finish(), _finish()])
+    ctrl = RunController()
+    seen_live: list[int] = []
+
+    def _spy_interpreter(batch: list[str], live_session: bool) -> None:
+        seen_live.append(len(ctrl.live_cells or []))
+
+    ctrl.interpreter = _spy_interpreter
+    ctrl.submit_line("what is happening?")
+    agent = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=8, controller=ctrl)
+    agent.run(dataset=_dataset(tmp_path), brief="b", experiment_id="live-test")
+    assert seen_live, "the interpreter never saw a checkpoint"
+    assert seen_live[0] >= 1  # at least the preamble cell was visible live
+    assert ctrl.live_cells is None  # cleared when the session ended
