@@ -264,3 +264,4 @@ credentials/
 .idea/
 *.swp
 *~
+examples/adult_income.csv
