@@ -196,8 +196,8 @@ def test_fallback_baseline_matches_the_task_and_parses() -> None:
     reg = codegen.fallback_baseline("regression")
     ast.parse(clf)
     ast.parse(reg)
-    assert "HistGradientBoostingClassifier" in clf
-    assert "HistGradientBoostingRegressor" in reg
+    assert "LogisticRegression" in clf  # a fast linear floor: the net must never time out
+    assert "Ridge" in reg
     assert codegen.PREDICTIONS_CSV in clf
     assert "random_state=42" in clf  # deterministic floor
 
@@ -243,3 +243,28 @@ def test_raising_function_is_captured_by_the_runner(tmp_path: Path) -> None:
         ds, run.outputs.get(codegen.PREDICTIONS_CSV), metric="f1", experiment_id="e4"
     )
     assert not result.succeeded
+
+
+# ─── v0.3.1 timeout-class fixes ───────────────────────────────────────────────
+
+
+def test_preamble_caps_threads_before_any_import() -> None:
+    from iterate.core.codegen import session_preamble
+
+    pre = session_preamble()
+    assert "OMP_NUM_THREADS" in pre
+    assert "OPENBLAS_NUM_THREADS" in pre
+    # the caps must land before numpy/pandas load their BLAS runtime
+    assert pre.index("OMP_NUM_THREADS") < pre.index("import json")
+
+
+def test_fallback_baseline_is_a_fast_linear_model_with_imputation() -> None:
+    from iterate.core.codegen import fallback_baseline
+
+    clf = fallback_baseline("classification")
+    assert "LogisticRegression" in clf
+    assert "fillna" in clf  # linear models are not NaN-native
+    assert "HistGradientBoosting" not in clf
+    reg = fallback_baseline("regression")
+    assert "Ridge" in reg
+    assert "fillna" in reg

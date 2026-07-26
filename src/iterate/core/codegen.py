@@ -109,8 +109,19 @@ def session_preamble() -> str:
     It also seeds the global RNGs (``random`` + ``numpy``). Estimators left at
     ``random_state=None`` draw from numpy's global RNG, so seeding once here makes a
     session reproducible: the rendered notebook re-executes to the SAME score the
-    run reported, instead of drifting by the model's run-to-run variance."""
+    run reported, instead of drifting by the model's run-to-run variance.
+
+    The thread caps come FIRST, before any import loads a BLAS/OpenMP runtime:
+    generated code runs in a raw kernel, and Week 2 measured sklearn's
+    HistGradientBoosting at ~200x slower under thread oversubscription on Apple
+    Silicon (the v0.1 spec path caps threads via threadpoolctl; this is the same
+    lesson applied to the cell-by-cell session). A live v0.3 run lost an
+    iteration to fit cells hitting the 120s cell timeout for exactly this."""
     return (
+        "import os\n"
+        "for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', "
+        "'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):\n"
+        "    os.environ.setdefault(_v, '1')\n"
         "import json, random, pandas as pd, numpy as np\n"
         "random.seed(42); np.random.seed(42)\n"
         f"with open({META_JSON!r}) as _f:\n"
@@ -146,20 +157,27 @@ def fallback_baseline(task: str) -> str:
 
     Run as a last-resort cell when a session ends without a valid predictions file
     (a heavy lever ate the whole budget, or the approach was abandoned), so the
-    iteration degrades to a floor score instead of a total loss. Kept minimal on
-    purpose: one-hot via get_dummies (holdout reindexed to the train columns) into
-    a NaN-native gradient-boosted tree, seeded for reproducibility."""
-    estimator = (
-        "HistGradientBoostingClassifier" if task == "classification"
-        else "HistGradientBoostingRegressor"
-    )
+    iteration degrades to a floor score instead of a total loss. A LINEAR model on
+    purpose: the floor ran a gradient-boosted tree until a live v0.3 session died
+    to fit-cell timeouts and the floor timed out WITH it — the safety net must
+    train in milliseconds under any thread weather. Median-imputed (linear models
+    are not NaN-native), one-hot via get_dummies, seeded."""
+    if task == "classification":
+        import_line = "from sklearn.linear_model import LogisticRegression\n"
+        model = "LogisticRegression(max_iter=1000, random_state=42)"
+    else:
+        import_line = "from sklearn.linear_model import Ridge\n"
+        model = "Ridge(random_state=42)"
     return (
         "import pandas as pd\n"
-        f"from sklearn.ensemble import {estimator}\n"
-        "_fb_cats = X_train.select_dtypes(exclude='number').columns.tolist()\n"
+        + import_line
+        + "_fb_cats = X_train.select_dtypes(exclude='number').columns.tolist()\n"
         "_fb_Xt = pd.get_dummies(X_train, columns=_fb_cats)\n"
         "_fb_Xh = pd.get_dummies(X_holdout, columns=_fb_cats).reindex(columns=_fb_Xt.columns, fill_value=0)\n"
-        f"_fb_model = {estimator}(random_state=42).fit(_fb_Xt, y_train)\n"
+        "_fb_med = _fb_Xt.median()\n"
+        "_fb_Xt = _fb_Xt.fillna(_fb_med)\n"
+        "_fb_Xh = _fb_Xh.fillna(_fb_med)\n"
+        f"_fb_model = {model}.fit(_fb_Xt, y_train)\n"
         f"pd.Series(_fb_model.predict(_fb_Xh)).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
         "print('fallback baseline banked', len(_fb_Xh), 'predictions')\n"
     )

@@ -277,6 +277,12 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 **Contract:** specialists are separate LLM roles with typed handoffs, graduating from supervisor tools without contract changes (the 2026-06-04 seam). Own harness, no LangGraph, ever. New supervisor context stays lean (watch the validation run for lever collapse). Eval changes respect the sealed holdout. Researcher citations must be genuine: `Candidate.citations`, `source="researcher"`, dedup against Memory so it neither re-reads papers nor re-runs known ideas.
 
+**Carry-ins from the v0.3 live drive (taken same-day as v0.3.1 instead — see the release entry above):** a live run lost iteration 5 to a timeout spiral: a HistGB fit hit the 120s per-cell cap (the Week-2 thread-oversubscription class — agent-generated cells run in a raw kernel with no thread cap, unlike the v0.1 spec path), the coder retried the IDENTICAL fit, the canned floor trains the same family so the submission guarantee timed out too, and the failure recorded as "no predictions file produced", which teaches the next iteration nothing.
+1. Kernel session preamble caps BLAS/OpenMP threads (the v0.1 `threadpool_limits` lesson applied to generated code) — kills the whole oversubscription timeout class.
+2. Timed-out cells get their own deterministic nudge (names the operation, forbids an identical retry, demands a cheaper model or a subsample) and count toward the same-error breaker.
+3. A session that dies records WHY (which cells timed out or errored, on what operation), so the failure feeds the supervisor's REPAIR rung, the dead-ends channel, and the digest — instead of a contract one-liner.
+4. The canned floor submission switches to a fast estimator (logistic regression) so the safety net can never time out.
+
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
 | Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | |
@@ -477,6 +483,19 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-07-26 | v0.3.1 | The timeout-spiral patch (found live, fixed before publish)
+
+**Task:** Tony's pre-publish test drive lost iteration 5 to a timeout spiral: a HistGB fit hit the 120s per-cell cap (the Week-2 thread-oversubscription class — generated code ran in a raw kernel with no thread cap), the coder retried the identical fit, the canned floor trains the same family so the safety net timed out too, and the failure recorded as a bare contract violation. Four deterministic fixes, patch-released as 0.3.1 before anything reached PyPI.
+
+**What shipped:**
+- Session preamble caps BLAS/OpenMP threads BEFORE any import (the v0.1 `threadpool_limits` lesson applied to generated code) — kills the oversubscription timeout class.
+- Timed-out cells now count toward the consecutive-failure breaker and carry their own nudge (names the limit, forbids an identical retry, demands a cheaper family or a subsample).
+- A dead session's failure record states WHY: "N cell(s) timed out; last killed: 'model.fit(...)'" — food for the REPAIR rung and the dead-ends channel instead of "no predictions file produced".
+- The canned floor is now a linear model (LogisticRegression / Ridge, median-imputed): the safety net trains in milliseconds under any thread weather.
+- `Cell` gains `timed_out`; 443 unit tests (440 at v0.3.0); ruff + mypy --strict clean.
+
+**Deeper fix unchanged:** cross-iteration timeout knowledge (digest/dossier carrying "this model class stalls here") is sprint-2 work as planned.
 
 ### 2026-07-26 | Sprint 1 | v0.3.0: interactive runs (TUI + chat + pause/resume + hard stop)
 

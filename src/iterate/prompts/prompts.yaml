@@ -333,6 +333,15 @@ coder:
     showed — fix the cause it revealed or change the approach — and if you already
     have valid predictions written, call the finish tool.
 
+  # Prepended to the observation when a cell hit the per-cell time limit and was
+  # killed. Placeholder: {seconds}
+  timeout_nudge: >-
+    STOP. That cell ran past the {seconds}s per-cell limit and was KILLED — running
+    the same operation again will time out again and burn the budget. Change the
+    approach NOW: switch to a faster model family (LogisticRegression instead of a
+    boosted tree), subsample the rows, or cut features. If valid predictions were
+    already written, protect them and call finish.
+
   # Prepended to the observation when the SAME error recurs. Placeholder: {error}
   same_error_nudge: >-
     STOP. You have hit the SAME error repeatedly: {error}. Cosmetic changes (a
