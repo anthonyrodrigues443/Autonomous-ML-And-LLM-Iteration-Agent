@@ -19,12 +19,25 @@
 **Updated 2026-05-30 — interactivity split into two milestones (Option B):**
 - **v0.2 picks up the cheap interactive wins** alongside sandboxed code-gen: live progress display, streaming LLM responses, graceful Ctrl-C. About a day of extra work; fits inside the v0.2 window.
 - **v0.3 is a new milestone for the real interactivity:** pause via Esc, mid-run chat with the LLM, resume. The hard engineering (async input, in-flight cancellation, conversational state) gets its own focused milestone.
-- Everything that was v0.3+ shifts by one version. The Streamlit UI becomes v0.10 (its main "interactive interface" value is covered by v0.3's CLI; v0.10 carries demos, multi-backend benchmark, polish). Build is now ~14 weeks (was ~13).
+- Everything that was v0.3+ shifts by one version. The Streamlit UI becomes v0.10 (its main "interactive interface" value is covered by v0.3's CLI; v0.10 carries demos, multi-backend benchmark, polish). Build is now ~14 weeks (was ~13). *(Superseded 2026-07-25: 16 plan-weeks; see the update below.)*
 
 **Updated 2026-06-01 — going multi-agent after v0.2 (at the Researcher milestone):**
 - v0.1 and v0.2 stay **single-agent** (one Proposer LLM in a deterministic loop). The architecture moves to **multi-agent at the Researcher milestone (v0.4)** — the natural single-to-multi transition, where the second genuine LLM role appears.
 - Shape: **specialist agents** (Researcher, Proposer, a Critic/Reviewer, later Discovery), each doing one focused job and handing **structured, typed output** to a **supervisor agent** that makes the decisions. Rationale: specialization raises per-agent tool-call reliability, and the supervisor reasons over digested high-quality context instead of raw everything. Our Pydantic schemas are the handoff contracts.
 - Built on our own harness (no LangGraph — Week-1 decision stands). Executor + Memory stay deterministic; the supervisor takes the judgment calls. See DECISIONS.md.
+
+**Updated 2026-07-25: post-v0.2 re-plan (v0.3 through v1.0 scoped day-by-day).**
+- v0.2.0 shipped 2026-07-18 (PyPI + tag + GitHub release; v0.2.1 the same night; launch posts scheduled 2026-07-19). v0.2 grew far beyond its planned row: the multi-agent core (Supervisor + CodingAgent + Summarizer), cell-by-cell kernel sessions, the deterministic guard stack, and a release gated on a certified trajectory quality bar.
+- Because the multi-agent core landed IN v0.2, v0.4 is no longer "go multi-agent". It graduates the remaining specialists (Researcher, Critic) at the existing `plan_next` tool boundary, hardens evaluation (probability metrics, CV option, leakage checks), and turns the first input dial (agent picks metric + starting model).
+- Plan-weeks stopped tracking calendar weeks long ago (Weeks 1-3 took 8 calendar days; Weeks 4-5 took ~7 calendar weeks). The re-numbered tables below keep plan-weeks as scope units and add target calendar windows as ranges. Windows assume 1-2 sessions per calendar week during the semester and more during breaks; re-anchor at every release; public ETAs stay ranges, never hard dates.
+- v0.4 and v0.9 get two plan-weeks each (the Week 4-5 lesson: a milestone carrying many tracked commitments overruns a single week).
+- Day-by-day plans for Weeks 6 through 16 added below, plus a standing release checklist and a backlog disposition list (every deferred item re-homed or explicitly closed). Per-section Target window lines are retired in favor of the central releases table. Later plans firm up right before execution; expect reconciliation notes like Week 1's.
+
+**Updated 2026-07-25 (cont): compressed to a 6-week Sunday-release sprint (Tony's call, same day).**
+- One release every Sunday, project complete 2026-09-06: v0.3 Jul 26 · v0.4 Aug 2 · v0.5 Aug 9 · v0.6 Aug 16 · v0.7 Aug 23 · v0.9 Aug 30 (absorbs v0.8) · v1.0 Sep 6 (absorbs v0.10).
+- Two merges make 9 milestones fit 7 Sundays: the v0.8 input-inference dial ships inside the v0.9 discovery release, and the v0.10 benchmark/dashboard/reporter ship inside v1.0. Version numbers v0.8.0 and v0.10.0 are skipped as standalone tags.
+- The cadence is ~1 build day per calendar day, so each sprint day carries roughly two of the earlier plan-days. What makes Sundays real is the cut lists: every week names what ships and what moves to the post-v1.0 backlog. Anything unfinished on Saturday rolls forward; the Sunday release ships whatever passed the gate, and release notes state exactly what made it.
+- The week sections below are rewritten to sprint calendar dates; the earlier scope-unit week numbering (6-16) is retired. v0.3 builds TODAY (Sat 2026-07-25) and releases tomorrow.
 
 - **Targets:** `ModelTarget` (tabular ML) · `PromptTarget` (production LLM prompts, prompt-iteration only) · `DLModelTarget` (vision, transfer learning — validated on local RTX 4050).
 - **Moat — the specialized combination, not one feature:** a domain specialist for ML/DL/prompt iteration that does *together* what no single tool does — agentic iteration across **ML + DL models AND LLM prompts** · **persistent memory** (revisits past failures when conditions change) · **literature-grounded** proposals · **bounded autonomy** + human-approval gates · **auditable reasoning trail** · **cost-constrained optimization** (best score you can *afford to serve* — cheapest cloud, $/mo, req/hr) · **rich auto-discovered context** (DB / MCP / Drive). Cost-aware serving is the flagship for cost-sensitive startups; the moat is the *combination* + the specialization. (Full matrix: README comparison table.)
@@ -32,37 +45,35 @@
 
 | Wk | Phase |
 |---|---|
-| 1 | Foundation — schemas + LLM client (tool-calling) + config + CLI · done |
-| 2 | Tabular execution substrate — `BenchmarkTarget` + data adapter + `ModelTarget` + model factory (any installed sklearn/XGBoost/LightGBM estimator) + local executor |
-| 3 | **The agentic loop** — Proposer + Orchestrator + Terminator + Memory → first autonomous tabular run (**v0.1**) |
-| 4–5 | **Sandboxed code-gen** (Proposer writes training code, runs it in e2b → any model at all) **+ cheap interactive wins** (live progress display, streaming LLM responses, graceful Ctrl-C) → **v0.2** |
-| 6 | **Full interactive CLI** — pause via Esc, mid-run chat with the LLM, resume → **v0.3** |
-| 7 | **Multi-agent split** (Researcher + Proposer + Critic specialists → supervisor) + Dial A: agent picks the metric + starting model from research → **v0.4** |
-| 8 | Dial B: `PromptTarget` — agentic prompt iteration → **v0.5** |
-| 9 | Dial B: `DLModelTarget` — vision transfer learning (4050) → **v0.6** |
-| 10 | Cost-constrained recommendation + serving profile + `iterate cost` → **v0.7** |
-| 11 | Dial A: infer features/target from the data + a description → **v0.8** |
-| 12 | Dial A: MCP discovery — find the data/code itself → **v0.9** |
-| 13 | Multi-backend benchmark + Streamlit UI + demos → **v0.10** |
-| 14 | Full minimum-viable-input + polish + launch → **v1.0** |
+| 1 | Foundation: schemas + LLM client (tool-calling) + config + CLI · done |
+| 2 | Tabular execution substrate: `BenchmarkTarget` + data adapter + `ModelTarget` + model factory + local executor · done |
+| 3 | **The agentic loop**: Proposer + Orchestrator + Terminator + Memory · **v0.1.0 shipped 2026-05-31** |
+| 4-5 | **Sandboxed code-gen + the multi-agent core**: cell-by-cell kernel sessions (LocalKernel/E2BKernel), Supervisor + CodingAgent + Summarizer, deterministic guard stack, certified quality bar, notebook deliverable, per-cell progress + graceful Ctrl-C · **v0.2.0 shipped 2026-07-18** |
+| Jul 25 | **Interactive CLI**: pause, mid-run chat, resume (streaming stretch) → **v0.3 · Sun 2026-07-26** |
+| Jul 27 to Aug 1 | **Specialists + eval hardening**: Researcher + Critic, dossier + lean ledger, probability metrics, agent picks the metric + starting model → **v0.4 · Sun 2026-08-02** |
+| Aug 3-8 | Dial B: `PromptTarget`, agentic prompt iteration (toxicity + intent examples) → **v0.5 · Sun 2026-08-09** |
+| Aug 10-15 | Dial B: `DLModelTarget`, vision transfer learning (4050) → **v0.6 · Sun 2026-08-16** |
+| Aug 17-22 | Cost-constrained recommendation + serving profile + `iterate cost` → **v0.7 · Sun 2026-08-23** |
+| Aug 24-29 | Dial A, both steps: infer inputs from data + a description AND MCP discovery (filesystem/Postgres, gap-fill pause) → **v0.9 · Sun 2026-08-30** *(absorbs v0.8)* |
+| Aug 31 to Sep 5 | One-sentence input + benchmark + dashboard + Reporter + docs + launch → **v1.0 · Sun 2026-09-06** *(absorbs v0.10)* |
 
 ### Releases (incremental — ship a working slice, then iterate)
 
 Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. **The agentic loop is present from v0.1**; two dials then turn — inputs you must give *shrink*, problem types *grow*. Tag a GitHub release at each milestone; publish to PyPI from v0.1.0.
 
-| Version | After | Problem types | Inputs you give (shrinking →) / New capability |
-|---|---|---|---|
-| v0.1.0 | Week 3 · **RELEASED 2026-05-31** | tabular | data + features + target + metric + baseline/notebook + deadline — **agentic loop on** (any installed-library model via the factory; best model saved as a joblib artifact) |
-| v0.2.0 | Week 4–5 | tabular | *(same inputs)* — agent **writes & runs training code in a sandbox** → any model at all + **live progress / streaming / graceful Ctrl-C** |
-| v0.3.0 | Week 6 | tabular | *(same inputs)* — **full interactive CLI**: pause the loop, chat with the LLM, resume |
-| v0.4.0 | Week 7 | tabular | data + features + target + baseline + deadline  *(multi-agent: Researcher + Proposer + Critic specialists report to a supervisor; agent picks metric + starting model from research)* |
-| v0.5.0 | Week 8 | + prompts | prompt + eval set + deadline |
-| v0.6.0 | Week 9 | + DL / vision | data + target + deadline |
-| v0.7.0 | Week 10 | all three | + serving budget / cloud  *(cost-constrained recommendation)* |
-| v0.8.0 | Week 11 | all | data + a one-line description  *(infers features/target/metric)* |
-| v0.9.0 | Week 12 | all | one sentence + a data source  *(MCP finds the data/code)* |
-| v0.10.0 | Week 13 | all | + multi-backend benchmark + Streamlit UI |
-| v1.0.0 | Week 14 | all | one sentence  *(full discovery)* |
+| Version | Plan week | Target window | Problem types | Inputs you give (shrinking →) / New capability |
+|---|---|---|---|---|
+| v0.1.0 | 3 | **RELEASED 2026-05-31** | tabular | data + features + target + metric + baseline/notebook + deadline: **agentic loop on** (allow-listed installed models via the factory; joblib artifact) |
+| v0.2.0 | 4-5 | **RELEASED 2026-07-18** | tabular | *(same inputs)*: agent **writes + runs its own training code cell-by-cell** (local kernel default, e2b sandbox flag); Supervisor + CodingAgent + Summarizer; guard stack + certified quality bar; notebook deliverable; per-cell progress + graceful Ctrl-C |
+| v0.3.0 | sprint 1 | **Sun 2026-07-26** | tabular | *(same inputs)*: **full interactive CLI** (pause the loop, chat with the agent, resume); token streaming is the stretch item |
+| v0.4.0 | sprint 2 | **Sun 2026-08-02** | tabular | data + features + target + baseline + deadline  *(Researcher + Critic specialists at the tool boundary; agent picks metric + starting model from research; probability metrics)* |
+| v0.5.0 | sprint 3 | **Sun 2026-08-09** | + prompts | prompt + eval set + deadline |
+| v0.6.0 | sprint 4 | **Sun 2026-08-16** | + DL / vision | data + target + deadline  *(validated on the RTX 4050)* |
+| v0.7.0 | sprint 5 | **Sun 2026-08-23** | all three | + serving budget / cloud  *(cost-constrained recommendation + serving profile + `iterate cost`)* |
+| v0.9.0 | sprint 6 | **Sun 2026-08-30** | all | data + a one-line description OR one sentence + a data source  *(absorbs v0.8: infers features/target/metric with a confirm pause; MCP discovery over filesystem + Postgres with the gap-fill pause)* |
+| v1.0.0 | sprint 7 | **Sun 2026-09-06** | all | one sentence  *(absorbs v0.10: multi-backend benchmark + read-only dashboard + prose report; full discovery + docs + launch)* |
+
+Sprint arithmetic, stated so it can be checked: 7 releases in 43 calendar days means ~1 build day per calendar day around college (9-5) and Keeper (6pm-2am); weekday build slots are late-night, weekends carry the heavy days. The compression is bought with the per-week cut lists below (cut items go to the post-v1.0 backlog, and LIMITATIONS.md states each cut honestly at release time). A slipped day rolls into that week's Saturday; a slipped WEEK does not move the Sunday: the release ships whatever passed the gate and the release notes say what made it. README's public status table gets synced to this calendar at the v0.3 release.
 
 ---
 
@@ -106,7 +117,7 @@ Realistic per-session scope (3 hours focused). One real commit per day.
 
 **Slack day:** Sunday May 31 (rest, or catch up on anything that slipped).
 
-**Note (2026-05-25):** Week 1's foundation — schemas + LLM client + config + CLI — shipped in **Days 1–3** (ahead of plan). The original Days 4–7 (tool dispatcher, Anthropic adapter, memory skeleton) were superseded by the expanded 11-week plan: memory + proposer + researcher → **Week 7**; tool dispatcher → **Week 7** (orchestrator); Anthropic adapter → optional/later. Week 1 is effectively complete; next is Week 2.
+**Note (2026-05-25):** Week 1's foundation — schemas + LLM client + config + CLI — shipped in **Days 1–3** (ahead of plan). The original Days 4–7 (tool dispatcher, Anthropic adapter, memory skeleton) were superseded by the expanded 11-week plan: memory + proposer + researcher → **Week 7**; tool dispatcher → **Week 7** (orchestrator); Anthropic adapter → optional/later. Week 1 is effectively complete; next is Week 2. *(Those "Week 7" pointers are the old 11-week numbering; the items shipped in Weeks 3-4. Under the 2026-07-25 sprint calendar the Anthropic adapter lands in sprint 7, Tue 2026-09-01.)*
 
 ### Daily session shape
 
@@ -213,9 +224,206 @@ Total: ~3 hrs. If a session needs more, the task was too big — split it.
 
 ---
 
-## MCP + Discovery Backlog (preview — Week 9 under the agent-first plan)
+## Standing release checklist (every vX.Y from here on)
 
-> **Re-sequenced 2026-05-27 (agent-first):** Proposer (4.10) + Memory (4.11) moved **forward to Week 3** (the core agentic loop); Researcher (4.9) → Week 4 (Dial A). The MCP + discovery items below (4.1–4.8, 4.12–4.13) land at **Week 9** — they're Dial-A input-reduction (toward one-sentence input), *not* prerequisites for the agent.
+Learned from the v0.2 release arc (release mechanics alone took 11 calendar days when improvised):
+
+1. **Release gate:** no new roadmap features ride along a release-gate iteration (locked 2026-07-04). If the release touched the loop, re-run the trajectory quality bar on the floor model before tagging.
+2. **Build gate:** full unit suite + ruff + mypy --strict green; `make build`.
+3. **Doc sync:** README (status table, test count, validated model, shipped-vs-planned rows), LIMITATIONS.md (retire fixed rows, add honest new ones), examples/ READMEs. LIMITATIONS.md explicitly pairs with this roadmap; keeping it current is release work, not optional polish.
+4. **Version mechanics:** bump pyproject + `__init__` + lockfile, tag, `uv publish` (Tony runs it), GitHub release notes (feature-first, honest capability floor).
+5. **Launch assets:** demo recorded from the published pip package; posts drafted in LAUNCH_POST.md as a vPREV-to-vX.Y diff (what it does, what changed, honest does-NOT-do list, what is next, repo link; no em dashes; max 275 chars per tweet; at most one process stat woven into a feature story). Tony schedules via native platform schedulers for US mornings.
+6. **Post-launch listening window:** the v0.1 replies produced two roadmap decisions; budget one session to read and log reactions.
+
+---
+
+## Sprint 1: v0.3, the interactive CLI. Build Sat 2026-07-25, release Sun 2026-07-26
+
+**Goal:** the public v0.3 promise from the launch posts, built today, shipped tomorrow: pause a live run, talk to the agent mid-loop, resume. Ordered must-ship-first; the day ends wherever it ends and Sunday ships what passed the gate.
+
+**v0.3 contract (updated same day after Tony's design pass):**
+- **Scope:** the default supervised code path only. The frozen `--spec` fast lane keeps its non-interactive behavior (documented, not built).
+- **Chat is plain English, non-modal, queued:** the user types free sentences ANY time; while a cell or an LLM call is in flight they queue; delivery happens at the next boundary (after a cell finishes, or just before the next supervisor call). No command syntax: `pause`, `resume`, `stop` match as bare English words; everything else is interpreted. Line-based input means no raw terminal mode at all.
+- **Intent is interpreted by the supervisor, routing is executed by the harness:** every Enter gets an INSTANT timing-only ack driven by a shared run-status field ("got it, cell 7 executing, delivering at the next safe point"), which is all the harness truthfully knows at that moment. At the boundary the supervisor runs one small structured `route_message` call (question | steer this notebook | steer later | standing rule) on the no-think client; the harness then moves the message: questions → the Q&A turn, standing rules → the capped rules list, current-notebook steers → injected into the live session (budget-nudge pattern, one capped user-role line) plus visibility at the next planning turn, later-steers → the next brief. On a failed classification after one retry the message defaults to the least-destructive route (current-notebook steer + next-brief visibility) and the console says so; interpretation degrades, never crashes.
+- **Pause point is the boundary:** on `pause` the coder finishes the executing cell, then the loop parks in place (kernel alive with periodic e2b keepalive, Memory already durable). No mid-cell kernel interrupt (an interrupt is a kill, not a pause).
+- **Clocks:** the run deadline and the 30-minute session wall ceiling suspend while paused; the kernel-time budget is naturally safe (it charges kernel seconds only).
+- **Two kinds of guidance, both lean:** a plain message is a one-shot steer (current session note + next `plan_next` turn, one capped line each); `rule: <text>` is a standing instruction (e.g. "do not test lever X") rendered as a capped list (3 items max, dead-ends style) in EVERY subsequent planning turn, so it shapes all future notebooks, and stamped into `candidate.changes` for audit. Mid-session notes are permanent session context (elision trims tool outputs only), hence the hard caps; the EDA-ledger regression is the cautionary tale, and the validation run watches a steered session for quality collapse.
+- **Questions get answered from the notebooks, safely:** queued questions trigger a SEPARATE supervisor Q&A turn at the boundary with a `read_notebook` tool. The tool is backed by Memory's stored cells + digests (sqlite), not by parsing .ipynb files, which honors the 2026-06-03 "the agent never re-parses notebooks" decision. The Q&A turn has a capped tool budget, degrades to "cannot answer" instead of raising, prints to the console, and its context NEVER enters `plan_next` (the supervisor's single structured tool call stays uncrowded).
+- **Guards outrank guidance:** a guidance-induced duplicate still gets rejected and stamped; chat can never unseal the holdout or bypass a gate. Guard-veto reasons already print at INFO, so the user sees why a steer was overridden.
+- **The default face is a terminal UI (scope added same day, built):** a scrollable log pane + a pinned always-yours input box (Textual), title bar with the run config; `--plain` keeps line-mode chat; non-tty and BACKGROUNDED runs stay non-interactive (foreground-tty gated + SIGTTIN-safe, so `iterate run ... &` cannot freeze). Ctrl-C in the TUI means graceful stop, never a hard quit that abandons a live kernel.
+- **Adversarially reviewed before the release (4-lens workflow):** caught and fixed two blockers (a backgrounded run would have been SIGTTIN-suspended by the stdin listener; Q&A resolved iteration numbers against ALL runs in memory instead of the current run) plus stop-then-pause deadlock, markup-mangled replies, e2b keepalive starvation around Q&A drains, second-note truncation, stop-reason mislabeling, and guidance lost on a supervisor retry. 424 unit tests (was 391), ruff + mypy --strict clean.
+
+**Today, Sat 2026-07-25 (ordered blocks, must-ship first):**
+
+| # | Block | Lands | Done? |
+|---|---|---|---|
+| 0 | Ten minutes of small calls: flip saved default backend groq → ollama; decide `--compute`-twice (warn or leave) and dataset-switch (document only for now); confirm the v0.2 posts went out; drop a superseded-by-BUILD_LOG header note into PRD.md | config + PRD note | |
+| 1 | Controller + pause/resume: `RunController` (message queue, standing rules, pause/abort flags, paused-seconds accounting, shared run-status field driving instant routing acks) + daemon stdin LINE reader (commands vs messages, prints the ack); checkpoint hook at the coder cell boundary and the loop iteration boundary; deadline + wall-ceiling suspension; `keepalive()` on the kernel protocol (e2b lease outlives a long pause) | `core/interactive.py` + kernel/coder/agent_loop wiring + tests | |
+| 2 | Guidance delivery, both routes: current-session injection at the coder cell boundary (budget-nudge pattern, one capped user-role note) + one-shot steer line and standing-rules list into `decide()` via the typed seam; prompts.yaml guidance keys + one precedence sentence; stamp applied guidance into `candidate.changes` | coder + supervisor + prompts + tests | |
+| 3 | Supervisor interpreter + Q&A turn: `route_message` structured tool (question / steer-now / steer-later / standing rule, one retry then safest-default) and `answer()` with the Memory-backed `read_notebook` tool (list experiments, fetch cells + digest of one, capped rendering), max 2 tool calls then forced answer, console output, zero bleed into `plan_next` | supervisor interpreter + Q&A + tests | |
+| 4 | CLI wiring: construct controller + line reader in the supervised branch, thread into `make_coder` + `run_supervised`, print queued-delivery acks and Q&A answers via the shared console; integration test on deterministic fakes | CLI + tests | |
+| 5 | Floor-model validation run on gemma4:12b exercising queue-while-busy, pause/resume, a steer, a standing rule honored in the NEXT notebook, a notebook question answered; check trajectory criteria hold | validation notes + fixes | |
+| 6 | STRETCH, only if the day still has legs (first casualty): token streaming on the native `OllamaClient`; `--debug` flag; notebook-header absolute-score item | stream + small wins | |
+
+**Tomorrow, Sun 2026-07-26 (release day, standing checklist compressed):** build gate (tests + ruff + mypy, `make build`) → doc sync (README status table to this sprint calendar, LIMITATIONS updated incl. honest cut notes, EVAL_LOG pointer fixed: publish a backfilled public copy or repoint) → bump + tag + `uv publish` + GitHub release (feature-first) → demo recorded from the pip package → posts drafted in LAUNCH_POST (vPREV-to-v0.3 diff, honest does-NOT-do incl. anything that slipped) and scheduled in the night window for US Monday morning.
+
+**Cut from v0.3 (to the post-v1.0 backlog unless a later Saturday absorbs them):** `OpenAICompatibleClient` streaming, LocalKernel IPC transport, the remaining certification polish items, pre-run undefined-name lint, e2b egress-deny template + per-experiment caps, BOTTLENECKS/EVAL_LOG cadence decision (retire recommended, decide any Sunday), cross-run persistence of standing rules (v0.3 rules are run-scoped; surviving a process restart needs Memory schema and waits).
+
+---
+
+## Sprint 2: v0.4, specialists + eval hardening. Mon 2026-07-27 to Sat 2026-08-01, release Sun 2026-08-02
+
+**Goal:** the two remaining specialists (Researcher, Critic) graduate at the supervisor's `plan_next` tool boundary, probability metrics land, and the first input dial turns (agent picks the metric + starting model from research). Public commitments riding on this release: "Literature-aware proposals" and "Researcher + Critic specialists; agent picks the metric + starting model" (README). This is the heaviest sprint; the cut list below is what makes it fit one week.
+
+**Contract:** specialists are separate LLM roles with typed handoffs, graduating from supervisor tools without contract changes (the 2026-06-04 seam). Own harness, no LangGraph, ever. New supervisor context stays lean (watch the validation run for lever collapse). Eval changes respect the sealed holdout. Researcher citations must be genuine: `Candidate.citations`, `source="researcher"`, dedup against Memory so it neither re-reads papers nor re-runs known ideas.
+
+| Date | Focus | Lands | Done? |
+|---|---|---|---|
+| Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | |
+| Tue Jul 28 | Experiment dossier, deterministic (distill captured cell stdout into a structured per-experiment record feeding briefs) + lean tried/untried idea ledger on `components_used` (capped, out of the dense supervisor prompt; watch for the EDA-ledger regression pattern) | dossier + ledger + tests | |
+| Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | |
+| Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | |
+| Fri Jul 31 | Dial A: agent picks the metric + starting model from research + the data profile; `--metric` optional; free unscored inspect/EDA step so exploration stops costing a scored iteration | proposer/supervisor + CLI + loop + tests | |
+| Sat Aug 1 | Certification-style validation on gemma4:12b (bar criteria + citations genuine + Critic catches seeded leakage + no context regression) + fixes; buffer absorbs anything slipped Mon-Fri | validation + fixes | |
+| Sun Aug 2 | **Release v0.4.0** per the standing checklist; LIMITATIONS retires the metric-panel, proba-metrics, and averaging rows and states the CV cut | v0.4.0 out | |
+
+**Cut from v0.4 (post-v1.0 backlog):** CV/k-fold selection option, typed Session handoff (`_winning_code` blob stays), qwen3:14b re-run, `iterate history`/`best`/`why-failed` (any green Saturday can absorb these).
+
+---
+
+## Sprint 3: v0.5, PromptTarget. Mon 2026-08-03 to Sat 2026-08-08, release Sun 2026-08-09
+
+**Goal:** the second problem type. Prompts as a `BenchmarkTarget`: same iteration loop, different execution path. Two public example commitments come due: `examples/toxicity_jigsaw/` and `examples/intent_clinc150/`. Prompt iteration only, never foundation-model fine-tuning (permanent scope lock).
+
+| Date | Focus | Lands | Done? |
+|---|---|---|---|
+| Mon Aug 3 | Contract + `PromptTarget`: prompt candidate anatomy (instruction edits, few-shot selection, format, decomposition), eval-set split + sealed scoring (labeled-set metrics first; LLM-judge only where labels are absent), baseline = current prompt re-measured; RESEARCH_LOG entry | `targets/prompt.py` + tests + RESEARCH_LOG | |
+| Tue Aug 4 | Loop integration: prompt lever classes for the supervisor ladder, coder session writes prompt variants + scoring cells, guard stack audited for the new path (duplicate gates hash prompt text, dead-ends transfer) | wiring + tests | |
+| Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | |
+| Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | |
+| Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | |
+| Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | |
+| Sun Aug 9 | **Release v0.5.0** per the standing checklist; examples/ README de-placeholdered; "CSV path until v0.5/v0.6" rows updated | v0.5.0 out | |
+
+---
+
+## Sprint 4: v0.6, DLModelTarget vision. Mon 2026-08-10 to Sat 2026-08-15, release Sun 2026-08-16
+
+**Goal:** the third problem type. Vision transfer learning validated on the RTX 4050 (the public claim), with GPU-aware execution. Line up 4050 access for Wed-Fri NOW; MPS is the smoke path, not the claim.
+
+| Date | Focus | Lands | Done? |
+|---|---|---|---|
+| Mon Aug 10 | Recipe research (torchvision/timm backbone, freeze + head; dataset that trains on a 6 GB card; MPS vs CUDA) + vision data adapter (image folders behind the existing data seam); RESEARCH_LOG entry | adapter + RESEARCH_LOG | |
+| Tue Aug 11 | `DLModelTarget` baseline (frozen backbone + linear head, deterministic) | `targets/dl.py` + tests | |
+| Wed Aug 12 | Candidate space via the code path: agent writes training cells (unfreeze depth, lr schedule, augmentation); GPU-aware kernel (device pick; OOM captured as a failure, never a crash) | wiring + tests | |
+| Thu Aug 13 | RTX 4050 validation (the public claim) + MPS smoke test; kernel-time budget semantics under GPU training re-checked | validation notes | |
+| Fri Aug 14 | Vision example + notebook deliverable (training curves in cells); if local floor-model latency is impractical for DL, document the honest cloud-backend recommendation | example + validation | |
+| Sat Aug 15 | Buffer; if green, the cloud-GPU `ComputeBackend` interface (interface only, implementation stays trigger-based) | fixes | |
+| Sun Aug 16 | **Release v0.6.0** per the standing checklist | v0.6.0 out | |
+
+---
+
+## Sprint 5: v0.7, cost-constrained serving. Mon 2026-08-17 to Sat 2026-08-22, release Sun 2026-08-23
+
+**Goal:** the flagship differentiator. Semantics locked long ago: score is the pure objective inside a hard serving-cost wall, never score-per-dollar; zero reward for being cheaper than the budget. Deliverable is a serving profile: best model within budget, cheapest cloud to host it, estimated $/month, requests/hour.
+
+| Date | Focus | Lands | Done? |
+|---|---|---|---|
+| Mon Aug 17 | Pricing research (per-cloud instance pricing snapshots, refresh policy; model-size/quantization → feasibility mapping) + serving-cost model + serving-profile schema; RESEARCH_LOG entry | `core/serving.py` + tests + RESEARCH_LOG | |
+| Tue Aug 18 | Constraint wiring: `--serving-budget` makes infeasible candidates losers regardless of score (a feasible-region filter in the compare step, not a penalty term) | wiring + tests | |
+| Wed Aug 19 | `iterate cost` command: per-experiment + cumulative agent operating cost by compute and LLM backend (`ExperimentResult.cost_usd` aggregation); operating cost reported, never a constraint (infra-over-model stance) | CLI + tests | |
+| Thu Aug 20 | Quantization as a feasibility lever for DL winners (4050 if reachable; MPS/e2b fallback) | lever + tests | |
+| Fri Aug 21 | End-to-end demo: the same task with and without a budget produces different recommendations; validation | example + validation | |
+| Sat Aug 22 | Buffer + carried items if green | fixes | |
+| Sun Aug 23 | **Release v0.7.0** per the standing checklist; comparison-table cost rows flip to shipped; the parked cost-win post angle becomes honest here | v0.7.0 out | |
+
+---
+
+## Sprint 6: v0.9, infer the inputs + MCP discovery (absorbs v0.8). Mon 2026-08-24 to Sat 2026-08-29, release Sun 2026-08-30
+
+**Goal:** Dial A turns hard, both steps in one release. Half the week is the v0.8 scope (data + a one-line description in, proposed target/features/metric out, confirmed at a pause), half is trimmed MCP discovery (the agent finds the data/code itself over filesystem + Postgres, then pauses for gap-fill). The PRD discovery-heuristics table is the ready-made spec. Security scoping is not optional: isolated subprocesses, path-restricted filesystem, read-only Postgres, every MCP call logged to Memory for audit.
+
+| Date | Focus | Lands | Done? |
+|---|---|---|---|
+| Mon Aug 24 | Inference module: host-computed data profile + description → typed proposal (target, features, metric + direction, task type) with stated reasons; low confidence asks, never guesses silently; confirm-pause UX; `--target`/`--metric` optional, `--yes` for scripts | `core/infer.py` + CLI + tests | |
+| Tue Aug 25 | Data versioning: content-hash chapter scoping in Memory + hash-based splitting + dataset-switch warning; split snapshot persisted to `.iterate/runs/<id>/` | memory/split + tests | |
+| Wed Aug 26 | MCP substrate: client (stdio first), config-driven registry, tool bridge (MCP tool defs → OpenAI schemas) | `mcp/` + tests | |
+| Thu Aug 27 | Wire filesystem (path-restricted) + Postgres (read-only) servers + security scoping + audit logging to Memory | config + docs + tests | |
+| Fri Aug 28 | Discovery agent: one-line goal → repo scan + baseline/eval extraction + DB table relevance → "what I found / what I could not find" gap-fill pause, grounding committed to Memory | `core/discovery.py` + tests | |
+| Sat Aug 29 | End-to-end `iterate init --discover` on a seeded fixture repo + DB; validation across 4+ datasets for the inference path; buffer | integration test + validation | |
+| Sun Aug 30 | **Release v0.9.0** per the standing checklist (release notes cover both dials; v0.8.0 is skipped as a standalone tag); LIMITATIONS states the trims honestly | v0.9.0 out | |
+
+**Cut from v0.9 (post-v1.0 backlog):** Notion + github MCP servers, Notion/markdown logging adapters, `DataSource` protocol + Kaggle/HF loader (the `[datasets]` extra stays dormant; LIMITATIONS "beyond a local CSV" row updated to say so), HTTP MCP transport if stdio suffices, source-artifact ask on claimed prior scores.
+
+---
+
+## Sprint 7: v1.0, one-sentence input + the evidence release (absorbs v0.10). Mon 2026-08-31 to Sat 2026-09-05, release Sun 2026-09-06
+
+**Goal:** make every public positioning claim literally true, then launch. `iterate "improve our churn baseline"` end to end: discovery → gap-fill pause → bounded iteration → serving profile + notebook + report, with human-approval gates throughout. The v0.10 evidence items (benchmark, dashboard, reporter) ship inside this release.
+
+| Date | Focus | Lands | Done? |
+|---|---|---|---|
+| Mon Aug 31 | One-line form glue: goal sentence → discovery → gap-fill pause → run, sane defaults (budget, deadline), every power-user override still working; human-approval gates audit (propose-only everywhere, never auto-merge to a production path) | CLI + tests + audit | |
+| Tue Sep 1 | Anthropic adapter behind the `LLMClient` protocol + benchmark harness (same task, N backends, score x agent cost x wall time, publishable table) | `llm/anthropic_client.py` + `examples/benchmark/` + tests | |
+| Wed Sep 2 | Run the benchmark (churn + toxicity) and publish the table; the Ollama-floor leg doubles as the release quality gate (trajectory bar re-run: a new adapter touched the loop) | results | |
+| Thu Sep 3 | Streamlit read-only dashboard (runs, experiments, memory, cost panel) + prose Reporter from Memory + digests, both minimal | `ui/dashboard.py` + `core/reporter.py` + tests | |
+| Fri Sep 4 | `docs/` real user documentation (install, quickstart per target family, config, backends, compute, memory, MCP; empty scaffold since Week 0) + full doc reconcile (README pitch rows all true, LIMITATIONS honest v1 gaps, PRD rewritten or retired, BOTTLENECKS/EVAL_LOG final state) | docs/ + doc PRs | |
+| Sat Sep 5 | Proof-points run (fill the LAUNCH_POST table: 30+ experiments overnight under $10, a past-failure retry win, papers cited, the benchmark table) + release-candidate regression (all three targets, both compute paths, 3+ backends) + launch assets (3-5 min demo video, posts) | proof runs + rc + assets | |
+| Sun Sep 6 | **Release v1.0.0**: tag + PyPI + GitHub release (v0.10.0 skipped as a standalone tag); launch: demo video to YouTube + LinkedIn + X, post series over the following 2 weeks (launch, architecture deep-dive with the multi-agent staleness note inverted, retry win, cost win, pluggability), scheduled through the night-window convention | v1.0.0 out | |
+
+**The v1.0 bar still holds:** it ships when the public claims are true. If the Saturday rc says a claim is not true yet, the Sunday release goes out as v0.10.0 (the evidence release) and v1.0.0 follows the next Sunday with the gap closed. That is the only sanctioned slip in this calendar.
+
+---
+
+## Backlog disposition (2026-07-25, sprint edition: every tracked deferral re-homed or closed)
+
+"Sat buffer" means the item rides any green Saturday; "post-v1.0" is the honest backlog that survives the sprint and gets stated in LIMITATIONS at each release.
+
+| Item | Was | Now |
+|---|---|---|
+| Token streaming (both adapters) | deferred out of v0.2 | v0.3 stretch block 5 (Ollama first); OpenAI-compatible → Sat buffer / post-v1.0 |
+| LocalKernel IPC transport, `--debug` flag, 3 non-gating certification items | parked at v0.2 close | `--debug` + header item in v0.3 stretch; rest → Sat buffer / post-v1.0 |
+| e2b egress-deny (custom template) + per-experiment memory/CPU caps | "v0.2.x" / old isolation backlog | Sat buffer; else post-v1.0 (security batch, first item) |
+| Pre-run undefined-name lint on generated cells | promised before v0.2, silently dropped | Sat buffer; else post-v1.0 |
+| Default backend flip (groq → ollama) + `--compute` twice + dataset-switch call | open small calls | v0.3 block 0 (today) |
+| Metric panel lift + predict_proba metrics + averaging | v0.4 rows in LIMITATIONS | sprint 2, Mon Jul 27 |
+| CV/k-fold selection option | v0.4 row | CUT → post-v1.0 |
+| Experiment dossier (deterministic → Summarizer graduation) | knowledge-transfer ladder step 2 | sprint 2: deterministic Tue Jul 28, Summarizer authors it Thu Jul 30 |
+| Lean tried/untried idea ledger (post-revert redesign) | knowledge-transfer ladder step 3 | sprint 2, Tue Jul 28 (watch validation for lever collapse) |
+| Free inspect/EDA step (unscored) | named v0.4 follow-up | sprint 2, Fri Jul 31 |
+| Typed Session handoff (replaces `_winning_code` blob) | "typed handoff at v0.4" | CUT → post-v1.0 |
+| Researcher (citations, dedup) + Critic (leakage, eval verdicts) | v0.4 specialists | sprint 2, Wed-Thu Jul 29-30 |
+| Agent picks metric + starting model | v0.4 dial | sprint 2, Fri Jul 31 |
+| `iterate history` / `best` / `why-failed` | unscheduled small add | Sat buffer; else post-v1.0 |
+| qwen3:14b re-run vs the worked-example prompt | monitor item | CUT → post-v1.0 |
+| PromptTarget + toxicity_jigsaw + intent_clinc150 examples | v0.5 | sprint 3 (release Aug 9) |
+| DLModelTarget + 4050 validation | v0.6 | sprint 4 (release Aug 16) |
+| Cloud-GPU adapter | interface ~v0.6, implementation later | interface: sprint 4 Sat if green, else post-v1.0; implementation trigger-based |
+| Cost-constrained recommendation + serving profile + `iterate cost` + quantization lever | v0.7 / v1 moat | sprint 5 (release Aug 23) |
+| Infer features/target/metric + confirm pause | v0.8 | sprint 6, Mon Aug 24 (ships inside v0.9.0) |
+| Hash-based splitting + data-version Memory scoping + split-snapshot persist | old Week 8/9 + IDEAS deferrals | sprint 6, Tue Aug 25 |
+| Source-artifact ask on claimed prior scores | old Week 7-8 anchor | CUT → post-v1.0 |
+| MCP client/registry/bridge + filesystem/Postgres servers + discovery agent + gap-fill pause | v0.9 / old Week 4 zombie | sprint 6, Wed-Sat Aug 26-29 |
+| Notion + github MCP servers, Notion/markdown logging adapters | v0.9 substrate items | CUT → post-v1.0 |
+| Kaggle/HF data sources + `DataSource` protocol (the `[datasets]` extra) | promised at v0.9 | CUT → post-v1.0; LIMITATIONS row updated to say so at the v0.9 release |
+| Streamlit CHAT UI (old backlog 5.3: chat input + live reasoning stream) | Week-10-era preview | narrowed 2026-07-25 to the read-only dashboard (sprint 7, Thu Sep 3); interactive chat shipped in the v0.3 CLI instead |
+| Multi-backend benchmark + Streamlit dashboard + prose Reporter + Anthropic adapter | v0.10 | sprint 7, Tue-Thu Sep 1-3 (ships inside v1.0.0) |
+| Demo-asset checklist (charts, dashboard shots) | LAUNCH_POST backlog | sprint 7, Sat Sep 5 |
+| One-line form + docs/ + proof points + PRD reconcile | v1.0 | sprint 7 (release Sep 6) |
+| Semantic memory retrieval | "if wrong retrievals surface" | stays trigger-based, unscheduled |
+| Import → package alias-map architecture revisit | provisional, TBD | stays open; revisit if resolve failures recur (soft-fail backstop holds) |
+| Spec-path preprocessing flexibility; multi-target/multi-label | TBD | stay unscheduled, trigger-based |
+| Proposer-yield levers (few-shot, temperature, text-fallback) | logged, not pulled | superseded in practice by gemma floor + cloud path; keep listed, unscheduled |
+| PostgresMemory | conditional | only if multi-user/hosted materializes |
+| Cross-notebook EDA-repetition retry | reverted feature | folded into the sprint 2 ledger work, guard-first, watch for regression |
+| LightGBM macOS-ARM wheel slowness | known issue | documented, no action (fine on Linux/e2b) |
+| Optuna / AutoML HPO | v2 ambition | stays out of v1 scope |
+
+---
+
+## MCP + Discovery Backlog (re-homed 2026-07-25: sprint 6, v0.9, release Sun 2026-08-30)
+
+> **Re-sequenced 2026-05-27 (agent-first):** Proposer (4.10) + Memory (4.11) moved **forward to Week 3** (the core agentic loop); Researcher (4.9) → v0.4 (sprint 2, release 2026-08-02). Under the sprint calendar: 4.1-4.5 + 4.8 land in **sprint 6 (v0.9, release 2026-08-30)**; 4.6, 4.7, 4.12, 4.13 (Notion, github, logging adapters) are **cut to the post-v1.0 backlog**. They're Dial-A input-reduction (toward one-sentence input), *not* prerequisites for the agent.
 
 This phase shifts the agent from "user provides every input" to **"user provides one input — `iterate 'improve our churn baseline'` — and the agent discovers the rest."**
 
@@ -254,21 +462,46 @@ The discovery agent is what makes the demo wow. It does:
 
 ---
 
-## UI + Benchmark Backlog (preview — Week 10 under the agent-first plan)
+## UI + Benchmark Backlog (re-homed 2026-07-25 per row; the core lands in sprint 7, v1.0)
 
 | # | Task | Files |
 |---|------|-------|
-| 5.1 | Terminator — patience / deadline / compute budget / plateau detection | `src/iterate/core/terminator.py` |
-| 5.2 | Reporter — generates run summary + PR-shaped report | `src/iterate/core/reporter.py` |
-| 5.3 | **Streamlit chat UI** — sidebar (MCP status + experiments + memory + cost), chat input, live agent reasoning stream | `src/iterate/ui/chat.py` |
-| 5.4 | Second example target (intent_clinc150) to prove framework genericity | `examples/intent_clinc150/` |
-| 5.5 | Multi-LLM backend benchmark — same task run on Ollama / Groq / Together / Deepseek / Anthropic | `examples/benchmark/` |
-| 5.6 | Demo video walking through full discovery → iteration loop | `docs/demo.md` + recording |
-| 5.7 | Final README polish, launch post assembly from LAUNCH_POST.md | `README.md`, `LAUNCH_POST.md` |
+| 5.1 | Terminator — patience / deadline / compute budget / plateau detection · shipped in v0.1 | `src/iterate/core/terminator.py` |
+| 5.2 | Reporter — generates run summary + PR-shaped report · sprint 7, Thu Sep 3 | `src/iterate/core/reporter.py` |
+| 5.3 | **Streamlit chat UI** — sidebar (MCP status + experiments + memory + cost), chat input, live agent reasoning stream · narrowed 2026-07-25 to a READ-ONLY dashboard (sprint 7, Thu Sep 3); the chat value shipped in the v0.3 interactive CLI instead | `src/iterate/ui/dashboard.py` |
+| 5.4 | Second example target (intent_clinc150) to prove framework genericity · sprint 3, Thu Aug 6 (v0.5) | `examples/intent_clinc150/` |
+| 5.5 | Multi-LLM backend benchmark — same task run on Ollama / Groq / Together / Deepseek / Anthropic · sprint 7, Tue-Wed Sep 1-2 | `examples/benchmark/` |
+| 5.6 | Demo video walking through full discovery → iteration loop · sprint 7, Sat-Sun Sep 5-6 (v1.0) | `docs/demo.md` + recording |
+| 5.7 | Final README polish, launch post assembly from LAUNCH_POST.md · sprint 7, Fri-Sun Sep 4-6 (v1.0) | `README.md`, `LAUNCH_POST.md` |
 
 ---
 
 ## Done
+
+### 2026-07-26 | Sprint 1 | v0.3.0: interactive runs (TUI + chat + pause/resume + hard stop)
+
+**Task:** Build and ship v0.3 in one day per the sprint re-plan: talk to the run while it runs.
+
+**What shipped:**
+- Files: `core/interactive.py` (RunController: queued plain-English chat, control words, pause/abort, paused-clock accounting, live run snapshot), `ui/tui.py` (Textual interface: live transcript with two-tone syntax cell panels, command palette on "/", pinned input box), wiring through `coder.py` / `agent_loop.py` / `supervisor.py` / `kernel.py` / `cli.py`, new prompt keys for routing / Q&A / guidance / user notes.
+- Chat: type anything, anytime; messages queue to the next safe boundary with a timing-only ack; the supervisor classifies intent (question / steer now / steer later / standing rule) and the HARNESS executes the routing. Questions are answered from the dataset profile + the LIVE session's cells + recorded notebooks (2-fetch cap); steers reach the running session at its next cell; standing rules ride every later planning turn (3 x 90 chars, lean by design).
+- Controls: pause/resume at the cell boundary with all clocks suspended and the e2b lease kept alive; `/stop` or double Ctrl-C quits immediately and still prints the summary table from the loop's live snapshot; single Ctrl-C stays the graceful wind-down (floor banked, memory finalized).
+- Guards outrank chat everywhere; applied guidance is stamped into `candidate.changes` for audit; non-tty, piped, and backgrounded runs are byte-identical to v0.2 (foreground-tty gate + SIGTTIN safety); `--plain` keeps line-mode chat.
+- 440 unit tests (391 at v0.2.0), ruff + mypy --strict clean; `textual` added as a core dep; saved default backend flipped groq → ollama (rate-limit gotcha from the v0.2 launch).
+
+**What didn't:**
+- Token streaming (originally v0.3 scope) cut to the backlog; the transcript streams per cell and per event instead.
+- Parked polish not taken (LocalKernel IPC transport, `--debug`, the 3 certification items, undefined-name lint, e2b egress template); all tracked in the disposition table.
+- Q&A answers about the CURRENT run only; controls are exact words (`pause` / `resume` / `stop`, slash forms included) — natural-language stop routes as guidance.
+
+**Found live during the test drive (and fixed same-day):**
+- The sqlite Memory was created on the main thread but the TUI runs the loop on a worker thread → first write crashed; the Memory is now born on the thread that runs the loop, with a worker-thread regression test.
+- Q&A was blind to the dataset profile and the in-flight session, so questions the screen had literally just answered ("how many categorical columns?", "what's the split?") came back empty; both are now in its context.
+- Four-lens adversarial review before the test drive caught two more blockers pre-live: backgrounded runs would have been SIGTTIN-suspended by the stdin listener, and Q&A resolved iteration numbers against ALL runs in memory instead of the current one. Plus: stop-then-pause deadlock, markup-mangled replies, e2b keepalive starvation, second-note truncation.
+
+**Decisions (user calls, this session):** hard-stop semantics (stop = quit now with the table; pause/resume are the waiting tools); plain-English chat over command prefixes (supervisor routes, harness executes, safest-default fallback); the TUI as the default face with `--plain` opt-out; transcript palette (two-tone code, role colors, full-width wrapped panels).
+
+**Next session:** Sprint 2 (v0.4): Researcher + Critic specialists, probability metrics, dossier + lean ledger, agent picks metric + starting model. Release Sunday 2026-08-02.
 
 ### 2026-07-18 | Week 4 Day 8 (close) | v0.2.0 SHIPPED: PyPI + tag + GitHub release; both compute paths verified on the published package; new-dataset generalization run
 

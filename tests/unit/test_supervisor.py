@@ -1185,3 +1185,153 @@ def test_history_shows_within_session_validation_trail() -> None:
     Supervisor(fake, metric="f1").decide(data_summary="d", baseline=_baseline(), history=[prior])
     sent = "\n".join(m.content or "" for m in fake.calls[0])
     assert "val tries: 0.5800 -> 0.6100 -> 0.5900" in sent
+
+
+# ─── Interactive (v0.3): guidance, routing, Q&A ──────────────────────────────
+
+
+def _flat(messages: list[Message]) -> str:
+    return "\n".join(m.content or "" for m in messages)
+
+
+def test_user_guidance_and_rules_reach_the_prompt() -> None:
+    fake = _FakeLLM([_plan(False, "t", "next: try lightgbm")])
+    Supervisor(fake, metric="f1").decide(
+        data_summary="d", baseline=_baseline(), history=[],
+        user_guidance="try lightgbm please", standing_rules=("never drop rows",),
+    )
+    flat = _flat(fake.calls[0])
+    assert "USER GUIDANCE" in flat
+    assert "try lightgbm please" in flat
+    assert "USER RULES" in flat
+    assert "never drop rows" in flat
+
+
+def test_absent_guidance_leaves_the_prompt_unchanged() -> None:
+    fake = _FakeLLM([_plan(False, "t", "next: x")])
+    Supervisor(fake, metric="f1").decide(data_summary="d", baseline=_baseline(), history=[])
+    flat = _flat(fake.calls[0])
+    assert "USER GUIDANCE" not in flat
+    assert "USER RULES" not in flat
+
+
+def _route_reply(kind: str) -> ChatResponse:
+    return ChatResponse(
+        model="fake-model",
+        tool_calls=[ToolCall(id="r", name="route_message", arguments={"kind": kind})],
+    )
+
+
+def test_route_message_returns_the_model_kind() -> None:
+    fake = _FakeLLM([_route_reply("question")])
+    kind = Supervisor(fake, metric="f1").route_message("which iteration won?", live_session=True)
+    assert kind == "question"
+
+
+def test_route_message_defaults_to_a_steer_after_garbage() -> None:
+    fake = _FakeLLM([_text(), _text()])
+    kind = Supervisor(fake, metric="f1").route_message("hmm", live_session=False)
+    assert kind == "steer_now"
+
+
+class _BoomLLM:
+    @property
+    def model(self) -> str:
+        return "boom"
+
+    def chat(self, *a: object, **kw: object) -> ChatResponse:
+        raise RuntimeError("backend down")
+
+
+def test_route_message_survives_a_backend_error() -> None:
+    kind = Supervisor(_BoomLLM(), metric="f1").route_message("do it", live_session=True)  # type: ignore[arg-type]
+    assert kind == "steer_now"
+
+
+def _qa_experiment(iteration: int, score: float) -> Experiment:
+    return Experiment(
+        candidate=Candidate(
+            description=f"exp {iteration}",
+            changes={
+                "code": "x = 1",
+                "cells": [
+                    {"code": "print('validation f1 0.61')", "stdout": "validation f1 0.61",
+                     "error": None, "source": "agent", "outputs": [], "thinking": None}
+                ],
+            },
+            rationale="r",
+        ),
+        target="tabular-model", hypothesis="next: something", status="completed",
+        iteration=iteration,
+        result=ExperimentResult(
+            experiment_id=f"e{iteration}",
+            metrics=Metrics(values={"f1": score}, primary="f1", direction="maximize", n_samples=100),
+        ),
+    )
+
+
+def test_answer_reads_a_notebook_and_answers() -> None:
+    read = ChatResponse(
+        model="fake-model",
+        tool_calls=[ToolCall(id="n", name="read_notebook", arguments={"iteration": 1})],
+    )
+    final = ChatResponse(model="fake-model", content="Iteration 1 won with f1 0.6000.")
+    fake = _FakeLLM([read, final])
+    answer = Supervisor(fake, metric="f1").answer(
+        "which iteration won?", history=[_qa_experiment(1, 0.60)], baseline=_baseline()
+    )
+    assert "0.60" in answer
+    # the second turn carried the real notebook record (cells from Memory)
+    flat = _flat(fake.calls[1])
+    assert "cell 1" in flat
+    assert "validation f1 0.61" in flat
+
+
+def test_answer_survives_a_backend_error() -> None:
+    answer = Supervisor(_BoomLLM(), metric="f1").answer(  # type: ignore[arg-type]
+        "what happened?", history=[], baseline=_baseline()
+    )
+    assert answer.startswith("(could not answer")
+
+
+def test_guided_banked_rebrief_is_still_rejected() -> None:
+    # Guidance steers toward work the carried best already contains; the banked
+    # guard must still bounce it — guards outrank guidance.
+    carried = _qa_experiment(1, 0.60)
+    carried.candidate.changes["code"] = "model = HistGradientBoostingClassifier(class_weight='balanced')"
+    fake = _FakeLLM([
+        _plan(False, "cw", "next: imbalance-or-threshold: set class_weight balanced"),
+        _plan(False, "te", "next: encoding-of-categoricals: target encode the cats"),
+    ])
+    decision = Supervisor(fake, metric="f1").decide(
+        data_summary="d", baseline=_baseline(), history=[carried], carried_best=carried,
+        user_guidance="use class weights",
+    )
+    assert "target encode" in decision.brief
+    # the nudge round-trip happened: two chat calls, the second carrying a rejection
+    assert len(fake.calls) == 2
+
+
+def test_answer_grounds_on_the_dataset_profile_and_live_session() -> None:
+    class _LiveCell:
+        code = "print(X_train.shape)"
+        stdout = "Training fold shape: (4506, 19)"
+        error = None
+        source = "agent"
+
+    from iterate.core.supervisor import render_live_cells
+
+    live = render_live_cells([_LiveCell()])
+    final = ChatResponse(model="fake-model", content="19 features; train fold 4506 rows.")
+    fake = _FakeLLM([final])
+    answer = Supervisor(fake, metric="f1").answer(
+        "what is the train test split?", history=[], baseline=_baseline(),
+        data_summary="7043 rows, 19 features (3 numeric, 16 categorical)",
+        live_session=live,
+    )
+    assert "4506" in answer or answer  # the model answered; now check its context
+    flat = _flat(fake.calls[0])
+    assert "Dataset profile" in flat
+    assert "16 categorical" in flat
+    assert "RUNNING RIGHT NOW" in flat
+    assert "Training fold shape: (4506, 19)" in flat

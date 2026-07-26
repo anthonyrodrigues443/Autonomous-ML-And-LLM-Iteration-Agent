@@ -64,7 +64,7 @@ class _FakeCoder:
 
 
 def _loop(supervisor: object, coders: list[_FakeCoder], terminator: object,
-          on_experiment=None, summarizer=None, memory=None):
+          on_experiment=None, summarizer=None, memory=None, controller=None):
     it = iter(coders)
     return run_supervised(
         target=_FakeTarget(),  # type: ignore[arg-type]
@@ -76,6 +76,7 @@ def _loop(supervisor: object, coders: list[_FakeCoder], terminator: object,
         data_summary="d",
         summarizer=summarizer,
         on_experiment=on_experiment,
+        controller=controller,
     )
 
 
@@ -447,3 +448,188 @@ def test_winning_code_keeps_a_fallback_floor_submit() -> None:
     assert code is not None
     assert "hgb_floor_submit()" in code
     assert "model.fit(broken)" not in code  # errored agent cell still dropped
+
+
+# ─── Interactive controller wiring (v0.3) ────────────────────────────────────
+
+
+class _GuidedSupervisor(_FakeSupervisor):
+    """A fake that also records the interactive kwargs the loop passes."""
+
+    def __init__(self, decisions: list[SupervisorDecision]) -> None:
+        super().__init__(decisions)
+        self.seen_guidance: list[str | None] = []
+        self.seen_rules: list[tuple] = []
+
+    def decide(
+        self, *, data_summary: str, baseline: object, history: list,
+        carried_best: object = None, user_guidance: str | None = None,
+        standing_rules: tuple = (),
+    ) -> SupervisorDecision:
+        self.seen_guidance.append(user_guidance)
+        self.seen_rules.append(tuple(standing_rules))
+        return super().decide(
+            data_summary=data_summary, baseline=baseline, history=history,
+            carried_best=carried_best,
+        )
+
+
+def test_a_typed_message_becomes_guidance_and_is_stamped() -> None:
+    from iterate.core.interactive import RunController
+
+    ctrl = RunController()
+    ctrl.submit_line("prefer smaller models")
+    sup = _GuidedSupervisor([SupervisorDecision(False, "a", "try a")])
+    result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), controller=ctrl)
+    # no route_message on the fake supervisor -> the interpreter defaults to a steer
+    assert sup.seen_guidance == ["prefer smaller models"]
+    assert result.history[0].candidate.changes["user_guidance"] == "prefer smaller models"
+
+
+def test_stop_before_planning_ends_the_run_and_finalizes_memory() -> None:
+    from iterate.core.interactive import RunController
+
+    ctrl = RunController()
+    ctrl.submit_line("stop")
+    mem = InMemoryMemory()
+    sup = _FakeSupervisor([])  # must never be consulted
+    result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(3), memory=mem, controller=ctrl)
+    assert result.stopped_because == "stopped-by-user"
+    assert result.history == []
+    assert result.run_id is not None
+    assert mem._runs[result.run_id]["stopped_because"] == "stopped-by-user"
+
+
+def test_paused_time_is_excluded_from_the_deadline_clock() -> None:
+    from iterate.core.interactive import RunController
+
+    class _SpyTerminator:
+        def __init__(self) -> None:
+            self.elapsed: list[float] = []
+
+        def update_and_check(self, state) -> str:
+            self.elapsed.append(state.elapsed_seconds)
+            return "spied"
+
+    ctrl = RunController()
+    ctrl.paused_seconds_total = 3600.0  # pretend an hour of pause already accrued
+    spy = _SpyTerminator()
+    sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
+    _loop(sup, [_FakeCoder(_result(0.60))], spy, controller=ctrl)
+    # real elapsed is milliseconds; the paused credit dominates and the clamp holds
+    assert spy.elapsed == [0.0]
+
+
+class _QASupervisor(_FakeSupervisor):
+    """Routes every line as a question and records what context answer() saw."""
+
+    def __init__(self, decisions: list[SupervisorDecision]) -> None:
+        super().__init__(decisions)
+        self.answered_over: list[int] = []
+        self.seen_summaries: list[str] = []
+        self.seen_live: list[object] = []
+
+    def route_message(self, text: str, *, live_session: bool) -> str:
+        return "question"
+
+    def answer(
+        self, question: str, *, history: list, baseline: object,
+        data_summary: str = "", live_session: object = None,
+    ) -> str:
+        self.answered_over.append(len(history))
+        self.seen_summaries.append(data_summary)
+        self.seen_live.append(live_session)
+        return "answered"
+
+
+def test_questions_are_answered_from_the_current_run_only() -> None:
+    from iterate.core.interactive import RunController
+
+    # An earlier run on the same target sits in memory; its experiments must be
+    # invisible to Q&A about THIS run.
+    mem = InMemoryMemory()
+    old_run = mem.start_run("tabular-model", _result(0.50))
+    old_exp = Experiment(
+        candidate=Candidate(description="old", changes={"code": "x"}, rationale="r"),
+        target="tabular-model", hypothesis="h", status="completed", iteration=3,
+        result=_result(0.55),
+    )
+    mem.record(old_run, old_exp)
+    mem.finish_run(old_run, "max_iterations")
+
+    ctrl = RunController()
+    ctrl.submit_line("why did iteration 3 fail?")
+    sup = _QASupervisor([SupervisorDecision(False, "a", "try a")])
+    _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), memory=mem, controller=ctrl)
+    assert sup.answered_over == [0]  # the current run had no experiments yet
+
+
+def test_stop_during_an_iteration_wins_the_stop_reason() -> None:
+    from iterate.core.interactive import RunController
+
+    ctrl = RunController()
+
+    def hook(**kwargs) -> None:  # type: ignore[no-untyped-def]
+        ctrl.submit_line("stop")  # the user stops while the iteration finishes
+
+    sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
+    result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), hook, controller=ctrl)
+    # MaxIterations(1) would also fire here; the user's stop outranks its label
+    assert result.stopped_because == "stopped-by-user"
+
+
+def test_two_messages_in_one_window_both_reach_the_brief() -> None:
+    from iterate.core.interactive import RunController
+
+    ctrl = RunController()
+    first = "use a much smaller learning rate for the gradient boosting model " * 3
+    ctrl.submit_line(first)
+    ctrl.submit_line("and never touch the test split")
+    sup = _GuidedSupervisor([SupervisorDecision(False, "a", "try a")])
+    _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), controller=ctrl)
+    (guidance,) = sup.seen_guidance
+    assert guidance is not None
+    assert "never touch the test split" in guidance
+
+
+def test_brief_and_score_events_are_emitted_for_the_ui() -> None:
+    from iterate.core.interactive import RunController
+
+    ctrl = RunController()
+    events: list[tuple[str, dict]] = []
+    ctrl.on_event = lambda kind, payload: events.append((kind, payload))
+    sup = _FakeSupervisor([SupervisorDecision(False, "class weights", "next: balance")])
+    _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), controller=ctrl)
+    kinds = [k for k, _ in events]
+    assert kinds == ["brief", "score"]
+    brief = dict(events[0][1])
+    assert brief["iteration"] == 1
+    assert brief["title"] == "class weights"
+    score = dict(events[1][1])
+    assert score["score"] == 0.60
+    assert score["is_best"] is True
+
+
+def test_questions_get_the_dataset_profile_even_with_no_experiments() -> None:
+    from iterate.core.interactive import RunController
+
+    ctrl = RunController()
+    ctrl.submit_line("how many numeric and categorical columns?")
+    sup = _QASupervisor([SupervisorDecision(False, "a", "try a")])
+    _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), controller=ctrl)
+    assert sup.answered_over == [0]  # no experiments yet, and that is fine now:
+    assert sup.seen_summaries == ["d"]  # the profile still grounds the answer
+
+
+def test_snapshot_reflects_finished_work_for_the_hard_quit() -> None:
+    from iterate.core.interactive import RunController
+
+    ctrl = RunController()
+    sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
+    _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), controller=ctrl)
+    assert callable(ctrl.snapshot)
+    snap = ctrl.snapshot()
+    assert snap.stopped_because == "stopped-by-user"
+    assert len(snap.history) == 1
+    assert snap.best is not None
+    assert snap.best.result.metrics.primary_value == 0.60

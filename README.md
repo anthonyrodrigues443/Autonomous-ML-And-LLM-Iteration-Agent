@@ -15,14 +15,14 @@ pip install iterate-ai
 iterate run --data examples/churn_tabular/data.clean.csv --target Churn --metric f1
 ```
 
-`iterate` runs an autonomous experiment loop on your ML problem. In v0.2 the agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 391 unit tests across 31 files run in CI on every push.
+`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 428 unit tests across 33 files run in CI on every push.
 
-| v0.2 today | On the roadmap |
+| v0.3 today | On the roadmap |
 |---|---|
-| The agent writes + runs its own training code (any model, any preprocessing) in a local kernel or an isolated e2b sandbox | Interactive CLI: pause, mid-run chat, resume, token streaming (v0.3) |
-| Multi-agent core: Supervisor briefs, coding agent executes cell by cell, Summarizer carries knowledge across notebooks | Researcher + Critic specialists; agent picks the metric + starting model (v0.4) |
-| A deterministic guard stack converts weak-model waste: grounded briefs, duplicate hashing, dead-end transfer, floor submissions | LLM prompt iteration (v0.5), vision transfer learning (v0.6) |
-| Winner ships as a runnable notebook (hypothesis, staged cells, real outputs, dead ends labeled, findings); persistent memory across runs | Cost-to-serve recommendations (v0.7), MCP auto-discovery of data + context (v0.9) |
+| Talk to the run while it runs: terminal UI with a scrollable live transcript + input box; plain-English chat with queued delivery; pause / resume / stop as words | Researcher + Critic specialists; agent picks the metric + starting model (v0.4) |
+| The agent writes + runs its own training code (any model, any preprocessing) in a local kernel or an isolated e2b sandbox | LLM prompt iteration (v0.5), vision transfer learning (v0.6) |
+| Multi-agent core: Supervisor briefs, coding agent executes cell by cell, Summarizer carries knowledge across notebooks; questions answered from the actual run record | Cost-to-serve recommendations (v0.7) |
+| A deterministic guard stack converts weak-model waste, and it outranks chat: user steers can shape a brief, never bypass a gate; winner ships as a runnable notebook; persistent memory across runs | Inferred inputs + MCP auto-discovery (v0.9), one-sentence input (v1.0) |
 
 ## Why I built this
 
@@ -42,26 +42,21 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 
 ## Status
 
-**v0.2 released: the agent writes and runs its own training code.** In v0.1 the agent picked estimators from an allow-list; in v0.2 it works like an engineer in a notebook, and the winner ships as one.
+**v0.3 released: talk to the run while it runs.** v0.1 proved the autonomous loop, v0.2 made the agent write and run its own code, and v0.3 puts you in the loop without stopping it: watch the session as a live transcript, steer it, question it, pause it.
 
-**Agent-first:** the autonomous loop landed at v0.1 (Week 3), not as a late-stage add-on. Two dials turn release to release: the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular, then prompts, then DL/vision).
+**Agent-first:** the autonomous loop landed at v0.1, not as a late-stage add-on. Two dials turn release to release: the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular, then prompts, then DL/vision).
 
-| Week | Phase | Status |
+| Release | Phase | Status |
 |---|---|---|
-| 0 | Scaffolding + scope lock | done |
-| 1 | Foundation: schemas + LLM client (tool-calling) + config + CLI | done |
-| 2 | Tabular execution substrate: `BenchmarkTarget` + data adapter + `ModelTarget` + model factory + local executor | done |
-| 3 | **The agentic loop**: Proposer + Orchestrator + Terminator + Memory + CLI, first autonomous tabular run (**v0.1**) | done |
-| 4-5 | **Sandboxed code-gen + the multi-agent cell-by-cell system** (Supervisor, coding agent, Summarizer, pulled forward from the original v0.4 plan) + notebook deliverable + live progress + graceful Ctrl-C (**v0.2**) | done |
-| 6 | **Full interactive CLI**: pause, mid-run chat, resume + token streaming (**v0.3**) | next |
-| 7 | Researcher + Critic specialists; agent picks the metric + starting model (**v0.4**) | planned |
-| 8 | `PromptTarget`: agentic prompt iteration (**v0.5**) | planned |
-| 9 | `DLModelTarget`: vision transfer learning, validated on a local RTX 4050 (**v0.6**) | planned |
-| 10 | **Cost-constrained recommendation** + serving profile + `iterate cost` (**v0.7**) | planned |
-| 11 | Infer features/target from the data + a description (**v0.8**) | planned |
-| 12 | **MCP discovery**: find the data/code itself (**v0.9**) | planned |
-| 13 | Multi-backend benchmark + **Streamlit chat UI** + demos (**v0.10**) | planned |
-| 14 | Full minimum-viable-input + polish + launch (**v1.0**) | planned |
+| v0.1 | **The agentic loop**: Proposer + Orchestrator + Terminator + Memory + CLI, first autonomous tabular run | shipped |
+| v0.2 | **Sandboxed code-gen + the multi-agent cell-by-cell system** (Supervisor, coding agent, Summarizer) + notebook deliverable + the deterministic guard stack | shipped |
+| v0.3 | **Interactive runs**: terminal UI (live transcript + input box), plain-English chat with queued delivery, pause / resume / stop, notebook Q&A, standing rules | shipped |
+| v0.4 | Researcher + Critic specialists; agent picks the metric + starting model; probability metrics | planned |
+| v0.5 | `PromptTarget`: agentic prompt iteration | planned |
+| v0.6 | `DLModelTarget`: vision transfer learning, validated on a local RTX 4050 | planned |
+| v0.7 | **Cost-constrained recommendation** + serving profile + `iterate cost` | planned |
+| v0.9 | Infer features/target from the data + a description; **MCP discovery** of the data/code itself (absorbs the v0.8 milestone) | planned |
+| v1.0 | One-sentence input + multi-backend benchmark + read-only dashboard + docs + launch (absorbs the v0.10 milestone) | planned |
 
 ---
 
@@ -101,6 +96,19 @@ Each iteration is a real R&D session, not a script dump:
 
 ---
 
+## What v0.3 adds: you, in the loop
+
+On a terminal, `iterate run` now opens an interactive session view: the run streams as a live transcript (each executed cell as a syntax-highlighted block with its status, seconds, and budget; briefs and scores as styled rows) above an input box that is always yours. Type anything, anytime, in plain English:
+
+- **Questions** ("did we complete an iteration?", "why did iteration 3 fail?") get answered by the Supervisor from the run's actual recorded notebooks, not from model recall.
+- **Instructions** ("try a smaller learning rate") reach the RUNNING session at its next cell, and the next brief sees them too. "next run, try catboost" waits for the next experiment.
+- **Standing rules** ("from now on, never use lightgbm") are carried into every later experiment's planning, capped and lean.
+- **`pause` / `resume`** park and continue the run at the next cell boundary, kernel kept alive (e2b leases included) and every clock suspended. **`/stop`** (or a double Ctrl-C) quits immediately and still prints the run summary of everything finished so far; a single Ctrl-C winds down gracefully first (the in-flight attempt banks its floor). Type **`/`** for the command palette: arrow keys move, Enter completes into the input box, a second Enter sends.
+
+Messages queue while a cell or an LLM call is in flight; you get an instant ack saying when they will land. The message routing is decided by the Supervisor but EXECUTED by the harness, and the guard stack outranks chat: a steer can shape a brief, it can never re-commission banked work, unseal the holdout, or bypass a gate. `--plain` keeps the classic scrolling output (chat still works, line by line); piped, scripted, CI, and backgrounded runs behave exactly as before, non-interactive.
+
+---
+
 ## Quick start
 
 **Local-first. $0. No API keys required.**
@@ -137,7 +145,7 @@ iterate run --data train.clean.csv --target churn --metric f1 \
             --until 30m --notebooks all
 ```
 
-Useful flags: `--max-iterations`, `--patience`, `--until` (wall-clock bound), `--notebooks best|all|none`, `--compute local|e2b`, `--install/--no-install` (package-install consent), `--think` (reasoning mode for the coder, Ollama only), `--fresh` (archive memory, start a new chapter), `--spec` (the v0.1 allow-list path, kept as the fast lane). Full reference: `iterate run --help`
+Useful flags: `--max-iterations`, `--patience`, `--until` (wall-clock bound), `--notebooks best|all|none`, `--compute local|e2b`, `--install/--no-install` (package-install consent), `--think` (reasoning mode for the coder, Ollama only), `--fresh` (archive memory, start a new chapter), `--plain` (classic output instead of the interactive UI), `--spec` (the v0.1 allow-list path, kept as the fast lane). Full reference: `iterate run --help`
 
 **Where things land:** `.iterate/runs/<run_id>/best.ipynb` (the runnable winner), `notebooks/` (with `--notebooks all`), `best.json` (config + score sidecar). Code-path winners ship as notebooks by design; `--spec` winners also save `best_model.joblib`.
 
@@ -163,7 +171,7 @@ All inherit from `BenchmarkTarget`. Same iteration loop, different execution pat
 
 ---
 
-## Pluggable data + tools via MCP (Week 12, v0.9)
+## Pluggable data + tools via MCP (v0.9)
 
 `iterate` will use **Model Context Protocol (MCP)** servers as its discovery layer: filesystem, Postgres, Notion and friends, so adding a data source is config, not code. The discovery workflow (agent introspects your tables, past experiments, and notebooks, then pauses for your gap-fill) lands at v0.9. Today the data interface is a prepared CSV, deliberately: the loop had to be proven before the input surface grows.
 
@@ -197,7 +205,7 @@ src/iterate/
 └── schemas/              # Pydantic types
 ```
 
-**The LLM is plug-and-play; the harness does the lifting.** The same loop runs on a local 12B or a cloud 70B. The bet (see the [infra-over-model A/B in EVAL_LOG.md](EVAL_LOG.md)): a good enough harness makes weak local models perform like much bigger ones, and the guard stack is what closed that gap.
+**The LLM is plug-and-play; the harness does the lifting.** The same loop runs on a local 12B or a cloud 70B. The bet (the infra-over-model A/B is logged in [DECISIONS.md](DECISIONS.md) and [BUILD_LOG.md](BUILD_LOG.md)): a good enough harness makes weak local models perform like much bigger ones, and the guard stack is what closed that gap.
 
 ---
 
@@ -217,7 +225,7 @@ src/iterate/
 | Auto-discovers data + context (MCP) | ✗ | ✗ | ✗ | partial | planned v0.9 |
 | Open-source | mostly ✗ | MLflow yes | ✗ | ✓ | ✓ |
 
-Known limits are documented honestly in [LIMITATIONS.md](LIMITATIONS.md); the evaluation trail lives in [EVAL_LOG.md](EVAL_LOG.md).
+Known limits are documented honestly in [LIMITATIONS.md](LIMITATIONS.md); the evaluation trail lives in [BUILD_LOG.md](BUILD_LOG.md).
 
 ---
 

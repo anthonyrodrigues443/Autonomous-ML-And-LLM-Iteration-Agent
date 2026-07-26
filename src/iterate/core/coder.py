@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
     from iterate.adapters.compute.kernel import CellResult, StatefulKernel
     from iterate.adapters.data.tabular import TabularDataset
+    from iterate.core.interactive import RunController
     from iterate.llm.base import LLMClient
     from iterate.schemas.experiment import ExperimentResult
 
@@ -240,6 +241,7 @@ class CodingAgent:
         max_cells: int = 50,  # safety backstop against a non-finishing loop; time is the real bound
         context_budget_chars: int = 400_000,  # prompt cap; oldest observations elide first
         wall_ceiling_seconds: float = 1800.0,  # hard wall-clock bound on one session
+        controller: RunController | None = None,  # interactive pause/chat; None = today's behavior
     ) -> None:
         self._client = client
         self._kernel = kernel
@@ -251,6 +253,7 @@ class CodingAgent:
         self._install = install
         self._max_cells = max_cells
         self._context_budget_chars = context_budget_chars
+        self._controller = controller
         # The kernel-time deadline deliberately does NOT charge LLM latency (a slow
         # local model gets the same working budget as a fast cloud one) — but that
         # leaves a thrashing session unbounded in wall-clock: tiny errored cells
@@ -274,6 +277,11 @@ class CodingAgent:
         from iterate.core.proposer import summarize_dataset
 
         cells: list[Cell] = []
+        if self._controller is not None:
+            # Share the live transcript by reference: a question typed mid-run
+            # is usually about the work on screen, which is not in Memory until
+            # this experiment finishes.
+            self._controller.live_cells = cells
         self._kernel.start(codegen.build_inputs(dataset))
         try:
             pre = codegen.session_preamble()
@@ -313,6 +321,8 @@ class CodingAgent:
                 predictions_sha256=hashlib.sha256(preds).hexdigest() if preds else None,
             )
         finally:
+            if self._controller is not None:
+                self._controller.live_cells = None
             self._kernel.close()
 
     def _drive(
@@ -352,6 +362,34 @@ class CodingAgent:
         truncation_rejections = 0  # consecutive truncated cells rejected unexecuted
         session_start = time.monotonic()
         for _ in range(self._max_cells):
+            if self._controller is not None:
+                # The interactive boundary, FIRST — a pending pause is honored
+                # before the session-ending checks below so its clock credit is in
+                # place when they run. Pause blocks IN PLACE (the kernel and every
+                # local survive; run()'s finally would kill the kernel on any
+                # return); the paused time shifts the wall-ceiling anchor forward
+                # so a long pause never burns the session. The kernel-time
+                # deadline needs no credit — it only accrues inside cell
+                # execution. A user note lands here as one more user-role message,
+                # exactly like the budget nudge; the loop top is the only safe
+                # injection point (the last message is always a tool result, so
+                # threading stays valid).
+                self._controller.status = f"session {experiment_id}: at a cell boundary"
+                paused = self._controller.checkpoint(self._kernel)
+                if paused:
+                    session_start += paused
+                if self._controller.abort_requested:
+                    log.info("coder[%s]: user stop; ending session", experiment_id)
+                    self._controller.reply(
+                        "session ended — banking a floor submission so this iteration "
+                        "still scores, then winding down"
+                    )
+                    return
+                for user_note in self._controller.take_session_notes():
+                    messages.append(
+                        Message(role="user", content=_PROMPTS["user_note_prefix"] + user_note)
+                    )
+                self._controller.status = f"session {experiment_id}: model writing the next cell"
             if work >= self._deadline_seconds:
                 break
             if time.monotonic() - session_start >= self._wall_ceiling_seconds:
@@ -500,6 +538,12 @@ class CodingAgent:
                 "coder[%s]: cell %d %s (%.1fs, %.0f/%.0fs budget)",
                 experiment_id, n_agent_cells, status, spent, work, self._deadline_seconds,
             )
+            if self._controller is not None:
+                self._controller.emit(
+                    "cell", code=code, index=n_agent_cells, status=status, seconds=spent,
+                    ok=not (cell_result.error or cell_result.timed_out),
+                    budget_spent=work, budget_total=self._deadline_seconds,
+                )
             obs = _observation(cell_result)
             if note:
                 obs = note + "\n\n" + obs
