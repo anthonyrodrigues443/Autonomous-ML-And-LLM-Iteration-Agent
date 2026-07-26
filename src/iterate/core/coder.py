@@ -198,6 +198,7 @@ class Cell:
     source: str  # "preamble" (trusted host cell) | "agent" | "fallback" (host floor submit)
     outputs: list[dict[str, Any]] = field(default_factory=list)  # nbformat-ready cell outputs
     thinking: str | None = None  # the model's reasoning that produced this cell (think mode)
+    timed_out: bool = False  # killed at the per-cell limit — the failure record needs the WHY
 
 
 @dataclass(frozen=True)
@@ -314,6 +315,10 @@ class CodingAgent:
             result = codegen.score_predictions(
                 dataset, preds, metric=self._metric, experiment_id=experiment_id
             )
+            if result.error:
+                forensics = _failure_forensics(cells)
+                if forensics:
+                    result = result.model_copy(update={"error": f"{result.error} ({forensics})"})
             logs = _tail("\n".join(c.stdout for c in cells if c.stdout))
             return CodingResult(
                 result=result.model_copy(update={"logs": logs or None}),
@@ -552,7 +557,22 @@ class CodingAgent:
             # different cells (e.g. swapping the encoder while the real cause — a string
             # column reaching a numeric step — is unchanged). When an error signature
             # recurs, escalate with a nudge that names it and forbids cosmetic retries.
-            if cell_result.error:
+            if cell_result.timed_out:
+                # A timeout is a failure the breakers must see: a live run burned
+                # its whole budget re-running an identical two-minute fit because
+                # timeouts didn't count and carried no corrective nudge.
+                consecutive_errors += 1
+                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    log.info(
+                        "coder[%s]: %d consecutive failed cells (timeouts included); ending session early",
+                        experiment_id, consecutive_errors,
+                    )
+                    return
+                obs = (
+                    _PROMPTS["timeout_nudge"].format(seconds=int(self._cell_timeout))
+                    + "\n\n" + obs
+                )
+            elif cell_result.error:
                 consecutive_errors += 1
                 if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                     # A DIFFERENT error each time evades the repeat and same-error
@@ -737,7 +757,31 @@ def _cell(code: str, result: CellResult, source: str, *, thinking: str | None = 
     return Cell(
         code=code, stdout=result.stdout, stderr=result.stderr, error=result.error,
         source=source, outputs=list(result.outputs), thinking=thinking,
+        timed_out=result.timed_out,
     )
+
+
+def _failure_forensics(cells: list[Cell]) -> str:
+    """One line on WHY a session died, appended to the failure record — the
+    supervisor's REPAIR rung and the dead-ends channel need the cause ("2 cells
+    timed out; last killed: model.fit(...)"), not just the contract violation."""
+    ran = [c for c in cells if c.source != "preamble"]
+    timeouts = [c for c in ran if c.timed_out]
+    errors = [c for c in ran if c.error and not c.timed_out]
+    parts: list[str] = []
+    if timeouts:
+        code = timeouts[-1].code
+        hot = next((ln.strip() for ln in code.splitlines() if ".fit(" in ln), None)
+        if hot is None:
+            hot = next(
+                (ln.strip() for ln in code.splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")),
+                "",
+            )
+        parts.append(f"{len(timeouts)} cell(s) timed out; last killed: {hot[:80]!r}")
+    if errors:
+        parts.append(f"{len(errors)} cell(s) errored; last: {_error_signature(errors[-1].error or '')}")
+    return "; ".join(parts)
 
 
 def _tail(text: str, limit: int = _OBSERVATION_TAIL) -> str:

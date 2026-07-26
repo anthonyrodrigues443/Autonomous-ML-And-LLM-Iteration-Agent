@@ -485,7 +485,7 @@ def test_session_without_predictions_banks_the_fallback_floor(tmp_path: Path) ->
     assert out.result.succeeded, out.result.error
     fallback = [c for c in out.cells if c.source == "fallback"]
     assert len(fallback) == 1
-    assert "HistGradientBoostingClassifier" in fallback[0].code
+    assert "LogisticRegression" in fallback[0].code
     assert "fallback baseline banked" in fallback[0].stdout
 
 
@@ -519,7 +519,7 @@ def test_fallback_falls_through_to_the_canned_baseline_when_carried_code_errors(
     fallback = [c for c in out.cells if c.source == "fallback"]
     assert len(fallback) == 2  # carried attempt (errored) + canned baseline (banked)
     assert fallback[0].error is not None
-    assert "HistGradientBoostingClassifier" in fallback[1].code
+    assert "LogisticRegression" in fallback[1].code
     assert "fallback baseline banked" in fallback[1].stdout
 
 
@@ -790,3 +790,56 @@ def test_live_cells_are_shared_during_the_session_and_cleared_after(tmp_path: Pa
     assert seen_live, "the interpreter never saw a checkpoint"
     assert seen_live[0] >= 1  # at least the preamble cell was visible live
     assert ctrl.live_cells is None  # cleared when the session ended
+
+
+# ─── Timeout resilience (v0.3.1: a live run lost an iteration to a fit-timeout spiral) ─
+
+
+class _TimeoutKernel:
+    """Every cell times out — simulates a fit that can never finish in the cap."""
+
+    def start(self, inputs: dict) -> None:
+        pass
+
+    def run_cell(self, code: str, *, timeout: float) -> CellResult:
+        return CellResult("", "", error=None, timed_out=True)
+
+    def install(self, packages: list) -> str:
+        return ""
+
+    def namespace_summary(self) -> str:
+        return ""
+
+    def read_output(self, name: str) -> bytes | None:
+        return None
+
+    def keepalive(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_timeouts_get_a_nudge_count_toward_the_breaker_and_enrich_the_failure(
+    tmp_path: Path,
+) -> None:
+    from iterate.core.coder import _MAX_CONSECUTIVE_ERRORS
+
+    # Each turn's cell differs slightly (as a real model retries) so the
+    # repeated-cell breaker does not swallow them before the timeout counter.
+    fake = _FakeLLM([
+        _run(f"model_{i} = HistGradientBoostingClassifier(random_state=42).fit(Xa, ya)")
+        for i in range(_MAX_CONSECUTIVE_ERRORS + 2)
+    ])
+    agent = CodingAgent(fake, _TimeoutKernel(), metric="f1", max_cells=20)  # type: ignore[arg-type]
+    coding = agent.run(dataset=_dataset(tmp_path), brief="b", experiment_id="to-test")
+    # the breaker sees timeouts: the session ended after the cap, not max_cells
+    assert len(fake.calls) == _MAX_CONSECUTIVE_ERRORS
+    # the second turn carried the timeout nudge, naming the limit and the pivot
+    second_turn = "\n".join(m.content or "" for m in fake.calls[1])
+    assert "per-cell limit" in second_turn
+    assert "faster model family" in second_turn
+    # the failure record carries the WHY, not just the contract violation
+    assert coding.result.error is not None
+    assert "timed out" in coding.result.error
+    assert "fit(" in coding.result.error
