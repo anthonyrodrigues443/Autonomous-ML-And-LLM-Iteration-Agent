@@ -8,12 +8,15 @@ import numpy as np
 import pytest
 
 from iterate.core.scoring import (
+    AVERAGES,
     CLASSIFICATION_METRICS,
     LABEL_METRICS,
     PROBA_METRICS,
+    REGISTRY,
     REGRESSION_METRICS,
     direction,
     requires_proba,
+    resolve_average,
     score,
     task_for_metric,
 )
@@ -142,3 +145,79 @@ def test_string_labels_score_against_the_greater_class_as_positive() -> None:
 def test_unknown_metric_names_the_known_ones() -> None:
     with pytest.raises(ValueError, match="roc_auc"):
         task_for_metric("nonsense")
+    with pytest.raises(ValueError, match="roc_auc"):
+        direction("nonsense")
+
+
+# ─── The registry is the single source of truth ──────────────────────────────
+
+
+def test_every_exported_set_is_derived_from_the_registry() -> None:
+    """The bug this guards: the panel, the direction table and the CLI's metric
+    names used to be independent lists, and they drifted."""
+    assert set(REGISTRY) == CLASSIFICATION_METRICS | REGRESSION_METRICS
+    assert not CLASSIFICATION_METRICS & REGRESSION_METRICS
+    for name, spec in REGISTRY.items():
+        assert task_for_metric(name) == spec.task
+        assert direction(name) == spec.direction
+        assert requires_proba(name) is spec.needs_proba
+
+
+def test_every_registered_metric_is_scorable() -> None:
+    """A row added to the registry without a working compute would otherwise only
+    surface on a live run."""
+    binary = score("classification", BINARY_TRUE, BINARY_PRED, y_proba=BINARY_PROBA)
+    regression = score("regression", [1.0, 2.0, 3.0], [1.1, 1.9, 3.2])
+    scored = set(binary) | set(regression)
+    assert scored == set(REGISTRY)
+
+
+def test_pr_auc_is_registered_and_maximizes() -> None:
+    assert requires_proba("average_precision")
+    assert direction("average_precision") == "maximize"
+    assert task_for_metric("average_precision") == "classification"
+
+
+def test_pr_auc_scores_on_both_binary_and_multiclass() -> None:
+    """PR-AUC is the metric that matters on an imbalanced target, so it has to
+    survive the multiclass path too — where sklearn needs a binarized y_true."""
+    binary = score("classification", BINARY_TRUE, BINARY_PRED, y_proba=BINARY_PROBA)
+    multi = score("classification", MULTI_TRUE, MULTI_PRED, y_proba=MULTI_PROBA)
+    assert 0.0 <= binary["average_precision"] <= 1.0
+    assert 0.0 <= multi["average_precision"] <= 1.0
+
+
+# ─── Configurable averaging ──────────────────────────────────────────────────
+
+
+def test_average_defaults_preserve_pre_v04_behaviour() -> None:
+    assert resolve_average(None, binary=True) == "binary"
+    assert resolve_average(None, binary=False) == "macro"
+
+
+@pytest.mark.parametrize("average", AVERAGES)
+def test_every_advertised_average_resolves(average: str) -> None:
+    assert resolve_average(average, binary=average == "binary") == average
+
+
+def test_micro_averaging_changes_the_label_metrics() -> None:
+    macro = score("classification", MULTI_TRUE, MULTI_PRED, average="macro")
+    micro = score("classification", MULTI_TRUE, MULTI_PRED, average="micro")
+    assert macro["f1"] != micro["f1"]
+
+
+def test_binary_averaging_on_a_multiclass_target_is_refused() -> None:
+    with pytest.raises(ValueError, match="two-class"):
+        score("classification", MULTI_TRUE, MULTI_PRED, average="binary")
+
+
+def test_unknown_average_names_the_known_ones() -> None:
+    with pytest.raises(ValueError, match="weighted"):
+        score("classification", BINARY_TRUE, BINARY_PRED, average="nonsense")
+
+
+def test_averaging_does_not_touch_the_probability_panel() -> None:
+    macro = score("classification", MULTI_TRUE, MULTI_PRED, y_proba=MULTI_PROBA, average="macro")
+    micro = score("classification", MULTI_TRUE, MULTI_PRED, y_proba=MULTI_PROBA, average="micro")
+    for name in PROBA_METRICS & set(macro):
+        assert macro[name] == micro[name]

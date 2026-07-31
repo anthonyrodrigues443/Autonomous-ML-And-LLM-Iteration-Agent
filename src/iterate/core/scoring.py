@@ -5,12 +5,21 @@ through these functions, so "improvement" stays an apples-to-apples comparison
 no matter how a candidate was run. Keep all metric computation here; nothing
 should reimplement it.
 
-Probability metrics (v0.4) are a bonus panel: pass `y_proba` and the classification
-panel gains ROC-AUC, log-loss and (binary only) Brier alongside the label metrics,
-which are always computed so a run's history stays comparable across iterations
-that did and didn't emit probabilities. `y_proba` shape follows the task — one
-positive-class probability per row for binary, one row per sample by one column
-per class for multiclass.
+Every metric is one row in `REGISTRY`, carrying its task, its direction, whether
+it needs probabilities, and how to compute it. Adding a metric is that row and
+nothing else — the exported frozensets, `direction()`, `task_for_metric()` and
+`requires_proba()` are all derived from it. That single source of truth is the
+point: the panel, the direction table and the CLI's own copy of the metric names
+used to be three independent lists, and they drifted (the CLI called every
+classification metric a maximize metric, which would have inverted the whole loop
+the moment log-loss became selectable).
+
+Probability metrics are a bonus panel: pass `y_proba` and the classification panel
+gains ROC-AUC, PR-AUC, log-loss and (binary only) Brier alongside the label
+metrics, which are always computed so a run's history stays comparable across
+iterations that did and didn't emit probabilities. `y_proba` shape follows the
+task — one positive-class probability per row for binary, one row per sample by
+one column per class for multiclass.
 
 Policy lives in the callers, not here: this module raises on malformed
 probabilities rather than deciding whether that should sink an experiment. Whether
@@ -21,11 +30,13 @@ only the caller knows.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     brier_score_loss,
     f1_score,
     log_loss,
@@ -36,28 +47,179 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from sklearn.preprocessing import label_binarize
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from iterate.adapters.models.registry import Task
 
-PROBA_METRICS = frozenset({"roc_auc", "log_loss", "brier"})
-LABEL_METRICS = frozenset({"accuracy", "f1", "precision", "recall"})
-CLASSIFICATION_METRICS = LABEL_METRICS | PROBA_METRICS
-REGRESSION_METRICS = frozenset({"rmse", "mae", "mse", "r2"})
-_MINIMIZE = frozenset({"rmse", "mae", "mse", "log_loss", "brier"})
+Direction = Literal["maximize", "minimize"]
+
+# Averaging applies to f1 / precision / recall only, which is exactly the
+# limitation LIMITATIONS.md tracks. ROC-AUC keeps macro averaging on multiclass:
+# sklearn's supported set for `multi_class="ovr"` is narrower and varies by
+# version, and this package's floor is scikit-learn>=1.5.
+AVERAGES = ("binary", "micro", "macro", "weighted")
+
+
+@dataclass(frozen=True)
+class Inputs:
+    """Everything a metric needs, resolved once per `score()` call."""
+
+    y_true: Any
+    y_pred: Any
+    y_proba: Any
+    classes: Any
+    average: str
+
+    @property
+    def binary(self) -> bool:
+        return len(self.classes) <= 2
+
+    @property
+    def positive(self) -> Any:
+        """The positive class: the greater label, stated explicitly rather than
+        left to sklearn's `pos_label=1` default, which raises on a string target
+        ("yes"/"no" has no label 1). Naming it here also keeps the label panel and
+        the probability panel pointed at the SAME class — f1 and Brier disagreeing
+        about which class is positive would make the panel incoherent."""
+        return self.classes[-1]
+
+    @property
+    def label_kwargs(self) -> dict[str, Any]:
+        if self.average == "binary":
+            return {"average": "binary", "pos_label": self.positive, "zero_division": 0}
+        return {"average": self.average, "zero_division": 0}
+
+    def positive_column(self) -> Any:
+        """Binary probabilities as a 1-D positive-class column."""
+        proba = np.asarray(self.y_proba, dtype=float)
+        if proba.ndim > 2:
+            raise ValueError(f"probabilities must be 1-D or 2-D, got {proba.ndim}-D")
+        if proba.ndim == 2:
+            if proba.shape[1] != 2:
+                raise ValueError(
+                    f"binary probabilities need 1 or 2 columns, got {proba.shape[1]}"
+                )
+            return proba[:, 1]
+        return proba
+
+    def class_matrix(self) -> Any:
+        """Multiclass probabilities as an (n_samples, n_classes) matrix."""
+        proba = np.asarray(self.y_proba, dtype=float)
+        if proba.ndim != 2 or proba.shape[1] != len(self.classes):
+            raise ValueError(
+                f"multiclass probabilities need one column per class "
+                f"({len(self.classes)}), got shape {proba.shape}"
+            )
+        return proba
+
+
+@dataclass(frozen=True)
+class MetricSpec:
+    task: Task
+    direction: Direction
+    needs_proba: bool
+    compute: Callable[[Inputs], float]
+    # Binary-only metrics are skipped on a multiclass target rather than raising:
+    # multiclass Brier landed after the scikit-learn>=1.5 floor this package ships.
+    binary_only: bool = False
+
+
+def _roc_auc(i: Inputs) -> float:
+    if i.binary:
+        return float(roc_auc_score(i.y_true, i.positive_column()))
+    return float(roc_auc_score(i.y_true, i.class_matrix(), multi_class="ovr", average="macro"))
+
+
+def _average_precision(i: Inputs) -> float:
+    if i.binary:
+        return float(
+            average_precision_score(i.y_true, i.positive_column(), pos_label=i.positive)
+        )
+    # Binarized explicitly rather than handed a multiclass y_true: sklearn only
+    # grew multiclass support for this metric well after the >=1.5 floor, and it
+    # raises "multiclass format is not supported" below that.
+    binarized = label_binarize(i.y_true, classes=list(i.classes))
+    return float(average_precision_score(binarized, i.class_matrix(), average="macro"))
+
+
+def _log_loss(i: Inputs) -> float:
+    proba = i.positive_column() if i.binary else i.class_matrix()
+    return float(log_loss(i.y_true, proba, labels=i.classes))
+
+
+def _brier(i: Inputs) -> float:
+    return float(brier_score_loss(i.y_true, i.positive_column(), pos_label=i.positive))
+
+
+def _mse(i: Inputs) -> float:
+    return float(mean_squared_error(i.y_true, i.y_pred))
+
+
+REGISTRY: dict[str, MetricSpec] = {
+    "accuracy": MetricSpec(
+        "classification", "maximize", False, lambda i: float(accuracy_score(i.y_true, i.y_pred))
+    ),
+    "f1": MetricSpec(
+        "classification",
+        "maximize",
+        False,
+        lambda i: float(f1_score(i.y_true, i.y_pred, **i.label_kwargs)),
+    ),
+    "precision": MetricSpec(
+        "classification",
+        "maximize",
+        False,
+        lambda i: float(precision_score(i.y_true, i.y_pred, **i.label_kwargs)),
+    ),
+    "recall": MetricSpec(
+        "classification",
+        "maximize",
+        False,
+        lambda i: float(recall_score(i.y_true, i.y_pred, **i.label_kwargs)),
+    ),
+    "roc_auc": MetricSpec("classification", "maximize", True, _roc_auc),
+    "average_precision": MetricSpec("classification", "maximize", True, _average_precision),
+    "log_loss": MetricSpec("classification", "minimize", True, _log_loss),
+    "brier": MetricSpec("classification", "minimize", True, _brier, binary_only=True),
+    "rmse": MetricSpec("regression", "minimize", False, lambda i: math.sqrt(_mse(i))),
+    "mae": MetricSpec(
+        "regression", "minimize", False, lambda i: float(mean_absolute_error(i.y_true, i.y_pred))
+    ),
+    "mse": MetricSpec("regression", "minimize", False, _mse),
+    "r2": MetricSpec(
+        "regression", "maximize", False, lambda i: float(r2_score(i.y_true, i.y_pred))
+    ),
+}
+
+CLASSIFICATION_METRICS = frozenset(
+    name for name, spec in REGISTRY.items() if spec.task == "classification"
+)
+REGRESSION_METRICS = frozenset(
+    name for name, spec in REGISTRY.items() if spec.task == "regression"
+)
+PROBA_METRICS = frozenset(name for name, spec in REGISTRY.items() if spec.needs_proba)
+LABEL_METRICS = CLASSIFICATION_METRICS - PROBA_METRICS
 
 
 def task_for_metric(metric: str) -> Task:
-    if metric in REGRESSION_METRICS:
-        return "regression"
-    if metric in CLASSIFICATION_METRICS:
-        return "classification"
-    known = sorted(CLASSIFICATION_METRICS | REGRESSION_METRICS)
-    raise ValueError(f"unknown metric {metric!r}; expected one of {known}")
+    try:
+        return REGISTRY[metric].task
+    except KeyError:
+        raise ValueError(
+            f"unknown metric {metric!r}; expected one of {sorted(REGISTRY)}"
+        ) from None
 
 
-def direction(metric: str) -> Literal["maximize", "minimize"]:
-    return "minimize" if metric in _MINIMIZE else "maximize"
+def direction(metric: str) -> Direction:
+    try:
+        return REGISTRY[metric].direction
+    except KeyError:
+        raise ValueError(
+            f"unknown metric {metric!r}; expected one of {sorted(REGISTRY)}"
+        ) from None
 
 
 def requires_proba(metric: str) -> bool:
@@ -69,83 +231,62 @@ def requires_proba(metric: str) -> bool:
     return metric in PROBA_METRICS
 
 
-def score(task: Task, y_true: Any, y_pred: Any, *, y_proba: Any = None) -> dict[str, float]:
-    if task == "regression":
-        mse = float(mean_squared_error(y_true, y_pred))
-        return {
-            "rmse": math.sqrt(mse),
-            "mae": float(mean_absolute_error(y_true, y_pred)),
-            "mse": mse,
-            "r2": float(r2_score(y_true, y_pred)),
-        }
-    # The positive class is the greater label, stated explicitly rather than left
-    # to sklearn's pos_label=1 default: a string target ("yes"/"no") has no label
-    # 1, so the default raises. Naming it here also keeps the label panel and the
-    # probability panel pointed at the SAME positive class — f1 and brier
-    # disagreeing about which class is positive would make the panel incoherent.
+def resolve_average(average: str | None, *, binary: bool) -> str:
+    """The averaging strategy for f1 / precision / recall.
+
+    None means auto, which preserves the pre-v0.4 behaviour exactly: binary on a
+    two-class target, macro otherwise. An explicit choice is honoured, except that
+    "binary" on a multiclass target is a contradiction and raises.
+    """
+    if average is None:
+        return "binary" if binary else "macro"
+    if average not in AVERAGES:
+        raise ValueError(f"unknown average {average!r}; expected one of {list(AVERAGES)}")
+    if average == "binary" and not binary:
+        raise ValueError("average='binary' needs a two-class target")
+    return average
+
+
+def score(
+    task: Task,
+    y_true: Any,
+    y_pred: Any,
+    *,
+    y_proba: Any = None,
+    average: str | None = None,
+) -> dict[str, float]:
     classes = np.unique(np.asarray(y_true))
-    binary = len(classes) <= 2
-    average = "binary" if binary else "macro"
-    positive: dict[str, Any] = {"pos_label": classes[-1]} if binary else {}
-    values = {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "f1": float(f1_score(y_true, y_pred, average=average, zero_division=0, **positive)),
-        "precision": float(
-            precision_score(y_true, y_pred, average=average, zero_division=0, **positive)
-        ),
-        "recall": float(
-            recall_score(y_true, y_pred, average=average, zero_division=0, **positive)
-        ),
-    }
-    if y_proba is not None:
-        values.update(_proba_scores(y_true, y_proba, classes))
+    inputs = Inputs(
+        y_true=y_true,
+        y_pred=y_pred,
+        y_proba=y_proba,
+        classes=classes,
+        average=resolve_average(average, binary=len(classes) <= 2),
+    )
+    values: dict[str, float] = {}
+    for name, spec in REGISTRY.items():
+        if spec.task != task:
+            continue
+        if spec.needs_proba and y_proba is None:
+            continue
+        if spec.binary_only and not inputs.binary:
+            continue
+        values[name] = spec.compute(inputs)
     return values
 
 
-def _proba_scores(y_true: Any, y_proba: Any, classes: Any) -> dict[str, float]:
-    """The probability panel. Raises ValueError on a shape that can't be scored.
-
-    sklearn clips log-loss internally (>=1.5), so a confidently-wrong probability
-    yields a large finite number rather than `inf` — which matters because
-    `Metrics` rejects non-finite values outright.
-    """
-    proba = np.asarray(y_proba, dtype=float)
-    if proba.ndim > 2:
-        raise ValueError(f"probabilities must be 1-D or 2-D, got {proba.ndim}-D")
-
-    if len(classes) <= 2:
-        if proba.ndim == 2:
-            if proba.shape[1] != 2:
-                raise ValueError(
-                    f"binary probabilities need 1 or 2 columns, got {proba.shape[1]}"
-                )
-            proba = proba[:, 1]
-        positive = classes[-1]
-        return {
-            "roc_auc": float(roc_auc_score(y_true, proba)),
-            "log_loss": float(log_loss(y_true, proba, labels=classes)),
-            # Binary only: multiclass Brier landed after the scikit-learn>=1.5 floor.
-            "brier": float(brier_score_loss(y_true, proba, pos_label=positive)),
-        }
-
-    if proba.ndim != 2 or proba.shape[1] != len(classes):
-        raise ValueError(
-            f"multiclass probabilities need one column per class "
-            f"({len(classes)}), got shape {proba.shape}"
-        )
-    return {
-        "roc_auc": float(roc_auc_score(y_true, proba, multi_class="ovr", average="macro")),
-        "log_loss": float(log_loss(y_true, proba, labels=classes)),
-    }
-
-
 __all__ = [
+    "AVERAGES",
     "CLASSIFICATION_METRICS",
     "LABEL_METRICS",
     "PROBA_METRICS",
+    "REGISTRY",
     "REGRESSION_METRICS",
+    "Inputs",
+    "MetricSpec",
     "direction",
     "requires_proba",
+    "resolve_average",
     "score",
     "task_for_metric",
 ]
