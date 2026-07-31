@@ -51,10 +51,6 @@ app = typer.Typer(
 
 console = Console()
 
-# Metric → task. Matches the private logic in iterate.targets.model.
-_CLASSIFICATION_METRICS = {"accuracy", "f1", "precision", "recall"}
-_REGRESSION_METRICS = {"rmse", "mae", "mse", "r2"}
-
 
 @app.callback()
 def _root() -> None:
@@ -225,6 +221,8 @@ def run(
     from iterate.core.orchestrator import Orchestrator
     from iterate.core.proposer import Proposer, summarize_dataset
     from iterate.core.reconstructor import Reconstructor
+    from iterate.core.scoring import CLASSIFICATION_METRICS, REGRESSION_METRICS
+    from iterate.core.scoring import direction as metric_direction
     from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor
     from iterate.core.terminator import default_terminator
@@ -253,10 +251,10 @@ def run(
     if baseline is not None and source is None:
         raise typer.BadParameter("--baseline requires --source")
     metric = metric.lower()
-    if metric not in _CLASSIFICATION_METRICS and metric not in _REGRESSION_METRICS:
+    if metric not in CLASSIFICATION_METRICS and metric not in REGRESSION_METRICS:
         raise typer.BadParameter(
             f"unknown metric {metric!r}; expected one of "
-            f"{sorted(_CLASSIFICATION_METRICS | _REGRESSION_METRICS)}"
+            f"{sorted(CLASSIFICATION_METRICS | REGRESSION_METRICS)}"
         )
 
     settings = get_settings()
@@ -306,7 +304,7 @@ def run(
     dataset = load_csv(data, target=target)
     model_target = ModelTarget(dataset, metric=metric)
     data_summary = summarize_dataset(dataset)
-    direction = "minimize" if metric in _REGRESSION_METRICS else "maximize"
+    direction = metric_direction(metric)
 
     # ─── LLM clients + memory ──────────────────────────────────────────────
     # Two clients on purpose: thinking applies to the CODER only. The supervisor
@@ -669,7 +667,9 @@ def _candidate_model(candidate: Candidate) -> str:
 
 def _default_baseline_model(metric: str) -> str:
     """Factory default per task. Mirrors the private mapping in adapters.models.registry."""
-    if metric in _CLASSIFICATION_METRICS:
+    from iterate.core.scoring import task_for_metric
+
+    if task_for_metric(metric) == "classification":
         return "sklearn.ensemble.HistGradientBoostingClassifier"
     return "sklearn.ensemble.HistGradientBoostingRegressor"
 
