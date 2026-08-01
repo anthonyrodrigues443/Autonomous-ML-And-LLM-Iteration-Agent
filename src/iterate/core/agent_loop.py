@@ -18,6 +18,8 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from iterate.adapters.compute.local import run_in_process
+from iterate.core.critic import stamp as stamp_verdict
+from iterate.core.critic import was_rejected
 from iterate.core.orchestrator import RunResult
 from iterate.core.researcher import credited
 from iterate.core.supervisor import (
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
 
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.core.coder import CodingAgent
+    from iterate.core.critic import Critic
     from iterate.core.interactive import RunController
     from iterate.core.memory import Memory
     from iterate.core.researcher import Findings, Researcher
@@ -77,6 +80,7 @@ def run_supervised(
     data_summary: str,
     summarizer: Summarizer | None = None,
     researcher: Researcher | None = None,
+    critic: Critic | None = None,
     max_research_calls: int = 3,
     on_experiment: Callable[..., None] | None = None,
     controller: RunController | None = None,
@@ -252,6 +256,15 @@ def run_supervised(
                         experiment = _digest(summarizer, experiment, iteration)
                     experiment = _sanitize_unmeasured_digest(experiment, decision.brief)
                     current_run.append(experiment)
+                    if critic is not None:
+                        bar = (
+                            best.result.metrics.primary_value
+                            if best is not None
+                            and best.result is not None
+                            and best.result.metrics is not None
+                            else None
+                        )
+                        stamp_verdict(experiment, critic.review(experiment, previous_best=bar))
                     memory.record(run_id, experiment)
                     last_experiment = experiment
                     result = experiment.result
@@ -265,7 +278,11 @@ def run_supervised(
                     else:
                         log.info("agent loop: iteration %d %r -> failed (%s)", iteration,
                                  decision.title, result.error)
-                    if result.succeeded and _improves(result, best, baseline, direction):
+                    if (
+                        result.succeeded
+                        and _improves(result, best, baseline, direction)
+                        and not was_rejected(experiment)
+                    ):
                         best = experiment
                         outcome = "improved"
                     else:

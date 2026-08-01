@@ -288,7 +288,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | done |
 | Tue Jul 28 | Experiment dossier, deterministic (distill captured cell stdout into a structured per-experiment record feeding briefs) + lean tried/untried idea ledger on `components_used` (capped, out of the dense supervisor prompt; watch for the EDA-ledger regression pattern) | dossier + ledger + tests | done |
 | Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | done |
-| Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | |
+| Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | done (Summarizer-authors-dossier deferred, see entry) |
 | Fri Jul 31 | Dial A: agent picks the metric + starting model from research + the data profile; `--metric` optional; the RESEARCHER picks it (not the supervisor — the metric must exist before ModelTarget, which exists before the baseline, which is an argument to decide(), so at choosing time the supervisor has no baseline or history to reason from); validated against the registry for name and task, defaulting deterministically from the target dtype when research is unavailable; FIXED at run start and never changed mid-run, since one ruler is what makes history and cross-run baselines comparable; free unscored inspect/EDA step so exploration stops costing a scored iteration | proposer/supervisor + CLI + loop + tests | |
 | Sat Aug 1 | Certification-style validation on gemma4:12b (bar criteria + citations genuine + Critic catches seeded leakage + no context regression) + fixes; buffer absorbs anything slipped Mon-Fri | validation + fixes | |
 | Sun Aug 2 | **Release v0.4.0** per the standing checklist; LIMITATIONS retires the metric-panel, proba-metrics, and averaging rows and states the CV cut | v0.4.0 out | |
@@ -483,6 +483,30 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-01 | Sprint 2 Day 4 | The Critic: can this score be believed?
+
+**Task:** The last specialist. Reviews every finished experiment before its score is allowed to bank as the run's best. This is the direct answer to the question a commenter asked in public — whether the agent can tell overfitting from genuine improvement (PROGRESS_NOTES:140) — and to the leak class that cannot be caught statically (PROGRESS_NOTES:162).
+
+**Deviation from the plan row, argued and taken:** the row specifies leak review "as a typed PRE-EXECUTION check". Moved to post-session, pre-banking, for three reasons. There is no single "the code" before execution on the cell-by-cell path — a pre-execution check means an LLM call PER CELL, and sessions run 10-30 cells. The question is about the score, not the code: leakage matters because it inflates a holdout number, which is inherently a post-hoc judgement. And the mirage check needs the score anyway, so both jobs land in one call instead of two mechanisms.
+
+**The design decision this day turns on — leak vetoes, mirage does not:**
+- **leak** = a defect visible in the submitted code (a transform fitted on the holdout, the target used to build a feature). VETOES banking, because a number produced by cheating is not a score.
+- **mirage** = a statistical suspicion about the gain, most often a holdout score far above the validation trail. FLAGS only, never vetoes.
+
+A leak is checkable, so acting on it is safe. Whether a gain is "real" is probabilistic, and the sealed holdout is already this project's ruler — letting a 12B overrule it would put a model back into the control flow that direction, the guard stack and duplicate-hashing were all deliberately kept out of. So the Critic can subtract a win it can prove was cheated, and can raise a hand about one it merely doubts. Nothing it says can promote a losing experiment; it only ever takes away.
+
+**What shipped:**
+- `core/critic.py` + `critic:` prompts key. One structured call per experiment, reviewing the backward slice from the final predictions write (`submit_path_code`, promoted from private) so probes and abandoned branches are already excluded. It sees the holdout score, the previous best, and the validation trail the session printed — the val-vs-holdout gap IS the mirage evidence, so it is put in front of the model rather than left to be inferred. **Day 2's dossier supplies that trail**, which is the first place that day's work paid off.
+- Verdicts stamped into `candidate.changes` as `critic_rejected` / `critic_flagged`, joining `duplicate_submission` and `lever_unmeasured`. The supervisor's technique table already excludes stamped experiments from crediting their techniques, so a vetoed experiment stops teaching a false lesson with **zero new prompt context**.
+- The banking gate reads `_improves(...) and not was_rejected(...)`. Deterministic ruler first, veto second, and the veto can only subtract.
+- **The history annotation is not optional colour.** Without it the supervisor reads a leaked 0.81 as the run's high-water mark and pushes that direction, so the scoreboard would be actively lying. A rejected score renders as `f1=0.8100 [REJECTED, <reason> — this number is not a result]`, the same pattern the floor and duplicate markers already use.
+- Degrades like every other agent: a backend failure, a model that will not call the tool, a failed experiment, or a spec candidate with no code all yield a clean verdict. A flaky review must never cost a real result. String booleans are coerced, because the supervisor hit `bool("false") is True` live on groq and the same models drive the Critic.
+- `--critique/--no-critique`, defaulting on. 19 new tests; 552 unit tests, ruff + mypy --strict clean.
+
+**Verified end to end:** a pipeline fitting StandardScaler on `pd.concat([X_train, X_holdout])` scored 0.81 against a 0.60 baseline. It passes `_improves`. The Critic caught the concat, the experiment was stamped rejected, and it did not bank.
+
+**Deferred, deliberately: the Summarizer graduating to author the dossier.** That is Day 2's carried deferral and the only part of this day that changes what the supervisor eventually reads, so it is the part carrying the June EDA-ledger risk. Shipping an unmeasured context change the day before a release, with Dial A and the certification run still ahead, is the trade that bites. It stays for the v0.5 week with the decision rule already written down: keep only if lever diversity holds.
 
 ### 2026-08-01 | Sprint 2 Day 3 | The Researcher: literature grounding with citations that cannot be invented
 

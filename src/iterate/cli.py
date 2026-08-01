@@ -145,6 +145,12 @@ def run(
         help="Ground briefs in retrievable literature (OpenAlex + arXiv, no API key). "
         "Cached on disk; --no-research skips it entirely for offline or fast runs.",
     ),
+    critique: bool = typer.Option(
+        True,
+        "--critique/--no-critique",
+        help="Review each experiment for leakage and for gains that look like luck. "
+        "A proven leak stops that experiment banking as the run's best.",
+    ),
     baseline: float | None = typer.Option(
         None, "--baseline", help="Your reported baseline score (sanity check; requires --source)."
     ),
@@ -229,6 +235,7 @@ def run(
     from iterate.adapters.data.tabular import load_csv
     from iterate.core.agent_loop import run_supervised
     from iterate.core.coder import CodingAgent
+    from iterate.core.critic import Critic
     from iterate.core.memory import SqliteMemory
     from iterate.core.orchestrator import Orchestrator
     from iterate.core.proposer import Proposer, summarize_dataset
@@ -363,6 +370,9 @@ def run(
         # Same no-think client as the other strict roles: the Researcher must emit
         # a single structured tool call, and a thinking trace crowds that out.
         # Cached beside the runs so a re-run on the same data pays nothing.
+        critic_agent = (
+            Critic(client, metric=metric, direction=direction) if critique else None
+        )
         researcher = (
             Researcher(
                 client,
@@ -484,7 +494,7 @@ def run(
                 target=model_target, dataset=dataset, supervisor=supervisor,
                 make_coder=make_coder, terminator=terminator, memory=loop_memory,
                 data_summary=data_summary, summarizer=summarizer,
-                researcher=researcher,
+                researcher=researcher, critic=critic_agent,
                 on_experiment=on_experiment, controller=controller,
             )
 

@@ -493,6 +493,61 @@ supervisor:
       brief: |-
         The "next:" move handed to the coding agent: 1-2 lines opening "next:", exactly ONE move naming the technique and its lever class, with one reason citing a profile fact or a past number; effect in plain words, never a predicted number. Do NOT write a "so far:" summary — the harness composes that slot from the recorded history and discards anything you write before "next:". Example: next: imbalance-or-threshold: class balance 73/27, metric f1, keep the best pipeline and train with class_weight balanced so the majority class stops dominating. On experiment 1 brief the plain baseline only (one-hot, median-impute, HistGradientBoosting), nothing else: no extra models, features, or tuning. After experiment 1, keep the best configuration and add exactly one change; never repeat a scored approach. Required unless stopping.
 
+critic:
+  # Reviews ONE finished experiment before its score is allowed to bank as the run's
+  # best. Two questions with deliberately different consequences:
+  #
+  #   leak   -> a verifiable defect in the submitted code. VETOES banking, because
+  #             the number was produced by cheating and is not a score at all.
+  #   mirage -> a statistical suspicion about the gain. FLAGS only, never vetoes.
+  #
+  # The split is the point. A leak is visible in code and checkable, so acting on it
+  # is safe. Whether a gain is "real" is a probabilistic judgement, and the sealed
+  # holdout is already this project's ruler — letting a 12B overrule it would put a
+  # model back in the control flow that direction, guards and duplicate-hashing were
+  # all deliberately kept out of.
+
+  # Placeholders: {metric}, {direction}
+  system: |-
+    You review one finished machine-learning experiment for HONESTY, not for quality. The score is '{metric}' ({direction}) measured on a sealed holdout the experiment never saw. Someone else already decided whether the number is an improvement; your job is whether the number can be believed.
+
+    LEAK — did the submitted pipeline see the holdout, or the target, when it should not have? Look for: a scaler, imputer or encoder FIT on train and holdout together (fit_transform on a combined frame, or fit on X_holdout); target encoding or aggregate statistics computed over all rows rather than the training fold; the target column used to build a feature; a validation split carved AFTER transforms were already fitted on everything. Only report a leak you can point at in the code shown. Rebuilding the same transform separately for train and holdout is CORRECT, not a leak. Transforming the holdout with an object fitted on train only is CORRECT.
+
+    MIRAGE — is the reported gain likely to be luck rather than signal? The strongest evidence is a large gap between the validation scores the session printed and the holdout score it reached: validation around 0.55 with a holdout of 0.68 is not a better model, it is a lucky split or a leak you did not spot. A gain far smaller than the run-to-run wobble visible in the validation trail is also weak. An improvement consistent with the validation trail is NOT a mirage.
+
+    Be conservative in both. A false leak report throws away a real result. Report leak=false and mirage=false whenever the evidence is not in front of you. Call review_experiment; respond with nothing else.
+
+  # Placeholders: {metric}, {score}, {previous_best}, {val_trail}, {code}
+  user_template: |-
+    Holdout {metric}: {score}
+    Best before this experiment: {previous_best}
+    Validation scores this session printed, in order: {val_trail}
+
+    The code that produced the submission (a backward slice from the final predictions write, so probes and abandoned branches are already excluded):
+    ---
+    {code}
+    ---
+
+    Review it now by calling review_experiment.
+
+  retry_nudge: "Respond ONLY by calling the review_experiment tool. No prose."
+
+  tool:
+    name: review_experiment
+    description: "Record whether this experiment's score can be believed."
+    fields:
+      leak: >-
+        true only if the submitted code demonstrably fit something on the holdout,
+        or used the target to build a feature. Must be pointable-at in the code
+        shown. When unsure, false.
+      mirage: >-
+        true only if the gain looks like luck rather than signal — most often a
+        holdout score far above the validation trail the session printed. When
+        unsure, false.
+      reason: >-
+        ONE sentence naming the specific line or step, and for a mirage the two
+        numbers being compared. Empty when both flags are false.
+
 summarizer:
   # Distills ONE finished experiment notebook into a structured digest for the
   # Supervisor. Runs once per experiment; reads only that session, never others.
