@@ -62,7 +62,7 @@ def _content_hash(frame: pd.DataFrame) -> str:
     return hashlib.sha256(row_hashes.tobytes()).hexdigest()[:16]
 
 
-def _looks_like_classification(target: pd.Series) -> bool:
+def looks_like_classification(target: pd.Series) -> bool:
     """Discrete target → classification; a continuous float target → regression."""
     if not pd.api.types.is_float_dtype(target):
         return True
@@ -90,7 +90,7 @@ def load_csv(
     feature_frame = frame[features]
     target_col = frame[target]
 
-    stratify_on = target_col if (stratify and _looks_like_classification(target_col)) else None
+    stratify_on = target_col if (stratify and looks_like_classification(target_col)) else None
     train_feat, test_feat, train_tgt, test_tgt = train_test_split(
         feature_frame,
         target_col,

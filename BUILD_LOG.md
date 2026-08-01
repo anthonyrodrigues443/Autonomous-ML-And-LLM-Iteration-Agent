@@ -289,7 +289,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Tue Jul 28 | Experiment dossier, deterministic (distill captured cell stdout into a structured per-experiment record feeding briefs) + lean tried/untried idea ledger on `components_used` (capped, out of the dense supervisor prompt; watch for the EDA-ledger regression pattern) | dossier + ledger + tests | done |
 | Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | done |
 | Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | done (Summarizer-authors-dossier deferred, see entry) |
-| Fri Jul 31 | Dial A: agent picks the metric + starting model from research + the data profile; `--metric` optional; the RESEARCHER picks it (not the supervisor — the metric must exist before ModelTarget, which exists before the baseline, which is an argument to decide(), so at choosing time the supervisor has no baseline or history to reason from); validated against the registry for name and task, defaulting deterministically from the target dtype when research is unavailable; FIXED at run start and never changed mid-run, since one ruler is what makes history and cross-run baselines comparable; free unscored inspect/EDA step so exploration stops costing a scored iteration | proposer/supervisor + CLI + loop + tests | |
+| Fri Jul 31 | Dial A: agent picks the metric + starting model from research + the data profile; `--metric` optional; the RESEARCHER picks it (not the supervisor — the metric must exist before ModelTarget, which exists before the baseline, which is an argument to decide(), so at choosing time the supervisor has no baseline or history to reason from); validated against the registry for name and task, defaulting deterministically from the target dtype when research is unavailable; FIXED at run start and never changed mid-run, since one ruler is what makes history and cross-run baselines comparable; free unscored inspect/EDA step so exploration stops costing a scored iteration | proposer/supervisor + CLI + loop + tests | done (free inspect step cut, see entry) |
 | Sat Aug 1 | Certification-style validation on gemma4:12b (bar criteria + citations genuine + Critic catches seeded leakage + no context regression) + fixes; buffer absorbs anything slipped Mon-Fri | validation + fixes | |
 | Sun Aug 2 | **Release v0.4.0** per the standing checklist; LIMITATIONS retires the metric-panel, proba-metrics, and averaging rows and states the CV cut | v0.4.0 out | |
 
@@ -483,6 +483,30 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-01 | Sprint 2 Day 5 | Dial A: the first input to disappear since v0.1
+
+**Task:** `--metric` becomes optional. This is the roadmap spine turning — v0.2 and v0.3 both read "(same inputs)" in the README release table and grew capability instead; v0.4 is the first release since v0.1 where the inputs you must give SHRINK.
+
+**Design change from the plan, on Tony's call.** The plan had a dedicated `choose_setup()` pass to pick the metric. Wrong for two reasons he named: it would run research TWICE (once pre-loop to pick a metric, again at iteration 1 to pick techniques), and the metric — the thing the entire run optimizes — would have been decided by the THINNER of the two passes, grounded in a class balance rather than in literature. Revised to one retrieval feeding two judgements: the same fetched papers back both the setup choice and the technique suggestions, so the metric choice compounds off the full research. It is also fewer calls than before, since iteration 1 no longer researches separately.
+
+Kept as a separate structured call rather than extra fields on `suggest_techniques`: a 12B asked for techniques, a metric AND a starting model in one emit starts dropping fields (DECISIONS 2026-06-01, one focused job per specialist call). Two calls over identical papers cost one local LLM call and zero extra API calls.
+
+**The construction-order blocker, fixed first.** `ModelTarget` was built at cli.py:329 and the LLM client at 338 — the metric was needed nine lines before the thing that could choose it existed. `summarize_dataset` needs only the dataset and `build_client` needs neither, so both moved above. Mechanical, no behaviour change.
+
+**What shipped:**
+- `core/setup.py` — the single place a run's ruler is decided. Explicit wins; otherwise the proposal is validated against the registry AND against the target column; anything failing falls back to what v0.3 would have run (f1 / f1_macro / rmse). **The agent can only ever upgrade the default**, never produce a run that fails to start.
+- The choice is printed with its reason before the first experiment. A tool that silently picks your evaluation metric is worse than one that asks.
+- The starting model is treated as a WEAKER claim than the metric: a junk model name falls back on its own without costing the metric choice, because the agent rewrites the model every iteration anyway — a bad one costs one experiment, a bad ruler costs the run.
+- 17 new tests; 569 unit tests, ruff + mypy --strict clean.
+
+**A duplicate-source-of-truth bug caught by a failing test, the third of this sprint.** I wrote a fresh classification-vs-regression heuristic in `target_task`. `tabular.py` already had one (`_looks_like_classification`, used to decide whether to stratify), and they disagreed: on an integer target with many distinct values mine said regression, the loader said classification. The test failed inside `load_csv` — the dataset could not even be LOADED. `target_task` now delegates to the loader's heuristic. Two definitions of "is this classification" would eventually diverge, and a metric chosen for a task the data was never split for cannot score at all.
+
+That also surfaced a pre-existing limitation, now recorded: an integer regression target (a count, a year) gets stratified and raises at load time. Fixing the heuristic changes every existing split and therefore every recorded score, so it needs its own change rather than being a side effect of this one.
+
+**Verified end to end**, with live API calls on the agent path: explicit `--metric roc_auc` wins unchanged; offline gives `f1` exactly as v0.3 did; the agent on a 27/73 imbalanced target picks `average_precision` and explains that PR-AUC reflects the minority class where accuracy and ROC-AUC flatter the majority; a proposed `rmse` on a label target is rejected and falls back to `f1`.
+
+**Cut: the free unscored inspect step.** It needs a fourth `AttemptOutcome`, must not burn patience or count toward `max_iterations`, and needs its own cap so an unproductive inspect cannot eat the budget. That is a loop change with real blast radius, and it is an efficiency improvement rather than part of the README promise ("agent picks the metric + starting model"). Not worth its risk the night before a release with the certification run still to go. Moves to the v0.5 week.
 
 ### 2026-08-01 | Sprint 2 Day 4 | The Critic: can this score be believed?
 

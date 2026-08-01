@@ -57,12 +57,23 @@ class Suggestion:
 
 
 @dataclass(frozen=True)
+class Setup:
+    """How the run should be measured, chosen from the same papers the technique
+    suggestions came from. Validated by the caller before anything is built."""
+
+    metric: str
+    starting_model: str = ""
+    why: str = ""
+
+
+@dataclass(frozen=True)
 class Findings:
     """What one research pass produced. Empty is a valid, common outcome."""
 
     suggestions: list[Suggestion] = field(default_factory=list)
     queries: list[str] = field(default_factory=list)
     papers_seen: int = 0
+    setup: Setup | None = None  # only on the pre-loop pass, when no metric was given
 
     def __bool__(self) -> bool:
         return bool(self.suggestions)
@@ -125,6 +136,25 @@ def _suggest_tool() -> ToolSpec:
     )
 
 
+def _setup_tool() -> ToolSpec:
+    spec = _PROMPTS["setup_tool"]
+    fields = spec["fields"]
+    return ToolSpec(
+        name=spec["name"],
+        description=spec["description"],
+        parameters={
+            "type": "object",
+            "properties": {
+                "metric": {"type": "string", "description": fields["metric"]},
+                "starting_model": {"type": "string", "description": fields["starting_model"]},
+                "why": {"type": "string", "description": fields["why"]},
+            },
+            "required": ["metric"],
+        },
+    )
+
+
+CHOOSE_SETUP = _setup_tool()
 PLAN_QUERIES = _queries_tool()
 SUGGEST_TECHNIQUES = _suggest_tool()
 
@@ -136,8 +166,8 @@ class Researcher:
         self,
         client: LLMClient,
         *,
-        metric: str,
-        direction: str,
+        metric: str = "",
+        direction: str = "",
         sources: Sequence[PaperSource] | None = None,
         cache_dir: Any | None = None,
         temperature: float = 0.3,
@@ -154,7 +184,14 @@ class Researcher:
         self._temperature = temperature
         self._max_tokens = max_tokens
 
-    def research(self, *, profile: str, tried: Sequence[str] = ()) -> Findings:
+    def research(
+        self,
+        *,
+        profile: str,
+        tried: Sequence[str] = (),
+        choose_setup: bool = False,
+        allowed_metrics: Sequence[str] = (),
+    ) -> Findings:
         """One research pass. Never raises; empty findings mean the run proceeds
         without literature grounding, exactly like a failed digest."""
         tried_text = ", ".join(tried) or "nothing yet"
@@ -180,13 +217,27 @@ class Researcher:
         if not shortlist:
             return Findings(queries=queries)
 
+        setup: Setup | None = None
+        if choose_setup:
+            # Runs BEFORE the technique judgement and over the same papers, so the
+            # metric choice compounds off the full research rather than off a
+            # thinner second pass. Separate call, not extra fields: a 12B asked for
+            # techniques, a metric and a model in one emit starts dropping fields.
+            try:
+                setup = self._choose_setup(profile, shortlist, allowed=allowed_metrics)
+            except Exception as exc:
+                log.info("researcher: setup choice failed (%s: %s)", type(exc).__name__, exc)
+
         try:
             suggestions = self._suggest(profile, tried_text, shortlist)
         except Exception as exc:
             log.info("researcher: suggestion failed (%s: %s)", type(exc).__name__, exc)
             suggestions = []
         return Findings(
-            suggestions=suggestions, queries=queries, papers_seen=len(shortlist)
+            suggestions=suggestions,
+            queries=queries,
+            papers_seen=len(shortlist),
+            setup=setup,
         )
 
     def _plan_queries(self, profile: str, tried: str) -> list[str]:
@@ -249,6 +300,33 @@ class Researcher:
             )
         return out
 
+    def _choose_setup(
+        self, profile: str, papers: list[Paper], *, allowed: Sequence[str]
+    ) -> Setup | None:
+        listing = "\n".join(f"{i + 1}. {p.brief()}\n   {p.abstract}" for i, p in enumerate(papers))
+        metrics = ", ".join(sorted(allowed))
+        messages = [
+            Message(role="system", content=_PROMPTS["setup_system"]),
+            Message(
+                role="user",
+                content=_PROMPTS["setup_user"]
+                .replace("{profile}", profile.strip())
+                .replace("{metrics}", metrics)
+                .replace("{papers}", listing),
+            ),
+        ]
+        args = self._call(messages, CHOOSE_SETUP)
+        if not args:
+            return None
+        metric = str(args.get("metric") or "").strip()
+        if not metric:
+            return None
+        return Setup(
+            metric=metric,
+            starting_model=str(args.get("starting_model") or "").strip(),
+            why=str(args.get("why") or "").strip(),
+        )
+
     def _call(self, messages: list[Message], tool: ToolSpec) -> dict[str, Any] | None:
         """One structured call with a single retry nudge, mirroring the Summarizer."""
         for attempt in range(2):
@@ -281,7 +359,7 @@ def _resolve(index: Any, papers: list[Paper]) -> Paper | None:
     return None
 
 
-__all__ = ["Findings", "Researcher", "Suggestion", "credited"]
+__all__ = ["Findings", "Researcher", "Setup", "Suggestion", "credited"]
 
 
 _STOPWORDS = frozenset(
