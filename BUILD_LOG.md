@@ -285,7 +285,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
-| Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | |
+| Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | **partial** — registry, ROC-AUC / PR-AUC / log-loss / Brier, averaging, and the CLI collapse landed (PR #47). Still open: the `probabilities.csv` contract, the `--average` flag, and the notebook header. Briefs needed nothing (`_format_history` renders `primary_value`, already metric-agnostic). |
 | Tue Jul 28 | Experiment dossier, deterministic (distill captured cell stdout into a structured per-experiment record feeding briefs) + lean tried/untried idea ledger on `components_used` (capped, out of the dense supervisor prompt; watch for the EDA-ledger regression pattern) | dossier + ledger + tests | |
 | Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | |
 | Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | |
@@ -483,6 +483,28 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-01 | Sprint 2 Day 1 | The metric layer: registry, probability metrics, configurable averaging
+
+**Task:** Lift the fixed 8-metric panel — the first half of the sprint-2 Day 1 row. Probability metrics (ROC-AUC, PR-AUC, log-loss, Brier) become scorable, averaging becomes selectable, and the metric table becomes one source of truth instead of four.
+
+**What shipped:**
+- `core/scoring.py`: every metric is one row in `REGISTRY` carrying its task, direction, probability requirement and compute. `CLASSIFICATION_METRICS`, `REGRESSION_METRICS`, `PROBA_METRICS`, `LABEL_METRICS`, `task_for_metric()`, `direction()` and the new `requires_proba()` are all derived from it; `_MINIMIZE` deleted. Adding a metric is now one line.
+- Probability panel: `score()` takes keyword-only `y_proba`; classification gains `roc_auc`, `average_precision`, `log_loss`, `brier` (binary only). Label metrics are still always computed, so a run's history stays comparable across iterations that did and didn't emit probabilities. Shape validation lives in `Inputs.positive_column()` / `class_matrix()`; malformed probabilities raise here rather than being swallowed, because whether that sinks an experiment depends on `requires_proba(primary)`, which only the caller knows.
+- `resolve_average()`: binary/micro/macro/weighted for f1/precision/recall, with `None` preserving the pre-v0.4 behaviour exactly so no existing run changes score.
+- 29 new tests in a new `tests/unit/test_scoring.py` (scoring had no direct test file — it was only covered through `test_model.py` and `test_codegen.py`). Two are structural: one asserts every exported set is derived from the registry, one asserts every registered metric actually scores, so a drifted set or a broken compute fails CI instead of a live run. 472 unit tests (443 at v0.3.1); ruff + mypy --strict clean.
+
+**Two bugs found on the way, both pre-existing:**
+- **`cli.py` kept its own copy of the metric names** and computed direction as "minimize if regression, else maximize". That held right up until `log_loss` became selectable — a classification metric that minimizes. Had it shipped, the Terminator's stop decision, the supervisor's `_best_holdout` and `_prior_best`'s cross-run baseline carry-over would all have been told lower loss is worse: the run banks its worst result as best and optimizes away from the goal, looking completely normal the whole time. Collapsing to the registry is the fix, and it is the reason the registry was worth doing rather than just widening the frozensets.
+- **Binary string targets have never scored**, since v0.1. The label panel inherited sklearn's `pos_label=1` default, so a `Yes`/`No` target raised on f1/precision/recall. The churn example only avoids it because `prepare_churn` maps to 0/1, but `codegen._coerce` has a branch specifically for string labels, so any user pointing at their own CSV could hit it. The positive class is now named explicitly as the greater label — which had to happen regardless, so that the label panel and the probability panel agree on which class is positive.
+
+**Portability call:** multiclass PR-AUC binarizes `y_true` explicitly rather than relying on sklearn's own multiclass support, which landed well after the `scikit-learn>=1.5` floor and raises below it. Same trap keeps Brier binary-only. Verified against the installed 1.8; the floor is what the pinned range has to survive.
+
+**What didn't (carries into the rest of Day 1):**
+- `probabilities.csv` contract + validator — until it lands, probability metrics are callable in-process but unreachable from a live run.
+- `--average` CLI flag, deferred to the same block where `--metric` goes optional.
+- `deliver/notebook.py:_score_code_cell` still emits `score(task_for_metric(metric), y_holdout, predictions)` with no `y_proba`, under a comment claiming it is "the same ruler iterate used". On a `roc_auc` run the delivered notebook prints a panel with no `roc_auc` in it.
+- Briefs needed nothing: `_format_history` renders `result.metrics.primary_value`, already metric-agnostic.
 
 ### 2026-07-26 | v0.3.1 | The timeout-spiral patch (found live, fixed before publish)
 
