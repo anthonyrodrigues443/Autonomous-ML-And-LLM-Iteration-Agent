@@ -25,7 +25,7 @@ import json
 import sys
 from typing import TYPE_CHECKING, Any
 
-from iterate.core.scoring import direction, score, task_for_metric
+from iterate.core.scoring import direction, requires_proba, score, task_for_metric
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
 if TYPE_CHECKING:
@@ -36,6 +36,11 @@ TRAIN_CSV = "train.csv"
 HOLDOUT_CSV = "holdout.csv"
 META_JSON = "meta.json"
 PREDICTIONS_CSV = "predictions.csv"
+# Sibling artifact, deliberately NOT a second column in predictions.csv: that file's
+# validator rejects a two-column line as an index-column mistake (`to_csv` without
+# index=False), a guard that already caught the single worst failure in 100+ live
+# iterations. Widening it to sometimes mean probabilities would blunt it.
+PROBABILITIES_CSV = "probabilities.csv"
 
 # The single function the agent must define; the harness calls it.
 ENTRY_POINT = "train_and_predict"
@@ -60,8 +65,13 @@ X_holdout = pd.read_csv({HOLDOUT_CSV!r})  # FEATURES ONLY — labels are held ba
 
 _POSTAMBLE = f"""
 # ─── harness: run the agent's function and write predictions ───
-_preds = {ENTRY_POINT}(X_train, y_train, X_holdout)
+# A 2-tuple return is the opt-in probability contract: (predictions, probabilities).
+# Returning predictions alone stays valid, so every pre-v0.4 function is unaffected.
+_out = {ENTRY_POINT}(X_train, y_train, X_holdout)
+_preds, _proba = _out if isinstance(_out, tuple) and len(_out) == 2 else (_out, None)
 pd.Series(list(_preds)).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)
+if _proba is not None:
+    pd.DataFrame(_proba).to_csv({PROBABILITIES_CSV!r}, index=False, header=False)
 """
 
 # import-name -> pip distribution name, for the cases where they differ. PROVISIONAL:
@@ -152,7 +162,7 @@ RESET_INPUTS = (
 )
 
 
-def fallback_baseline(task: str) -> str:
+def fallback_baseline(task: str, *, with_proba: bool = False) -> str:
     """A host-authored, deterministic floor submission for the cell-by-cell path.
 
     Run as a last-resort cell when a session ends without a valid predictions file
@@ -161,13 +171,26 @@ def fallback_baseline(task: str) -> str:
     purpose: the floor ran a gradient-boosted tree until a live v0.3 session died
     to fit-cell timeouts and the floor timed out WITH it — the safety net must
     train in milliseconds under any thread weather. Median-imputed (linear models
-    are not NaN-native), one-hot via get_dummies, seeded."""
+    are not NaN-native), one-hot via get_dummies, seeded.
+
+    ``with_proba`` makes the floor write `probabilities.csv` too. Without it, a run
+    on a probability metric would have an unscoreable safety net: the floor banks
+    labels, scoring needs probabilities, and the iteration is a total loss exactly
+    when the net was supposed to catch it. LogisticRegression is already a
+    probability model, so this costs one extra line of generated code."""
     if task == "classification":
         import_line = "from sklearn.linear_model import LogisticRegression\n"
         model = "LogisticRegression(max_iter=1000, random_state=42)"
     else:
         import_line = "from sklearn.linear_model import Ridge\n"
         model = "Ridge(random_state=42)"
+    # Probability metrics are classification-only, so a regression floor never needs it.
+    proba_line = ""
+    if with_proba and task == "classification":
+        proba_line = (
+            f"pd.DataFrame(_fb_model.predict_proba(_fb_Xh))"
+            f".to_csv({PROBABILITIES_CSV!r}, index=False, header=False)\n"
+        )
     return (
         "import pandas as pd\n"
         + import_line
@@ -179,7 +202,8 @@ def fallback_baseline(task: str) -> str:
         "_fb_Xh = _fb_Xh.fillna(_fb_med)\n"
         f"_fb_model = {model}.fit(_fb_Xt, y_train)\n"
         f"pd.Series(_fb_model.predict(_fb_Xh)).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
-        "print('fallback baseline banked', len(_fb_Xh), 'predictions')\n"
+        + proba_line
+        + "print('fallback baseline banked', len(_fb_Xh), 'predictions')\n"
     )
 
 
@@ -313,14 +337,61 @@ def _is_float(series: object) -> bool:
     return bool(getattr(dtype, "kind", "") == "f")
 
 
+def parse_probabilities(probabilities_csv: bytes | None, *, expected: int) -> list[list[float]]:
+    """Parse `probabilities.csv` into rows of floats. Raises ValueError with a
+    reason the agent can act on.
+
+    One value per line for binary (the positive class), or one comma-separated
+    value per class for multiclass. Shape agreement with the label set is checked
+    downstream by `core.scoring`, which owns what each shape means.
+    """
+    # `is None` rather than falsy: a zero-byte file exists and "was not found" would
+    # send the agent looking for a write bug it doesn't have.
+    if probabilities_csv is None:
+        raise ValueError(f"{PROBABILITIES_CSV} was not found in the working directory")
+    raw = probabilities_csv.decode(errors="replace").strip()
+    if not raw:
+        raise ValueError(f"{PROBABILITIES_CSV} is empty")
+    lines = raw.splitlines()
+    if len(lines) != expected:
+        raise ValueError(
+            f"expected {expected} probability rows (one per holdout row), found {len(lines)}"
+        )
+    rows: list[list[float]] = []
+    for n, line in enumerate(lines, start=1):
+        try:
+            rows.append([float(part) for part in line.split(",")])
+        except ValueError:
+            raise ValueError(
+                f"{PROBABILITIES_CSV} line {n} is not numeric: {line[:40]!r}. Write raw "
+                "probabilities, not labels, with index=False and header=False"
+            ) from None
+    widths = {len(row) for row in rows}
+    if len(widths) != 1:
+        raise ValueError(f"{PROBABILITIES_CSV} rows have inconsistent widths: {sorted(widths)}")
+    return rows
+
+
 def score_predictions(
-    dataset: TabularDataset, predictions_csv: bytes | None, *, metric: str, experiment_id: str
+    dataset: TabularDataset,
+    predictions_csv: bytes | None,
+    *,
+    metric: str,
+    experiment_id: str,
+    probabilities_csv: bytes | None = None,
+    average: str | None = None,
 ) -> ExperimentResult:
     """Score a script's predictions against the held-back holdout labels.
 
     A missing/empty/wrong-length predictions file is a captured failure (a
     non-success `ExperimentResult`), never an exception — same contract as a bad
     spec candidate.
+
+    Probabilities are where the policy `core.scoring` deliberately refuses to make
+    lives: if the primary metric needs them, a bad probability file sinks the
+    experiment like a bad predictions file. If it doesn't, they are a bonus panel
+    and a bad file is dropped silently — a broken `probabilities.csv` must never
+    cost an otherwise-valid f1 iteration.
     """
     if not predictions_csv:
         return _failed(experiment_id, "no predictions file produced")
@@ -331,15 +402,49 @@ def score_predictions(
     expected = dataset.n_test
     if len(preds) != expected:
         return _failed(experiment_id, f"expected {expected} predictions, got {len(preds)}")
+
+    needs_proba = requires_proba(metric)
+    y_proba: list[list[float]] | list[float] | None = None
+    if probabilities_csv is not None or needs_proba:
+        try:
+            rows = parse_probabilities(probabilities_csv, expected=expected)
+            y_proba = [row[0] for row in rows] if len(rows[0]) == 1 else rows
+        except ValueError as exc:
+            if needs_proba:
+                return _failed(experiment_id, f"{metric} needs probabilities: {exc}")
+            y_proba = None
+
     # Coercing + scoring can fail on garbage predictions (wrong dtype, non-numeric
     # values for a numeric target, a label the metric can't handle). That's the
     # agent's code being wrong, not ours — capture it as a failed experiment (and
     # feed the reason back) rather than letting it crash the loop.
     try:
         y_pred = _coerce(preds, target=dataset.test_target)
-        values = score(task_for_metric(metric), dataset.test_target.to_numpy(), y_pred)
+        values = score(
+            task_for_metric(metric),
+            dataset.test_target.to_numpy(),
+            y_pred,
+            y_proba=y_proba,
+            average=average,
+        )
     except Exception as exc:
-        return _failed(experiment_id, f"could not score predictions ({type(exc).__name__}: {exc})")
+        if y_proba is not None and not needs_proba:
+            # A malformed bonus panel must not sink a valid label-metric run.
+            try:
+                values = score(
+                    task_for_metric(metric),
+                    dataset.test_target.to_numpy(),
+                    y_pred,
+                    average=average,
+                )
+            except Exception:
+                return _failed(
+                    experiment_id, f"could not score predictions ({type(exc).__name__}: {exc})"
+                )
+        else:
+            return _failed(
+                experiment_id, f"could not score predictions ({type(exc).__name__}: {exc})"
+            )
     metrics = Metrics(
         values=values,
         primary=metric,
@@ -371,6 +476,7 @@ __all__ = [
     "HOLDOUT_CSV",
     "META_JSON",
     "PREDICTIONS_CSV",
+    "PROBABILITIES_CSV",
     "TRAIN_CSV",
     "assemble_script",
     "build_inputs",
@@ -378,6 +484,7 @@ __all__ = [
     "fallback_baseline",
     "is_code_candidate",
     "package_for_import",
+    "parse_probabilities",
     "required_imports",
     "score_predictions",
     "session_preamble",

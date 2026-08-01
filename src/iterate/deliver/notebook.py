@@ -277,11 +277,21 @@ def _load_cell(data_path: str, target: str) -> str:
 
 
 def _score_code_cell(metric: str) -> str:
+    """The delivered notebook's scoring cell.
+
+    It claims to be "the same ruler iterate used", so it has to unpack the same
+    2-tuple probability contract the run harness does. Without that, a notebook
+    from a roc_auc run would print a panel with no roc_auc in it.
+    """
     return (
         "# Run the approach and score it on the sealed holdout, the same ruler iterate used.\n"
         "from iterate.core.scoring import score, task_for_metric\n\n"
-        "predictions = train_and_predict(X_train, y_train, X_holdout)\n"
-        f"print(score(task_for_metric({metric!r}), y_holdout, list(predictions)))"
+        "_out = train_and_predict(X_train, y_train, X_holdout)\n"
+        "predictions, probabilities = (\n"
+        "    _out if isinstance(_out, tuple) and len(_out) == 2 else (_out, None)\n"
+        ")\n"
+        f"print(score(task_for_metric({metric!r}), y_holdout, list(predictions), "
+        "y_proba=probabilities))"
     )
 
 

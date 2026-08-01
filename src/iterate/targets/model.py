@@ -150,12 +150,14 @@ class ModelTarget:
         dataset: TabularDataset,
         *,
         metric: str,
+        average: str | None = None,
         name: str = "tabular-model",
         max_threads: int = 1,
     ) -> None:
         self.name = name
         self._dataset = dataset
         self._metric = metric
+        self._average = average
         self._task: Task = task_for_metric(metric)
         self._max_threads = max_threads
 
@@ -204,8 +206,25 @@ class ModelTarget:
             # warning — keep it quiet too so the loop's output stays clean.
             with _silence_native_stdio():
                 predictions = pipeline.predict(self._dataset.test_features)
+                # Probabilities are free here (the fitted pipeline is in hand), so the
+                # spec path always offers them when the estimator can produce them —
+                # a probability primary scores, and a label primary gets the panel as
+                # a bonus. Estimators without predict_proba (SVC default, Ridge) fall
+                # back to labels only, and a probability primary then fails scoring
+                # with a clear reason rather than silently reporting nothing.
+                probabilities = (
+                    pipeline.predict_proba(self._dataset.test_features)
+                    if hasattr(pipeline, "predict_proba")
+                    else None
+                )
         metrics = Metrics(
-            values=score(self._task, self._dataset.test_target, predictions),
+            values=score(
+                self._task,
+                self._dataset.test_target,
+                predictions,
+                y_proba=probabilities,
+                average=self._average,
+            ),
             primary=self._metric,
             direction=direction(self._metric),
             n_samples=self._dataset.n_test,

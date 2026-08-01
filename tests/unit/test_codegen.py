@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pandas as pd
+import pytest
 
 from iterate.adapters.compute.runner import LocalCodeRunner
 from iterate.adapters.data.tabular import load_csv
@@ -268,3 +269,100 @@ def test_fallback_baseline_is_a_fast_linear_model_with_imputation() -> None:
     reg = fallback_baseline("regression")
     assert "Ridge" in reg
     assert "fillna" in reg
+
+
+# ─── the probability contract (v0.4) ─────────────────────────────────────────
+
+
+def _binary_probs(n: int) -> bytes:
+    return "\n".join(f"{0.9 if i % 2 else 0.1:.3f}" for i in range(n)).encode()
+
+
+def test_parse_probabilities_reads_one_column_and_many(tmp_path: Path) -> None:
+    assert codegen.parse_probabilities(b"0.1\n0.9\n", expected=2) == [[0.1], [0.9]]
+    assert codegen.parse_probabilities(b"0.1,0.9\n0.7,0.3\n", expected=2) == [
+        [0.1, 0.9],
+        [0.7, 0.3],
+    ]
+
+
+def test_parse_probabilities_rejects_the_actionable_mistakes() -> None:
+    for blob, expected, needle in [
+        (None, 3, "not found"),
+        (b"", 3, "empty"),
+        (b"0.1\n0.9\n", 3, "expected 3"),
+        (b"yes\nno\n", 2, "not numeric"),
+        (b"0.1,0.9\n0.5\n", 2, "inconsistent widths"),
+    ]:
+        with pytest.raises(ValueError, match=needle):
+            codegen.parse_probabilities(blob, expected=expected)
+
+
+def test_probability_metric_scores_from_the_probabilities_file(tmp_path: Path) -> None:
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    preds = ("\n".join(["1", "0"] * (ds.n_test // 2)) + "\n").encode()
+    result = codegen.score_predictions(
+        ds,
+        preds,
+        metric="roc_auc",
+        experiment_id="e",
+        probabilities_csv=_binary_probs(ds.n_test),
+    )
+    assert result.metrics is not None
+    assert result.metrics.primary == "roc_auc"
+    assert "roc_auc" in result.metrics.values
+
+
+def test_probability_metric_without_probabilities_is_a_captured_failure(tmp_path: Path) -> None:
+    """The run must not crash and must not silently score something else — it fails
+    with a reason the agent can act on."""
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    preds = ("\n".join(["1", "0"] * (ds.n_test // 2)) + "\n").encode()
+    result = codegen.score_predictions(ds, preds, metric="roc_auc", experiment_id="e")
+    assert result.metrics is None
+    assert result.error is not None
+    assert "roc_auc needs probabilities" in result.error
+
+
+def test_a_broken_probabilities_file_never_sinks_a_label_metric_run(tmp_path: Path) -> None:
+    """The bonus panel is best-effort. An f1 iteration is not lost because the agent
+    also wrote a malformed probabilities.csv."""
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    preds = ("\n".join(["1", "0"] * (ds.n_test // 2)) + "\n").encode()
+    result = codegen.score_predictions(
+        ds, preds, metric="f1", experiment_id="e", probabilities_csv=b"garbage\nrows\n"
+    )
+    assert result.metrics is not None
+    assert result.metrics.primary == "f1"
+    assert "roc_auc" not in result.metrics.values
+
+
+def test_label_metric_gains_the_bonus_panel_when_probabilities_are_valid(tmp_path: Path) -> None:
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    preds = ("\n".join(["1", "0"] * (ds.n_test // 2)) + "\n").encode()
+    result = codegen.score_predictions(
+        ds, preds, metric="f1", experiment_id="e", probabilities_csv=_binary_probs(ds.n_test)
+    )
+    assert result.metrics is not None
+    assert "roc_auc" in result.metrics.values
+
+
+def test_fallback_floor_writes_probabilities_only_when_asked() -> None:
+    """A probability run whose session dies needs a SCOREABLE floor; without this the
+    safety net banks labels that roc_auc cannot score, and the iteration is a total
+    loss exactly when the net was meant to catch it."""
+    plain = codegen.fallback_baseline("classification")
+    with_proba = codegen.fallback_baseline("classification", with_proba=True)
+    assert codegen.PROBABILITIES_CSV not in plain
+    assert "predict_proba" in with_proba
+    assert codegen.PROBABILITIES_CSV in with_proba
+    # Probability metrics are classification-only, so a regression floor never needs it.
+    assert codegen.PROBABILITIES_CSV not in codegen.fallback_baseline(
+        "regression", with_proba=True
+    )
+
+
+def test_postamble_tuple_return_is_the_opt_in_proba_contract() -> None:
+    script = codegen.assemble_script(_GOOD_FN)
+    assert "isinstance(_out, tuple)" in script
+    assert codegen.PROBABILITIES_CSV in script
