@@ -843,3 +843,27 @@ def test_timeouts_get_a_nudge_count_toward_the_breaker_and_enrich_the_failure(
     assert coding.result.error is not None
     assert "timed out" in coding.result.error
     assert "fit(" in coding.result.error
+
+
+# ─── the probability contract at the finish gate (v0.4) ──────────────────────
+
+
+def test_proba_requirement_is_only_added_for_probability_metrics() -> None:
+    """Every line of the coder system prompt competes for a weak model's attention,
+    so an f1 run must not carry an instruction about a file it should never write."""
+    from iterate.core.coder import _proba_requirement
+
+    assert _proba_requirement("f1") == ""
+    assert _proba_requirement("rmse") == ""
+    for metric in ("roc_auc", "average_precision", "log_loss", "brier"):
+        text = _proba_requirement(metric)
+        assert "probabilities.csv" in text
+        assert "predict_proba" in text
+
+
+def test_validate_probabilities_mirrors_the_parser() -> None:
+    from iterate.core.coder import _validate_probabilities
+
+    assert _validate_probabilities(b"0.1\n0.9\n", 2) is None
+    assert _validate_probabilities(None, 2) is not None
+    assert "expected 2" in (_validate_probabilities(b"0.1\n", 2) or "")

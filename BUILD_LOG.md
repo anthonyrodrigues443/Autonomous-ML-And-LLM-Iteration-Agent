@@ -285,7 +285,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
-| Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | **partial** — registry, ROC-AUC / PR-AUC / log-loss / Brier, averaging, and the CLI collapse landed (PR #47). Still open: the `probabilities.csv` contract, the `--average` flag, and the notebook header. Briefs needed nothing (`_format_history` renders `primary_value`, already metric-agnostic). |
+| Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | done |
 | Tue Jul 28 | Experiment dossier, deterministic (distill captured cell stdout into a structured per-experiment record feeding briefs) + lean tried/untried idea ledger on `components_used` (capped, out of the dense supervisor prompt; watch for the EDA-ledger regression pattern) | dossier + ledger + tests | |
 | Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | |
 | Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | |
@@ -500,11 +500,22 @@ The discovery agent is what makes the demo wow. It does:
 
 **Portability call:** multiclass PR-AUC binarizes `y_true` explicitly rather than relying on sklearn's own multiclass support, which landed well after the `scikit-learn>=1.5` floor and raises below it. Same trap keeps Brier binary-only. Verified against the installed 1.8; the floor is what the pinned range has to survive.
 
-**What didn't (carries into the rest of Day 1):**
-- `probabilities.csv` contract + validator — until it lands, probability metrics are callable in-process but unreachable from a live run.
-- `--average` CLI flag, deferred to the same block where `--metric` goes optional.
-- `deliver/notebook.py:_score_code_cell` still emits `score(task_for_metric(metric), y_holdout, predictions)` with no `y_proba`, under a comment claiming it is "the same ruler iterate used". On a `roc_auc` run the delivered notebook prints a panel with no `roc_auc` in it.
-- Briefs needed nothing: `_format_history` renders `result.metrics.primary_value`, already metric-agnostic.
+**The probability contract, so the metrics are reachable from a real run:**
+- `probabilities.csv` as a SIBLING artifact, never a second column in `predictions.csv`. That file's validator reads a two-field line as an index-column mistake (`to_csv` without `index=False`) — the guard that caught the single worst failure of the v0.2 live runs. Widening it to sometimes mean probabilities would have blunted it.
+- `codegen.parse_probabilities` + `coder._validate_probabilities`: one value per line for binary, one comma-separated value per class for multiclass, with error strings the model can act on ("line 4 is not numeric… write raw probabilities, not labels").
+- The policy split `core.scoring` deliberately refused to make: `score_predictions` sinks the experiment when `requires_proba(primary)` and the file is bad, and silently drops the bonus panel when it isn't. A malformed `probabilities.csv` must never cost an otherwise-valid f1 iteration.
+- **Verified finish now checks probabilities too.** Caught at the finish gate rather than at scoring time, so a model that forgot the file is sent back into the session with turns left to write it instead of losing the whole iteration to the floor.
+- **The floor writes probabilities when the metric needs them.** Without this, a probability run whose session died would bank a labels-only safety net that ROC-AUC cannot score — a total loss exactly when the net was supposed to catch it. LogisticRegression is already a probability model, so it cost one generated line.
+- The one-shot harness takes an opt-in 2-tuple return `(predictions, probabilities)`; returning predictions alone stays valid, so every pre-v0.4 function is unaffected. The delivered notebook's scoring cell unpacks the same contract — it calls itself "the same ruler iterate used", and on a `roc_auc` run it would otherwise have printed a panel with no `roc_auc` in it.
+- The spec path offers probabilities whenever the fitted pipeline has `predict_proba`, so a label-metric run gets the probability panel as a free bonus.
+- `_proba_requirement` appends the extra submission rule to the coder prompt ONLY for a probability metric: an f1 run must not carry an instruction about a file it should never write, since every line competes for a weak model's attention.
+- `--average` exposed on the CLI and threaded through `ModelTarget`, `CodingAgent` and `score_predictions`.
+
+**Verified end to end** through the real `LocalCodeRunner`, not just in units: a `train_and_predict` returning `(labels, proba)` wrote both files, scored the full 8-metric classification panel, and the same run with the probabilities file removed failed with "roc_auc needs probabilities: probabilities.csv was not found" instead of silently scoring nothing.
+
+**Briefs needed nothing:** `_format_history` renders `result.metrics.primary_value`, already metric-agnostic.
+
+**Test count:** 483 unit tests (443 at v0.3.1), ruff + mypy --strict clean, CLI startup verified still free of sklearn.
 
 ### 2026-07-26 | v0.3.1 | The timeout-spiral patch (found live, fixed before publish)
 

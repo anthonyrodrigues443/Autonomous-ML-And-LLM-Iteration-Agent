@@ -131,7 +131,13 @@ def run(
     ),
     target: str = typer.Option(..., "--target", help="Name of the target column."),
     metric: str = typer.Option(
-        ..., "--metric", help="Primary metric: f1 | accuracy | rmse | mae | r2 | …"
+        ..., "--metric", help="Primary metric: f1 | accuracy | roc_auc | log_loss | rmse | r2 | …"
+    ),
+    average: str | None = typer.Option(
+        None,
+        "--average",
+        help="Averaging for f1/precision/recall: binary | micro | macro | weighted. "
+        "Default adapts to the target (binary on two classes, macro otherwise).",
     ),
     baseline: float | None = typer.Option(
         None, "--baseline", help="Your reported baseline score (sanity check; requires --source)."
@@ -221,7 +227,7 @@ def run(
     from iterate.core.orchestrator import Orchestrator
     from iterate.core.proposer import Proposer, summarize_dataset
     from iterate.core.reconstructor import Reconstructor
-    from iterate.core.scoring import CLASSIFICATION_METRICS, REGRESSION_METRICS
+    from iterate.core.scoring import AVERAGES, CLASSIFICATION_METRICS, REGRESSION_METRICS
     from iterate.core.scoring import direction as metric_direction
     from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor
@@ -256,6 +262,10 @@ def run(
             f"unknown metric {metric!r}; expected one of "
             f"{sorted(CLASSIFICATION_METRICS | REGRESSION_METRICS)}"
         )
+    if average is not None:
+        average = average.lower()
+        if average not in AVERAGES:
+            raise typer.BadParameter(f"unknown average {average!r}; expected one of {list(AVERAGES)}")
 
     settings = get_settings()
     resolved_memory_path = memory_path or Path(settings.iterate_memory_db)
@@ -302,7 +312,7 @@ def run(
 
     # ─── Load data + build target ──────────────────────────────────────────
     dataset = load_csv(data, target=target)
-    model_target = ModelTarget(dataset, metric=metric)
+    model_target = ModelTarget(dataset, metric=metric, average=average)
     data_summary = summarize_dataset(dataset)
     direction = metric_direction(metric)
 
@@ -425,7 +435,7 @@ def run(
                 E2BKernel(api_key=e2b_api_key) if compute == "e2b" else LocalKernel()
             )
             return CodingAgent(
-                coder_client, kernel, metric=metric,
+                coder_client, kernel, metric=metric, average=average,
                 install=(install or compute == "e2b"),
                 context_budget_chars=context_budget,
                 controller=controller,

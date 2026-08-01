@@ -310,3 +310,14 @@ def test_write_notebooks_all_emits_one_per_experiment(tmp_path: Path) -> None:
     journey = list((tmp_path / "notebooks").glob("*.ipynb"))
     assert len(journey) == 2
     assert (tmp_path / "best.ipynb").exists()
+
+
+def test_delivered_notebook_scoring_cell_handles_the_proba_contract() -> None:
+    """The cell calls itself "the same ruler iterate used", so it has to unpack the
+    same 2-tuple contract; otherwise a roc_auc notebook prints a panel with no
+    roc_auc in it."""
+    from iterate.deliver.notebook import _score_code_cell
+
+    cell = _score_code_cell("roc_auc")
+    assert "isinstance(_out, tuple)" in cell
+    assert "y_proba=probabilities" in cell

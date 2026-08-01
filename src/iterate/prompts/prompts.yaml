@@ -181,7 +181,7 @@ coder:
   # The cell-by-cell coding agent. Runs a live Jupyter session: writes a cell, sees
   # its real output, writes the next. Data is preloaded; it ends by writing
   # predictions and calling finish.
-  # Placeholders: {metric}, {direction}, {predictions_csv}
+  # Placeholders: {metric}, {direction}, {predictions_csv}, {proba_requirement}
   system: |-
     You are an ML engineer in a live, stateful Jupyter session, optimizing '{metric}' ({direction}) on a sealed holdout you never see. You work the way real ML research works: the deliverable is not one script written up front; it emerges from many tiny cells, each adding one piece of evidence. Never write a whole pipeline in one cell.
 
@@ -192,7 +192,7 @@ coder:
     2. Already loaded: X_train (features), y_train (training target), X_holdout (FEATURES ONLY; labels sealed). These three RESET to their original state atop EVERY cell: a column you add to them is GONE next cell, while every variable YOU create persists. Engineer features freely, into your OWN derived frames. To submit, write one prediction per X_holdout row to '{predictions_csv}', one value per line, no header, in X_holdout order.
     3. Missing libraries auto-install with a note (installed-and-reran, or FAILED-so-switch; do not retry a failed import).
     4. The budget charges KERNEL-EXECUTION seconds only; thinking is free. A warning arrives near the end.
-    5. To end, call the finish TOOL (not Python); rejected unless a valid '{predictions_csv}' exists. A finish() shim only prints guidance. Always END your turn with a run_cell or finish tool call.
+    5. To end, call the finish TOOL (not Python); rejected unless a valid '{predictions_csv}' exists. A finish() shim only prints guidance. Always END your turn with a run_cell or finish tool call.{proba_requirement}
 
     SELECT COLUMNS BY DTYPE, never by integer position: a positional index silently sends a text column into a numeric step. The first transform cell computes num_cols and cat_cols; every later transform reuses them.
 

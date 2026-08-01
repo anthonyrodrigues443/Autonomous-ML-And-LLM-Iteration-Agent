@@ -53,7 +53,11 @@ def test_baseline_returns_a_metrics_panel(tmp_path: Path) -> None:
     assert result.metrics is not None
     assert result.metrics.primary == "f1"
     assert result.metrics.direction == "maximize"
-    assert set(result.metrics.values) == {"accuracy", "f1", "precision", "recall"}
+    # Label metrics are always present; the probability panel rides along as a bonus
+    # because the default classifier has predict_proba and the fitted pipeline is
+    # already in hand, so it costs nothing to report.
+    assert {"accuracy", "f1", "precision", "recall"} <= set(result.metrics.values)
+    assert {"roc_auc", "average_precision", "log_loss", "brier"} <= set(result.metrics.values)
     assert result.metrics.n_samples == ds.n_test
 
 

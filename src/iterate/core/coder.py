@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from iterate.core import codegen
-from iterate.core.scoring import direction, task_for_metric
+from iterate.core.scoring import direction, requires_proba, task_for_metric
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
 
@@ -187,6 +187,39 @@ def _validate_predictions(preds: bytes | None, n_test: int) -> str | None:
     return None
 
 
+def _proba_requirement(metric: str) -> str:
+    """The extra submission rule for a probability metric, or "" for a label metric.
+
+    Appended to the coder's system prompt rather than made permanent: a run on f1
+    should not carry an instruction about a file it must never write, and every
+    line in that prompt is competing for a weak model's attention.
+    """
+    if not requires_proba(metric):
+        return ""
+    return (
+        f"\n    6. '{metric}' is scored from PROBABILITIES, not labels. As well as "
+        f"'{codegen.PREDICTIONS_CSV}', write predict_proba output to "
+        f"'{codegen.PROBABILITIES_CSV}' in the same X_holdout order: for two classes "
+        "one positive-class probability per line, for more one comma-separated value "
+        "per class per line, no header, no index. finish is rejected without it."
+    )
+
+
+def _validate_probabilities(probs: bytes | None, n_test: int) -> str | None:
+    """Why a `finish` should be rejected for want of probabilities, or None if they
+    are valid. Only consulted when the primary metric needs them.
+
+    Deliberately a separate file from predictions.csv rather than a second column:
+    that file's validator reads a two-field line as an index-column mistake, and
+    that guard already caught the worst failure of the v0.2 live runs.
+    """
+    try:
+        codegen.parse_probabilities(probs, expected=n_test)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
 @dataclass(frozen=True)
 class Cell:
     """One cell of the session — for the notebook deliverable + memory."""
@@ -234,6 +267,7 @@ class CodingAgent:
         kernel: StatefulKernel,
         *,
         metric: str,
+        average: str | None = None,
         deadline_seconds: float = 300.0,
         cell_timeout: float = 120.0,
         temperature: float = 0.7,
@@ -247,6 +281,7 @@ class CodingAgent:
         self._client = client
         self._kernel = kernel
         self._metric = metric
+        self._average = average
         self._deadline_seconds = deadline_seconds
         self._cell_timeout = cell_timeout
         self._temperature = temperature
@@ -306,14 +341,27 @@ class CodingAgent:
             )
 
             preds = self._kernel.read_output(codegen.PREDICTIONS_CSV)
-            if _validate_predictions(preds, dataset.n_test) is not None:
+            probs = self._kernel.read_output(codegen.PROBABILITIES_CSV)
+            # A probability metric with no probabilities is as empty-handed as no
+            # predictions at all, so it takes the floor path too.
+            unusable = _validate_predictions(preds, dataset.n_test) is not None or (
+                requires_proba(self._metric)
+                and _validate_probabilities(probs, dataset.n_test) is not None
+            )
+            if unusable:
                 self._bank_floor(
                     cells, starting_code=starting_code, n_test=dataset.n_test,
                     experiment_id=experiment_id,
                 )
                 preds = self._kernel.read_output(codegen.PREDICTIONS_CSV)
+                probs = self._kernel.read_output(codegen.PROBABILITIES_CSV)
             result = codegen.score_predictions(
-                dataset, preds, metric=self._metric, experiment_id=experiment_id
+                dataset,
+                preds,
+                metric=self._metric,
+                experiment_id=experiment_id,
+                probabilities_csv=probs,
+                average=self._average,
             )
             if result.error:
                 forensics = _failure_forensics(cells)
@@ -430,6 +478,17 @@ class CodingAgent:
                 # Verified finish: only end if valid predictions were actually written.
                 preds = self._kernel.read_output(codegen.PREDICTIONS_CSV)
                 reason = _validate_predictions(preds, n_test)
+                if reason is None and requires_proba(self._metric):
+                    # Caught here rather than at scoring time: rejecting the finish
+                    # sends the model back into the session with a turn left to write
+                    # the file, instead of losing the whole iteration to the floor.
+                    probs = self._kernel.read_output(codegen.PROBABILITIES_CSV)
+                    proba_reason = _validate_probabilities(probs, n_test)
+                    if proba_reason is not None:
+                        reason = (
+                            f"{self._metric} is scored from probabilities, so "
+                            f"{codegen.PROBABILITIES_CSV} is required as well: {proba_reason}"
+                        )
                 if reason is None:
                     # Lever gate (once): the briefed change never reached a single
                     # executed cell — a submission without it is not this experiment.
@@ -611,7 +670,12 @@ class CodingAgent:
         if starting_code and starting_code.strip():
             candidates.append(("carried-forward best", starting_code.strip()))
         candidates.append(
-            ("canned baseline", codegen.fallback_baseline(task_for_metric(self._metric)))
+            (
+                "canned baseline",
+                codegen.fallback_baseline(
+                    task_for_metric(self._metric), with_proba=requires_proba(self._metric)
+                ),
+            )
         )
         # A dead session's namespace is untrusted: a stale or mutated variable could
         # steer the carried code into a silently different pipeline. Wipe it and
@@ -681,6 +745,7 @@ def _build_messages(
         metric=metric,
         direction=direction,
         predictions_csv=codegen.PREDICTIONS_CSV,
+        proba_requirement=_proba_requirement(metric),
     )
     if starting_code and starting_code.strip():
         score = f" (scored {metric}={starting_score:.4f})" if starting_score is not None else ""
