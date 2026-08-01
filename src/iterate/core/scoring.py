@@ -29,6 +29,7 @@ only the caller knows.
 
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -50,7 +51,7 @@ from sklearn.metrics import (
 from sklearn.preprocessing import label_binarize
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from iterate.adapters.models.registry import Task
 
@@ -158,7 +159,7 @@ def _mse(i: Inputs) -> float:
     return float(mean_squared_error(i.y_true, i.y_pred))
 
 
-REGISTRY: dict[str, MetricSpec] = {
+PANEL: dict[str, MetricSpec] = {
     "accuracy": MetricSpec(
         "classification", "maximize", False, lambda i: float(accuracy_score(i.y_true, i.y_pred))
     ),
@@ -194,6 +195,98 @@ REGISTRY: dict[str, MetricSpec] = {
     ),
 }
 
+# ─── the wider vocabulary, derived from sklearn rather than hand-written ─────
+#
+# PANEL above is what every run computes: a small, comparable, always-present set.
+# REGISTRY below is what a run may SELECT as its primary, and it is derived from
+# sklearn's own scorer registry so the vocabulary is not a list somebody has to
+# remember to extend. The Researcher can propose Matthews correlation or balanced
+# accuracy and the harness already knows both.
+#
+# Crucially, DIRECTION is derived too, never guessed. sklearn's scorers are all
+# "higher is better" by construction, with loss metrics carrying a -1 sign (the
+# `neg_` naming convention). That sign is the direction, straight from the library
+# that defines the metric. An LLM proposing a metric therefore still cannot invert
+# the loop, because it never supplies the direction — which is the whole reason
+# direction stayed out of the model's hands in the first place.
+_CLASSIFICATION_MODULES = frozenset({"_classification", "_ranking", "_scorer"})
+_REGRESSION_MODULES = frozenset({"_regression"})
+
+
+def _sklearn_compute(
+    func: Callable[..., Any], kwargs: dict[str, Any], *, needs_proba: bool
+) -> Callable[[Inputs], float]:
+    # Checked once at derivation, not per call. Note that most binary scorers do
+    # NOT carry pos_label in their kwargs at all (jaccard, f1, precision, recall
+    # ship only average="binary"), so sklearn's own pos_label=1 default applies —
+    # the exact default that made string targets unscorable. Reading the signature
+    # is what catches those; inspecting kwargs alone would miss every one of them.
+    accepts_pos_label = "pos_label" in inspect.signature(func).parameters
+
+    def compute(i: Inputs) -> float:
+        call = dict(kwargs)
+        if accepts_pos_label and i.binary and call.get("average", "binary") in (None, "binary"):
+            call["pos_label"] = i.positive
+        if needs_proba:
+            proba = i.positive_column() if i.binary else i.class_matrix()
+            return float(func(i.y_true, proba, **call))
+        return float(func(i.y_true, i.y_pred, **call))
+
+    return compute
+
+
+def _derive_from_sklearn() -> dict[str, MetricSpec]:
+    """Every sklearn scorer that applies to a supervised tabular target.
+
+    Reads private scorer attributes (`_sign`, `_score_func`, `_kwargs`,
+    `_response_method`). They have been stable for years, but they are private, so
+    every step is guarded and a failure degrades to the curated PANEL rather than
+    breaking scoring. `test_scoring` asserts the derivation still works on the
+    installed version, so a sklearn upgrade that changes this fails CI instead of a
+    user's run.
+    """
+    try:
+        from sklearn.metrics import get_scorer, get_scorer_names
+
+        names = list(get_scorer_names())
+    except Exception:  # pragma: no cover - sklearn API moved
+        return {}
+
+    out: dict[str, MetricSpec] = {}
+    for name in names:
+        try:
+            scorer = get_scorer(name)
+            func = scorer._score_func
+            sign = int(scorer._sign)
+            kwargs = dict(scorer._kwargs)
+            response = scorer._response_method
+        except Exception:  # pragma: no cover - one bad scorer must not sink the rest
+            continue
+        module = func.__module__.rsplit(".", 1)[-1]
+        if module in _CLASSIFICATION_MODULES:
+            task: Task = "classification"
+        elif module in _REGRESSION_MODULES:
+            task = "regression"
+        else:
+            # sklearn also registers clustering scores (rand, v-measure, mutual
+            # info). They take two label assignments, not a prediction against a
+            # target, so they are meaningless here and offering them would invite
+            # the agent to pick one.
+            continue
+        needs_proba = response != "predict"
+        out[name] = MetricSpec(
+            task,
+            "maximize" if sign > 0 else "minimize",
+            needs_proba,
+            _sklearn_compute(func, kwargs, needs_proba=needs_proba),
+        )
+    return out
+
+
+# Curated entries win: PANEL's computes are the ones with their own tests, their
+# own shape validation, and the binary/multiclass handling this project needs.
+REGISTRY: dict[str, MetricSpec] = {**_derive_from_sklearn(), **PANEL}
+
 CLASSIFICATION_METRICS = frozenset(
     name for name, spec in REGISTRY.items() if spec.task == "classification"
 )
@@ -201,7 +294,12 @@ REGRESSION_METRICS = frozenset(
     name for name, spec in REGISTRY.items() if spec.task == "regression"
 )
 PROBA_METRICS = frozenset(name for name, spec in REGISTRY.items() if spec.needs_proba)
-LABEL_METRICS = CLASSIFICATION_METRICS - PROBA_METRICS
+# Panel-scoped, unlike the three above: those answer "may this be selected", this
+# answers "what does score() always return for a classification run".
+LABEL_METRICS = frozenset(
+    name for name, spec in PANEL.items() if spec.task == "classification" and not spec.needs_proba
+)
+PANEL_METRICS = frozenset(PANEL)
 
 
 def task_for_metric(metric: str) -> Task:
@@ -254,6 +352,7 @@ def score(
     *,
     y_proba: Any = None,
     average: str | None = None,
+    include: Sequence[str] = (),
 ) -> dict[str, float]:
     classes = np.unique(np.asarray(y_true))
     inputs = Inputs(
@@ -264,7 +363,7 @@ def score(
         average=resolve_average(average, binary=len(classes) <= 2),
     )
     values: dict[str, float] = {}
-    for name, spec in REGISTRY.items():
+    for name, spec in PANEL.items():
         if spec.task != task:
             continue
         if spec.needs_proba and y_proba is None:
@@ -272,6 +371,18 @@ def score(
         if spec.binary_only and not inputs.binary:
             continue
         values[name] = spec.compute(inputs)
+    # The panel stays small so history is comparable and cheap across every run.
+    # A primary metric from the wider vocabulary is computed ON TOP, on request —
+    # scoring all 49 every iteration would be slow and would bury the comparison.
+    for name in include:
+        if name in values:
+            continue
+        extra = REGISTRY.get(name)
+        if extra is None or extra.task != task:
+            continue
+        if extra.needs_proba and y_proba is None:
+            continue
+        values[name] = extra.compute(inputs)
     return values
 
 
@@ -279,6 +390,8 @@ __all__ = [
     "AVERAGES",
     "CLASSIFICATION_METRICS",
     "LABEL_METRICS",
+    "PANEL",
+    "PANEL_METRICS",
     "PROBA_METRICS",
     "REGISTRY",
     "REGRESSION_METRICS",
