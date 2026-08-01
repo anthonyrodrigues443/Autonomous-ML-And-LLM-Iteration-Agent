@@ -37,8 +37,9 @@ infer features/target + MCP discovery (absorbs v0.8) · v1.0 one-sentence input 
 | Tabular CSV only as input. | **v0.5 / v0.6** | Prompts (v0.5), vision/DL (v0.6). |
 | Classification + regression tasks only. | **v0.5 / v0.6** | Expands with prompt + vision targets. |
 | Single local CSV (`load_csv`); no Kaggle / HuggingFace / DB / MCP sources. | **v0.9** (partial) | v0.9 ships MCP discovery over filesystem + Postgres; Kaggle/HuggingFace loaders and the Notion/github servers are tracked on the backlog. |
+| An integer target with many distinct values is treated as classification, so the split is stratified and `load_csv` raises on a genuine integer regression target (a count, a year). | pre-existing; backlog | Surfaced while building the metric dial. `target_task` deliberately DELEGATES to the loader's own heuristic rather than adding a second one — two definitions of "is this classification" would eventually disagree, and a metric chosen for a task the data was never split for cannot score at all. Fixing the heuristic changes every existing split and therefore every recorded score, so it needs its own change, not a side effect of this one. |
 | Single target column; no multi-target / multi-label. | TBD | When needed; not scheduled. |
-| `--metric` must be given explicitly. | **v0.4** | Agent picks the metric. |
+| `--metric` is optional: omitted, the Researcher proposes one over the papers it fetched and the harness validates it. An explicit `--metric` always wins. | **lifted v0.4** | Every failure path — unknown name, wrong task for the target, dead network, model that will not answer — falls back to exactly what v0.3 would have run (f1 / f1_macro / rmse by target type), so the dial can only upgrade a working run, never break one. The choice is printed with its reason before the first experiment: a tool that silently picks your evaluation metric is worse than one that asks. |
 | `--target` + features must be given. | **v0.9** | Infer from the data + a one-line description (the v0.8 milestone, shipping inside the v0.9 release). |
 | Full one-sentence input not yet possible. | **v1.0** | Autonomous discovery. |
 

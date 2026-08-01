@@ -130,8 +130,12 @@ def run(
         ..., "--data", help="Path to the CSV dataset.", exists=True, dir_okay=False
     ),
     target: str = typer.Option(..., "--target", help="Name of the target column."),
-    metric: str = typer.Option(
-        ..., "--metric", help="Primary metric: f1 | accuracy | roc_auc | log_loss | rmse | r2 | …"
+    metric: str | None = typer.Option(
+        None,
+        "--metric",
+        help="Primary metric: f1 | accuracy | roc_auc | average_precision | rmse | r2 | … "
+        "Omit it and the agent picks one from your data profile and the literature, "
+        "then states why. An explicit choice always wins.",
     ),
     average: str | None = typer.Option(
         None,
@@ -270,12 +274,13 @@ def run(
     # ─── Validate ──────────────────────────────────────────────────────────
     if baseline is not None and source is None:
         raise typer.BadParameter("--baseline requires --source")
-    metric = metric.lower()
-    if metric not in CLASSIFICATION_METRICS and metric not in REGRESSION_METRICS:
-        raise typer.BadParameter(
-            f"unknown metric {metric!r}; expected one of "
-            f"{sorted(CLASSIFICATION_METRICS | REGRESSION_METRICS)}"
-        )
+    if metric is not None:
+        metric = metric.lower()
+        if metric not in CLASSIFICATION_METRICS and metric not in REGRESSION_METRICS:
+            raise typer.BadParameter(
+                f"unknown metric {metric!r}; expected one of "
+                f"{sorted(CLASSIFICATION_METRICS | REGRESSION_METRICS)}"
+            )
     if average is not None:
         average = average.lower()
         if average not in AVERAGES:
@@ -324,11 +329,9 @@ def run(
     if not use_tui:
         _configure_logging()
 
-    # ─── Load data + build target ──────────────────────────────────────────
+    # ─── Load data ─────────────────────────────────────────────────────────
     dataset = load_csv(data, target=target)
-    model_target = ModelTarget(dataset, metric=metric, average=average)
     data_summary = summarize_dataset(dataset)
-    direction = metric_direction(metric)
 
     # ─── LLM clients + memory ──────────────────────────────────────────────
     # Two clients on purpose: thinking applies to the CODER only. The supervisor
@@ -341,6 +344,28 @@ def run(
         if think
         else client
     )
+    # ─── How this run is measured ──────────────────────────────────────────
+    # Resolved BEFORE the target is built, because ModelTarget, the Supervisor, the
+    # Summarizer, the Critic and the coder are all constructed around a metric. An
+    # explicit --metric is used as given; otherwise the Researcher proposes one over
+    # the papers it fetched for this problem, and anything that fails validation
+    # falls back to what v0.3 would have done. The result is then FIXED for the run:
+    # one ruler, or the history and the cross-run baseline stop being comparable.
+    run_setup = _resolve_setup(
+        dataset=dataset,
+        explicit=metric,
+        data_summary=data_summary,
+        client=client,
+        enabled=research and metric is None,
+    )
+    metric = run_setup.metric
+    direction = metric_direction(metric)
+    model_target = ModelTarget(dataset, metric=metric, average=average)
+    if line := run_setup.render():
+        console.print(f"[dim]{line}[/dim]")
+        if run_setup.starting_model:
+            console.print(f"[dim]starting model: {run_setup.starting_model}[/dim]")
+
     # NOTE: the sqlite Memory is deliberately NOT constructed here. A sqlite
     # connection can only be used on the thread that created it, and in TUI mode
     # the supervised loop runs on a worker thread — each branch below constructs
@@ -541,7 +566,7 @@ def run(
             )
         else:
             baseline_candidate = None
-            baseline_model = _default_baseline_model(metric)
+            baseline_model = run_setup.starting_model
 
         orchestrator = Orchestrator(
             model_target, Proposer(client), LocalExecutor(), terminator, memory,
@@ -704,6 +729,39 @@ def _candidate_model(candidate: Candidate) -> str:
     if isinstance(model, str) and model.strip():
         return model.strip()
     return candidate.description or "generated code"
+
+
+def _resolve_setup(
+    *,
+    dataset: Any,
+    explicit: str | None,
+    data_summary: str,
+    client: Any,
+    enabled: bool,
+) -> Any:
+    """Decide the run's metric + starting model. Never raises: every failure path
+    lands on the deterministic default, so the dial can only upgrade a working run."""
+    from iterate.core import setup as run_setup_mod
+    from iterate.core.scoring import CLASSIFICATION_METRICS, REGRESSION_METRICS
+
+    if explicit or not enabled:
+        return run_setup_mod.resolve(dataset, explicit=explicit)
+
+    from iterate.core.researcher import Researcher
+
+    task = run_setup_mod.target_task(dataset)
+    allowed = CLASSIFICATION_METRICS if task == "classification" else REGRESSION_METRICS
+    try:
+        findings = Researcher(client).research(
+            profile=data_summary, choose_setup=True, allowed_metrics=sorted(allowed)
+        )
+        proposed = findings.setup
+    except Exception:  # a specialist must never stop a run from starting
+        proposed = None
+    resolved = run_setup_mod.resolve(dataset, proposed=proposed)
+    if proposed is not None and not resolved.chosen_by_agent and resolved.why:
+        logging.getLogger(__name__).info("setup: %s", resolved.why)
+    return resolved
 
 
 def _default_baseline_model(metric: str) -> str:

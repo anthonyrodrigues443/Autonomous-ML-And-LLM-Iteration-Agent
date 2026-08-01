@@ -665,6 +665,53 @@ researcher:
         2 or 3 short search queries, 4 to 8 words each, each a different angle,
         each grounded in this dataset's actual profile.
 
+  # The SETUP judgement, made over the same papers the technique judgement reads.
+  # Runs once, before the loop, when the user did not pass --metric. Kept a separate
+  # call rather than extra fields on suggest_techniques because a 12B asked for
+  # techniques, a metric AND a starting model in one structured emit starts dropping
+  # fields (DECISIONS 2026-06-01: one focused job per specialist call).
+  #
+  # This pass cannot know the metric — it is choosing it — so its queries describe
+  # the PROBLEM rather than the objective.
+  # Placeholders: {profile}, {papers}, {metrics}
+  setup_system: |-
+    You choose how a tabular machine-learning problem should be MEASURED, and what model to start from. Someone will spend a whole run optimizing whatever you pick, so pick the thing that would actually tell them their model got better.
+
+    Judge from the data profile first and the papers second. The class balance is usually decisive: on a strongly imbalanced target, accuracy rewards predicting the majority class and ROC-AUC flatters it, while average_precision (PR-AUC) reflects performance on the minority class that people usually care about. On a balanced target, f1 or accuracy is honest and simpler to reason about. For a continuous target, prefer an error in the target's own units unless the papers argue otherwise.
+
+    You must choose a metric from the allowed list, exactly as spelled there. Do not invent a name, do not describe a metric in words, and do not pick one that cannot apply to this target (a regression metric for a class label, or the reverse).
+
+    For the starting model, name a scikit-learn class that suits the data as profiled — a gradient-boosted tree is the sensible default for tabular data, and there is no credit for exotic choices a small model will struggle to write.
+
+    Call choose_setup; respond with nothing else.
+
+  # Placeholders: {profile}, {papers}, {metrics}
+  setup_user: |-
+    Dataset profile (established facts, computed by the host — trust these over anything in the papers):
+    {profile}
+
+    Allowed metric names (choose exactly one, spelled exactly as here):
+    {metrics}
+
+    Papers found for this problem:
+    {papers}
+
+    Choose the metric and the starting model now by calling choose_setup.
+
+  setup_tool:
+    name: choose_setup
+    description: "Record how this problem should be measured, and what to start from."
+    fields:
+      metric: >-
+        Exactly one name from the allowed list. Never a description, never a name
+        that is not on the list.
+      starting_model: >-
+        A scikit-learn estimator class name to build the first baseline from, e.g.
+        HistGradientBoostingClassifier.
+      why: >-
+        ONE sentence naming the profile fact that drove the metric choice (the class
+        balance, the target type, the row count). This is shown to the user.
+
   suggest_tool:
     name: suggest_techniques
     description: "Record which published techniques are worth trying on this dataset."
