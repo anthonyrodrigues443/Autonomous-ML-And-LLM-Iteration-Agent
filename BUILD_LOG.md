@@ -286,7 +286,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
 | Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | done |
-| Tue Jul 28 | Experiment dossier, deterministic (distill captured cell stdout into a structured per-experiment record feeding briefs) + lean tried/untried idea ledger on `components_used` (capped, out of the dense supervisor prompt; watch for the EDA-ledger regression pattern) | dossier + ledger + tests | |
+| Tue Jul 28 | Experiment dossier, deterministic (distill captured cell stdout into a structured per-experiment record feeding briefs) + lean tried/untried idea ledger on `components_used` (capped, out of the dense supervisor prompt; watch for the EDA-ledger regression pattern) | dossier + ledger + tests | done |
 | Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | |
 | Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | |
 | Fri Jul 31 | Dial A: agent picks the metric + starting model from research + the data profile; `--metric` optional; free unscored inspect/EDA step so exploration stops costing a scored iteration | proposer/supervisor + CLI + loop + tests | |
@@ -483,6 +483,26 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-01 | Sprint 2 Day 2 | The deterministic record: experiment dossier + one definition of tried/untried
+
+**Task:** Give the run two records that need no LLM — what a finished session can be observed to have done, and what the run has already spent itself on — and collapse the copies of that logic already scattered through the supervisor.
+
+**What shipped:**
+- `core/dossier.py`: distils a finished session into an observed record — techniques instantiated, data facts the cells printed, the validation trail, error signatures deduped on the same signature the coder's breaker uses, and the session shape (cells run / errored / timed out). The load-bearing rule is that it NEVER invents: every fact is a line the session printed, quoted, or a count of the cell records. That is exactly what makes it safe as the Summarizer's fallback, because a fallback that could hallucinate would be worse than no fallback. `build()` never raises — it is the path that runs when everything else has already degraded.
+- `core/ledger.py`: tried/untried over two dimensions. Lever classes are marker-matched and can false-positive; components come from `codegen.components_used` via the AST and cannot, so `component_tried()` distinguishes `GradientBoostingClassifier` from `HistGradientBoostingClassifier` where substring matching cannot. The marker-neutralising pass is injectable, so the module owns no marker vocabulary of its own.
+- The Summarizer's deterministic skeleton now reads the dossier instead of keeping a parallel copy; its dead `_val_trail` / `_FLOAT` helpers are gone.
+- 24 new tests (`test_dossier.py` 13, `test_ledger.py` 11). 508 unit tests, ruff + mypy --strict clean.
+
+**The consolidation was the real win.** The tried-set loop existed TWICE in `supervisor.py`, inline in `_fallback_move` and again in `_lever_ledger`. Both now read `run_ledger()`; zero duplicate loops remain. Same class of problem as Day 1's metric frozensets — a fact about the run with more than one definition.
+
+**A trap caught doing it:** `_LEVER_MARKERS` and `_CANONICAL_MOVES` hold the SAME keys in DIFFERENT orders, deliberately — the first is display order for the prompt line, the second is fallback priority for `_fallback_move`. Naively sharing the sequence would have silently reordered text inside the supervisor's prompt, and list order is a salience signal to an LLM. So the shared piece is the tried SET only, never the order: share the derivation, never the presentation. A test pins it, since the invariant is otherwise invisible to whoever next reorders either dict.
+
+**Correction to the sprint plan's premise.** The Day 2 row says to watch for the EDA-ledger regression pattern, which read as "a ledger in the prompt is the thing that regressed." It is not. Two different June events: the LEVER ledger shipped 2026-06-10 and HELPED (it is in the first 10/10-above-0.60 run entry, and it is live in the prompt today as `_lever_ledger`); the EDA ledger plus a supervisor status line was the thing built and reverted 2026-06-20. The component ledger still stays out of the prompt, but on the weaker ground that it is new context on an already-dense prompt, not that it repeats a measured failure.
+
+**One visible behaviour change:** `val_trail` renders at a consistent 4dp instead of echoing whatever precision the session printed, and dedupes by value — so 0.55 followed by 0.5500 is one entry, not two.
+
+**Deliberately not done, and why:** feeding the dossier into the Summarizer's PROMPT, and seeding the digest's insight fields from observation. Both change what eventually reaches the supervisor, so both are gated on a before/after rather than on being available. They belong to Day 4, where the Summarizer graduates to authoring the dossier, and Day 6 already carries "no context regression" as a bar criterion. The decision rule for that run: keep only if lever diversity holds — a score that rises while diversity collapses is the June pattern presenting itself as a win. Nothing in this PR changes a single character the supervisor reads.
 
 ### 2026-08-01 | Sprint 2 Day 1 | The metric layer: registry, probability metrics, configurable averaging
 

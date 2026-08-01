@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from iterate.core import codegen
+from iterate.core import codegen, ledger
 from iterate.core.scoring import direction
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
@@ -1071,23 +1071,25 @@ _CANONICAL_MOVES: dict[str, str] = {
 }
 
 
+def run_ledger(history: list[Experiment]) -> ledger.Ledger:
+    """This run's tried/untried record. One definition of "already attempted",
+    shared by the fallback move and anything downstream that needs it."""
+    return ledger.build(
+        history,
+        lever_markers=_LEVER_MARKERS,
+        lever_order=_CANONICAL_MOVES,
+        normalize=_neutralize_hgb,
+    )
+
+
 def _fallback_move(history: list[Experiment]) -> tuple[str, str] | None:
     """A harness-composed (title, move) from the first lever class never tried this
     run, or None when every class is tried. The last resort after a guard fires
     twice: guaranteed novel by construction."""
-    tried: set[str] = set()
-    for exp in history:
-        code = exp.candidate.changes.get("code")
-        if not isinstance(code, str):
-            continue
-        low = _neutralize_hgb(code.lower())
-        for lever, markers in _LEVER_MARKERS.items():
-            if lever not in tried and any(m in low for m in markers):
-                tried.add(lever)
-    for lever, move in _CANONICAL_MOVES.items():
-        if lever not in tried:
-            return f"untried lever: {lever}", f"next: {lever}: {move}."
-    return None
+    lever = run_ledger(history).first_untried()
+    if lever is None:
+        return None
+    return f"untried lever: {lever}", f"next: {lever}: {_CANONICAL_MOVES[lever]}."
 
 
 def _rebriefs_a_just_duplicated_class(brief: str, history: list[Experiment]) -> bool:
@@ -1224,15 +1226,11 @@ def _lever_ledger(history: list[Experiment]) -> str:
     tried side."""
     if not history:
         return ""
-    tried: set[str] = set()
-    for exp in history:
-        code = exp.candidate.changes.get("code")
-        if not isinstance(code, str):
-            continue
-        low = _neutralize_hgb(code.lower())
-        for lever, markers in _LEVER_MARKERS.items():
-            if lever not in tried and any(m in low for m in markers):
-                tried.add(lever)
+    # Shares the run ledger's computation, but keeps its OWN ordering: this line is
+    # display order (`_LEVER_MARKERS`), while the ledger's `untried_levers` is
+    # fallback-priority order (`_CANONICAL_MOVES`). Same keys, different orders, on
+    # purpose — so the shared piece is the tried SET, never the sequence.
+    tried = run_ledger(history).tried_levers
     tried_s = ", ".join(lv for lv in _LEVER_MARKERS if lv in tried) or "none"
     untried_s = ", ".join(lv for lv in _LEVER_MARKERS if lv not in tried) or "none"
     return f"Levers tried: {tried_s} | Levers NOT yet tried: {untried_s}"

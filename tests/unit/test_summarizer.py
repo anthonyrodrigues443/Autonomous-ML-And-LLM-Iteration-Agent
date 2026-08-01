@@ -91,7 +91,10 @@ def test_digest_merges_deterministic_skeleton_with_llm_insight() -> None:
     assert "OneHotEncoder" in digest.techniques
     assert any("HistGradientBoosting" in t for t in digest.techniques)
     assert digest.score == 0.61
-    assert digest.val_trail == "0.55 -> 0.61"
+    # 4dp, matching how scores render everywhere else, rather than echoing whatever
+    # precision the session happened to print. Also dedups by value, so a session
+    # printing 0.55 and then 0.5500 is one entry rather than two.
+    assert digest.val_trail == "0.5500 -> 0.6100"
     # LLM-filled insight
     assert digest.data_insights == ["PaymentMethod cardinality 4"]
     assert digest.what_helped == ["target encoding: 0.55 -> 0.61"]
