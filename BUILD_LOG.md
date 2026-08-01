@@ -287,7 +287,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 |---|---|---|---|
 | Mon Jul 27 | Metric registry replaces the fixed 8-metric panel + probability capture through the predictions contract + ROC-AUC / log-loss / PR-AUC + configurable averaging; plumbed through CLI, briefs, notebook headers | scoring + contract + tests | done |
 | Tue Jul 28 | Experiment dossier, deterministic (distill captured cell stdout into a structured per-experiment record feeding briefs) + lean tried/untried idea ledger on `components_used` (capped, out of the dense supervisor prompt; watch for the EDA-ledger regression pattern) | dossier + ledger + tests | done |
-| Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | |
+| Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | done |
 | Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | |
 | Fri Jul 31 | Dial A: agent picks the metric + starting model from research + the data profile; `--metric` optional; free unscored inspect/EDA step so exploration stops costing a scored iteration | proposer/supervisor + CLI + loop + tests | |
 | Sat Aug 1 | Certification-style validation on gemma4:12b (bar criteria + citations genuine + Critic catches seeded leakage + no context regression) + fixes; buffer absorbs anything slipped Mon-Fri | validation + fixes | |
@@ -483,6 +483,29 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-01 | Sprint 2 Day 3 | The Researcher: literature grounding with citations that cannot be invented
+
+**Task:** The first specialist graduates at the tool boundary the architecture has described since 2026-06-01, and the first time this codebase talks to an external API.
+
+**Plan correction, forced:** the row says "arxiv + papers-with-code clients". **papers-with-code no longer exists** — `paperswithcode.com` now 302-redirects to `huggingface.co/papers/trending`. Replaced with **OpenAlex**, which is a straight upgrade: ~320M works across journals and conferences versus arXiv's ~2.4M preprints, and it returns citation counts, which gives the Researcher a ranking signal it otherwise lacks. Both are keyless and free, so `pip install iterate-ai` still needs no account.
+
+**Architecture correction, caught before building.** The plan (and my own first description) had the supervisor calling the Researcher as a tool. It does not, and should not. In this codebase the HARNESS orchestrates and agents never call each other: `agent_loop` calls `supervisor.decide()`, then `coder.run()`, then `summarizer.summarize()`. The one place a supervisor drives a tool loop is `answer()` (Q&A with `read_notebook`), and that is deliberately quarantined — its docstring says "none of this context ever enters `plan_next`", because `plan_next` must stay ONE structured call. That is the same constraint that turned thinking mode off for strict roles. So the Researcher is orchestrated exactly like the Summarizer, and the supervisor's ASK is a `want_research` boolean on the emit it already makes: one field, not an extra round trip.
+
+**What shipped:**
+- `adapters/research/` — OpenAlex + arXiv clients, disk-cached by query hash under `.iterate/research/` (survives across runs), arXiv rate-limited to its requested 1-per-3s, both hitting https directly since the http endpoint 301-redirects on every uncached query.
+- `core/researcher.py` — two focused LLM calls with deterministic retrieval between them: `plan_queries` turns the host profile into 2-3 queries, the harness searches and dedupes, `suggest_techniques` picks from what came back. Split because a specialist with one narrow job tool-calls far more reliably on a weak model than one call juggling search, judgement and citation.
+- **The citation guarantee is structural, not prompted.** The model picks a paper by its INDEX in the list it was shown; the harness resolves that index to the identifier the API returned. It is incapable of emitting a DOI that was never fetched. An out-of-range or non-numeric index DROPS the suggestion rather than keeping it with a blank citation. Prompting a model not to invent citations is a request; indexing makes it impossible, and a fabricated citation in a tool advertising "literature-aware proposals" is the worst bug this project could ship.
+- **Crediting is conservative.** `Candidate.source` becomes "researcher" and citations are stamped ONLY when the brief actually took up a suggestion (technique phrase present, or two shared content words). A pass the supervisor read and ignored stamps nothing, because an unearned citation is no better than an invented one.
+- Two deterministic guards around the supervisor's judgement: iteration 1 always researches (no history means nothing to base a `want_research` call on), and `max_research_calls` (3) caps the run so literature can never eat the experiment budget.
+- `--research/--no-research`, defaulting on. Findings reach `decide()` as one capped block (420 chars, three lines) alongside guidance and standing rules.
+- 17 new tests. 525 unit tests, ruff + mypy --strict clean.
+
+**A real bug the tests caught:** `search_all` did not guard against a source raising. The built-in clients swallow their own network errors, but the AGGREGATOR did not, so any custom or later-added source broke the never-raises contract. Now guarded per source: one dead source degrades to the others' results, not to a dead run.
+
+**A logging call that paid for itself immediately:** the Researcher's two broad `except` blocks logged at DEBUG. During testing one of them silently swallowed a pydantic ValidationError — a genuine programming error, invisible, presenting exactly like "the literature search found nothing". Raised to INFO with the exception text. Research silently producing nothing and research legitimately finding nothing look identical from outside, and only one of them is a problem.
+
+**Verified end to end against the live APIs**, not only against fakes: a scripted model produced two queries, the clients returned 10 deduped papers, and both suggestions came back with real DOIs (`10.1038/s41586-024-08328-6`, `10.1186/s40537-020-00305-w`). Crediting attributed the brief that took up a suggestion and refused an unrelated one. Cold 3.1s, warm 0.00s from cache.
 
 ### 2026-08-01 | Sprint 2 Day 2 | The deterministic record: experiment dossier + one definition of tried/untried
 

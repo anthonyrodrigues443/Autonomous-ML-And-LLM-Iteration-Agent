@@ -19,7 +19,13 @@ from typing import TYPE_CHECKING, Any
 
 from iterate.adapters.compute.local import run_in_process
 from iterate.core.orchestrator import RunResult
-from iterate.core.supervisor import SupervisorError, lever_markers_for_brief, render_live_cells
+from iterate.core.researcher import credited
+from iterate.core.supervisor import (
+    SupervisorError,
+    lever_markers_for_brief,
+    render_live_cells,
+    run_ledger,
+)
 from iterate.core.terminator import AttemptOutcome, LoopState
 from iterate.schemas.experiment import Candidate, Experiment
 
@@ -30,6 +36,7 @@ if TYPE_CHECKING:
     from iterate.core.coder import CodingAgent
     from iterate.core.interactive import RunController
     from iterate.core.memory import Memory
+    from iterate.core.researcher import Findings, Researcher
     from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor, SupervisorDecision
     from iterate.core.terminator import Terminator
@@ -69,6 +76,8 @@ def run_supervised(
     memory: Memory,
     data_summary: str,
     summarizer: Summarizer | None = None,
+    researcher: Researcher | None = None,
+    max_research_calls: int = 3,
     on_experiment: Callable[..., None] | None = None,
     controller: RunController | None = None,
 ) -> RunResult:
@@ -78,6 +87,16 @@ def run_supervised(
     `ExperimentDigest` attached to the experiment before it is recorded, so the next
     Supervisor reasons over digests instead of raw notebooks (cross-notebook
     knowledge transfer). It never raises; a failed digest is simply absent.
+
+    ``researcher`` (optional) grounds a brief in retrievable literature. The harness
+    orchestrates it, exactly as it does the Summarizer — the supervisor never calls
+    another agent; it ASKS, via ``want_research`` on the emit it already makes, and
+    the harness runs the pass before the next ``decide()``. Two deterministic guards
+    sit around that judgement: iteration 1 always researches (there is no history to
+    reason from, so there is nothing to ask), and ``max_research_calls`` caps the
+    run, so a supervisor that keeps asking cannot spend the budget on literature
+    instead of experiments. A failed pass yields no findings and the run proceeds
+    ungrounded.
 
     ``on_experiment`` (optional) is invoked after EVERY completed experiment —
     success or failure — with ``experiment=, baseline=, is_best=, run_id=`` keyword
@@ -103,6 +122,9 @@ def run_supervised(
     started_at = perf_counter()
     stopped_because = "exhausted"
     iteration = 0
+    wants_research = False  # the supervisor's ask, carried to the next iteration
+    research_calls = 0
+    last_findings: Findings | None = None
     if controller is not None:
         # Q&A is scoped to THIS run: current_run is appended in place below, so
         # the closure always sees exactly the experiments the user is watching —
@@ -145,6 +167,24 @@ def run_supervised(
                     extra["user_guidance"] = "; ".join(guidance)
                 if rules:
                     extra["standing_rules"] = rules
+                # Iteration 1 always researches: with no history there is nothing for
+                # the supervisor to base a want_research judgement on. After that it
+                # is the supervisor's ask, bounded by the run cap.
+                if researcher is not None and (iteration == 1 or wants_research) and (
+                    research_calls < max_research_calls
+                ):
+                    research_calls += 1
+                    findings = researcher.research(
+                        profile=data_summary, tried=run_ledger(memory.history(target.name)).tried_components
+                    )
+                    wants_research = False
+                    if findings:
+                        last_findings = findings
+                        extra["research"] = findings.render()
+                        log.info(
+                            "agent loop: researched %d papers -> %d suggestions",
+                            findings.papers_seen, len(findings.suggestions),
+                        )
                 # Memory already holds every recorded experiment (line below records each
                 # one) — adding current_run would feed this run's experiments in twice.
                 decision = supervisor.decide(
@@ -157,6 +197,7 @@ def run_supervised(
                     carried_best=best,
                     **extra,
                 )
+                wants_research = decision.want_research
             except SupervisorError as exc:
                 log.warning("agent loop: iteration %d supervisor failed: %s", iteration, exc)
                 memory.record_proposer_failure(run_id, iteration, "supervisor", str(exc))
@@ -182,6 +223,7 @@ def run_supervised(
                     experiment, preds_digest = _run_experiment(
                         make_coder(), dataset, decision, iteration, target.name,
                         start_code, start_score, seen_digests=frozenset(seen_digests),
+                        findings=last_findings,
                     )
                 except Exception as exc:  # one bad experiment must not kill the run
                     # e.g. the LLM backend timing out after retries, or a kernel dying.
@@ -422,6 +464,7 @@ def _run_experiment(
     starting_score: float | None,
     *,
     seen_digests: frozenset[str] = frozenset(),
+    findings: Findings | None = None,
 ) -> tuple[Experiment, str | None]:
     """Run one briefed session; returns the experiment and the sha256 of its
     submitted predictions (for later sessions' identical-submission gate)."""
@@ -452,11 +495,17 @@ def _run_experiment(
         # The commissioned lever never ran successfully — the score is the carried
         # pipeline's, not the lever's, and the supervisor must not credit it.
         changes["lever_unmeasured"] = True
+    citations = credited(findings, decision.brief)
     candidate = Candidate(
         description=decision.title,
         changes=changes,
         rationale=decision.brief,
-        source="proposer",
+        # "researcher" only when the brief actually took up a suggestion. A
+        # research pass that the supervisor read and ignored leaves the candidate
+        # a plain proposer candidate, because claiming otherwise would put a
+        # citation on work no paper informed.
+        source="researcher" if citations else "proposer",
+        citations=citations,
     )
     experiment = Experiment(
         candidate=candidate,

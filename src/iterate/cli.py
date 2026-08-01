@@ -139,6 +139,12 @@ def run(
         help="Averaging for f1/precision/recall: binary | micro | macro | weighted. "
         "Default adapts to the target (binary on two classes, macro otherwise).",
     ),
+    research: bool = typer.Option(
+        True,
+        "--research/--no-research",
+        help="Ground briefs in retrievable literature (OpenAlex + arXiv, no API key). "
+        "Cached on disk; --no-research skips it entirely for offline or fast runs.",
+    ),
     baseline: float | None = typer.Option(
         None, "--baseline", help="Your reported baseline score (sanity check; requires --source)."
     ),
@@ -227,6 +233,7 @@ def run(
     from iterate.core.orchestrator import Orchestrator
     from iterate.core.proposer import Proposer, summarize_dataset
     from iterate.core.reconstructor import Reconstructor
+    from iterate.core.researcher import Researcher
     from iterate.core.scoring import AVERAGES, CLASSIFICATION_METRICS, REGRESSION_METRICS
     from iterate.core.scoring import direction as metric_direction
     from iterate.core.summarizer import Summarizer
@@ -353,6 +360,19 @@ def run(
         # the no-think client even when --think is set (thinking crowds out the call).
         supervisor = Supervisor(client, metric=metric)
         summarizer = Summarizer(client, metric=metric)
+        # Same no-think client as the other strict roles: the Researcher must emit
+        # a single structured tool call, and a thinking trace crowds that out.
+        # Cached beside the runs so a re-run on the same data pays nothing.
+        researcher = (
+            Researcher(
+                client,
+                metric=metric,
+                direction=direction,
+                cache_dir=Path(settings.iterate_runs_dir).parent / "research",
+            )
+            if research
+            else None
+        )
         # Local models live in a small context window (num_ctx); cap the coder's
         # prompt well under it so the system prompt is never what truncates.
         context_budget = 48_000 if backend == "ollama" else 400_000
@@ -464,6 +484,7 @@ def run(
                 target=model_target, dataset=dataset, supervisor=supervisor,
                 make_coder=make_coder, terminator=terminator, memory=loop_memory,
                 data_summary=data_summary, summarizer=summarizer,
+                researcher=researcher,
                 on_experiment=on_experiment, controller=controller,
             )
 
