@@ -775,7 +775,7 @@ _ASSIGN_TARGET = re.compile(r"\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*=[^=]")
 _FIT_MUTATION = re.compile(r"\s*([A-Za-z_]\w*)\s*\.\s*fit\b")
 
 
-def _submit_path_code(code: str) -> str:
+def submit_path_code(code: str) -> str:
     """A backward slice of the carried code from its LAST predictions write: only
     lines that assign (or fit) something the submission transitively depends on.
     The whole-code component list credited null probes to the banked pipeline in a
@@ -804,7 +804,7 @@ def _submit_path_code(code: str) -> str:
 def _submit_components(code: str) -> list[str]:
     """The components the final submission actually uses; whole-code fallback when
     the slice is unparseable (multi-line statements defeat line slicing)."""
-    components = codegen.components_used(_submit_path_code(code))
+    components = codegen.components_used(submit_path_code(code))
     return components if components else codegen.components_used(code)
 
 
@@ -1163,7 +1163,15 @@ def _format_history(history: list[Experiment], metric: str) -> list[str]:
         result = exp.result
         if result is not None and result.succeeded and result.metrics is not None:
             outcome = f"{metric}={result.metrics.primary_value:.4f}"
-            if _was_floor_banked(exp):
+            if reason := exp.candidate.changes.get("critic_rejected"):
+                # NOT optional context. Without this the supervisor reads a leaked
+                # 0.81 as the run's high-water mark and pushes that direction, so
+                # omitting it would leave the scoreboard actively lying. Same
+                # reasoning as the floor and duplicate markers below.
+                outcome += f" [REJECTED, {reason} — this number is not a result]"
+            elif flagged := exp.candidate.changes.get("critic_flagged"):
+                outcome += f" [{flagged}]"
+            elif _was_floor_banked(exp):
                 # The score came from the harness's fallback submit, not the lever —
                 # the supervisor must not credit the lever for it.
                 outcome += " [floor: harness fallback submission, the lever itself did not score]"
@@ -1272,7 +1280,12 @@ def _technique_table(history: list[Experiment], metric: str) -> str:
         if exp.digest is None or exp.digest.score is None:
             continue
         changes = exp.candidate.changes
-        if changes.get("duplicate_submission") or changes.get("lever_unmeasured") or _was_floor_banked(exp):
+        if (
+            changes.get("duplicate_submission")
+            or changes.get("lever_unmeasured")
+            or changes.get("critic_rejected")
+            or _was_floor_banked(exp)
+        ):
             # A stamped experiment's score belongs to the incumbent (or the harness
             # floor), not its techniques — crediting them re-invited the settled
             # lever in a live run.
