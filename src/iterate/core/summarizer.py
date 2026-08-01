@@ -17,10 +17,9 @@ never kill the run.
 
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING, Any
 
-from iterate.core import codegen
+from iterate.core import dossier
 from iterate.prompts import PROMPTS
 from iterate.schemas.experiment import ExperimentDigest
 from iterate.schemas.llm import Message, ToolSpec
@@ -30,7 +29,6 @@ if TYPE_CHECKING:
     from iterate.schemas.experiment import Experiment
 
 _PROMPTS = PROMPTS["summarizer"]
-_FLOAT = re.compile(r"\d+\.\d+")
 _CELL_OUTPUT_TAIL = 600  # per-cell stdout shown to the summarizer
 _SESSION_CAP = 16000  # total session text handed to the summarizer (one bounded call)
 
@@ -106,36 +104,22 @@ class Summarizer:
 
 def _skeleton(experiment: Experiment, metric: str) -> ExperimentDigest:
     """The deterministic part: techniques actually instantiated, the score, and the
-    within-session validation trail. Always correct, no LLM."""
-    code = experiment.candidate.changes.get("code")
-    techniques = codegen.components_used(code) if isinstance(code, str) else []
-    result = experiment.result
-    score = (
-        result.metrics.primary_value
-        if result is not None and result.succeeded and result.metrics is not None
-        else None
-    )
+    within-session validation trail. Always correct, no LLM.
+
+    Read off the dossier rather than recomputed here, so there is exactly one
+    definition of what a session can be observed to have done. The insight fields
+    (data_insights / what_helped / what_hurt) stay empty on this path on purpose:
+    they flow into the supervisor's planning context, and seeding them from
+    observation is a context change that needs its own before/after measurement
+    (see the June EDA-ledger revert). That decision belongs to Day 4, where the
+    Summarizer graduates to authoring the dossier.
+    """
+    record = dossier.build(experiment)
     return ExperimentDigest(
-        techniques=techniques, score=score, val_trail=_val_trail(experiment)
+        techniques=record.techniques,
+        score=record.score,
+        val_trail=" -> ".join(f"{v:.4f}" for v in record.val_trail),
     )
-
-
-def _val_trail(experiment: Experiment) -> str:
-    """The validation scores the session printed, in order (raw 'a -> b -> c')."""
-    cells = experiment.candidate.changes.get("cells")
-    if not isinstance(cells, list):
-        return ""
-    seen: list[str] = []
-    for cell in cells:
-        stdout = cell.get("stdout") if isinstance(cell, dict) else None
-        for line in (stdout or "").splitlines():
-            low = line.lower()
-            if "val" not in low and "score" not in low:
-                continue
-            floats = _FLOAT.findall(line)
-            if floats and (not seen or seen[-1] != floats[-1]):
-                seen.append(floats[-1])
-    return " -> ".join(seen[-8:])
 
 
 def _render_session(experiment: Experiment) -> str:
