@@ -291,7 +291,7 @@ def _score_code_cell(metric: str) -> str:
         "    _out if isinstance(_out, tuple) and len(_out) == 2 else (_out, None)\n"
         ")\n"
         f"print(score(task_for_metric({metric!r}), y_holdout, list(predictions), "
-        "y_proba=probabilities))"
+        f"y_proba=probabilities, include=({metric!r},)))"
     )
 
 

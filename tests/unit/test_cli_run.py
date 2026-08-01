@@ -475,6 +475,9 @@ def _stub_run_supervised(
         *, target: Any, dataset: Any, supervisor: Any, make_coder: Any,
         terminator: Any, memory: Any, data_summary: str, summarizer: Any = None,
         on_experiment: Any = None, controller: Any = None,
+        # **kwargs so adding a loop parameter does not break every CLI test; the
+        # ones these tests assert on are named explicitly above.
+        **kwargs: Any,
     ) -> Any:
         from iterate.core.orchestrator import RunResult
         from iterate.schemas.experiment import Candidate, Experiment
@@ -483,6 +486,7 @@ def _stub_run_supervised(
         captured["supervisor_client"] = supervisor._client
         captured["coder_client"] = coder._client
         captured["controller"] = controller
+        captured["researcher"] = kwargs.get("researcher")
         baseline = ExperimentResult(
             experiment_id="b",
             metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize", n_samples=100),
@@ -578,3 +582,27 @@ def test_each_iteration_notebook_is_saved_the_moment_it_finishes(
     # written by the per-iteration hook — i.e. while the run was still going.
     assert list((run_dir / "notebooks").glob("iter_01_*.ipynb")), "incremental save missing"
     assert (run_dir / "best.ipynb").exists()  # best.ipynb tracks the best-so-far
+
+
+def test_research_is_on_by_default_and_can_be_turned_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--no-research must genuinely skip the specialist, so an offline or
+    hurry-up run never waits on a literature API."""
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+
+    captured = _stub_run_supervised(monkeypatch)
+    result = CliRunner().invoke(
+        app, ["run", "--data", str(data), "--target", "churn", "--metric", "f1"]
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["researcher"] is not None
+
+    captured = _stub_run_supervised(monkeypatch)
+    result = CliRunner().invoke(
+        app,
+        ["run", "--data", str(data), "--target", "churn", "--metric", "f1", "--no-research"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["researcher"] is None

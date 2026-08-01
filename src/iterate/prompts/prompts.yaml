@@ -447,6 +447,7 @@ supervisor:
   # contain braces). Both are hard-capped by the caller; lean context always.
   guidance_prefix: "USER GUIDANCE (from the human watching the run — prefer it when it names a legal move, but the ladder, PIVOT, and the never-re-brief rules still outrank it): "
   rules_prefix: "USER RULES (standing instructions from the human — every brief must respect them): "
+  research_prefix: "Literature findings for this dataset (each with the paper that supports it) — you may brief one of these, or ignore them if a better move is already clear: "
 
   # Classifies ONE chat line; the harness executes the routing.
   route_system: |-
@@ -483,6 +484,12 @@ supervisor:
         another experiment.
       title: >-
         A short label for this experiment (a few words), for the leaderboard.
+      want_research: >-
+        true if the NEXT experiment would benefit from a literature search before
+        it is briefed — you are out of promising untried levers, or several
+        iterations have not improved on the best. false when you already know the
+        move worth making; research costs a call and adds nothing when the path is
+        clear.
       brief: |-
         The "next:" move handed to the coding agent: 1-2 lines opening "next:", exactly ONE move naming the technique and its lever class, with one reason citing a profile fact or a past number; effect in plain words, never a predicted number. Do NOT write a "so far:" summary — the harness composes that slot from the recorded history and discards anything you write before "next:". Example: next: imbalance-or-threshold: class balance 73/27, metric f1, keep the best pipeline and train with class_weight balanced so the majority class stops dominating. On experiment 1 brief the plain baseline only (one-hot, median-impute, HistGradientBoosting), nothing else: no extra models, features, or tuning. After experiment 1, keep the best configuration and add exactly one change; never repeat a scored approach. Required unless stopping.
 
@@ -537,6 +544,85 @@ summarizer:
         Empty list if none.
       takeaway: >-
         ONE sentence: the single most promising concrete next move given this run.
+
+researcher:
+  # The Researcher specialist. TWO focused calls, each with one job — a specialist
+  # with a single narrow task tool-calls far more reliably on a weak model than one
+  # LLM juggling search, judgement and citation at once (DECISIONS 2026-06-01).
+  #
+  # Call 1 turns the data profile into search queries. Call 2 picks techniques from
+  # what those queries actually returned. The model NEVER writes a citation string:
+  # it selects a paper by its INDEX in the list it was shown, and the harness
+  # resolves that index to the identifier the API returned. A fabricated citation
+  # in a tool that advertises "literature-aware" is the worst bug this can ship, so
+  # the guarantee is structural, not a prompt instruction.
+
+  # Placeholders: {metric}, {direction}
+  queries_system: |-
+    You turn a machine-learning problem into literature search queries. You are optimizing '{metric}' ({direction}) on a TABULAR dataset, and you are searching for techniques that could raise it.
+
+    Write 2 or 3 SHORT search queries (4 to 8 words each), each attacking a DIFFERENT angle of this specific problem. Ground every query in the actual data profile below: its size, its class balance, the kinds of columns it really has. A query about image augmentation or text embeddings is wasted here, and so is a query about a column this dataset does not contain.
+
+    Good queries name a technique family plus the data condition that motivates it ("target encoding high cardinality categorical", "class imbalance tabular boosting", "feature interactions gradient boosted trees"). Bad queries are generic ("machine learning", "improve accuracy") or name a specific library.
+
+    Do not repeat an angle already exhausted this run. Call plan_queries; respond with nothing else.
+
+  # Placeholders: {metric}, {profile}, {tried}
+  queries_user: |-
+    Dataset profile (established facts, computed by the host — trust these):
+    {profile}
+
+    Goal: raise '{metric}' on this dataset.
+    Already attempted this run: {tried}
+
+    Write the queries now by calling plan_queries.
+
+  # Placeholders: {metric}, {direction}
+  suggest_system: |-
+    You pick which published techniques are worth spending a real experiment on, for THIS dataset, optimizing '{metric}' ({direction}).
+
+    You are shown numbered papers. For each technique you suggest, give the NUMBER of the paper that supports it. You must never write out a paper id, DOI or URL yourself — only the number. If no paper shown supports a technique, do not suggest it.
+
+    Judge applicability against the data profile, not against how interesting the paper is. A technique that needs columns this dataset does not have is useless here, however good the paper. A technique needing far more rows than this dataset has is useless too. Prefer well-cited, simple, tabular-applicable methods; this will be implemented by a small model on modest hardware.
+
+    Suggest at most 3, ordered best first, and suggest fewer (or none) rather than padding with something inapplicable. Call suggest_techniques; respond with nothing else.
+
+  # Placeholders: {metric}, {profile}, {tried}, {papers}
+  suggest_user: |-
+    Dataset profile (established facts):
+    {profile}
+
+    Goal: raise '{metric}' on this dataset.
+    Already attempted this run (do NOT re-suggest these): {tried}
+
+    Papers found:
+    {papers}
+
+    Pick the techniques worth trying now by calling suggest_techniques.
+
+  retry_nudge: "Respond ONLY with the tool call. No prose."
+
+  queries_tool:
+    name: plan_queries
+    description: "Record the literature search queries for this dataset."
+    fields:
+      queries: >-
+        2 or 3 short search queries, 4 to 8 words each, each a different angle,
+        each grounded in this dataset's actual profile.
+
+  suggest_tool:
+    name: suggest_techniques
+    description: "Record which published techniques are worth trying on this dataset."
+    fields:
+      technique: >-
+        The concrete technique to try, named as a modelling move a coder could
+        implement (e.g. "target-encode the high-cardinality categoricals").
+      rationale: >-
+        ONE sentence tying the paper's finding to THIS dataset's profile — the
+        column type, class balance or row count that makes it applicable here.
+      paper: >-
+        The NUMBER of the supporting paper from the list shown. Never a DOI, URL
+        or title.
 
 reconstructor:
   # System prompt for source-aware baseline reconstruction. The LLM reads the

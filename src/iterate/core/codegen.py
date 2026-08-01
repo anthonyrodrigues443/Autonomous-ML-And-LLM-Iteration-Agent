@@ -426,6 +426,7 @@ def score_predictions(
             y_pred,
             y_proba=y_proba,
             average=average,
+            include=(metric,),
         )
     except Exception as exc:
         if y_proba is not None and not needs_proba:
@@ -436,6 +437,7 @@ def score_predictions(
                     dataset.test_target.to_numpy(),
                     y_pred,
                     average=average,
+                    include=(metric,),
                 )
             except Exception:
                 return _failed(

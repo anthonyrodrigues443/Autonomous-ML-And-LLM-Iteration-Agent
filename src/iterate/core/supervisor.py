@@ -48,6 +48,12 @@ class SupervisorDecision:
     stop: bool
     title: str  # short label for the leaderboard
     brief: str  # the instruction handed to the coding agent (summary + strategy)
+    # The supervisor's ASK for literature grounding before the next experiment. A
+    # field on the emit it already makes, deliberately not a tool the supervisor
+    # drives: plan_next stays ONE structured call, which is why thinking is off for
+    # strict roles at all (LIMITATIONS). The harness reads this and runs the
+    # Researcher before the next decide().
+    want_research: bool = False
 
 
 def _build_tool() -> ToolSpec:
@@ -62,6 +68,10 @@ def _build_tool() -> ToolSpec:
                 "stop": {"type": "boolean", "description": fields["stop"]},
                 "title": {"type": "string", "description": fields["title"]},
                 "brief": {"type": "string", "description": fields["brief"]},
+                "want_research": {
+                    "type": "boolean",
+                    "description": fields["want_research"],
+                },
             },
             "required": ["stop", "brief"],
         },
@@ -98,6 +108,7 @@ class Supervisor:
         carried_best: Experiment | None = None,
         user_guidance: str | None = None,
         standing_rules: Sequence[str] = (),
+        research: str = "",
     ) -> SupervisorDecision:
         """Plan the next experiment. ``carried_best`` is the loop's CURRENT best —
         the experiment whose code the coder will actually receive as its starting
@@ -121,6 +132,16 @@ class Supervisor:
         guidance = _guidance_message(user_guidance, standing_rules)
         if guidance is not None:
             messages.append(Message(role="user", content=guidance))
+        if research.strip():
+            # One lean block, capped like guidance is. Findings are already one line
+            # per suggestion; the cap is the backstop that keeps a research pass from
+            # becoming the dense-context failure the EDA ledger was.
+            messages.append(
+                Message(
+                    role="user",
+                    content=_PROMPTS["research_prefix"] + _word_cut(research.strip(), _RESEARCH_CHARS),
+                )
+            )
         detail = ""
         rebrief_nudged = False
         dup_class_nudged = False
@@ -335,6 +356,9 @@ _ROUTE_KINDS = frozenset({"question", "steer_now", "steer_later", "rule"})
 # so what the user was acked is exactly what the model sees — never a re-cut.
 _GUIDANCE_CHARS = 620
 _RULE_CHARS = 90
+# Research findings are one line per suggestion (max 3), so this caps a pass at
+# roughly the size of a standing-rules block rather than a page of prose.
+_RESEARCH_CHARS = 420
 _RULES_SHOWN = 3
 
 
@@ -842,7 +866,9 @@ def _to_decision(args: dict[str, Any]) -> SupervisorDecision:
     title = str(args.get("title") or "").strip() or (brief[:60] or "experiment")
     if not stop and not brief:
         raise SupervisorError("plan_next returned neither stop nor a brief")
-    return SupervisorDecision(stop=stop, title=title, brief=brief)
+    return SupervisorDecision(
+        stop=stop, title=title, brief=brief, want_research=_coerce_bool(args.get("want_research"))
+    )
 
 
 def _build_messages(

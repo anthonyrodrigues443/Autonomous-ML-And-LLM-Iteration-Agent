@@ -224,6 +224,7 @@ class ModelTarget:
                 predictions,
                 y_proba=probabilities,
                 average=self._average,
+                include=(self._metric,),
             ),
             primary=self._metric,
             direction=direction(self._metric),

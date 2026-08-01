@@ -11,6 +11,7 @@ from iterate.core.scoring import (
     AVERAGES,
     CLASSIFICATION_METRICS,
     LABEL_METRICS,
+    PANEL,
     PROBA_METRICS,
     REGISTRY,
     REGRESSION_METRICS,
@@ -62,7 +63,7 @@ def test_label_panel_unchanged_when_no_probabilities_given() -> None:
 
 def test_binary_probabilities_add_the_full_panel() -> None:
     values = score("classification", BINARY_TRUE, BINARY_PRED, y_proba=BINARY_PROBA)
-    assert set(values) == CLASSIFICATION_METRICS
+    assert set(values) == {n for n, s in PANEL.items() if s.task == "classification"}
     # Label metrics are still computed, so history stays comparable across
     # iterations that did and didn't emit probabilities.
     labels_only = score("classification", BINARY_TRUE, BINARY_PRED)
@@ -103,7 +104,7 @@ def test_regression_ignores_probabilities() -> None:
 
 def test_regression_panel_is_the_four_known_metrics() -> None:
     values = score("regression", [1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
-    assert set(values) == REGRESSION_METRICS
+    assert set(values) == {n for n, s in PANEL.items() if s.task == "regression"}
     assert values["rmse"] == pytest.approx(math.sqrt(values["mse"]))
 
 
@@ -163,13 +164,20 @@ def test_every_exported_set_is_derived_from_the_registry() -> None:
         assert requires_proba(name) is spec.needs_proba
 
 
-def test_every_registered_metric_is_scorable() -> None:
-    """A row added to the registry without a working compute would otherwise only
-    surface on a live run."""
+def test_every_panel_metric_is_scorable() -> None:
+    """A panel row without a working compute would otherwise only surface live."""
     binary = score("classification", BINARY_TRUE, BINARY_PRED, y_proba=BINARY_PROBA)
     regression = score("regression", [1.0, 2.0, 3.0], [1.1, 1.9, 3.2])
-    scored = set(binary) | set(regression)
-    assert scored == set(REGISTRY)
+    assert set(binary) | set(regression) == set(PANEL)
+
+
+def test_every_exported_set_is_derived_from_the_right_table() -> None:
+    """Vocabulary sets answer "may this be selected"; LABEL_METRICS answers "what
+    does the panel always contain". Conflating them silently changes what a run
+    computes, so pin which table each reads."""
+    assert set(REGISTRY) == CLASSIFICATION_METRICS | REGRESSION_METRICS
+    assert set(PANEL) >= LABEL_METRICS
+    assert len(REGISTRY) > len(PANEL)  # the vocabulary is genuinely wider
 
 
 def test_pr_auc_is_registered_and_maximizes() -> None:
@@ -221,3 +229,75 @@ def test_averaging_does_not_touch_the_probability_panel() -> None:
     micro = score("classification", MULTI_TRUE, MULTI_PRED, y_proba=MULTI_PROBA, average="micro")
     for name in PROBA_METRICS & set(macro):
         assert macro[name] == micro[name]
+
+
+# ─── the derived vocabulary ──────────────────────────────────────────────────
+
+
+def test_the_vocabulary_is_derived_from_sklearn_not_hand_written() -> None:
+    """CANARY. The derivation reads private scorer attributes (_sign, _score_func,
+    _kwargs, _response_method). They have been stable for years, but if a sklearn
+    upgrade moves them this must fail HERE, in CI, rather than silently shrinking
+    a user's metric vocabulary back to the 12 curated ones."""
+    from sklearn.metrics import get_scorer_names
+
+    assert len(REGISTRY) > 40, "derivation produced almost nothing — sklearn API moved?"
+    for name in ("matthews_corrcoef", "balanced_accuracy", "f1_weighted", "jaccard"):
+        assert name in get_scorer_names()
+        assert name in REGISTRY
+
+
+def test_direction_for_derived_metrics_comes_from_sklearns_sign() -> None:
+    """The point of deriving: an agent may propose any of these and still cannot
+    invert the loop, because it never supplies the direction."""
+    assert direction("matthews_corrcoef") == "maximize"
+    assert direction("balanced_accuracy") == "maximize"
+    assert direction("neg_log_loss") == "minimize"
+    assert direction("neg_root_mean_squared_error") == "minimize"
+    assert direction("neg_mean_absolute_error") == "minimize"
+
+
+def test_clustering_scorers_are_excluded_from_the_vocabulary() -> None:
+    """sklearn also registers clustering scores. They compare two label
+    assignments rather than a prediction against a target, so offering them would
+    invite the agent to select something meaningless here."""
+    for name in ("rand_score", "v_measure_score", "adjusted_mutual_info_score"):
+        assert name not in REGISTRY
+
+
+def test_a_selected_metric_outside_the_panel_is_computed_on_top() -> None:
+    values = score(
+        "classification", BINARY_TRUE, BINARY_PRED, include=("matthews_corrcoef",)
+    )
+    assert "matthews_corrcoef" in values
+    assert set(values) >= LABEL_METRICS  # the panel is still there
+
+
+def test_include_is_ignored_for_the_wrong_task_or_missing_probabilities() -> None:
+    regression = score("regression", [1.0, 2.0], [1.1, 1.9], include=("matthews_corrcoef",))
+    assert "matthews_corrcoef" not in regression
+    no_proba = score("classification", BINARY_TRUE, BINARY_PRED, include=("neg_log_loss",))
+    assert "neg_log_loss" not in no_proba
+
+
+def test_derived_binary_metrics_honour_the_datasets_own_positive_label() -> None:
+    """sklearn bakes pos_label=1 into its binary scorers — the exact default that
+    made string targets unscorable. The derived compute re-points it."""
+    values = score(
+        "classification",
+        ["no", "yes", "no", "yes"],
+        ["no", "yes", "no", "no"],
+        include=("jaccard",),
+    )
+    assert "jaccard" in values
+
+
+def test_a_derived_probability_metric_scores_from_probabilities() -> None:
+    values = score(
+        "classification",
+        BINARY_TRUE,
+        BINARY_PRED,
+        y_proba=BINARY_PROBA,
+        include=("neg_log_loss",),
+    )
+    assert values["neg_log_loss"] > 0  # the raw loss, with direction saying minimize
