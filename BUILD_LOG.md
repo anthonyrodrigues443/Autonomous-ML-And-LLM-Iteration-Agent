@@ -291,7 +291,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | done (Summarizer-authors-dossier deferred, see entry) |
 | Fri Jul 31 | Dial A: agent picks the metric + starting model from research + the data profile; `--metric` optional; the RESEARCHER picks it (not the supervisor — the metric must exist before ModelTarget, which exists before the baseline, which is an argument to decide(), so at choosing time the supervisor has no baseline or history to reason from); validated against the registry for name and task, defaulting deterministically from the target dtype when research is unavailable; FIXED at run start and never changed mid-run, since one ruler is what makes history and cross-run baselines comparable; free unscored inspect/EDA step so exploration stops costing a scored iteration | proposer/supervisor + CLI + loop + tests | done (free inspect step cut, see entry) |
 | Sat Aug 1 | Certification-style validation on gemma4:12b (bar criteria + citations genuine + Critic catches seeded leakage + no context regression) + fixes; buffer absorbs anything slipped Mon-Fri | validation + fixes | done |
-| Sun Aug 2 | **Release v0.4.0** per the standing checklist; LIMITATIONS retires the metric-panel, proba-metrics, and averaging rows and states the CV cut | v0.4.0 out | |
+| Sun Aug 2 | **Release v0.4.0** per the standing checklist; LIMITATIONS retires the metric-panel, proba-metrics, and averaging rows and states the CV cut | v0.4.0 out | done |
 
 **Cut from v0.4 (post-v1.0 backlog):** CV/k-fold selection option, typed Session handoff (`_winning_code` blob stays), qwen3:14b re-run, `iterate history`/`best`/`why-failed` (any green Saturday can absorb these).
 
@@ -483,6 +483,24 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-02 | Sprint 2 Day 7 | v0.4.0 released
+
+**Task:** Release mechanics per the standing checklist.
+
+**Release gate (step 1):** v0.4 touched the loop in three places, so the trajectory bar was re-run before tagging rather than after — 8 runs across 6 datasets on gemma4:12b. That gate found seven bugs and is written up in the Day 6 entry. Four of eight runs improved on their baseline; of the four that did not, two had zero measured headroom and reporting nothing was the correct answer.
+
+**Build gate (step 2):** 583 unit tests, ruff + mypy --strict clean, CLI startup verified still free of sklearn. One thing caught here that would have failed the release: `make build` runs `ruff check .` over the WHOLE repo while CI runs `ruff check src tests`, so the new `docs/evidence/` reproduction script (33 lint errors, deliberately not production code) would have broken the build. Excluded in pyproject, which is what its own README already claimed.
+
+**Doc sync (step 3):** README status paragraph, release table row to shipped, the roadmap cell, the comparison-table "Literature-aware proposals" row flipped to a tick, and the capability section heading which still read "What v0.2 does" two releases on. LIMITATIONS: five rows flipped to fixed, the metric-panel row rewritten as the closed-registry row, the probability and averaging rows retired, and the false integer-target backlog row replaced. First ever EVAL_LOG entry, carrying the headroom table and a dimension scorecard.
+
+**Version mechanics (step 4):** 0.3.1 -> 0.4.0 in pyproject, `__init__`, and the lockfile; tagged v0.4.0. Tony runs `uv publish`.
+
+**Launch assets (step 5):** X thread (7 tweets, all under 275) and LinkedIn post (355 words, inside the 323-458 range of v0.1-v0.3) drafted in LAUNCH_POST.md, feature-first per the v0.2 REV2 lesson that a score-led post reads wrong. Demo to be recorded from the published package on `laptop_price.csv --max-iterations 3`, which shows the metric dial, a real citation and the 412 -> 322 win inside about twenty minutes.
+
+**What v0.4 shipped:** all five public promises. Researcher and Critic specialists, literature-grounded proposals with citations that cannot be fabricated, probability metrics (plus 42 more than promised, derived from scikit-learn), a selection-bias watch, and the first input dial to turn since v0.1 — `--metric` is optional.
+
+**Honest state of the evidence:** the headline capability claim rests on one dataset. Laptop price captured 110% of measured headroom by retrieving a 2022 paper on high-cardinality features and beating a hand-parsed baseline. Five of the six other datasets were near-ceiling, which is the real shape of tabular ML rather than a weakness of the agent, but it does mean "captures large gains" is n=1. The posts claim a specific run rather than a general capability, which is the correct framing for what was measured.
 
 ### 2026-08-02 | Sprint 2 Day 6 | Certification: seven real bugs, none of which 583 unit tests could find
 

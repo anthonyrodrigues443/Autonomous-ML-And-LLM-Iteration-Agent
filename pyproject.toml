@@ -2,7 +2,7 @@
 # Distribution name on PyPI ("iterate" is taken). The import package + CLI
 # command are both still `iterate` (like scikit-learn → import sklearn).
 name = "iterate-ai"
-version = "0.3.1"
+version = "0.4.0"
 description = "Autonomous ML iteration agent: a Supervisor briefs experiments, a coding agent writes and runs real notebook cells against your data, and the winner ships as a runnable notebook. Multi-LLM backend (local Ollama to cloud), persistent memory, bounded autonomy."
 authors = [
     { name = "Anthony Rodrigues", email = "anthonyrodrigues443@users.noreply.github.com" },
@@ -125,6 +125,10 @@ include = [
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+# Reproduction scripts for measurements that justify a guard. They are workings,
+# not shipped code: `make build` runs `ruff check .` over the whole repo, and
+# holding a one-off sweep to production lint would fail a release for no gain.
+exclude = ["docs/evidence"]
 
 [tool.ruff.lint]
 select = [
