@@ -199,3 +199,27 @@ def test_early_stopping_true_for_histgb_does_not_trigger_eval_set(tmp_path: Path
     result = ModelTarget(ds, metric="f1").run(candidate)
     assert result.metrics is not None
     assert 0.0 <= result.metrics.primary_value <= 1.0
+
+
+def test_a_boolean_column_does_not_abort_the_baseline(tmp_path: Path) -> None:
+    """Found on a real 9000-row dataset: SimpleImputer rejects bool dtype, and a
+    frame mixing bool with string columns makes it take the numeric path and die on
+    the first string. The baseline failed, so the whole run aborted before
+    iteration 1. Any yes/no column stored as a real boolean hit this."""
+    frame = pd.DataFrame(
+        {
+            "age": [40 + i % 20 for i in range(60)],
+            "sex": ["Male", "Female"] * 30,
+            "family_history": [True, False] * 30,
+            "wearable_owner": [False, True] * 30,
+            "churn": [0, 1] * 30,
+        }
+    )
+    path = tmp_path / "bools.csv"
+    frame.to_csv(path, index=False)
+    ds = load_csv(path, target="churn")
+    assert any(ds.train_features[c].dtype == bool for c in ds.features)
+
+    result = ModelTarget(ds, metric="f1").baseline()
+    assert result.succeeded, result.error
+    assert result.metrics is not None

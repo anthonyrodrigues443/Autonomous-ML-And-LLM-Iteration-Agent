@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from iterate.core import dossier
+from iterate.core.scoring import direction as metric_direction
 from iterate.core.supervisor import submit_path_code
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
@@ -135,11 +136,13 @@ class Critic:
             return Verdict()
 
         record = dossier.build(experiment)
+        holdout = result.metrics.primary_value
         try:
             args = self._call(
                 score=f"{result.metrics.primary_value:.4f}",
                 previous_best=("none" if previous_best is None else f"{previous_best:.4f}"),
                 val_trail=(" -> ".join(f"{v:.4f}" for v in record.val_trail) or "none printed"),
+                comparison=_compare(holdout, record.val_trail, self._metric),
                 code=_tail(submit_path_code(code), _CODE_CAP),
             )
         except Exception as exc:
@@ -167,11 +170,9 @@ class Critic:
                 role="user",
                 # Concatenated field-by-field rather than one .format over the code:
                 # generated code contains braces and would break str.format.
-                content=_PROMPTS["user_template"].replace("{metric}", self._metric).replace(
-                    "{score}", fields["score"]
-                ).replace("{previous_best}", fields["previous_best"]).replace(
-                    "{val_trail}", fields["val_trail"]
-                ).replace("{code}", fields["code"]),
+                content=_fill(
+                    _PROMPTS["user_template"], {"metric": self._metric, **fields}
+                ),
             ),
         ]
         for attempt in range(2):
@@ -189,6 +190,45 @@ class Critic:
             if attempt == 0:
                 messages = [*messages, Message(role="user", content=_PROMPTS["retry_nudge"])]
         return None
+
+
+def _fill(template: str, fields: dict[str, str]) -> str:
+    """Substitute placeholders one at a time rather than with str.format.
+
+    The submitted code is one of the fields and routinely contains dict literals,
+    so a single .format over the template would raise on the braces. A loop rather
+    than a chain of .replace calls because a chain silently no-ops when a new field
+    is added and its call is missed — which is exactly what happened when the
+    host comparison was introduced.
+    """
+    for key, value in fields.items():
+        template = template.replace("{" + key + "}", value)
+    return template
+
+
+def _compare(holdout: float, val_trail: list[float], metric: str) -> str:
+    """The val-versus-holdout verdict, computed here with the direction applied.
+
+    The mirage signal is "holdout better than validation", and whether a NUMBER is
+    better depends on the metric's direction. Asked to work that out from raw
+    figures, gemma4:12b called 59.29-vs-56.69 a lucky split on an RMSE run — it
+    applied maximize reasoning to a minimize metric, exactly the confusion the
+    registry exists to prevent everywhere else. So the harness states the fact and
+    the model only judges whether the gap is suspicious.
+    """
+    if not val_trail:
+        return "no validation scores were printed, so no comparison is possible"
+    best_val = min(val_trail) if metric_direction(metric) == "minimize" else max(val_trail)
+    gap = abs(holdout - best_val)
+    better = (
+        holdout < best_val if metric_direction(metric) == "minimize" else holdout > best_val
+    )
+    verdict = "BETTER than" if better else "worse than or equal to"
+    return (
+        f"the holdout score ({holdout:.4f}) is {verdict} the best validation score "
+        f"({best_val:.4f}), a gap of {gap:.4f}. Only a holdout BETTER than "
+        "validation is evidence of a mirage; a worse holdout is just a worse model."
+    )
 
 
 def _tail(text: str, limit: int) -> str:

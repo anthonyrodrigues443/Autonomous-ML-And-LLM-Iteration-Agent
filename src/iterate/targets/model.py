@@ -25,7 +25,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder
 from threadpoolctl import threadpool_limits
 
 from iterate.adapters.compute.base import CodeJob
@@ -140,6 +140,16 @@ def _wants_eval_set(params: dict[str, Any]) -> bool:
         if isinstance(value, int):
             return True
     return False
+
+
+def _as_object(frame: Any) -> Any:
+    """Cast a categorical frame to object dtype before imputation.
+
+    A module-level function, not a lambda: the winning pipeline is persisted with
+    joblib and a lambda cannot be pickled, so `save_model` would hand the user a
+    model file they could never load back.
+    """
+    return frame.astype(object)
 
 
 class ModelTarget:
@@ -303,6 +313,13 @@ class ModelTarget:
         if categorical:
             encode = Pipeline(
                 [
+                    # Cast to object BEFORE imputing. SimpleImputer rejects bool
+                    # dtype outright, and a frame mixing bool with string columns
+                    # makes it take the numeric path and die on the first string
+                    # ("could not convert string to float: 'Female'"). Any dataset
+                    # with a yes/no column stored as a real boolean hit this, and
+                    # the baseline aborted the whole run before iteration 1.
+                    ("as_object", FunctionTransformer(_as_object, feature_names_out="one-to-one")),
                     ("impute", SimpleImputer(strategy="most_frequent")),
                     ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
                 ]

@@ -90,3 +90,19 @@ def test_continuous_target_does_not_crash(tmp_path: Path) -> None:
     ds = load_csv(path, target="price", test_size=0.2)
     assert ds.n_train == 40
     assert ds.n_test == 10
+
+
+def test_a_non_utf8_csv_loads_instead_of_raising(tmp_path: Path) -> None:
+    """Found by a real dataset: `pd.read_csv` assumes UTF-8 and raises
+    UnicodeDecodeError on anything else. Any European export with a euro sign or an
+    accented name is latin-1, so the user's first contact with the tool would be a
+    decoding traceback on a file that opens fine in every spreadsheet."""
+    path = tmp_path / "latin1.csv"
+    path.write_bytes(("a,b,label\n" + "".join(
+        f"{i},caf\xe9{i},{i % 2}\n" for i in range(40)
+    )).encode("latin-1"))
+    with pytest.raises(UnicodeDecodeError):
+        path.read_text(encoding="utf-8")  # the file really is not UTF-8
+    ds = load_csv(path, target="label")
+    assert ds.n_train + ds.n_test == 40
+    assert "b" in ds.features

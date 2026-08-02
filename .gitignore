@@ -265,3 +265,5 @@ credentials/
 *.swp
 *~
 examples/adult_income.csv
+examples/laptop_price.csv
+examples/heart_disease_risk_2026.csv
