@@ -106,3 +106,26 @@ def test_a_non_utf8_csv_loads_instead_of_raising(tmp_path: Path) -> None:
     ds = load_csv(path, target="label")
     assert ds.n_train + ds.n_test == 40
     assert "b" in ds.features
+
+
+def test_an_integer_regression_target_loads_instead_of_stratifying(tmp_path: Path) -> None:
+    """Found by the diamonds dataset: an integer target was always read as a class
+    label, so 11,602 distinct prices became 11,602 "classes" and the stratified
+    split raised before the run could start. Prices, counts and years are all
+    integers, so this is the common case, not an edge one."""
+    path = tmp_path / "prices.csv"
+    frame = pd.DataFrame({"carat": range(200), "depth": range(200),
+                          "price": [300 + i * 7 for i in range(200)]})
+    frame.to_csv(path, index=False)
+    ds = load_csv(path, target="price")           # would raise before the fix
+    assert ds.n_train + ds.n_test == 200
+
+
+def test_a_few_valued_integer_target_is_still_classification(tmp_path: Path) -> None:
+    """The fix must not reclassify anything that already worked: 0/1 labels and
+    small multiclass targets stay classification and stay stratified."""
+    from iterate.adapters.data.tabular import looks_like_classification
+
+    for values in ([0, 1] * 50, [0, 1, 2, 3] * 25, [True, False] * 50):
+        assert looks_like_classification(pd.Series(values))
+    assert not looks_like_classification(pd.Series(range(500)))

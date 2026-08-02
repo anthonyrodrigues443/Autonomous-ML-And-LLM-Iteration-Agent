@@ -267,3 +267,5 @@ credentials/
 examples/adult_income.csv
 examples/laptop_price.csv
 examples/heart_disease_risk_2026.csv
+examples/mobile_price.csv
+examples/diamonds.csv

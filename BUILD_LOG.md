@@ -484,7 +484,7 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
-### 2026-08-02 | Sprint 2 Day 6 | Certification: six real bugs, none of which 580 unit tests could find
+### 2026-08-02 | Sprint 2 Day 6 | Certification: seven real bugs, none of which 583 unit tests could find
 
 **Task:** Run the trajectory quality bar on gemma4:12b before tagging, per the standing release checklist ("if the release touched the loop, re-run the bar"). v0.4 touched it in three places, so this was mandatory rather than optional.
 
@@ -501,13 +501,15 @@ The discovery agent is what makes the demo wow. It does:
 
 **The result that answers the capability question.** On laptop price the agent read the profile, retrieved "Regularized target encoding outperforms traditional methods in supervised machine learning with high cardinality features" (2022), target-encoded the 618-unique Product column and friends, and reached 321.56 rmse against a 411.89 baseline. I had hand-parsed that dataset first, extracting 8GB and 1.37kg and screen pixels out of strings, and got 329.55. **It beat the hand-engineered ceiling**, its winning candidate is stamped `source="researcher"` with two citations, and the code fits every transform on the training fold only. Knowledge transfer is visible in the chain: iteration 1's digest takeaway was "replace one-hot with target encoding for high-cardinality", and iteration 2's brief was exactly that.
 
-**Six bugs, every one found by running on real data rather than by reasoning:**
+**Seven bugs, every one found by running on real data rather than by reasoning:**
 1. **The agent kernel ran the wrong interpreter.** `start_new_kernel()` resolves the machine's registered `python3` kernelspec — on macOS the Command Line Tools build. Measured: kernel on python 3.9.6 / sklearn 1.6.1, harness on 3.12.12 / 1.8.0. Worse, `install()` targets `sys.executable`, so auto-installed packages never reached the kernel at all and the "no library boundary" design was silently broken on local compute. Pre-existing since v0.2. On a machine with no system sklearn, every run would have failed.
 2. **Metric names were not importable.** The agent is told to optimize `average_precision`; `sklearn.metrics.average_precision` does not exist. 16 cells burned across the runs. The registry already held the real function name, so the coder is now told it. Two scorers wrapping private helpers are dropped from the vocabulary — a metric the agent cannot compute is not worth offering.
 3. **Boolean columns aborted the run at the baseline.** `SimpleImputer` rejects bool dtype, and a bool+string frame makes it take the numeric path and die on the first string. Any yes/no column stored as a real boolean killed the run before iteration 1.
 4. **Non-UTF-8 CSVs could not be loaded.** `pd.read_csv` assumes UTF-8; any European export with a euro sign is latin-1. First contact with the tool was a decoding traceback on a file that opens fine in a spreadsheet.
 5. **Threshold levers on ranking metrics.** Three runs picked `average_precision` then spent iteration 2 on class weighting. Measured across five datasets: threshold tuning moves f1 by ~0.02 and moves average_precision and roc_auc by EXACTLY 0.0000, because a ranking metric is invariant to the threshold. Reproduction lives in `docs/evidence/`.
 6. **The Critic reasoned about direction and got it wrong.** It called an RMSE holdout of 59.29 against validation 56.69 a "lucky split" — maximize logic on a minimize metric, 3 firings in 5 iterations. The harness now computes "the holdout is BETTER/worse than validation by X" with direction applied, and the model only judges whether the gap is suspicious. Re-run on the same dataset: 1 firing.
+
+7. **Integer regression targets could not be loaded at all.** Found by the diamonds dataset: an integer target was always read as a class label, so 11,602 distinct prices became 11,602 classes and the stratified split raised before the run started. Prices, counts and years are all integers, so this is the common regression case rather than an edge one. Recorded on Day 5 as a backlog item and DEFERRED on the reasoning that a fix would change existing splits. That reasoning was wrong and one measurement showed it: every dataset that works has 20 or fewer distinct target values and is untouched, so the only targets affected are ones that already crashed. Deferring on an unchecked assumption cost a day.
 
 **The lesson that repeated twice.** For bug 5 the prompt fix did nothing: the note reached the supervisor's system prompt (verified) and gemma4:12b briefed the dead lever anyway, three runs out of three. Converting it to a guard fixed it on the first run. That is the June EDA-ledger lesson landing again — guards beat prompt nudges on weak models — and it is why bug 6 was fixed by computing the fact host-side rather than explaining direction better.
 

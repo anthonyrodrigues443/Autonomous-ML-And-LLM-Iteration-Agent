@@ -64,8 +64,16 @@ def _content_hash(frame: pd.DataFrame) -> str:
 
 
 def looks_like_classification(target: pd.Series) -> bool:
-    """Discrete target → classification; a continuous float target → regression."""
-    if not pd.api.types.is_float_dtype(target):
+    """Discrete target → classification; a continuous target → regression.
+
+    The distinct-value cap applies to INTEGER targets as well as float ones. An
+    integer column was previously always read as a class label, so a price, a count
+    or a year became thousands of "classes" and the stratified split raised before
+    the run could start: the diamonds dataset, with 11,602 distinct integer prices,
+    could not be loaded at all. Every target with few enough distinct values is
+    unaffected, so nothing that worked before changes behaviour.
+    """
+    if pd.api.types.is_bool_dtype(target) or not pd.api.types.is_numeric_dtype(target):
         return True
     return bool(target.nunique(dropna=True) <= _MAX_CLASSES_FOR_STRATIFY)
 
