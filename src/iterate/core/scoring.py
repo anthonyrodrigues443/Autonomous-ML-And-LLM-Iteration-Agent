@@ -123,6 +123,12 @@ class MetricSpec:
     direction: Direction
     needs_proba: bool
     compute: Callable[[Inputs], float]
+    # The importable sklearn function behind this metric, when there is one. The
+    # metric NAME is a scorer name and is NOT importable: sklearn.metrics has
+    # `average_precision_score`, not `average_precision`. Telling the coder to
+    # optimize "average_precision" and leaving it to guess the import cost 16
+    # failed cells across the v0.4 certification runs.
+    sklearn_func: str = ""
     # Binary-only metrics are skipped on a multiclass target rather than raising:
     # multiclass Brier landed after the scikit-learn>=1.5 floor this package ships.
     binary_only: bool = False
@@ -246,6 +252,7 @@ def _derive_from_sklearn() -> dict[str, MetricSpec]:
     user's run.
     """
     try:
+        import sklearn.metrics as _skm
         from sklearn.metrics import get_scorer, get_scorer_names
 
         names = list(get_scorer_names())
@@ -273,12 +280,24 @@ def _derive_from_sklearn() -> dict[str, MetricSpec]:
             # target, so they are meaningless here and offering them would invite
             # the agent to pick one.
             continue
+        if not hasattr(_skm, func.__name__):
+            # The scorer wraps a private helper (the two likelihood ratios do),
+            # so an agent told to optimize it could never compute it itself.
+            # A metric we cannot hand an importable function for is not offerable.
+            continue
         needs_proba = response != "predict"
-        out[name] = MetricSpec(
+        # Registered WITHOUT sklearn's "neg_" prefix. That prefix marks a scorer
+        # whose VALUE is negated so higher-is-better; we call the underlying score
+        # function directly and report the raw quantity with direction="minimize"
+        # instead. Keeping the prefix would print `neg_root_mean_squared_error =
+        # 2.12` — a positive number under a name that promises a negative one. The
+        # sign convention still does its job: it is where `direction` comes from.
+        out[name.removeprefix("neg_")] = MetricSpec(
             task,
             "maximize" if sign > 0 else "minimize",
             needs_proba,
             _sklearn_compute(func, kwargs, needs_proba=needs_proba),
+            sklearn_func=func.__name__,
         )
     return out
 
@@ -327,6 +346,74 @@ def requires_proba(metric: str) -> bool:
     run's primary metric answers True here.
     """
     return metric in PROBA_METRICS
+
+
+def threshold_free(metric: str) -> bool:
+    """Whether this metric is computed from ranked probabilities, so no decision
+    threshold is applied and threshold-style levers cannot move it.
+
+    Identical to `requires_proba` by construction — a metric scored from
+    probabilities has no threshold — but named for the question callers actually
+    ask. Measured across five datasets: tuning the decision threshold moves f1 by
+    0.02 on average and moves average_precision and roc_auc by EXACTLY 0.0000,
+    every time. Class weighting is the same story about ten times weaker.
+    """
+    return requires_proba(metric)
+
+
+def sklearn_function(metric: str) -> str:
+    """`sklearn.metrics.<name>` the agent can actually import for this metric, or "".
+
+    Derived where possible, hand-mapped for the curated panel whose names are our
+    own shorthand (`rmse`, `brier`) rather than sklearn scorer names.
+    """
+    spec = REGISTRY.get(metric)
+    if spec is not None and spec.sklearn_func:
+        return spec.sklearn_func
+    return _CURATED_FUNCS.get(metric, "")
+
+
+_CURATED_FUNCS = {
+    "accuracy": "accuracy_score",
+    "f1": "f1_score",
+    "precision": "precision_score",
+    "recall": "recall_score",
+    "roc_auc": "roc_auc_score",
+    "average_precision": "average_precision_score",
+    "log_loss": "log_loss",
+    "brier": "brier_score_loss",
+    "rmse": "root_mean_squared_error",
+    "mae": "mean_absolute_error",
+    "mse": "mean_squared_error",
+    "r2": "r2_score",
+}
+
+
+def metric_guidance(metric: str) -> str:
+    """One line telling an agent what kind of ruler it is optimizing, or "".
+
+    The v0.4 metric dial made this necessary: the agent now picks its own metric,
+    and the lever playbook was written when the metric was always supplied and in
+    practice was f1. Both certification runs picked average_precision and then
+    spent their second iteration on class weighting — the right lever for f1, worth
+    nothing on a ranking metric. Registry owns the semantics; the model gets told.
+    """
+    func = sklearn_function(metric)
+    importable = (
+        f"To compute it yourself use `from sklearn.metrics import {func}` — the "
+        f"metric NAME '{metric}' is not importable. "
+        if func
+        else ""
+    )
+    if not threshold_free(metric):
+        return importable
+    return (
+        importable
+        + f"'{metric}' is computed from RANKED PROBABILITIES, not from labels at a "
+        "decision threshold. Tuning a threshold cannot change it at all, and class "
+        "weighting barely does. Improve the RANKING itself: better features, a "
+        "different model family, better-calibrated probabilities."
+    )
 
 
 def resolve_average(average: str | None, *, binary: bool) -> str:
@@ -398,8 +485,11 @@ __all__ = [
     "Inputs",
     "MetricSpec",
     "direction",
+    "metric_guidance",
     "requires_proba",
     "resolve_average",
     "score",
+    "sklearn_function",
     "task_for_metric",
+    "threshold_free",
 ]

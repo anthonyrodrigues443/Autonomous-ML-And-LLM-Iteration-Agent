@@ -16,14 +16,14 @@ iterate run --data examples/churn_tabular/data.clean.csv --target Churn
 # (--metric is optional now: omit it and the agent picks one from your data, and says why)
 ```
 
-`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 569 unit tests across 38 files run in CI on every push.
+`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 581 unit tests across 38 files run in CI on every push.
 
-| v0.3 today | On the roadmap |
+| v0.4 today | On the roadmap |
 |---|---|
-| Talk to the run while it runs: terminal UI with a scrollable live transcript + input box; plain-English chat with queued delivery; pause / resume / stop as words | Researcher + Critic specialists; agent picks the metric + starting model (v0.4) |
-| The agent writes + runs its own training code (any model, any preprocessing) in a local kernel or an isolated e2b sandbox | LLM prompt iteration (v0.5), vision transfer learning (v0.6) |
-| Multi-agent core: Supervisor briefs, coding agent executes cell by cell, Summarizer carries knowledge across notebooks; questions answered from the actual run record | Cost-to-serve recommendations (v0.7) |
-| A deterministic guard stack converts weak-model waste, and it outranks chat: user steers can shape a brief, never bypass a gate; winner ships as a runnable notebook; persistent memory across runs | Inferred inputs + MCP auto-discovery (v0.9), one-sentence input (v1.0) |
+| **You no longer pick the metric.** Omit `--metric` and the agent reads your data, searches the literature, and chooses one — then tells you why. An explicit choice always wins | LLM prompt iteration (v0.5), vision transfer learning (v0.6) |
+| **A Critic reviews every experiment for leakage** — a pipeline that fits on the holdout does not get to bank its score, however good it looks | Cost-to-serve recommendations (v0.7) |
+| **A Researcher grounds proposals in real papers** (OpenAlex + arXiv, no API key), citing work it actually retrieved; talk to the run while it runs; the agent writes and runs its own code cell by cell | Inferred inputs + MCP auto-discovery (v0.9), one-sentence input (v1.0) |
+| A deterministic guard stack converts weak-model waste and outranks everything else: a user steer can shape a brief but never bypass a gate, and no agent can overturn a guard; winner ships as a runnable notebook | |
 
 ## Why I built this
 
@@ -43,7 +43,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 
 ## Status
 
-**v0.3 released: talk to the run while it runs.** v0.1 proved the autonomous loop, v0.2 made the agent write and run its own code, and v0.3 puts you in the loop without stopping it: watch the session as a live transcript, steer it, question it, pause it.
+**v0.4 released: it decides how to measure, and checks whether the win is real.** v0.1 proved the autonomous loop, v0.2 made the agent write and run its own code, v0.3 put you in the loop without stopping it, and v0.4 turns the first input dial: `--metric` is now optional. A Researcher grounds the run in retrievable literature with real citations, and a Critic reviews every experiment for leakage before its score is allowed to count.
 
 **Agent-first:** the autonomous loop landed at v0.1, not as a late-stage add-on. Two dials turn release to release: the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular, then prompts, then DL/vision).
 
@@ -52,7 +52,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 | v0.1 | **The agentic loop**: Proposer + Orchestrator + Terminator + Memory + CLI, first autonomous tabular run | shipped |
 | v0.2 | **Sandboxed code-gen + the multi-agent cell-by-cell system** (Supervisor, coding agent, Summarizer) + notebook deliverable + the deterministic guard stack | shipped |
 | v0.3 | **Interactive runs**: terminal UI (live transcript + input box), plain-English chat with queued delivery, pause / resume / stop, notebook Q&A, standing rules | shipped |
-| v0.4 | Researcher + Critic specialists; agent picks the metric + starting model; probability metrics | planned |
+| v0.4 | **Researcher + Critic specialists**: literature-grounded proposals with real citations, leak review before a score banks; agent picks the metric + starting model; probability metrics | shipped |
 | v0.5 | `PromptTarget`: agentic prompt iteration | planned |
 | v0.6 | `DLModelTarget`: vision transfer learning, validated on a local RTX 4050 | planned |
 | v0.7 | **Cost-constrained recommendation** + serving profile + `iterate cost` | planned |
@@ -61,7 +61,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 
 ---
 
-## What v0.2 does
+## What it does
 
 You give it a prepared CSV, the target column, and a metric. The agent does the rest: builds its own baseline, then runs one briefed experiment per iteration, cell by cell, against a sealed holdout it never sees.
 
@@ -221,7 +221,7 @@ src/iterate/
 | Auditable reasoning trail (runnable notebooks) | ✗ | ✗ | ✗ | basic | **✓ shipped** |
 | Iterates LLM prompts | ✗ | ✗ | eval only | ✗ | planned v0.5 |
 | Iterates DL / vision models | partial | ✗ | ✗ | partial | planned v0.6 |
-| Literature-aware proposals | ✗ | ✗ | ✗ | partial | planned v0.4 |
+| Literature-aware proposals | ✗ | ✗ | ✗ | partial | ✓ |
 | Cost-to-serve-aware optimization | ✗ | ✗ | ✗ | ✗ | planned v0.7 |
 | Auto-discovers data + context (MCP) | ✗ | ✗ | ✗ | partial | planned v0.9 |
 | Open-source | mostly ✗ | MLflow yes | ✗ | ✓ | ✓ |

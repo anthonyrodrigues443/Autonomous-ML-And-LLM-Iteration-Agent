@@ -316,3 +316,38 @@ def test_a_flagged_score_is_annotated_more_gently() -> None:
     line = _format_history([exp], "f1")[0]
     assert "suspicious gain" in line
     assert "REJECTED" not in line
+
+
+# ─── direction-aware mirage comparison (found in the regression run) ─────────
+
+
+def test_the_comparison_applies_direction_so_the_model_does_not_have_to() -> None:
+    """gemma4:12b called an RMSE holdout of 59.29 vs validation 56.69 a "lucky
+    split" — maximize reasoning on a minimize metric, three firings in five
+    iterations. The harness now states which is better and the model only judges
+    whether the gap is suspicious."""
+    from iterate.core.critic import _compare
+
+    # minimize: a LOWER holdout is the suspicious one
+    assert "BETTER than" in _compare(53.68, [55.73, 56.10], "rmse")
+    assert "worse than" in _compare(59.29, [56.69, 57.20], "rmse")
+    # maximize: a HIGHER holdout is the suspicious one
+    assert "BETTER than" in _compare(0.68, [0.55, 0.54], "f1")
+    assert "worse than" in _compare(0.51, [0.55, 0.54], "f1")
+
+
+def test_no_validation_trail_means_no_comparison_rather_than_a_guess() -> None:
+    from iterate.core.critic import _compare
+
+    assert "no comparison is possible" in _compare(0.6, [], "f1")
+
+
+def test_the_comparison_reaches_the_prompt() -> None:
+    cells = [{"code": "x", "stdout": "val rmse 55.7301", "stderr": "", "error": None, "source": "agent"}]
+    llm = _FakeLLM([{"leak": False, "mirage": False, "reason": ""}])
+    Critic(llm, metric="rmse", direction="minimize").review(
+        _experiment(score=53.6875, cells=cells), previous_best=57.5
+    )
+    prompt = llm.seen[0]
+    assert "Host comparison" in prompt
+    assert "BETTER than" in prompt

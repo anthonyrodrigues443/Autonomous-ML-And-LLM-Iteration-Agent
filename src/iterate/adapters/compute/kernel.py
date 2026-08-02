@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import queue
 import re
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,13 +137,33 @@ class LocalKernel:
         self._workdir: Path | None = None
 
     def start(self, inputs: dict[str, bytes]) -> None:
-        from jupyter_client.manager import start_new_kernel
+        from jupyter_client.manager import KernelManager
 
         self._tmp = tempfile.TemporaryDirectory(prefix="iterate-kernel-")
         self._workdir = Path(self._tmp.name)
         for name, content in inputs.items():
             (self._workdir / name).write_bytes(content)
-        self._km, self._kc = start_new_kernel(cwd=str(self._workdir))
+
+        # Pin the kernel to THIS interpreter. `start_new_kernel()` resolves the
+        # machine's registered "python3" kernelspec, which on a typical mac is
+        # /Library/Developer/CommandLineTools/usr/bin/python3 — a completely
+        # different environment from the one iterate is installed in. The agent
+        # would write code against whatever libraries happen to live there (or
+        # none), while the harness scores with the pinned ones, and `install()`
+        # below pip-installs into sys.executable, so auto-installed packages never
+        # reached the kernel at all. Measured on this machine: kernel had python
+        # 3.9.6 / sklearn 1.6.1, harness had 3.12.12 / 1.8.0.
+        km = KernelManager(kernel_name="python3")
+        spec = km.kernel_spec
+        if spec is not None:  # no python3 kernelspec at all: fall back to default
+            spec.argv = [
+                sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"
+            ]
+        km.start_kernel(cwd=str(self._workdir))
+        kc = km.client()
+        kc.start_channels()
+        kc.wait_for_ready(timeout=60)
+        self._km, self._kc = km, kc
 
     def run_cell(self, code: str, *, timeout: float) -> CellResult:
         if self._kc is None or self._km is None:

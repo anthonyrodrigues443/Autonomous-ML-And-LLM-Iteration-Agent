@@ -14,6 +14,7 @@ later concern (see IDEAS / Week 8 discovery).
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -63,10 +64,37 @@ def _content_hash(frame: pd.DataFrame) -> str:
 
 
 def looks_like_classification(target: pd.Series) -> bool:
-    """Discrete target → classification; a continuous float target → regression."""
-    if not pd.api.types.is_float_dtype(target):
+    """Discrete target → classification; a continuous target → regression.
+
+    The distinct-value cap applies to INTEGER targets as well as float ones. An
+    integer column was previously always read as a class label, so a price, a count
+    or a year became thousands of "classes" and the stratified split raised before
+    the run could start: the diamonds dataset, with 11,602 distinct integer prices,
+    could not be loaded at all. Every target with few enough distinct values is
+    unaffected, so nothing that worked before changes behaviour.
+    """
+    if pd.api.types.is_bool_dtype(target) or not pd.api.types.is_numeric_dtype(target):
         return True
     return bool(target.nunique(dropna=True) <= _MAX_CLASSES_FOR_STRATIFY)
+
+
+log = logging.getLogger(__name__)
+
+
+def _read_csv_any_encoding(path: str | Path) -> pd.DataFrame:
+    """Read a CSV without demanding it be UTF-8.
+
+    Plain `pd.read_csv` assumes UTF-8 and raises `UnicodeDecodeError` on anything
+    else. That is not an edge case: any European export with a euro sign or an
+    accented product name is latin-1, and the user's first contact with the tool
+    would be a decoding traceback on a file that opens fine in every spreadsheet.
+    Try UTF-8 first, then latin-1, which is byte-complete and cannot itself fail.
+    """
+    try:
+        return pd.read_csv(path)
+    except UnicodeDecodeError:
+        log.info("%s is not UTF-8; re-reading as latin-1", path)
+        return pd.read_csv(path, encoding="latin-1")
 
 
 def load_csv(
@@ -82,7 +110,7 @@ def load_csv(
     ``stratify`` keeps the class balance identical in train and holdout for a
     classification target; it is ignored for a continuous (regression) target.
     """
-    frame = pd.read_csv(path)
+    frame = _read_csv_any_encoding(path)
     if target not in frame.columns:
         raise ValueError(f"target column {target!r} not in CSV columns {list(frame.columns)}")
 

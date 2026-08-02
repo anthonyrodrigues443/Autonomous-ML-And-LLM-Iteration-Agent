@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from iterate.core import codegen
-from iterate.core.scoring import direction, requires_proba, task_for_metric
+from iterate.core.scoring import direction, metric_guidance, requires_proba, task_for_metric
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
 
@@ -746,6 +746,7 @@ def _build_messages(
         direction=direction,
         predictions_csv=codegen.PREDICTIONS_CSV,
         proba_requirement=_proba_requirement(metric),
+        metric_note=metric_guidance(metric),
     )
     if starting_code and starting_code.strip():
         score = f" (scored {metric}={starting_score:.4f})" if starting_score is not None else ""

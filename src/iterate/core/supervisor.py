@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from iterate.core import codegen, ledger
-from iterate.core.scoring import direction
+from iterate.core.scoring import direction, metric_guidance, threshold_free
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
 
@@ -143,6 +143,7 @@ class Supervisor:
                 )
             )
         detail = ""
+        dead_lever_nudged = False
         rebrief_nudged = False
         dup_class_nudged = False
         banked_nudged = False
@@ -175,7 +176,14 @@ class Supervisor:
                 # re-emitted the same lever on the retry, and the known re-commission
                 # was accepted (detection without conversion).
                 violation: tuple[str, str, bool] | None = None  # (log reason, nudge, seen)
-                if _is_baseline_rebrief(decision.title, decision.brief):
+                if dead_reason := dead_lever_reason(decision.brief, self._metric):
+                    violation = (
+                        f"dead lever for this metric — {dead_reason}",
+                        _PROMPTS["dead_lever_nudge"].format(reason=dead_reason),
+                        dead_lever_nudged,
+                    )
+                    dead_lever_nudged = True
+                elif _is_baseline_rebrief(decision.title, decision.brief):
                     violation = (
                         f"baseline re-brief ({decision.title!r})",
                         _PROMPTS["baseline_rebrief_nudge"],
@@ -218,7 +226,7 @@ class Supervisor:
                     lint_nudged = True
                 if violation is not None:
                     reason, nudge, seen = violation
-                    fallback = _fallback_move(history) if seen or last_attempt else None
+                    fallback = _fallback_move(history, self._metric) if seen or last_attempt else None
                     if fallback is not None:
                         title, move = fallback
                         log.info(
@@ -874,7 +882,9 @@ def _to_decision(args: dict[str, Any]) -> SupervisorDecision:
 def _build_messages(
     *, data_summary: str, metric: str, direction: str, score: float, history: list[Experiment]
 ) -> list[Message]:
-    system = _PROMPTS["system"].format(metric=metric, direction=direction)
+    system = _PROMPTS["system"].format(
+        metric=metric, direction=direction, metric_note=metric_guidance(metric)
+    )
     if history:
         recent = history[-_HISTORY_LIMIT:]
         lines = _format_history(recent, metric)
@@ -1097,6 +1107,45 @@ _CANONICAL_MOVES: dict[str, str] = {
 }
 
 
+# Levers that act on the DECISION THRESHOLD rather than on the ranking. Measured
+# across five datasets: threshold tuning moves f1 by ~0.02 and moves
+# average_precision / roc_auc by exactly 0.0000, every time; class weighting is the
+# same story about ten times weaker. On a threshold-free metric these are not weak
+# moves, they are no-ops, so the harness stops offering them rather than trusting a
+# 12B to work it out. Both v0.4 certification runs spent iteration 2 here.
+_THRESHOLD_LEVERS = frozenset({"imbalance-or-threshold"})
+
+
+def dead_lever_reason(brief: str, metric: str) -> str | None:
+    """Why this brief commissions a lever that CANNOT move this metric, or None.
+
+    Added after the v0.4 certification runs. Telling the supervisor in its prompt
+    that a threshold lever is a no-op on a ranking metric was not enough — the note
+    reaches the prompt and gemma4:12b briefed imbalance weighting anyway, on
+    iteration 2, in three runs out of three. That is the banked June lesson
+    exactly: guards beat prompt nudges on weak models. So it becomes a guard, and
+    the prompt note stays as the explanation the retry needs.
+    """
+    if not threshold_free(metric):
+        return None
+    move = _move_text(brief)
+    for lever in _THRESHOLD_LEVERS:
+        if lever in move:
+            return (
+                f"{lever} cannot move {metric}: it is scored from ranked "
+                "probabilities, so changing a decision threshold is measurably a "
+                "no-op and class weighting is close to one"
+            )
+    return None
+
+
+def canonical_moves(metric: str) -> dict[str, str]:
+    """The fallback lever menu for this metric, with provable no-ops removed."""
+    if not threshold_free(metric):
+        return _CANONICAL_MOVES
+    return {k: v for k, v in _CANONICAL_MOVES.items() if k not in _THRESHOLD_LEVERS}
+
+
 def run_ledger(history: list[Experiment]) -> ledger.Ledger:
     """This run's tried/untried record. One definition of "already attempted",
     shared by the fallback move and anything downstream that needs it."""
@@ -1108,14 +1157,17 @@ def run_ledger(history: list[Experiment]) -> ledger.Ledger:
     )
 
 
-def _fallback_move(history: list[Experiment]) -> tuple[str, str] | None:
+def _fallback_move(history: list[Experiment], metric: str = "") -> tuple[str, str] | None:
     """A harness-composed (title, move) from the first lever class never tried this
     run, or None when every class is tried. The last resort after a guard fires
-    twice: guaranteed novel by construction."""
-    lever = run_ledger(history).first_untried()
-    if lever is None:
-        return None
-    return f"untried lever: {lever}", f"next: {lever}: {_CANONICAL_MOVES[lever]}."
+    twice: guaranteed novel by construction — and, since v0.4, guaranteed to be a
+    lever that can actually move THIS metric."""
+    moves = canonical_moves(metric)
+    ledger_now = run_ledger(history)
+    for lever in moves:
+        if lever not in ledger_now.tried_levers:
+            return f"untried lever: {lever}", f"next: {lever}: {moves[lever]}."
+    return None
 
 
 def _rebriefs_a_just_duplicated_class(brief: str, history: list[Experiment]) -> bool:

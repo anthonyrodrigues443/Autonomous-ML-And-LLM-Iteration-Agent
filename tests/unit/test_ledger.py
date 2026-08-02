@@ -137,3 +137,44 @@ def test_lever_ledger_line_keeps_display_order_not_fallback_order() -> None:
     untried = line.split("NOT yet tried: ")[1].split(", ")
     expected = [lv for lv in _LEVER_MARKERS if lv != "categorical-encoding"]
     assert untried == expected
+
+
+def test_the_fallback_menu_drops_levers_that_cannot_move_the_metric() -> None:
+    """Measured across five datasets: threshold tuning moves f1 by ~0.02 and moves
+    average_precision / roc_auc by EXACTLY 0.0000. On a threshold-free metric that
+    lever is not weak, it is a no-op, so the harness stops offering it rather than
+    trusting a 12B to reason it out."""
+    from iterate.core.supervisor import _CANONICAL_MOVES, canonical_moves
+
+    assert canonical_moves("f1") == _CANONICAL_MOVES
+    ranking = canonical_moves("average_precision")
+    assert "imbalance-or-threshold" not in ranking
+    assert "model-swap" in ranking  # levers that DO move ranking survive
+    assert len(ranking) == len(_CANONICAL_MOVES) - 1
+
+
+def test_the_fallback_move_respects_the_metric() -> None:
+    from iterate.core.supervisor import _fallback_move
+
+    for _ in range(8):  # walk the whole menu on a threshold-free metric
+        got = _fallback_move([], "roc_auc")
+        if got is None:
+            break
+        assert "imbalance-or-threshold" not in got[0]
+    assert _fallback_move([], "f1") is not None
+
+
+def test_a_threshold_lever_brief_is_rejected_on_a_ranking_metric() -> None:
+    """The prompt note alone did NOT change gemma4:12b's behaviour — it reached the
+    prompt and the model briefed imbalance weighting anyway, on iteration 2, in
+    three runs out of three. Guards beat prompt nudges on weak models, so this is a
+    guard; the note stays as the explanation the corrective retry needs."""
+    from iterate.core.supervisor import dead_lever_reason
+
+    brief = "next: imbalance-or-threshold: train with class_weight='balanced'."
+    assert dead_lever_reason(brief, "average_precision") is not None
+    assert dead_lever_reason(brief, "roc_auc") is not None
+    # the same brief is perfectly good when the metric IS threshold-dependent
+    assert dead_lever_reason(brief, "f1") is None
+    # and a ranking-moving lever is never rejected
+    assert dead_lever_reason("next: model-swap: try XGBoost.", "average_precision") is None

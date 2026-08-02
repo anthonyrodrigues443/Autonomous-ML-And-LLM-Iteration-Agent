@@ -290,7 +290,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Wed Jul 29 | Researcher: arxiv + papers-with-code clients (cached to disk) + the agent itself (goal + data profile + history → grounded technique suggestions with citations, consumed at the tool boundary) | `core/researcher.py` + adapters + tests | done |
 | Thu Jul 30 | Critic: generated-code review for subtle leakage (fit-on-train-only, target leakage in FE) as a typed pre-execution check + eval-hardening verdicts; Summarizer graduates to author the dossier (Tue's deterministic distiller becomes its input and fallback) | `core/critic.py` + tests | done (Summarizer-authors-dossier deferred, see entry) |
 | Fri Jul 31 | Dial A: agent picks the metric + starting model from research + the data profile; `--metric` optional; the RESEARCHER picks it (not the supervisor — the metric must exist before ModelTarget, which exists before the baseline, which is an argument to decide(), so at choosing time the supervisor has no baseline or history to reason from); validated against the registry for name and task, defaulting deterministically from the target dtype when research is unavailable; FIXED at run start and never changed mid-run, since one ruler is what makes history and cross-run baselines comparable; free unscored inspect/EDA step so exploration stops costing a scored iteration | proposer/supervisor + CLI + loop + tests | done (free inspect step cut, see entry) |
-| Sat Aug 1 | Certification-style validation on gemma4:12b (bar criteria + citations genuine + Critic catches seeded leakage + no context regression) + fixes; buffer absorbs anything slipped Mon-Fri | validation + fixes | |
+| Sat Aug 1 | Certification-style validation on gemma4:12b (bar criteria + citations genuine + Critic catches seeded leakage + no context regression) + fixes; buffer absorbs anything slipped Mon-Fri | validation + fixes | done |
 | Sun Aug 2 | **Release v0.4.0** per the standing checklist; LIMITATIONS retires the metric-panel, proba-metrics, and averaging rows and states the CV cut | v0.4.0 out | |
 
 **Cut from v0.4 (post-v1.0 backlog):** CV/k-fold selection option, typed Session handoff (`_winning_code` blob stays), qwen3:14b re-run, `iterate history`/`best`/`why-failed` (any green Saturday can absorb these).
@@ -303,7 +303,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
-| Mon Aug 3 | Contract + `PromptTarget`: prompt candidate anatomy (instruction edits, few-shot selection, format, decomposition), eval-set split + sealed scoring (labeled-set metrics first; LLM-judge only where labels are absent), baseline = current prompt re-measured; RESEARCH_LOG entry | `targets/prompt.py` + tests + RESEARCH_LOG | |
+| Mon Aug 3 | **Eval suite FIRST** (Tony's call after the v0.4 certification): the headroom table from EVAL_LOG becomes a runnable corpus, so a release is measured rather than argued about. Then the v0.5 work below | `evals/` + corpus + runner |
 | Tue Aug 4 | Loop integration: prompt lever classes for the supervisor ladder, coder session writes prompt variants + scoring cells, guard stack audited for the new path (duplicate gates hash prompt text, dead-ends transfer) | wiring + tests | |
 | Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | |
 | Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | |
@@ -483,6 +483,39 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-02 | Sprint 2 Day 6 | Certification: seven real bugs, none of which 583 unit tests could find
+
+**Task:** Run the trajectory quality bar on gemma4:12b before tagging, per the standing release checklist ("if the release touched the loop, re-run the bar"). v0.4 touched it in three places, so this was mandatory rather than optional.
+
+**Method change worth keeping: headroom-normalised scoring.** The first three runs all read "no candidate beat the baseline", and I could not tell a failing agent from a hard problem. So every dataset got a brute-force ceiling measured FIRST, by hand, no LLM. A run is then scored as the fraction of available gain captured, not as a raw delta. That single change turned every ambiguous result below into a clear one, and it is the seed of the v0.5 eval suite.
+
+| dataset | task | headroom | agent captured |
+|---|---|---|---|
+| laptop price (1303x13) | regression | 82.34 rmse (20%) | **90.33 rmse (110%)** |
+| diabetes (442x11) | regression | small | 2.52 rmse |
+| churn (7043x20) | binary | 1.6% | 0 |
+| heart, yours (9000x27) | binary | 0.6% | 0 |
+| heart, UCI (303x14) | binary | **0.0%** | 0, correctly |
+| wine (178x14) | multiclass | 0 (baseline 1.0000) | 0, correctly |
+
+**The result that answers the capability question.** On laptop price the agent read the profile, retrieved "Regularized target encoding outperforms traditional methods in supervised machine learning with high cardinality features" (2022), target-encoded the 618-unique Product column and friends, and reached 321.56 rmse against a 411.89 baseline. I had hand-parsed that dataset first, extracting 8GB and 1.37kg and screen pixels out of strings, and got 329.55. **It beat the hand-engineered ceiling**, its winning candidate is stamped `source="researcher"` with two citations, and the code fits every transform on the training fold only. Knowledge transfer is visible in the chain: iteration 1's digest takeaway was "replace one-hot with target encoding for high-cardinality", and iteration 2's brief was exactly that.
+
+**Seven bugs, every one found by running on real data rather than by reasoning:**
+1. **The agent kernel ran the wrong interpreter.** `start_new_kernel()` resolves the machine's registered `python3` kernelspec — on macOS the Command Line Tools build. Measured: kernel on python 3.9.6 / sklearn 1.6.1, harness on 3.12.12 / 1.8.0. Worse, `install()` targets `sys.executable`, so auto-installed packages never reached the kernel at all and the "no library boundary" design was silently broken on local compute. Pre-existing since v0.2. On a machine with no system sklearn, every run would have failed.
+2. **Metric names were not importable.** The agent is told to optimize `average_precision`; `sklearn.metrics.average_precision` does not exist. 16 cells burned across the runs. The registry already held the real function name, so the coder is now told it. Two scorers wrapping private helpers are dropped from the vocabulary — a metric the agent cannot compute is not worth offering.
+3. **Boolean columns aborted the run at the baseline.** `SimpleImputer` rejects bool dtype, and a bool+string frame makes it take the numeric path and die on the first string. Any yes/no column stored as a real boolean killed the run before iteration 1.
+4. **Non-UTF-8 CSVs could not be loaded.** `pd.read_csv` assumes UTF-8; any European export with a euro sign is latin-1. First contact with the tool was a decoding traceback on a file that opens fine in a spreadsheet.
+5. **Threshold levers on ranking metrics.** Three runs picked `average_precision` then spent iteration 2 on class weighting. Measured across five datasets: threshold tuning moves f1 by ~0.02 and moves average_precision and roc_auc by EXACTLY 0.0000, because a ranking metric is invariant to the threshold. Reproduction lives in `docs/evidence/`.
+6. **The Critic reasoned about direction and got it wrong.** It called an RMSE holdout of 59.29 against validation 56.69 a "lucky split" — maximize logic on a minimize metric, 3 firings in 5 iterations. The harness now computes "the holdout is BETTER/worse than validation by X" with direction applied, and the model only judges whether the gap is suspicious. Re-run on the same dataset: 1 firing.
+
+7. **Integer regression targets could not be loaded at all.** Found by the diamonds dataset: an integer target was always read as a class label, so 11,602 distinct prices became 11,602 classes and the stratified split raised before the run started. Prices, counts and years are all integers, so this is the common regression case rather than an edge one. Recorded on Day 5 as a backlog item and DEFERRED on the reasoning that a fix would change existing splits. That reasoning was wrong and one measurement showed it: every dataset that works has 20 or fewer distinct target values and is untouched, so the only targets affected are ones that already crashed. Deferring on an unchecked assumption cost a day.
+
+**The lesson that repeated twice.** For bug 5 the prompt fix did nothing: the note reached the supervisor's system prompt (verified) and gemma4:12b briefed the dead lever anyway, three runs out of three. Converting it to a guard fixed it on the first run. That is the June EDA-ledger lesson landing again — guards beat prompt nudges on weak models — and it is why bug 6 was fixed by computing the fact host-side rather than explaining direction better.
+
+**One "obvious" fix deliberately NOT made.** Two datasets carry an ID column (`patient_id`, `laptop_ID`) and flagging them looked like free value. Measured first: dropping `patient_id` is worth **-0.0031**. The agent independently reached the same conclusion on laptop, recording "Removing laptop_ID: 281.11 -> 290.51 (lost signal)". A no-op dressed as an improvement.
+
+**Bar status:** staged R&D (10-28 cells per iteration, no monoliths), zero FAILED iterations, duplicates <=2, citations all resolving, Critic catching seeded leakage 3/3 with no false positive, the dial adapting (average_precision on imbalanced targets, f1 on balanced), and progression demonstrated where headroom existed. 581 unit tests, ruff + mypy --strict clean.
 
 ### 2026-08-01 | Sprint 2 Day 5 | Dial A: the first input to disappear since v0.1
 

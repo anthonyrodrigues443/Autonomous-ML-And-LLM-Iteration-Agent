@@ -252,9 +252,12 @@ def test_direction_for_derived_metrics_comes_from_sklearns_sign() -> None:
     invert the loop, because it never supplies the direction."""
     assert direction("matthews_corrcoef") == "maximize"
     assert direction("balanced_accuracy") == "maximize"
-    assert direction("neg_log_loss") == "minimize"
-    assert direction("neg_root_mean_squared_error") == "minimize"
-    assert direction("neg_mean_absolute_error") == "minimize"
+    # Registered without sklearn's "neg_" prefix: we report the raw quantity and
+    # say minimize, rather than printing a positive number under a negative name.
+    assert direction("log_loss") == "minimize"
+    assert direction("root_mean_squared_error") == "minimize"
+    assert direction("mean_absolute_error") == "minimize"
+    assert not [n for n in REGISTRY if n.startswith("neg_")]
 
 
 def test_clustering_scorers_are_excluded_from_the_vocabulary() -> None:
@@ -276,8 +279,8 @@ def test_a_selected_metric_outside_the_panel_is_computed_on_top() -> None:
 def test_include_is_ignored_for_the_wrong_task_or_missing_probabilities() -> None:
     regression = score("regression", [1.0, 2.0], [1.1, 1.9], include=("matthews_corrcoef",))
     assert "matthews_corrcoef" not in regression
-    no_proba = score("classification", BINARY_TRUE, BINARY_PRED, include=("neg_log_loss",))
-    assert "neg_log_loss" not in no_proba
+    no_proba = score("classification", BINARY_TRUE, BINARY_PRED, include=("log_loss",))
+    assert "log_loss" not in no_proba
 
 
 def test_derived_binary_metrics_honour_the_datasets_own_positive_label() -> None:
@@ -298,6 +301,62 @@ def test_a_derived_probability_metric_scores_from_probabilities() -> None:
         BINARY_TRUE,
         BINARY_PRED,
         y_proba=BINARY_PROBA,
-        include=("neg_log_loss",),
+        include=("log_loss",),
     )
-    assert values["neg_log_loss"] > 0  # the raw loss, with direction saying minimize
+    assert values["log_loss"] > 0  # the raw loss, with direction saying minimize
+
+
+# ─── threshold-free metrics (v0.4 certification finding) ─────────────────────
+
+
+def test_threshold_free_is_exactly_the_probability_panel() -> None:
+    """A metric scored from probabilities has no decision threshold by
+    construction, so the predicate needs no new data — only a name."""
+    from iterate.core.scoring import requires_proba, threshold_free
+
+    for name in REGISTRY:
+        assert threshold_free(name) is requires_proba(name)
+    assert threshold_free("average_precision")
+    assert threshold_free("roc_auc")
+    assert not threshold_free("f1")
+    assert not threshold_free("accuracy")
+
+
+def test_guidance_is_given_only_where_it_changes_the_playbook() -> None:
+    """Both v0.4 certification runs picked average_precision and then spent
+    iteration 2 on class weighting — the right lever for f1, worth nothing on a
+    ranking metric. An f1 run must not carry the note; every line competes for a
+    weak model's attention."""
+    from iterate.core.scoring import metric_guidance
+
+    ranking = metric_guidance("average_precision")
+    assert "RANKED PROBABILITIES" in ranking
+    assert "threshold" in ranking.lower()
+    # Threshold metrics get the importable-name hint but NOT the ranking advice,
+    # which would be wrong for them and is another line competing for attention.
+    assert "RANKED PROBABILITIES" not in metric_guidance("f1")
+    assert "RANKED PROBABILITIES" not in metric_guidance("rmse")
+
+
+def test_every_metric_names_an_importable_sklearn_function() -> None:
+    """The v0.4 runs burned 16 cells on `from sklearn.metrics import
+    average_precision`, which does not exist — the metric NAME is a scorer name,
+    the importable symbol is `average_precision_score`. Every name we hand an agent
+    must resolve to something it can actually import."""
+    import sklearn.metrics as skm
+
+    from iterate.core.scoring import sklearn_function
+
+    missing = []
+    for name in REGISTRY:
+        func = sklearn_function(name)
+        if not func or not hasattr(skm, func):
+            missing.append(name)
+    assert not missing, f"no importable sklearn function for: {sorted(missing)}"
+
+
+def test_the_importable_name_reaches_the_guidance() -> None:
+    from iterate.core.scoring import metric_guidance
+
+    assert "average_precision_score" in metric_guidance("average_precision")
+    assert "f1_score" in metric_guidance("f1")  # threshold metrics get it too
