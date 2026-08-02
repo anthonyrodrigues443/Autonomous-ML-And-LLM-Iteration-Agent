@@ -299,6 +299,15 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 ## Sprint 3: v0.5, PromptTarget. Mon 2026-08-03 to Sat 2026-08-08, release Sun 2026-08-09
 
+**Carry-ins from the v0.4 certification (recorded 2026-08-02, ordered by what a user feels first):**
+1. **Eval suite, FIRST in the week.** Day 6 spent an afternoon hand-computing brute-force ceilings per dataset to tell a failing agent from a hard problem, and found seven bugs no unit test caught. Make it a runnable corpus: datasets, measured headroom, a scoring harness. Two things it must fix about the v0.4 method — the ceilings were LOWER BOUNDS from a short sweep, not true maxima, so scoring against public leaderboard positions where they exist would replace guesswork with a number; and the corpus is the CI defence against dataset-shape bugs, since 583 unit tests missed all three (non-UTF-8, boolean columns, integer targets) because every fixture shared the same shape.
+2. **The Researcher, Critic and Summarizer have no styled TUI events.** Only `brief`, `cell` and `score` are emitted; the two headline v0.4 specialists reach the transcript as dim ambient log lines via the logging handler, visually indistinguishable from routine chatter. They deserve the same weight the coder's cells get.
+3. **Research cache files are opaque.** `.iterate/research/{source}-{hash}.json` stores a bare array of papers, so the QUERY that produced them is recorded nowhere. Debugging "why did it search for that" or auditing the trail means inferring the question from the answers. Store `{query, fetched_at, papers}` instead — a cache-format change, which is why it was not done on a tagged release.
+4. **Threshold levers are not guarded on MULTICLASS.** `threshold_free` covers ranking metrics, but a multiclass problem has no single threshold regardless of metric, and the mobile-price run spent an iteration on "Threshold Refinement" against `accuracy`. Needs its own measurement before a guard, per the rule that no guard ships unmeasured.
+5. **The Summarizer authoring the dossier** (Day 4 deferral) and **the free unscored inspect step** (Day 5 cut). The first changes what reaches the supervisor's planning context, so it is gated on a before/after with the decision rule already written down: keep only if lever diversity holds.
+6. **`test_worker_thread_can_own_a_sqlite_memory` is flaky.** It waits a fixed `pilot.pause(0.3)` for sqlite work on a worker thread and fails intermittently on slower CI runners; it failed the v0.4 release PR once and passed on a re-run with no code change. Wait on a condition, not a duration.
+7. **The agent misses thin margins.** Of 8 certification runs, 4 improved; two of the four that did not had small but real headroom available (churn 1.6%, mobile 2.1%). Worth understanding once the eval suite makes it measurable rather than anecdotal.
+
 **Goal:** the second problem type. Prompts as a `BenchmarkTarget`: same iteration loop, different execution path. Two public example commitments come due: `examples/toxicity_jigsaw/` and `examples/intent_clinc150/`. Prompt iteration only, never foundation-model fine-tuning (permanent scope lock).
 
 | Date | Focus | Lands | Done? |
@@ -494,7 +503,7 @@ The discovery agent is what makes the demo wow. It does:
 
 **Doc sync (step 3):** README status paragraph, release table row to shipped, the roadmap cell, the comparison-table "Literature-aware proposals" row flipped to a tick, and the capability section heading which still read "What v0.2 does" two releases on. LIMITATIONS: five rows flipped to fixed, the metric-panel row rewritten as the closed-registry row, the probability and averaging rows retired, and the false integer-target backlog row replaced. First ever EVAL_LOG entry, carrying the headroom table and a dimension scorecard.
 
-**Version mechanics (step 4):** 0.3.1 -> 0.4.0 in pyproject, `__init__`, and the lockfile; tagged v0.4.0. Tony runs `uv publish`.
+**Version mechanics (step 4):** 0.3.1 -> 0.4.0 in pyproject, `__init__`, and the lockfile; tagged v0.4.0 and pushed. **Published to PyPI 2026-08-02T11:43:51Z**; the built wheel was installed into a clean 3.12 venv and verified before publish (`iterate 0.4.0`, `--metric` optional).
 
 **Launch assets (step 5):** X thread (7 tweets, all under 275) and LinkedIn post (355 words, inside the 323-458 range of v0.1-v0.3) drafted in LAUNCH_POST.md, feature-first per the v0.2 REV2 lesson that a score-led post reads wrong. Demo to be recorded from the published package on `laptop_price.csv --max-iterations 3`, which shows the metric dial, a real citation and the 412 -> 322 win inside about twenty minutes.
 
