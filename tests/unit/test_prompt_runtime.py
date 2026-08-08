@@ -286,3 +286,65 @@ def test_no_rows_means_no_calls() -> None:
 
     assert ask(PROMPT, [], client_factory=lambda: client, columns=["text"], labels=LABELS) == []
     assert client.calls == []
+
+
+def test_the_model_under_test_resolves_its_key_the_same_way_the_agent_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--target-backend groq` must pick up GROQ_API_KEY, which is already in the
+    environment for the driving model. One table, not two that agree until one
+    changes."""
+    from iterate.config import get_settings
+    from iterate.core.prompt_runtime import make_ask
+
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-from-the-environment")
+    get_settings.cache_clear()
+    seen: dict[str, object] = {}
+
+    def spy(name: str, **kwargs: object) -> FakeClient:
+        seen.update({"backend": name, **kwargs})
+        return FakeClient([_tool_reply("toxic")])
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", spy)
+    try:
+        make_ask(columns=["text"], labels=LABELS, backend="groq", model="llama-70b")(PROMPT, ROWS)
+    finally:
+        get_settings.cache_clear()
+
+    assert seen["api_key"] == "gsk-from-the-environment"
+    assert seen["backend"] == "groq"
+
+
+def test_an_explicit_target_key_overrides_the_shared_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from iterate.core.prompt_runtime import make_ask
+
+    monkeypatch.setenv("ITERATE_TARGET_API_KEY", "a-different-key")
+    seen: dict[str, object] = {}
+
+    def spy(name: str, **kwargs: object) -> FakeClient:
+        seen.update(kwargs)
+        return FakeClient([_tool_reply("toxic")])
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", spy)
+    make_ask(columns=["text"], labels=LABELS, backend="groq", model="llama-70b")(PROMPT, ROWS)
+
+    assert seen["api_key"] == "a-different-key"
+
+
+def test_ollama_gets_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Its settings default is the placeholder string "ollama", not a real key."""
+    from iterate.core.prompt_runtime import make_ask
+
+    monkeypatch.delenv("ITERATE_TARGET_API_KEY", raising=False)
+    seen: dict[str, object] = {}
+
+    def spy(name: str, **kwargs: object) -> FakeClient:
+        seen.update(kwargs)
+        return FakeClient([_tool_reply("toxic")])
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", spy)
+    make_ask(columns=["text"], labels=LABELS, backend="ollama", model="gemma4:12b")(PROMPT, ROWS)
+
+    assert seen["api_key"] is None

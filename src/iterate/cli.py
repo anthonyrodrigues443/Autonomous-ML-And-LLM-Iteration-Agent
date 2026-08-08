@@ -843,22 +843,14 @@ def _archive_memory_db(path: Path) -> Path | None:
 def _resolved_api_key_from_env(settings: object, backend: str) -> str | None:
     """Pull an api key from settings env-overrides for a cloud backend.
 
-    The user might have set ITERATE_BACKEND_API_KEY (generic), or a vendor-specific
-    one like OPENAI_API_KEY / GROQ_API_KEY.
+    Delegates to the llm factory, which owns the backend -> key-field table. The
+    model under test on a prompt run resolves its key through the same function, so
+    a `--target-backend groq` picks up `GROQ_API_KEY` exactly as the driving model
+    does — one table, not two that agree until one changes.
     """
-    candidates = {
-        "openai-compatible": ("openai_api_key", "iterate_backend_api_key"),
-        "openai": ("openai_api_key", "iterate_backend_api_key"),
-        "groq": ("groq_api_key", "iterate_backend_api_key"),
-        "together": ("together_api_key", "iterate_backend_api_key"),
-        "deepseek": ("deepseek_api_key", "iterate_backend_api_key"),
-        "vllm": ("iterate_backend_api_key",),
-    }
-    for attr in candidates.get(backend, ()):
-        value = getattr(settings, attr, None)
-        if value and value != "ollama":  # "ollama" is the placeholder default
-            return str(value)
-    return None
+    from iterate.llm.factory import api_key_for
+
+    return api_key_for(backend, settings)
 
 
 def _candidate_model(candidate: Candidate) -> str:

@@ -297,20 +297,24 @@ def make_ask(
 ) -> Callable[..., list[str]]:
     """Build the `ask` a session cell calls. Bound to ONE model, on purpose.
 
-    The api key is read from the environment at call time and never written to
-    meta.json, so it does not land on disk beside the data the agent can read.
+    No URL is constructed here. Calls go through the same `build_client` factory the
+    agent itself runs on, so a backend alias resolves its own endpoint and whatever
+    the user configured with `iterate setup` applies unchanged.
+
+    The key resolves through the same table too: `api_key_for` reads `GROQ_API_KEY`,
+    `OPENAI_API_KEY` and the rest exactly as the driving model does, so
+    `--target-backend groq` picks up the key already in the environment. It is read
+    at call time and never written into meta.json, so it does not land on disk
+    beside data the generated code reads. `ITERATE_TARGET_API_KEY` overrides it for
+    the case where the model under test needs a different key from the same provider.
     """
-    from iterate.llm.factory import build_client
+    from iterate.llm.factory import api_key_for, build_client
 
     cache = AnswerCache(cache_path)
 
     def client_factory() -> LLMClient:
-        return build_client(
-            backend,
-            model=model,
-            base_url=base_url,
-            api_key=os.environ.get("ITERATE_TARGET_API_KEY"),
-        )
+        key = os.environ.get("ITERATE_TARGET_API_KEY") or api_key_for(backend)
+        return build_client(backend, model=model, base_url=base_url, api_key=key)
 
     def bound(
         prompt: Prompt,
