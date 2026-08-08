@@ -27,8 +27,8 @@ This split is deliberate. The highest-value engineering work is judgment — cho
 Every build session runs the same loop:
 
 1. **Research** — before any code, the decision gets researched (libraries, papers, alternatives) and the reasoning is written down in [RESEARCH_LOG.md](RESEARCH_LOG.md), in my own words.
-2. **Plan** — the AI drafts a concrete, step-level plan from the day's goal in the BUILD_LOG roadmap.
-3. **Review + redirect** — I read the plan and approve it, push back on it, or change the approach. This is where the real decisions land.
+2. **Plan** — the AI drafts a concrete, step-level plan from the day's goal in the BUILD_LOG roadmap, in a fixed shape: the goal and who it helps, then every file it will write with one line on what goes in it, then how those parts connect to each other.
+3. **Review + redirect** — I read the plan and approve it, push back on it, or change the approach. No code is written before this. This is where the real decisions land.
 4. **Implement** — the AI writes the code and tests against the agreed plan.
 5. **Review** — I read the diff. If something is off, it goes back to step 4.
 6. **Log + ship** — the public docs are updated, a pull request is opened, reviewed, and merged. One reviewable PR per unit of work.

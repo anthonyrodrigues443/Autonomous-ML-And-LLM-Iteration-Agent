@@ -1,0 +1,5 @@
+data = "examples/heart_disease_risk_2026.csv"
+target = "has_heart_disease"
+metric = "average_precision"
+source = "Synthetic heart disease risk, 9000 rows"
+notes = "Large and almost exhausted: the hand sweep found well under a point of margin."

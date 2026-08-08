@@ -1,0 +1,5 @@
+data = "examples/adult_income.csv"
+target = "income"
+metric = "f1"
+source = "UCI Adult census income"
+notes = "Binary with a string target, the shape that never scored before the v0.4 metric layer."

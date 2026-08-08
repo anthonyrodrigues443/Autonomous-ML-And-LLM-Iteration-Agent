@@ -1,0 +1,5 @@
+data = "examples/churn_tabular/data.clean.csv"
+target = "Churn"
+metric = "average_precision"
+source = "Telco customer churn (IBM sample), prepared by examples/churn_tabular/prepare.py"
+notes = "The project's oldest reference dataset. Near its ceiling: the v0.4 sweep found only a small margin left above the baseline."

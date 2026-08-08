@@ -1,0 +1,5 @@
+data = "examples/mobile_price.csv"
+target = "price_range"
+metric = "accuracy"
+source = "Mobile price classification (Kaggle)"
+notes = "Multiclass. A v0.4 run spent an iteration tuning a decision threshold here, which is meaningless on multiclass; the guard for that is still unmeasured."

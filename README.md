@@ -16,7 +16,7 @@ iterate run --data examples/churn_tabular/data.clean.csv --target Churn
 # (--metric is optional now: omit it and the agent picks one from your data, and says why)
 ```
 
-`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 581 unit tests across 38 files run in CI on every push.
+`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 652 unit tests across 51 files run in CI on every push.
 
 | v0.4 today | On the roadmap |
 |---|---|
@@ -226,7 +226,7 @@ src/iterate/
 | Auto-discovers data + context (MCP) | ✗ | ✗ | ✗ | partial | planned v0.9 |
 | Open-source | mostly ✗ | MLflow yes | ✗ | ✓ | ✓ |
 
-Known limits are documented honestly in [LIMITATIONS.md](LIMITATIONS.md); the evaluation trail lives in [BUILD_LOG.md](BUILD_LOG.md).
+Known limits are documented honestly in [LIMITATIONS.md](LIMITATIONS.md); the evaluation trail lives in [BUILD_LOG.md](BUILD_LOG.md), and version-over-version measurements in [evals/RESULTS.md](evals/RESULTS.md) — same datasets, same floor model, same budget, with a brute-force ceiling per dataset so a flat result can be read as either a miss or an exhausted problem. That harness is internal development tooling and is not part of the installed package.
 
 ---
 

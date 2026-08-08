@@ -1,0 +1,5 @@
+data = "examples/laptop_price.csv"
+target = "Price_euros"
+metric = "rmse"
+source = "Laptop price dataset (Kaggle), latin-1 encoded with euro signs"
+notes = "The one dataset with real headroom in the v0.4 certification. Also the non-UTF-8 file that first broke the loader."

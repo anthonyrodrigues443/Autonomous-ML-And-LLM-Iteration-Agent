@@ -269,3 +269,10 @@ examples/laptop_price.csv
 examples/heart_disease_risk_2026.csv
 examples/mobile_price.csv
 examples/diamonds.csv
+
+# evals — internal measurement harness (evals/README.md)
+# The registry (dataset.toml) and the results table are tracked; the bytes,
+# the per-cell working directories and the ledger are not.
+evals/.work/
+evals/results.db
+evals/datasets/*/*.csv
