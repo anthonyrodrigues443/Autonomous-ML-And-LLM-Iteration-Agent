@@ -9,8 +9,17 @@ Public-dataset demos that ship with `iterate`.
 | `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | placeholder, lands with v0.5 |
 
 The two `PromptTarget` directories are intentionally empty for now: `PromptTarget`
-does not exist yet (roadmap v0.5, Week 8). They mark where the pluggability proof
+does not exist yet (roadmap v0.5, sprint 3). They mark where the pluggability proof
 will live so the layout does not churn later.
+
+## These datasets are also the eval corpus
+
+The tabular CSVs here double as the corpus the internal eval harness measures
+versions against, registered in `evals/datasets/*/dataset.toml` by path rather than
+copied. Each one has a brute-force ceiling measured against the same sealed split
+the agent gets, which is what separates "the agent found nothing" from "there was
+nothing to find". See [evals/README.md](../evals/README.md). That harness is
+internal tooling, never part of the installed package.
 
 ## Running the working example
 
