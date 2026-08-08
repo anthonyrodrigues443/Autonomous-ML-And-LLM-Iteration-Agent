@@ -312,7 +312,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
-| Mon Aug 3 | **Eval suite FIRST** (Tony's call after the v0.4 certification): the headroom table from EVAL_LOG becomes a runnable corpus, so a release is measured rather than argued about. Then the v0.5 work below | `evals/` + corpus + runner |
+| Mon Aug 3 | **Eval suite FIRST** (Tony's call after the v0.4 certification): the headroom table from EVAL_LOG becomes a runnable corpus, so a release is measured rather than argued about. Then the v0.5 work below | `evals/` + corpus + runner | done (built Sat Aug 8) |
 | Tue Aug 4 | Loop integration: prompt lever classes for the supervisor ladder, coder session writes prompt variants + scoring cells, guard stack audited for the new path (duplicate gates hash prompt text, dead-ends transfer) | wiring + tests | |
 | Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | |
 | Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | |
@@ -493,6 +493,39 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-08-08 | Sprint 3 Day 1 | The eval harness, and the first thing it found
+
+**Task:** carry-in item 1. Turn the hand-computed headroom table into a runnable system, so "did this release make the product better" is a command rather than an argument. Internal only: no `iterate eval`, nothing under `src/iterate`, nothing in the wheel. Tony's call on both the ordering and the scope.
+
+**Shape it took, after his pushback.** The first plan was a script that ran a sweep and printed a table. He pushed for a genuinely separate subsystem with its own store, versions and dates, and he was right for a reason the first plan missed: a full sweep is hours and released versions are frozen, so v0.2's number on churn can never change. Recomputing the grid on every release makes the tool too expensive to use, which is how measurement tools die. So `evals/results.db` accumulates and a sweep fills only what is missing. Adding v0.6 costs one row.
+
+**Config versus flags, as a correctness rule rather than a preference.** Everything that changes what a number MEANS lives in a tracked `config.toml` — model, budget, patience, repeats — and is hashed into a fingerprint stamped on every cell. Flags only select which rows to fill. If the budget were a flag, one sweep would run v0.4 at ten iterations and the next v0.5 at fifteen, the table would show v0.5 ahead, and the table would be fiction.
+
+**The decision that makes cross-version reading possible at all:** the memory-db reader uses raw SQL and `json.loads`, never the current pydantic models. Those models are `extra="forbid"`, so a v0.1 database fails validation the moment a field is added (`Candidate.citations` in v0.4, `Experiment.digest` before it). Parsing through them would mean the harness could only read runs produced by the version it shipped with, which is exactly the comparison it exists to make.
+
+**THE FINDING, and it corrects a public claim.** The measured ceiling on laptop price is **rmse 248.85**, not the 329.55 the Aug 2 hand sweep implied. A plain `Ridge` — one line, no tuning, no feature engineering — reaches it in under a second. The v0.4 run's best was 321.56, so against a properly measured ceiling it captured **55% of available headroom, not 110%**, and its result is beaten outright by the simplest linear model in the sweep. Same sealed split, same `load_csv` seed, same `ModelTarget` pipeline, same scoring, so it is a like-for-like comparison. No leaking column: the only numeric features are `laptop_ID` (r=0.07) and `Inches`. Ridge wins because one-hot over `Product` (618 distinct values in 1303 rows), `Cpu` and `Gpu` is a wide sparse problem that L2 handles and default-depth trees do not. This is the single dataset the v0.4 capability claim rests on.
+
+**The sweep is not uniformly better than the hand sweep, which changed a design.** It found much MORE headroom on laptop price and diamonds, and LESS on churn, heart and mobile — those three now measure at exactly zero, against 1.6%, 0.6% and 2.1% by hand. The reason is a real limitation: `brute_force_sweep_v1` varies the MODEL, not the FEATURES, and the hand sweep varied both. So the stored ceiling is now a running maximum: `put_ceiling` keeps the better of old and new, and re-measuring can only raise the bar. Overwriting would have silently lowered the bar the agent is judged against on three of six datasets. Feature treatments are `v2` of the sweep, and the `method` column says which kind of ceiling any number is.
+
+**Measured ceilings (gemma4-independent, no LLM, 9 models each):**
+
+| dataset | metric | baseline | ceiling | best model | headroom |
+|---|---|---|---|---|---|
+| laptop_price | rmse | 411.89 | **248.85** | Ridge | 163.04 |
+| diamonds | rmse | 549.06 | 537.14 | LGBM | 11.92 |
+| adult_income | f1 | 0.7187 | 0.7259 | XGB | 0.0072 |
+| churn | average_precision | 0.6449 | 0.6449 | factory default | 0 |
+| heart_risk | average_precision | 0.8967 | 0.8967 | factory default | 0 |
+| mobile_price | accuracy | 0.9450 | 0.9450 | factory default | 0 |
+
+**Also landed: the shape corpus,** the second half of carry-in 1 and a different thing entirely — no LLM, no versions, seconds not hours. Five synthetic files with the shapes that actually broke the loader (non-UTF-8, boolean columns, integer regression targets) plus high-cardinality strings and missing values, asserted in CI on every push. Writing it found a bug in the fixture itself: latin-1 has no euro codepoint, so the "European export with a euro sign" file could not be written at all. The real-world version of that file is cp1252, where the euro byte decodes under our latin-1 fallback as a control character — mangled rather than crashed, and not yet covered.
+
+**Isolation choices, and the one that is deliberately shared.** Each cell gets its own memory db, because a shared one would let a previous cell's best carry over as the next cell's baseline and the grid would measure the order the cells ran in. `XDG_CONFIG_HOME` is thrown away per sweep so a saved `iterate setup` backend cannot leak in. The research cache is SHARED on purpose: every version then sees the same papers, so a difference between two cells is the agent rather than what OpenAlex returned that minute.
+
+**Gates:** 652 unit tests (was 583; 69 new), ruff clean over the whole repo, mypy --strict clean over `src/iterate` and `evals`. `make lint`/`format`/`typecheck` now cover `evals/` too, closing the scope gap between them and `make build` that nearly broke the v0.4 release.
+
+**Noted, not fixed:** running `ruff format` with the currently installed version reformats 38 existing tracked files. Pre-existing drift, unrelated to this work, left alone to keep the diff readable.
+
 ### 2026-08-02 | Sprint 2 Day 7 | v0.4.0 released
 
 **Task:** Release mechanics per the standing checklist.
@@ -509,7 +542,7 @@ The discovery agent is what makes the demo wow. It does:
 
 **What v0.4 shipped:** all five public promises. Researcher and Critic specialists, literature-grounded proposals with citations that cannot be fabricated, probability metrics (plus 42 more than promised, derived from scikit-learn), a selection-bias watch, and the first input dial to turn since v0.1 — `--metric` is optional.
 
-**Honest state of the evidence:** the headline capability claim rests on one dataset. Laptop price captured 110% of measured headroom by retrieving a 2022 paper on high-cardinality features and beating a hand-parsed baseline. Five of the six other datasets were near-ceiling, which is the real shape of tabular ML rather than a weakness of the agent, but it does mean "captures large gains" is n=1. The posts claim a specific run rather than a general capability, which is the correct framing for what was measured.
+**Honest state of the evidence:** the headline capability claim rests on one dataset. Laptop price captured 110% of measured headroom by retrieving a 2022 paper on high-cardinality features and beating a hand-parsed baseline. **(Superseded 2026-08-08: the eval harness re-measured that ceiling at rmse 248.85 rather than 329.55, which makes the same run 55% of available headroom, not 110%. See the Sprint 3 Day 1 entry.)** Five of the six other datasets were near-ceiling, which is the real shape of tabular ML rather than a weakness of the agent, but it does mean "captures large gains" is n=1. The posts claim a specific run rather than a general capability, which is the correct framing for what was measured.
 
 ### 2026-08-02 | Sprint 2 Day 6 | Certification: seven real bugs, none of which 583 unit tests could find
 

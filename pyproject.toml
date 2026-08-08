@@ -150,6 +150,11 @@ ignore = [
     "B008",  # do not perform function calls in argument defaults
 ]
 
+[tool.ruff.lint.isort]
+# `evals/` is a repo-root package that never ships, so it is not on the `src` path
+# above and isort would otherwise sort it as a third-party import.
+known-first-party = ["iterate", "evals"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["B011"]  # allow assert False in tests
 

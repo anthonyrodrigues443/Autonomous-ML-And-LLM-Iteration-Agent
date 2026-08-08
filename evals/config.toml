@@ -1,0 +1,27 @@
+# Sweep conditions. Everything here changes what a number MEANS, so it is tracked
+# in git and stamped onto every cell as a fingerprint. Change one of these and the
+# existing cells stop being comparable to the new ones, which the report will say
+# out loud rather than averaging them together.
+#
+# What NOT to put here: anything that only selects which rows to fill. That is what
+# the --versions and --datasets flags are for.
+
+[conditions]
+# The floor model. The bar is what a 12B can do unaided, so the comparison is the
+# harness improving rather than a bigger model carrying it.
+model = "gemma4:12b"
+backend = "ollama"
+max_iterations = 10
+patience = 3
+# One run of an LLM loop says almost nothing; the median of three is reportable.
+repeats = 3
+timeout_minutes = 90
+# Threads for the no-LLM ceiling sweep. Changes how long it takes, not what it
+# finds: every estimator in that sweep is deterministic given its seed.
+sweep_threads = 4
+
+[versions]
+# The last patch of each release line, which is what a user on that line actually
+# had, plus the working tree. Older versions are only worth running once, since
+# their numbers can never change.
+track = ["0.1.3", "0.2.1", "0.3.1", "0.4.0", "dev"]

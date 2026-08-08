@@ -1,0 +1,5 @@
+data = "examples/diamonds.csv"
+target = "price"
+metric = "rmse"
+source = "ggplot2 diamonds, 53940 rows"
+notes = "Integer regression target. Could not be loaded at all until the v0.4 certification fixed the stratification heuristic, so it has never been swept."
