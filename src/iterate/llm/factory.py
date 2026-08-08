@@ -71,8 +71,7 @@ def build_client(
     if name in _OPENAI_COMPATIBLE_ALIASES:
         if think:
             logger.warning(
-                "think=True only applies to the ollama backend (native /api/chat); "
-                "ignored for %r",
+                "think=True only applies to the ollama backend (native /api/chat); ignored for %r",
                 name,
             )
         return OpenAICompatibleClient(
@@ -81,4 +80,37 @@ def build_client(
     raise UnknownBackendError(f"unknown backend {name!r}; choose one of {_KNOWN}")
 
 
-__all__ = ["UnknownBackendError", "build_client", "resolve_base_url"]
+# Which settings field holds the key for each cloud backend. One table, because the
+# same fact computed in two places is this project's most repeated bug: sprint 2 hit
+# it three times (a stale metric list, two lever orderings, two
+# classification heuristics), and each one agreed with its twin right up until one
+# of them needed to change.
+_KEY_FIELDS: dict[str, tuple[str, ...]] = {
+    "openai-compatible": ("openai_api_key", "iterate_backend_api_key"),
+    "openai": ("openai_api_key", "iterate_backend_api_key"),
+    "groq": ("groq_api_key", "iterate_backend_api_key"),
+    "together": ("together_api_key", "iterate_backend_api_key"),
+    "deepseek": ("deepseek_api_key", "iterate_backend_api_key"),
+    "vllm": ("iterate_backend_api_key",),
+}
+
+
+def api_key_for(backend: str, settings: object | None = None) -> str | None:
+    """The api key configured for a backend, or None.
+
+    Reads the vendor-specific env var (`GROQ_API_KEY`, `OPENAI_API_KEY`, …) and
+    falls back to the generic `ITERATE_BACKEND_API_KEY`. Ollama has no key, and its
+    placeholder default is treated as absent.
+    """
+    if settings is None:
+        from iterate.config import get_settings
+
+        settings = get_settings()
+    for attr in _KEY_FIELDS.get(backend, ()):
+        value = getattr(settings, attr, None)
+        if value and value != "ollama":  # the placeholder default, not a real key
+            return str(value)
+    return None
+
+
+__all__ = ["UnknownBackendError", "api_key_for", "build_client", "resolve_base_url"]

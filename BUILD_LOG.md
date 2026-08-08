@@ -313,7 +313,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
 | Mon Aug 3 | **Eval suite FIRST** (Tony's call after the v0.4 certification): the headroom table from EVAL_LOG becomes a runnable corpus, so a release is measured rather than argued about. Then the v0.5 work below | `evals/` + corpus + runner | done (built Sat Aug 8) |
-| Tue Aug 4 | Loop integration: prompt lever classes for the supervisor ladder, coder session writes prompt variants + scoring cells, guard stack audited for the new path (duplicate gates hash prompt text, dead-ends transfer) | wiring + tests | |
+| Tue Aug 4 | Loop integration: prompt lever classes for the supervisor ladder, coder session writes prompt variants + scoring cells, guard stack audited for the new path (duplicate gates hash prompt text, dead-ends transfer) | wiring + tests | done (built Sat Aug 8) |
 | Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | |
 | Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | |
 | Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | |
@@ -492,6 +492,32 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-08 | Sprint 3 Day 2 | `PromptTarget`: the second problem type, on the same machine
+
+**Task:** v0.5's public promise. Prompts as a target family, with the whole multi-agent apparatus reused rather than rebuilt.
+
+**I had the architecture wrong and Tony corrected it.** My plan was that prompts could not use `run_supervised` because it is typed to `TabularDataset`, so v0.5 would ride the older target-agnostic `Orchestrator` loop and go without the Researcher and Critic. His answer: everyone lives as is, it is the same as tabular, the only difference is that there is no ML model — there are LLM calls run per record. He was right, and the reason my objection dissolved is that **a prompt eval set IS tabular**: input columns plus a column holding the correct answer. `TabularDataset`, the deterministic split, the sealed holdout, the predictions contract and `core.scoring` all apply unchanged. Nothing needed decoupling. The whole day got smaller.
+
+**What actually differs is three strings and a helper.** The coder is not replaced by a "prompter" — it is parameterised. Its job, write cells until you can submit predictions, is the same job whether a cell fits a model or calls an LLM. Four additive constructor arguments, all defaulted so the tabular path is byte-identical: the session preamble, an extra input file, the floor cell, and which instruction set to use. 52 added lines in `coder.py`, and the Supervisor, Researcher, Critic, Summarizer, memory, dedup and dead-ends channel were not touched at all.
+
+**The one real piece of new infrastructure is `ask()`.** Tony asked whether the generated code could just construct the Ollama URL and call it. It could, and I pushed back on four grounds: a cloud key would sit in the same place as model-written code; a model writing its own call can silently change model or temperature between experiments, so two experiments would differ by more than the prompt; a hand-rolled loop is sequential, and one call per row sequentially is what makes a prompt loop too slow to finish; and retries, rate limits and garbled replies each become a dead iteration. So the session is handed `ask(prompt, rows)` — concurrent, cached to sqlite, tool-enforced answers — and the agent writes the prompt rather than the transport. The framing that settled it: the tabular coder does not implement gradient boosting from scratch, it calls the library.
+
+**A property that fell out for free, and it is the good kind.** `build_inputs` already writes train.csv WITH answers and holdout.csv WITHOUT them. So the prompt-path version of fitting on the test set — mining the answer key for few-shot examples — is not something the agent is stopped from doing, it is something it cannot see how to do. I had planned a guard for it. The guard was already there, four releases early, in a function written for a different reason.
+
+**The allowed answers are a tool schema, not an instruction.** Asking a model to reply with one of three labels is a request. Giving it a tool whose only argument is an enum of three labels makes anything else inexpressible. Same shape as the Researcher picking a paper by number rather than writing a DOI, and the same principle: make the bad outcome structurally impossible rather than prompted against.
+
+**Unparseable output counts as wrong and is reported.** A prompt that answers "I think this is probably toxic?" is a worse prompt. Coercion tries an exact match, then a UNIQUE substring — a reply naming two labels stays unparseable, because guessing which one it meant is how a wrong answer becomes right by accident. But an endpoint that fails on EVERY row is an error, not a score of zero: reporting 0.0 would bank a number and teach the next iteration a lie.
+
+**`prompts.yaml` is the deliverable, and Tony's call.** He pointed out that notebooks cannot really tell you which prompt was best, so prompts should be saved to a file with a version tag and a best marker. Right, and it is more than convenience: for a prompt run that file IS the artifact, the way `best_model.joblib` is for tabular. One correction to how he framed it — the harness writes it, never the agent, because an agent writing its own scoreboard can mislabel which one won. That forced a good constraint: `submit(prompt)` writes the predictions and `prompt.json` in the SAME call, so a prompt that did not produce the submitted predictions cannot be recorded. `best: true` respects the Critic; a rejected score can never be marked best, and rejected versions stay in the file with their reason.
+
+**The safety net is the majority answer, not a re-run of the baseline prompt.** v0.4 learned this when the tabular floor trained a gradient-boosted tree and timed out alongside the session it was meant to catch. A floor made of LLM calls has exactly that shape and would be slowest in precisely the situation that triggers it.
+
+**Scoped to local compute, stated honestly.** Generated code in an e2b sandbox would need the model endpoint and key shipped into the sandbox. For a local Ollama floor that is a non-issue. A host-side proxy is the fix when cloud sandboxing matters.
+
+**Gates:** 720 unit tests (was 652; 68 new), ruff clean repo-wide, mypy --strict clean. Two of those tests execute the generated session preamble for real in a temp directory and call `ask`, `evaluate` and `submit` — that contract only ever runs together inside a live session, so it needed a test that runs it together.
+
+**Diff discipline note:** running `ruff format` over `src/` reformats 15 files this change never touched, pre-existing drift between the committed code and the installed ruff. Reverted, and the three touched modules were re-edited without a format pass, taking the diff from 450 changed lines to 345 with 15 deletions.
 
 ### 2026-08-08 | Sprint 3 Day 1 | The eval harness, and the first thing it found
 
