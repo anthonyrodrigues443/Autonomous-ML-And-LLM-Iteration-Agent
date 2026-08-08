@@ -137,6 +137,31 @@ def run(
         "Omit it and the agent picks one from your data profile and the literature, "
         "then states why. An explicit choice always wins.",
     ),
+    task: str | None = typer.Option(
+        None,
+        "--task",
+        help='One line describing the job, e.g. "say whether the comment is toxic". '
+        "Supplying it switches the run to PROMPT iteration: the agent writes and "
+        "improves a prompt instead of a model, scored on the same sealed holdout.",
+    ),
+    prompt_file: Path | None = typer.Option(
+        None,
+        "--prompt-file",
+        help="Your current production prompt (txt/md, or yaml with system + user_template). "
+        "Becomes the baseline the agent has to beat. Omit it and a minimal prompt is "
+        "built from --task.",
+        exists=True,
+        dir_okay=False,
+    ),
+    target_model: str | None = typer.Option(
+        None,
+        "--target-model",
+        help="The model whose prompt is being tuned. Separate from the model DRIVING "
+        "the run (--model). Defaults to the same one.",
+    ),
+    target_backend: str | None = typer.Option(
+        None, "--target-backend", help="Backend for the model under test. Defaults to --backend."
+    ),
     average: str | None = typer.Option(
         None,
         "--average",
@@ -237,6 +262,7 @@ def run(
     from iterate.adapters.compute.kernel import E2BKernel, LocalKernel, StatefulKernel
     from iterate.adapters.compute.local import LocalExecutor
     from iterate.adapters.data.tabular import load_csv
+    from iterate.core import codegen
     from iterate.core.agent_loop import run_supervised
     from iterate.core.coder import CodingAgent
     from iterate.core.critic import Critic
@@ -360,7 +386,21 @@ def run(
     )
     metric = run_setup.metric
     direction = metric_direction(metric)
-    model_target = ModelTarget(dataset, metric=metric, average=average)
+    is_prompt_run = task is not None
+    if is_prompt_run:
+        model_target = _build_prompt_target(
+            dataset,
+            metric=metric,
+            average=average,
+            task=str(task),
+            prompt_file=prompt_file,
+            backend=target_backend or backend,
+            model=target_model or model,
+            base_url=base_url,
+            cache_path=Path(settings.iterate_runs_dir).parent / "prompt-answers.db",
+        )
+    else:
+        model_target = ModelTarget(dataset, metric=metric, average=average)
     if line := run_setup.render():
         console.print(f"[dim]{line}[/dim]")
         if run_setup.starting_model:
@@ -489,11 +529,24 @@ def run(
             kernel: StatefulKernel = (
                 E2BKernel(api_key=e2b_api_key) if compute == "e2b" else LocalKernel()
             )
+            family: dict[str, Any] = {}
+            if is_prompt_run:
+                # The four things that differ: what the session opens with, what
+                # else is in its working directory, which floor catches it, and
+                # which instructions it gets. The agent's job — write cells until
+                # you can submit — is unchanged.
+                family = {
+                    "preamble": model_target.session_preamble(),
+                    "extra_inputs": {codegen.META_JSON: model_target.meta_json()},
+                    "floor_cell": codegen.prompt_fallback_baseline(),
+                    "family": "prompt",
+                }
             return CodingAgent(
                 coder_client, kernel, metric=metric, average=average,
                 install=(install or compute == "e2b"),
                 context_budget_chars=context_budget,
                 controller=controller,
+                **family,
             )
 
         def on_experiment(
@@ -581,9 +634,30 @@ def run(
             reported=baseline, measured=result.baseline.metrics.primary_value
         )
 
-    # ─── Save the winning model so the user can actually use it ────────────
+    # ─── The deliverable the user actually leaves with ─────────────────────
     run_dir = Path(settings.iterate_runs_dir) / (result.run_id or "run")
-    if result.best is not None and result.best.result is not None:
+    if is_prompt_run:
+        # For a prompt run the artifact is the prompt, and a notebook cannot say
+        # which of its cells held the winner. Written by the harness, never by the
+        # agent, so `best` is decided by recorded scores and honours the Critic.
+        from iterate.deliver import prompt_record
+
+        record = prompt_record.write(
+            run_dir,
+            task=str(task),
+            metric=metric,
+            direction=direction,
+            model_under_test=model_target.model_under_test,
+            baseline_prompt=model_target.baseline_prompt,
+            baseline_score=(
+                result.baseline.metrics.primary_value
+                if result.baseline.metrics is not None
+                else None
+            ),
+            history=result.history,
+        )
+        console.print(f"[dim]prompts written to {record}[/dim]")
+    elif result.best is not None and result.best.result is not None:
         out_path = output or (run_dir / "best_model.joblib")
         _save_best_model(model_target, result, metric, out_path)
 
@@ -598,6 +672,71 @@ def run(
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+
+def _read_starting_prompt(path: Path) -> Any:
+    """The user's production prompt, from yaml (system + user_template) or plain text.
+
+    Plain text becomes the system message with a bare `{input}` template, which is
+    what someone pasting the prompt they already run actually means. A yaml file with
+    no `system` key is treated as text too, rather than silently producing an empty
+    prompt that would score like a broken run.
+    """
+    import yaml
+
+    from iterate.core.prompting import Prompt
+
+    raw = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in (".yaml", ".yml"):
+        try:
+            payload = yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            raise typer.BadParameter(f"{path} is not valid yaml: {exc}") from exc
+        if isinstance(payload, dict) and payload.get("system"):
+            return Prompt(
+                system=str(payload["system"]),
+                user_template=str(payload.get("user_template") or "{input}"),
+            )
+    if not raw.strip():
+        raise typer.BadParameter(f"{path} is empty")
+    return Prompt(system=raw.strip(), user_template="{input}")
+
+
+def _build_prompt_target(
+    dataset: Any,
+    *,
+    metric: str,
+    average: str | None,
+    task: str,
+    prompt_file: Path | None,
+    backend: str,
+    model: str | None,
+    base_url: str | None,
+    cache_path: Path,
+) -> Any:
+    from iterate.core.scoring import requires_proba
+    from iterate.targets.prompt import PromptTarget
+
+    if requires_proba(metric):
+        # Checked before anything runs, in the same spirit as validating a metric
+        # against the target column: a text model returns a label, not a calibrated
+        # probability, so this run could never score and should not start.
+        raise typer.BadParameter(
+            f"{metric!r} needs probabilities, which a prompt run cannot produce. "
+            "Pick a label metric such as f1, accuracy or f1_macro."
+        )
+
+    return PromptTarget(
+        dataset,
+        metric=metric,
+        average=average,
+        task=task,
+        target_backend=backend,
+        target_model=model or get_settings().iterate_model,
+        target_base_url=base_url,
+        cache_path=cache_path,
+        starting_prompt=_read_starting_prompt(prompt_file) if prompt_file else None,
+    )
 
 
 def _mask(secret: str) -> str:

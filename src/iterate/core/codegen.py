@@ -41,6 +41,10 @@ PREDICTIONS_CSV = "predictions.csv"
 # index=False), a guard that already caught the single worst failure in 100+ live
 # iterations. Widening it to sometimes mean probabilities would blunt it.
 PROBABILITIES_CSV = "probabilities.csv"
+# The prompt path's deliverable, written by `submit()` at the same moment as the
+# predictions it produced. A run's real output is the prompt you can put into
+# production, and a notebook cannot tell you which of its cells held the winner.
+PROMPT_JSON = "prompt.json"
 
 # The single function the agent must define; the harness calls it.
 ENTRY_POINT = "train_and_predict"
@@ -150,6 +154,82 @@ def session_preamble() -> str:
     )
 
 
+def prompt_session_preamble() -> str:
+    """The prompt path's opening cell.
+
+    Same data contract as the tabular preamble — `X_train` / `y_train` with answers,
+    `X_holdout` features only — plus the three things a prompt session needs and
+    should not have to build:
+
+    ``ask(prompt, rows)`` runs a prompt over records concurrently, with caching and
+    a tool-enforced answer, against the ONE model this run is tuning. The agent
+    writes the prompt; it does not hand-roll the transport, for the same reason the
+    tabular coder does not implement gradient boosting.
+
+    ``evaluate(answers, truth)`` scores with the RUN'S metric. Without it a session
+    reaches for accuracy while the host scores f1, and every "improvement" it
+    measures is measured with a different ruler than the one that decides.
+
+    ``submit(prompt)`` runs the prompt over the holdout and writes BOTH
+    predictions.csv and prompt.yaml in one call. That is what makes it impossible to
+    submit a prompt that did not produce the submitted predictions — a mismatch no
+    after-the-fact validation could reliably catch.
+    """
+    return (
+        "import os\n"
+        "for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', "
+        "'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):\n"
+        "    os.environ.setdefault(_v, '1')\n"
+        "import json, random, pandas as pd, numpy as np\n"
+        "random.seed(42); np.random.seed(42)\n"
+        "from iterate.core.prompting import Prompt\n"
+        "from iterate.core.prompt_runtime import make_ask, AskStats\n"
+        "from iterate.core.scoring import score as _score\n"
+        f"with open({META_JSON!r}) as _f:\n"
+        "    _meta = json.load(_f)\n"
+        "_target = _meta['target']\n"
+        "_labels = _meta.get('labels')\n"
+        "_metric = _meta['metric']\n"
+        "TASK = _meta['task']\n"
+        f"_train = pd.read_csv({TRAIN_CSV!r})\n"
+        "X_train = _train.drop(columns=[_target])\n"
+        "y_train = _train[_target]\n"
+        f"X_holdout = pd.read_csv({HOLDOUT_CSV!r})  # FEATURES ONLY — answers held back\n"
+        "_pristine_inputs = {'X_train': X_train.copy(), 'y_train': y_train.copy(), "
+        "'X_holdout': X_holdout.copy()}\n"
+        "_columns = list(_meta['features'])\n"
+        "_ask = make_ask(columns=_columns, labels=_labels, "
+        "backend=_meta['target_backend'], model=_meta['target_model'], "
+        "base_url=_meta.get('target_base_url'), cache_path=_meta.get('cache_path'), "
+        "max_workers=int(_meta.get('max_workers') or 8))\n"
+        "BASELINE_PROMPT = Prompt(**_meta['baseline_prompt'])\n"
+        "def ask(prompt, rows):\n"
+        "    frame = rows.to_dict(orient='records') if hasattr(rows, 'to_dict') else list(rows)\n"
+        "    stats = AskStats()\n"
+        "    out = _ask(prompt, frame, stats=stats)\n"
+        "    print('ask:', stats.summary())\n"
+        "    return out\n"
+        "def evaluate(answers, truth):\n"
+        "    truth = [str(t) for t in (truth.tolist() if hasattr(truth, 'tolist') else truth)]\n"
+        "    values = _score('classification', truth, [str(a) for a in answers], "
+        "include=(_metric,))\n"
+        "    return values[_metric]\n"
+        "def submit(prompt):\n"
+        "    answers = ask(prompt, X_holdout)\n"
+        f"    pd.Series(answers).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
+        f"    with open({PROMPT_JSON!r}, 'w') as _f:\n"
+        "        json.dump(prompt.as_dict(), _f)\n"
+        "    print('submitted', len(answers), 'answers for the holdout')\n"
+        "    return answers\n"
+        "def finish(*args, **kwargs):\n"
+        "    print('finish is a tool call, not a Python function. This cell still ran; "
+        "now invoke the finish tool to end the session.')\n"
+        "print('loaded:', X_train.shape, 'train /', X_holdout.shape, 'holdout; answers:', "
+        "(_labels if _labels else 'free text'))\n"
+        "print('task:', TASK)\n"
+    )
+
+
 # Prepended to every agent cell: restores the canonical inputs from the pristine
 # snapshot taken in the preamble, so in-place mutation of X_train/y_train/X_holdout
 # in one cell cannot leak into the next. Guarded so a stray preamble failure (no
@@ -204,6 +284,32 @@ def fallback_baseline(task: str, *, with_proba: bool = False) -> str:
         f"pd.Series(_fb_model.predict(_fb_Xh)).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
         + proba_line
         + "print('fallback baseline banked', len(_fb_Xh), 'predictions')\n"
+    )
+
+
+def prompt_fallback_baseline() -> str:
+    """The prompt path's floor submission: the most common training answer, for
+    every holdout row.
+
+    Emphatically NOT "re-run the baseline prompt". The tabular floor learned this
+    the expensive way — it trained a gradient-boosted tree until a session died to
+    fit-cell timeouts and the floor timed out with it. A floor made of LLM calls has
+    exactly that shape, and it would be slowest in precisely the situation that
+    triggers it: a session that already spent its budget on calls. The majority
+    answer needs no model, no network and no time.
+
+    It writes prompt.json too, so a floored iteration still records what was being
+    attempted rather than leaving a submission with no prompt behind it.
+    """
+    return (
+        "import json, pandas as pd\n"
+        "_fb_answer = str(y_train.astype(str).value_counts().index[0])\n"
+        f"pd.Series([_fb_answer] * len(X_holdout)).to_csv({PREDICTIONS_CSV!r}, "
+        "index=False, header=False)\n"
+        f"with open({PROMPT_JSON!r}, 'w') as _f:\n"
+        "    json.dump(BASELINE_PROMPT.as_dict(), _f)\n"
+        "print('fallback banked the majority answer', repr(_fb_answer), 'for', "
+        "len(X_holdout), 'rows')\n"
     )
 
 
