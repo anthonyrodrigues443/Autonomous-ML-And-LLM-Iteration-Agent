@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, replace
@@ -59,6 +60,8 @@ _MIN_VERSION: dict[str, tuple[int, int, int]] = {
     "--plain": (0, 3, 0),
     "--backend": (0, 2, 0),
 }
+
+DISTRIBUTION = "iterate-ai"
 
 _FUTURE = (999, 0, 0)
 
@@ -109,7 +112,11 @@ def command_for(version: str, dataset: Dataset, conditions: Conditions) -> list[
         if version == DEV_VERSION
         # An ephemeral environment per released version. --no-project keeps it from
         # resolving this repo's own package and shadowing the version under test.
-        else ["uv", "run", "--no-project", "--with", f"iterate=={version}"]
+        # `iterate-ai` is the DISTRIBUTION name; `iterate` is only the console
+        # script and the import. Getting this wrong failed the first cell of the
+        # first grid with "no version of iterate==0.1.3", which reads like a
+        # missing release rather than a wrong package name.
+        else ["uv", "run", "--no-project", "--with", f"{DISTRIBUTION}=={version}"]
     )
 
     argv = [
@@ -230,7 +237,10 @@ def run_cell(
     # a partial result into no result.
     try:
         runs = read(path / "memory.db")
-    except (UnreadableRunError, OSError) as exc:
+    except (UnreadableRunError, OSError, sqlite3.Error) as exc:
+        # sqlite3.Error is NOT an OSError, so a run that died before creating its
+        # database raised straight through this handler and killed the whole sweep
+        # on cell 1 of 24 — exactly what "never raises" was written to prevent.
         return _finish(
             base,
             status=STATUS_TIMEOUT if timed_out else STATUS_UNREADABLE,

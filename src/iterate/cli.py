@@ -471,9 +471,15 @@ def run(
         # it is not a single experiment's budget.
         # Supervisor and Summarizer are tool-only structured-output roles, so they use
         # the no-think client even when --think is set (thinking crowds out the call).
-        supervisor = Supervisor(
-            client, metric=metric, family="prompt" if is_prompt_run else "tabular"
-        )
+        if not is_prompt_run:
+            supervisor_family = "tabular"
+        else:
+            from iterate.core.scoring import task_for_metric
+
+            supervisor_family = (
+                "prompt_scoring" if task_for_metric(metric) == "regression" else "prompt"
+            )
+        supervisor = Supervisor(client, metric=metric, family=supervisor_family)
         summarizer = Summarizer(client, metric=metric)
         # Same no-think client as the other strict roles: the Researcher must emit
         # a single structured tool call, and a thinking trace crowds that out.

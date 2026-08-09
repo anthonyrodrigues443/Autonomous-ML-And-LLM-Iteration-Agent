@@ -946,8 +946,15 @@ def _build_messages(
     history: list[Experiment],
     family: str = "tabular",
 ) -> list[Message]:
-    prompt_family = family == "prompt"
-    key = "prompt_system" if prompt_family else "system"
+    prompt_family = family.startswith("prompt")
+    # A scoring run and a classification run are both prompt runs, and their rungs
+    # do not transfer: "define the hard case" names an edge between two answers, and
+    # a number has no answers to sit between.
+    key = (
+        "prompt_scoring_system"
+        if family == "prompt_scoring"
+        else ("prompt_system" if prompt_family else "system")
+    )
     system = _PROMPTS[key].format(
         metric=metric, direction=direction, metric_note=metric_guidance(metric)
     )

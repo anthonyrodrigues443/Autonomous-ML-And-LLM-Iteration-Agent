@@ -338,21 +338,28 @@ def test_guidance_is_given_only_where_it_changes_the_playbook() -> None:
     assert "RANKED PROBABILITIES" not in metric_guidance("rmse")
 
 
-def test_every_metric_names_an_importable_sklearn_function() -> None:
+def test_every_metric_names_an_importable_function() -> None:
     """The v0.4 runs burned 16 cells on `from sklearn.metrics import
     average_precision`, which does not exist — the metric NAME is a scorer name,
     the importable symbol is `average_precision_score`. Every name we hand an agent
     must resolve to something it can actually import."""
-    import sklearn.metrics as skm
+    import importlib
 
-    from iterate.core.scoring import sklearn_function
+    from iterate.core.scoring import metric_module, sklearn_function
 
+    # sklearn is where almost everything lives, but it is not the constraint — the
+    # constraint is that the agent can import and compute whatever we name. The
+    # correlations come from scipy and satisfy that just as well.
     missing = []
     for name in REGISTRY:
         func = sklearn_function(name)
-        if not func or not hasattr(skm, func):
+        if not func:
             missing.append(name)
-    assert not missing, f"no importable sklearn function for: {sorted(missing)}"
+            continue
+        module = importlib.import_module(metric_module(name))
+        if not hasattr(module, func):
+            missing.append(f"{name} ({metric_module(name)}.{func})")
+    assert not missing, f"no importable function for: {sorted(missing)}"
 
 
 def test_the_importable_name_reaches_the_guidance() -> None:

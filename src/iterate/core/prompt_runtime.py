@@ -136,6 +136,51 @@ def _key(model: str, prompt: Prompt, rendered: str) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+# A number the model wrote, possibly wrapped in prose: "4", "4.5", "I'd say 3".
+# Anchored to a token boundary so the 5 in "5 stars" is read and the 3 in "GPT-3"
+# is not — a stray identifier scoring as a rating is a silent wrong answer.
+_NUMBER = re.compile(r"(?<![\w.])[-+]?\d+(?:\.\d+)?(?![\w.])")
+
+
+def numeric_answer_tool(low: float | None, high: float | None) -> ToolSpec:
+    """The tool for a NUMERIC target: a number, bounded where bounds are known.
+
+    Same idea as the enum. A rating outside the observed range is not something the
+    model can express, so the commonest scoring failure — answering 7 on a 1-to-5
+    scale — is structurally impossible rather than something to catch afterwards.
+    """
+    value: dict[str, Any] = {"type": "number", "description": "The value for this record."}
+    if low is not None:
+        value["minimum"] = low
+    if high is not None:
+        value["maximum"] = high
+    return ToolSpec(
+        name=_ANSWER_TOOL,
+        description="Give your answer for this record as a number. Call this exactly once.",
+        parameters={"type": "object", "properties": {"value": value}, "required": ["value"]},
+    )
+
+
+def coerce_number(text: str | None, low: float | None, high: float | None) -> str:
+    """A number out of a reply, or the sentinel.
+
+    A reply containing more than one number is UNPARSEABLE rather than
+    first-wins: "somewhere between 3 and 4" names two and picking either invents a
+    precision the model did not express. Same rule as a reply naming two labels.
+    """
+    if text is None:
+        return UNPARSEABLE
+    found = _NUMBER.findall(text.strip())
+    if len(found) != 1:
+        return UNPARSEABLE
+    value = float(found[0])
+    if low is not None and value < low:
+        return UNPARSEABLE
+    if high is not None and value > high:
+        return UNPARSEABLE
+    return repr(value)
+
+
 def answer_tool(labels: Sequence[str] | None) -> ToolSpec:
     """The one tool the model under test may call.
 
@@ -206,13 +251,16 @@ def _one(
     rendered: str,
     labels: Sequence[str] | None,
     retries: int,
+    numeric_range: tuple[float | None, float | None] | None = None,
 ) -> tuple[str, int, int, str | None]:
     """One record. Returns (answer, prompt_tokens, completion_tokens, error)."""
     messages = [
         Message(role="system", content=prompt.system),
         Message(role="user", content=rendered),
     ]
-    tools = [answer_tool(labels)]
+    tools = [
+        numeric_answer_tool(*numeric_range) if numeric_range else answer_tool(labels)
+    ]
     last_error: str | None = None
     prompt_tokens = 0
     completion_tokens = 0
@@ -227,11 +275,15 @@ def _one(
         # spent three calls, and cost that only counts successes is not cost.
         prompt_tokens += reply.usage.prompt_tokens
         completion_tokens += reply.usage.completion_tokens
-        if reply.tool_calls:
-            raw = reply.tool_calls[0].arguments.get("value")
-            answer = coerce(str(raw) if raw is not None else None, labels)
-        else:
-            answer = coerce(reply.content, labels)
+        raw = (
+            reply.tool_calls[0].arguments.get("value")
+            if reply.tool_calls
+            else reply.content
+        )
+        text = None if raw is None else str(raw)
+        answer = (
+            coerce_number(text, *numeric_range) if numeric_range else coerce(text, labels)
+        )
         if answer != UNPARSEABLE:
             return answer, prompt_tokens, completion_tokens, None
         last_error = "model did not produce a usable answer"
@@ -256,6 +308,7 @@ def ask(
     client_factory: Callable[[], LLMClient],
     columns: Sequence[str],
     labels: Sequence[str] | None = None,
+    numeric_range: tuple[float | None, float | None] | None = None,
     cache: AnswerCache | None = None,
     max_workers: int = _DEFAULT_WORKERS,
     retries: int = _DEFAULT_RETRIES,
@@ -293,7 +346,7 @@ def ask(
             return
 
         answer, prompt_tokens, completion_tokens, error = _one(
-            client(), prompt, rendered, labels, retries
+            client(), prompt, rendered, labels, retries, numeric_range
         )
         answers[index] = answer
         counters.calls += 1
@@ -352,6 +405,7 @@ def make_ask(
     *,
     columns: Sequence[str],
     labels: Sequence[str] | None,
+    numeric_range: tuple[float | None, float | None] | None = None,
     backend: str,
     model: str,
     base_url: str | None = None,
@@ -391,6 +445,7 @@ def make_ask(
             client_factory=client_factory,
             columns=columns,
             labels=labels,
+            numeric_range=numeric_range,
             cache=cache,
             max_workers=max_workers,
             stats=stats,
