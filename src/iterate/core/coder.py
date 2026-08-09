@@ -277,6 +277,17 @@ class CodingAgent:
         context_budget_chars: int = 400_000,  # prompt cap; oldest observations elide first
         wall_ceiling_seconds: float = 1800.0,  # hard wall-clock bound on one session
         controller: RunController | None = None,  # interactive pause/chat; None = today's behavior
+        # ─── target family (v0.5) ───
+        # What the session opens with, what else lands in its working directory,
+        # which floor catches it, and which instructions it gets. Defaulted so the
+        # tabular path is byte-identical to v0.4: the prompt family supplies all
+        # four, and nothing else about this agent changes. Its job — write cells
+        # until you can submit predictions — is the same job whether a cell fits a
+        # model or calls an LLM.
+        preamble: str | None = None,
+        extra_inputs: dict[str, bytes] | None = None,
+        floor_cell: str | None = None,
+        family: str = "tabular",
     ) -> None:
         self._client = client
         self._kernel = kernel
@@ -298,6 +309,13 @@ class CodingAgent:
         # one experiment can consume; generous enough that healthy sessions (even
         # think-mode ones) never feel it.
         self._wall_ceiling_seconds = wall_ceiling_seconds
+        self._preamble = preamble
+        self._extra_inputs = extra_inputs
+        self._floor_cell = floor_cell
+        self._family = family
+
+    def _session_preamble(self) -> str:
+        return self._preamble if self._preamble is not None else codegen.session_preamble()
 
     def run(
         self,
@@ -318,9 +336,12 @@ class CodingAgent:
             # is usually about the work on screen, which is not in Memory until
             # this experiment finishes.
             self._controller.live_cells = cells
-        self._kernel.start(codegen.build_inputs(dataset))
+        inputs = codegen.build_inputs(dataset)
+        if self._extra_inputs:
+            inputs.update(self._extra_inputs)
+        self._kernel.start(inputs)
         try:
-            pre = codegen.session_preamble()
+            pre = self._session_preamble()
             pre_result = self._kernel.run_cell(pre, timeout=self._cell_timeout)
             cells.append(_cell(pre, pre_result, "preamble"))
 
@@ -332,6 +353,7 @@ class CodingAgent:
                 preamble_output=_observation(pre_result),
                 starting_code=starting_code,
                 starting_score=starting_score,
+                family=self._family,
             )
             self._drive(
                 messages, cells, n_test=dataset.n_test, experiment_id=experiment_id,
@@ -672,7 +694,9 @@ class CodingAgent:
         candidates.append(
             (
                 "canned baseline",
-                codegen.fallback_baseline(
+                self._floor_cell
+                if self._floor_cell is not None
+                else codegen.fallback_baseline(
                     task_for_metric(self._metric), with_proba=requires_proba(self._metric)
                 ),
             )
@@ -681,7 +705,7 @@ class CodingAgent:
         # steer the carried code into a silently different pipeline. Wipe it and
         # reload the pristine inputs first (plumbing, not recorded as cells).
         self._kernel.run_cell("%reset -f", timeout=self._cell_timeout)
-        self._kernel.run_cell(codegen.session_preamble(), timeout=self._cell_timeout)
+        self._kernel.run_cell(self._session_preamble(), timeout=self._cell_timeout)
         for label, code in candidates:
             cell_result = self._kernel.run_cell(
                 codegen.RESET_INPUTS + code, timeout=self._cell_timeout
@@ -740,14 +764,29 @@ def _build_messages(
     preamble_output: str,
     starting_code: str | None = None,
     starting_score: float | None = None,
+    family: str = "tabular",
 ) -> list[Message]:
-    system = _PROMPTS["system"].format(
-        metric=metric,
-        direction=direction,
-        predictions_csv=codegen.PREDICTIONS_CSV,
-        proba_requirement=_proba_requirement(metric),
-        metric_note=metric_guidance(metric),
-    )
+    """The session's opening messages.
+
+    The prompt family gets its own pair rather than a shared message with a few
+    swapped words. The tabular system message is dense with advice about dtype
+    splits, imputation and encoders, and on a floor model that advice is not merely
+    irrelevant to prompt work — it gets followed."""
+    if family == "prompt":
+        system = _PROMPTS["prompt_system"].format(
+            metric=metric,
+            direction=direction,
+            predictions_csv=codegen.PREDICTIONS_CSV,
+            metric_note=metric_guidance(metric),
+        )
+    else:
+        system = _PROMPTS["system"].format(
+            metric=metric,
+            direction=direction,
+            predictions_csv=codegen.PREDICTIONS_CSV,
+            proba_requirement=_proba_requirement(metric),
+            metric_note=metric_guidance(metric),
+        )
     if starting_code and starting_code.strip():
         score = f" (scored {metric}={starting_score:.4f})" if starting_score is not None else ""
         # Built by concatenation, not str.format — the code may contain braces.
@@ -759,7 +798,8 @@ def _build_messages(
         )
     else:
         starting_point = ""
-    user = _PROMPTS["user_template"].format(
+    template = _PROMPTS["prompt_user_template" if family == "prompt" else "user_template"]
+    user = template.format(
         data_summary=data_summary,
         brief=brief or "(no brief — choose a strong first approach yourself)",
         metric=metric,
