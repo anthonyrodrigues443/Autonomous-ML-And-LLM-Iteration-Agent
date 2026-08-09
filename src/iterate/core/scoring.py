@@ -73,6 +73,11 @@ class Inputs:
     y_proba: Any
     classes: Any
     average: str
+    # True when a prediction may be a value the target column never contains — the
+    # prompt path, where a model that refuses to answer usably yields a sentinel.
+    # Default False keeps every existing caller byte-identical: an sklearn estimator
+    # can only predict classes it was fitted on.
+    open_vocabulary: bool = False
 
     @property
     def binary(self) -> bool:
@@ -90,8 +95,21 @@ class Inputs:
     @property
     def label_kwargs(self) -> dict[str, Any]:
         if self.average == "binary":
+            if self.open_vocabulary:
+                # sklearn decides binary-vs-multiclass from y_true UNION y_pred, so
+                # ONE unusable answer makes average="binary" raise — measured live:
+                # 2 unparseable rows out of 300 killed a whole run at scoring time.
+                # Scoring the positive class directly is the identical number on
+                # clean predictions and cannot be derailed by what the model emitted.
+                return {"average": None, "labels": [self.positive], "zero_division": 0}
             return {"average": "binary", "pos_label": self.positive, "zero_division": 0}
-        return {"average": self.average, "zero_division": 0}
+        kwargs: dict[str, Any] = {"average": self.average, "zero_division": 0}
+        if self.open_vocabulary:
+            # Averaging over the TRUE classes only. Without this the sentinel
+            # becomes a class of its own with an f1 of zero and drags the macro
+            # average down, which would penalise the run twice for one bad answer.
+            kwargs["labels"] = list(self.classes)
+        return kwargs
 
     def positive_column(self) -> Any:
         """Binary probabilities as a 1-D positive-class column."""
@@ -100,9 +118,7 @@ class Inputs:
             raise ValueError(f"probabilities must be 1-D or 2-D, got {proba.ndim}-D")
         if proba.ndim == 2:
             if proba.shape[1] != 2:
-                raise ValueError(
-                    f"binary probabilities need 1 or 2 columns, got {proba.shape[1]}"
-                )
+                raise ValueError(f"binary probabilities need 1 or 2 columns, got {proba.shape[1]}")
             return proba[:, 1]
         return proba
 
@@ -142,9 +158,7 @@ def _roc_auc(i: Inputs) -> float:
 
 def _average_precision(i: Inputs) -> float:
     if i.binary:
-        return float(
-            average_precision_score(i.y_true, i.positive_column(), pos_label=i.positive)
-        )
+        return float(average_precision_score(i.y_true, i.positive_column(), pos_label=i.positive))
     # Binarized explicitly rather than handed a multiclass y_true: sklearn only
     # grew multiclass support for this metric well after the >=1.5 floor, and it
     # raises "multiclass format is not supported" below that.
@@ -161,6 +175,16 @@ def _brier(i: Inputs) -> float:
     return float(brier_score_loss(i.y_true, i.positive_column(), pos_label=i.positive))
 
 
+def _scalar(value: Any) -> float:
+    """One number out of a metric that may have been asked for a per-class array.
+
+    `label_kwargs` uses `average=None, labels=[positive]` on an open-vocabulary
+    binary target, which returns a one-element array rather than a float.
+    """
+    array = np.asarray(value, dtype=float).ravel()
+    return float(array[0]) if array.size else 0.0
+
+
 def _mse(i: Inputs) -> float:
     return float(mean_squared_error(i.y_true, i.y_pred))
 
@@ -173,19 +197,19 @@ PANEL: dict[str, MetricSpec] = {
         "classification",
         "maximize",
         False,
-        lambda i: float(f1_score(i.y_true, i.y_pred, **i.label_kwargs)),
+        lambda i: _scalar(f1_score(i.y_true, i.y_pred, **i.label_kwargs)),
     ),
     "precision": MetricSpec(
         "classification",
         "maximize",
         False,
-        lambda i: float(precision_score(i.y_true, i.y_pred, **i.label_kwargs)),
+        lambda i: _scalar(precision_score(i.y_true, i.y_pred, **i.label_kwargs)),
     ),
     "recall": MetricSpec(
         "classification",
         "maximize",
         False,
-        lambda i: float(recall_score(i.y_true, i.y_pred, **i.label_kwargs)),
+        lambda i: _scalar(recall_score(i.y_true, i.y_pred, **i.label_kwargs)),
     ),
     "roc_auc": MetricSpec("classification", "maximize", True, _roc_auc),
     "average_precision": MetricSpec("classification", "maximize", True, _average_precision),
@@ -228,15 +252,28 @@ def _sklearn_compute(
     # the exact default that made string targets unscorable. Reading the signature
     # is what catches those; inspecting kwargs alone would miss every one of them.
     accepts_pos_label = "pos_label" in inspect.signature(func).parameters
+    accepts_labels = "labels" in inspect.signature(func).parameters
 
     def compute(i: Inputs) -> float:
         call = dict(kwargs)
-        if accepts_pos_label and i.binary and call.get("average", "binary") in (None, "binary"):
+        binary_average = call.get("average", "binary") in (None, "binary")
+        if accepts_pos_label and i.binary and binary_average:
             call["pos_label"] = i.positive
+        if i.open_vocabulary and accepts_labels and not needs_proba:
+            # A prediction outside the target's vocabulary must count as wrong, not
+            # redefine the problem. Naming the labels keeps a binary target binary
+            # and keeps the sentinel out of a macro average. Metrics that take no
+            # `labels` (accuracy) already treat it as a plain mismatch.
+            if i.binary and binary_average:
+                call.pop("pos_label", None)
+                call["average"] = None
+                call["labels"] = [i.positive]
+            else:
+                call["labels"] = list(i.classes)
         if needs_proba:
             proba = i.positive_column() if i.binary else i.class_matrix()
             return float(func(i.y_true, proba, **call))
-        return float(func(i.y_true, i.y_pred, **call))
+        return _scalar(func(i.y_true, i.y_pred, **call))
 
     return compute
 
@@ -309,9 +346,7 @@ REGISTRY: dict[str, MetricSpec] = {**_derive_from_sklearn(), **PANEL}
 CLASSIFICATION_METRICS = frozenset(
     name for name, spec in REGISTRY.items() if spec.task == "classification"
 )
-REGRESSION_METRICS = frozenset(
-    name for name, spec in REGISTRY.items() if spec.task == "regression"
-)
+REGRESSION_METRICS = frozenset(name for name, spec in REGISTRY.items() if spec.task == "regression")
 PROBA_METRICS = frozenset(name for name, spec in REGISTRY.items() if spec.needs_proba)
 # Panel-scoped, unlike the three above: those answer "may this be selected", this
 # answers "what does score() always return for a classification run".
@@ -325,18 +360,14 @@ def task_for_metric(metric: str) -> Task:
     try:
         return REGISTRY[metric].task
     except KeyError:
-        raise ValueError(
-            f"unknown metric {metric!r}; expected one of {sorted(REGISTRY)}"
-        ) from None
+        raise ValueError(f"unknown metric {metric!r}; expected one of {sorted(REGISTRY)}") from None
 
 
 def direction(metric: str) -> Direction:
     try:
         return REGISTRY[metric].direction
     except KeyError:
-        raise ValueError(
-            f"unknown metric {metric!r}; expected one of {sorted(REGISTRY)}"
-        ) from None
+        raise ValueError(f"unknown metric {metric!r}; expected one of {sorted(REGISTRY)}") from None
 
 
 def requires_proba(metric: str) -> bool:
@@ -408,8 +439,7 @@ def metric_guidance(metric: str) -> str:
     if not threshold_free(metric):
         return importable
     return (
-        importable
-        + f"'{metric}' is computed from RANKED PROBABILITIES, not from labels at a "
+        importable + f"'{metric}' is computed from RANKED PROBABILITIES, not from labels at a "
         "decision threshold. Tuning a threshold cannot change it at all, and class "
         "weighting barely does. Improve the RANKING itself: better features, a "
         "different model family, better-calibrated probabilities."
@@ -440,7 +470,16 @@ def score(
     y_proba: Any = None,
     average: str | None = None,
     include: Sequence[str] = (),
+    open_vocabulary: bool = False,
 ) -> dict[str, float]:
+    """Score predictions against the truth.
+
+    `open_vocabulary` says a prediction may be a value the target column never
+    contains, which is only true of the prompt path: a model that will not answer
+    usably yields a sentinel. It makes such a prediction count as WRONG instead of
+    being treated as a new class, which would otherwise turn a binary target
+    multiclass and make the metric raise.
+    """
     classes = np.unique(np.asarray(y_true))
     inputs = Inputs(
         y_true=y_true,
@@ -448,6 +487,7 @@ def score(
         y_proba=y_proba,
         classes=classes,
         average=resolve_average(average, binary=len(classes) <= 2),
+        open_vocabulary=open_vocabulary,
     )
     values: dict[str, float] = {}
     for name, spec in PANEL.items():

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -140,4 +140,34 @@ def load_csv(
     )
 
 
-__all__ = ["DEFAULT_SEED", "DEFAULT_TEST_SIZE", "TabularDataset", "load_csv"]
+def with_smaller_holdout(dataset: TabularDataset, n: int) -> TabularDataset:
+    """The same dataset with its holdout cut to the first ``n`` rows.
+
+    For a target where scoring costs one model call per record, the full holdout is
+    too expensive to spend on every candidate — measured on a local 12B, 300 records
+    is sixteen minutes, and a three-iteration run spends half its wall clock there.
+
+    Taking the FIRST n is a random subset, not a biased one: `train_test_split` has
+    already shuffled, so the holdout is in no meaningful order. Taking the same
+    first n every time is the point — every candidate is then scored on identical
+    records, which makes the comparison paired and keeps ranking reliable even
+    though each individual score carries more sampling error than the full set
+    would. The winner is re-scored on the whole holdout at the end, and THAT is the
+    number worth quoting.
+    """
+    if n >= len(dataset.test_features) or n <= 0:
+        return dataset
+    return replace(
+        dataset,
+        test_features=dataset.test_features.head(n),
+        test_target=dataset.test_target.head(n),
+    )
+
+
+__all__ = [
+    "DEFAULT_SEED",
+    "DEFAULT_TEST_SIZE",
+    "TabularDataset",
+    "load_csv",
+    "with_smaller_holdout",
+]

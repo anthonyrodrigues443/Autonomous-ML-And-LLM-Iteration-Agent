@@ -322,3 +322,237 @@ def test_the_prompt_instructions_survive_placeholder_rendering() -> None:
     assert "{input}" in system
     assert "{{input}}" not in system
     assert "'f1'" in system
+
+
+def test_a_single_unusable_answer_does_not_break_scoring(
+    dataset: TabularDataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live-run bug, as a regression test.
+
+    Two unparseable answers out of 300 made y_pred carry a third value, sklearn read
+    the union of true and predicted as multiclass, average='binary' raised, and the
+    whole run aborted at the baseline. One bad answer must cost one row, not the run.
+    """
+    calls = {"n": 0}
+
+    class Flaky(ScriptedClient):
+        def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
+            calls["n"] += 1
+            if calls["n"] == 1:  # the first row answers with unusable prose
+                return ChatResponse(model="fake-12b", content="hmm, could be either")
+            return ChatResponse(
+                model="fake-12b",
+                tool_calls=[ToolCall(id="1", name="answer", arguments={"value": "not toxic"})],
+            )
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", lambda *a, **k: Flaky("not toxic"))
+
+    result = _target(dataset, metric="f1").baseline()
+
+    assert result.succeeded, result.error
+    assert result.metrics is not None
+    assert 0.0 <= result.metrics.primary_value <= 1.0
+
+
+def test_an_unusable_answer_can_never_improve_the_score() -> None:
+    """Measured before choosing the fix: mapping the sentinel to the POSITIVE class
+    scored 0.857 where the honest answer is 0.800, so garbage would have paid."""
+    from iterate.core.scoring import score
+
+    truth = ["not toxic", "toxic", "not toxic", "toxic", "toxic", "not toxic"]
+    perfect = list(truth)
+    with_junk = ["not toxic", "toxic", "__unparseable__", "__unparseable__", "toxic", "not toxic"]
+
+    clean = score("classification", truth, perfect, include=("f1",), open_vocabulary=True)["f1"]
+    junked = score("classification", truth, with_junk, include=("f1",), open_vocabulary=True)["f1"]
+
+    assert clean == pytest.approx(1.0)
+    assert junked == pytest.approx(0.8)
+    assert junked < clean
+
+
+def test_open_vocabulary_leaves_clean_predictions_identical() -> None:
+    """The flag must be a no-op when every prediction is in the label set, or it
+    would silently re-rule every tabular score."""
+    from iterate.core.scoring import score
+
+    truth = ["a", "b", "a", "b", "b"]
+    preds = ["a", "b", "b", "b", "a"]
+
+    assert score("classification", truth, preds, include=("f1",)) == pytest.approx(
+        score("classification", truth, preds, include=("f1",), open_vocabulary=True)
+    )
+
+
+def test_a_sentinel_does_not_pollute_a_macro_average() -> None:
+    """Without naming the labels the sentinel becomes a class with an f1 of zero and
+    drags macro down, penalising the run twice for one bad answer."""
+    from iterate.core.scoring import score
+
+    truth = ["a", "b", "c", "a", "b", "c"]
+    preds = ["a", "b", "c", "a", "b", "__unparseable__"]
+
+    naive = score("classification", truth, preds, average="macro", include=("f1",))["f1"]
+    fixed = score(
+        "classification", truth, preds, average="macro", include=("f1",), open_vocabulary=True
+    )["f1"]
+
+    # Only class "c" is hurt, and only by the one row it lost: a=1.0, b=1.0,
+    # c=0.667 (one false negative), macro 0.889. The naive number is 0.667 because
+    # the sentinel is averaged in as a fourth class scoring zero.
+    assert naive == pytest.approx(0.6667, abs=1e-4)
+    assert fixed == pytest.approx(0.8889, abs=1e-4)
+
+
+def test_the_supervisor_walks_a_prompt_ladder_not_a_tabular_one() -> None:
+    """The first live run's actual failure: the tabular supervisor read a column of
+    comment text as a high-cardinality categorical and briefed "one-hot encode
+    categorical 'comment', fit HistGradientBoostingClassifier". The coder obeyed and
+    never submitted a prompt."""
+    from iterate.core.supervisor import _build_messages
+
+    common = {
+        "data_summary": "1200 rows, one input column 'comment'",
+        "metric": "f1",
+        "direction": "maximize",
+        "score": 0.8611,
+        "history": [],
+    }
+    prompt_side = _build_messages(**common, family="prompt")[0].content or ""
+    tabular_side = _build_messages(**common)[0].content or ""
+
+    assert "THERE IS NO MODEL TO TRAIN" in prompt_side
+    for tabular_move in ("HistGradientBoosting", "one-hot", "median-impute", "class_weight"):
+        assert tabular_move not in prompt_side, f"{tabular_move} leaked into the prompt ladder"
+    assert "HistGradientBoosting" in tabular_side
+
+
+def test_the_prompt_ladder_names_moves_that_exist() -> None:
+    from iterate.core.supervisor import _build_messages
+
+    system = (
+        _build_messages(
+            data_summary="x",
+            metric="f1",
+            direction="maximize",
+            score=0.5,
+            history=[],
+            family="prompt",
+        )[0].content
+        or ""
+    )
+
+    for rung in ("READ THE MISTAKES", "DEFINE THE HARD CASE", "FEW-SHOT", "OUTPUT DISCIPLINE"):
+        assert rung in system
+    assert "100 to 150" in system  # sample, do not sweep
+
+
+def test_the_preamble_shows_a_worked_example() -> None:
+    """Describing the objects was not enough: the live session called .split() on a
+    Prompt and passed one to re.sub."""
+    preamble = codegen.prompt_session_preamble()
+
+    assert "HOW TO WORK" in preamble
+    assert "ask(BASE, sample)" in preamble
+    assert "BASE = BASELINE_PROMPT" in preamble  # the alias the example leans on
+    assert "is an OBJECT, not a string" in preamble
+
+
+def test_the_coder_captures_the_submitted_prompt_from_the_kernel() -> None:
+    """The live path reads its outputs in `CodingAgent.run`, not through
+    `score_code_job`. Without reading prompt.json there, a run that improved f1
+    three times shipped a prompts.yaml containing only the baseline — measured.
+    """
+    import inspect
+
+    from iterate.core import coder
+
+    source = inspect.getsource(coder.CodingAgent.run)
+
+    assert "PROMPT_JSON" in source, "the live path never reads the submitted prompt"
+    assert "artifacts" in source
+
+
+def test_the_record_carries_a_prompt_the_coder_captured() -> None:
+    """End to end from a captured artifact to the delivered file."""
+    from iterate.core.prompting import Prompt
+    from iterate.deliver import prompt_record
+    from iterate.schemas.experiment import Experiment, ExperimentResult, Metrics
+
+    winner = Experiment(
+        candidate=Candidate(
+            description="define the hard case", changes={"code": "..."}, rationale="r"
+        ),
+        target="prompt",
+        hypothesis="h",
+        status="completed",
+        result=ExperimentResult(
+            experiment_id="iter-01",
+            metrics=Metrics(values={"f1": 0.8822}, primary="f1", direction="maximize"),
+            artifacts={
+                codegen.PROMPT_JSON: json.dumps(
+                    {"system": "toxicity is personal attacks", "user_template": "{input}"}
+                )
+            },
+        ),
+    )
+
+    document = prompt_record.build(
+        task="decide whether this comment is toxic",
+        metric="f1",
+        direction="maximize",
+        model_under_test="gemma4:12b",
+        baseline_prompt=Prompt(system="decide", user_template="{input}"),
+        baseline_score=0.8611,
+        history=[winner],
+    )
+
+    assert "toxicity is personal attacks" in document
+    assert "v1" in document
+
+
+def test_the_prompt_fallback_never_reaches_for_a_tabular_lever() -> None:
+    """A live prompt run was handed "untried lever: categorical-encoding" as its
+    third experiment. The fallback exists to be novel BY CONSTRUCTION; novel
+    nonsense is not the deal. It scored only because the coder ignored the name."""
+    from iterate.core.supervisor import _prompt_fallback_move
+
+    result = _prompt_fallback_move([])
+
+    assert result is not None
+    title, move = result
+    for tabular in ("categorical-encoding", "imbalance", "model-swap", "hyperparameter"):
+        assert tabular not in title, f"{tabular} leaked into a prompt fallback"
+        assert tabular not in move
+
+
+def test_the_prompt_fallback_skips_moves_already_briefed() -> None:
+    from iterate.core.supervisor import _prompt_fallback_move
+    from iterate.schemas.experiment import Experiment
+
+    already = Experiment(
+        candidate=Candidate(
+            description="define-the-hard-case: quoted insults",
+            changes={"code": "..."},
+            rationale="r",
+        ),
+        target="prompt",
+        hypothesis="next: define-the-hard-case: ...",
+    )
+
+    result = _prompt_fallback_move([already])
+
+    assert result is not None
+    assert "define-the-hard-case" not in result[0]
+
+
+def test_the_rebrief_nudge_points_at_the_prompt_ladder() -> None:
+    """The tabular wording sends the supervisor to "Levers NOT yet tried" and asks
+    it to name a lever class, neither of which exists on this path."""
+    from iterate.prompts import PROMPTS
+
+    nudge = PROMPTS["supervisor"]["prompt_baseline_rebrief_nudge"]
+
+    assert "READ THE MISTAKES" in nudge
+    assert "lever" not in nudge.casefold()
+    assert "few-shot" in nudge

@@ -28,6 +28,7 @@ import queue
 import re
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -173,9 +174,20 @@ class LocalKernel:
         err: list[str] = []
         error: str | None = None
         outputs: list[dict[str, Any]] = []
+        # `timeout` bounds the CELL, not the gap between its messages. Waiting
+        # `timeout` for each next message resets the clock on every print, so a
+        # chatty cell can run forever: measured on the prompt path, where a progress
+        # heartbeat every 10% of a pass let cells reach 838s against a 600s limit
+        # and eat a whole session's budget. The per-message wait is now whatever is
+        # LEFT of the cell's own deadline.
+        deadline = time.monotonic() + timeout
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._km.interrupt_kernel()
+                return CellResult("".join(out), "".join(err), timed_out=True, outputs=outputs)
             try:
-                msg = self._kc.get_iopub_msg(timeout=timeout)
+                msg = self._kc.get_iopub_msg(timeout=remaining)
             except queue.Empty:
                 self._km.interrupt_kernel()
                 return CellResult("".join(out), "".join(err), timed_out=True, outputs=outputs)

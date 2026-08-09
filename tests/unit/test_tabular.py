@@ -129,3 +129,35 @@ def test_a_few_valued_integer_target_is_still_classification(tmp_path: Path) -> 
     for values in ([0, 1] * 50, [0, 1, 2, 3] * 25, [True, False] * 50):
         assert looks_like_classification(pd.Series(values))
     assert not looks_like_classification(pd.Series(range(500)))
+
+
+def test_a_smaller_holdout_keeps_the_same_records_every_time(tmp_path: Path) -> None:
+    """Every candidate must be scored on IDENTICAL records or the comparison stops
+    being paired, which is the only reason a 100-record slice is trustworthy for
+    ranking at all."""
+    from iterate.adapters.data.tabular import with_smaller_holdout
+
+    frame = pd.DataFrame({"text": [f"row {i}" for i in range(200)], "y": ["a", "b"] * 100})
+    path = tmp_path / "d.csv"
+    frame.to_csv(path, index=False)
+    dataset = load_csv(path, target="y")
+
+    first = with_smaller_holdout(dataset, 20)
+    second = with_smaller_holdout(dataset, 20)
+
+    assert first.n_test == 20
+    assert first.n_train == dataset.n_train  # training data is untouched
+    assert list(first.test_features["text"]) == list(second.test_features["text"])
+    assert list(first.test_target) == list(dataset.test_target[:20])
+
+
+def test_asking_for_more_holdout_than_exists_is_a_no_op(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import with_smaller_holdout
+
+    frame = pd.DataFrame({"x": list(range(100)), "y": ["a", "b"] * 50})
+    path = tmp_path / "d.csv"
+    frame.to_csv(path, index=False)
+    dataset = load_csv(path, target="y")
+
+    assert with_smaller_holdout(dataset, 10_000).n_test == dataset.n_test
+    assert with_smaller_holdout(dataset, 0).n_test == dataset.n_test

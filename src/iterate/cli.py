@@ -104,8 +104,7 @@ def setup() -> None:
         ).strip()
     else:
         console.print(
-            "[dim]On local, generated code runs on THIS machine with your "
-            "permissions.[/dim]"
+            "[dim]On local, generated code runs on THIS machine with your permissions.[/dim]"
         )
         install = typer.confirm(
             "May iterate pip-install packages your generated code imports "
@@ -161,6 +160,15 @@ def run(
     ),
     target_backend: str | None = typer.Option(
         None, "--target-backend", help="Backend for the model under test. Defaults to --backend."
+    ),
+    loop_holdout: int = typer.Option(
+        100,
+        "--loop-holdout",
+        min=0,
+        help="Prompt runs only: how many holdout records each candidate is scored on "
+        "DURING the search. The same records every time, so the comparison stays "
+        "paired; the winner is then re-scored on the whole holdout at the end. 0 uses "
+        "the full holdout throughout (slower, and no more reliable for ranking).",
     ),
     average: str | None = typer.Option(
         None,
@@ -310,7 +318,9 @@ def run(
     if average is not None:
         average = average.lower()
         if average not in AVERAGES:
-            raise typer.BadParameter(f"unknown average {average!r}; expected one of {list(AVERAGES)}")
+            raise typer.BadParameter(
+                f"unknown average {average!r}; expected one of {list(AVERAGES)}"
+            )
 
     settings = get_settings()
     resolved_memory_path = memory_path or Path(settings.iterate_memory_db)
@@ -328,7 +338,9 @@ def run(
 
     # ─── Cloud backend? API key required. ──────────────────────────────────
     if backend != "ollama":
-        resolved_key = api_key or cfg.get("api_key") or _resolved_api_key_from_env(settings, backend)
+        resolved_key = (
+            api_key or cfg.get("api_key") or _resolved_api_key_from_env(settings, backend)
+        )
         if not resolved_key:
             raise typer.BadParameter(
                 f"backend {backend!r} requires --api-key or a corresponding env var "
@@ -388,6 +400,21 @@ def run(
     direction = metric_direction(metric)
     is_prompt_run = task is not None
     if is_prompt_run:
+        from iterate.adapters.data.tabular import with_smaller_holdout
+
+        # The search runs on a cheap slice of the holdout; the winner is re-scored on
+        # all of it once the loop ends. One model call per record makes the full
+        # holdout too expensive to spend on every candidate — and since every
+        # candidate sees the SAME slice, ranking stays paired and reliable while the
+        # number finally quoted is measured on more data than any intermediate one.
+        full_dataset = dataset
+        dataset = with_smaller_holdout(dataset, loop_holdout) if loop_holdout else dataset
+        if dataset.n_test < full_dataset.n_test:
+            console.print(
+                f"[dim]scoring candidates on {dataset.n_test} of "
+                f"{full_dataset.n_test} holdout records; the winner is re-scored on "
+                f"all {full_dataset.n_test} at the end[/dim]"
+            )
         model_target = _build_prompt_target(
             dataset,
             metric=metric,
@@ -397,7 +424,13 @@ def run(
             backend=target_backend or backend,
             model=target_model or model,
             base_url=base_url,
-            cache_path=Path(settings.iterate_runs_dir).parent / "prompt-answers.db",
+            # ABSOLUTE. This path is written into meta.json and read back inside
+            # the kernel, which runs in its own temp working directory — a relative
+            # path resolved THERE, so every session built a fresh cache in scratch
+            # space and threw it away. Measured: 298 entries at the start of a
+            # 100-minute run and 298 at the end, with three sessions re-paying for
+            # the same baseline measurement in full.
+            cache_path=(Path(settings.iterate_runs_dir).parent / "prompt-answers.db").resolve(),
         )
     else:
         model_target = ModelTarget(dataset, metric=metric, average=average)
@@ -430,14 +463,14 @@ def run(
         # it is not a single experiment's budget.
         # Supervisor and Summarizer are tool-only structured-output roles, so they use
         # the no-think client even when --think is set (thinking crowds out the call).
-        supervisor = Supervisor(client, metric=metric)
+        supervisor = Supervisor(
+            client, metric=metric, family="prompt" if is_prompt_run else "tabular"
+        )
         summarizer = Summarizer(client, metric=metric)
         # Same no-think client as the other strict roles: the Researcher must emit
         # a single structured tool call, and a thinking trace crowds that out.
         # Cached beside the runs so a re-run on the same data pays nothing.
-        critic_agent = (
-            Critic(client, metric=metric, direction=direction) if critique else None
-        )
+        critic_agent = Critic(client, metric=metric, direction=direction) if critique else None
         researcher = (
             Researcher(
                 client,
@@ -506,7 +539,8 @@ def run(
                             _render_summary(cast("RunResult", result), metric)
                     console.print(
                         ">> stopped — everything already saved is under .iterate/",
-                        style="cyan", markup=False,
+                        style="cyan",
+                        markup=False,
                     )
                     os._exit(0)
 
@@ -540,9 +574,20 @@ def run(
                     "extra_inputs": {codegen.META_JSON: model_target.meta_json()},
                     "floor_cell": codegen.prompt_fallback_baseline(),
                     "family": "prompt",
+                    # A tabular cell is a fit: seconds. A prompt cell is one model
+                    # call per record: minutes. The first live run spent both its
+                    # sessions hitting the 120s cell timeout and never submitted,
+                    # so these are not generosity, they are the unit of work being
+                    # three orders of magnitude slower.
+                    "cell_timeout": 600.0,
+                    "deadline_seconds": 1800.0,
+                    "wall_ceiling_seconds": 5400.0,
                 }
             return CodingAgent(
-                coder_client, kernel, metric=metric, average=average,
+                coder_client,
+                kernel,
+                metric=metric,
+                average=average,
                 install=(install or compute == "e2b"),
                 context_budget_chars=context_budget,
                 controller=controller,
@@ -558,9 +603,14 @@ def run(
             if notebooks == "none":
                 return
             _write_experiment_notebook(
-                experiment, baseline=baseline, is_best=is_best,
-                run_dir=Path(settings.iterate_runs_dir) / run_id, mode=notebooks,
-                data_path=str(data), target=target, metric=metric,
+                experiment,
+                baseline=baseline,
+                is_best=is_best,
+                run_dir=Path(settings.iterate_runs_dir) / run_id,
+                mode=notebooks,
+                data_path=str(data),
+                target=target,
+                metric=metric,
             )
 
         def _run_loop() -> RunResult:
@@ -569,18 +619,26 @@ def run(
             # in plain mode) — sqlite objects are single-thread by design.
             loop_memory: Memory = SqliteMemory(resolved_memory_path)
             return run_supervised(
-                target=model_target, dataset=dataset, supervisor=supervisor,
-                make_coder=make_coder, terminator=terminator, memory=loop_memory,
-                data_summary=data_summary, summarizer=summarizer,
-                researcher=researcher, critic=critic_agent,
-                on_experiment=on_experiment, controller=controller,
+                target=model_target,
+                dataset=dataset,
+                supervisor=supervisor,
+                make_coder=make_coder,
+                terminator=terminator,
+                memory=loop_memory,
+                data_summary=data_summary,
+                summarizer=summarizer,
+                researcher=researcher,
+                critic=critic_agent,
+                on_experiment=on_experiment,
+                controller=controller,
             )
 
         if use_tui and controller is not None:
             from iterate.ui.tui import run_in_tui
 
             result = run_in_tui(
-                _run_loop, controller,
+                _run_loop,
+                controller,
                 title=(
                     f"iterate · {model_target.name} · target={target} · {metric} · "
                     f"{mode} · {compute} — type below; / for commands"
@@ -600,8 +658,10 @@ def run(
         baseline_model: str
         if source is not None:
             baseline_candidate = Reconstructor(client).reconstruct(
-                data_summary=data_summary, source_text=_read_source(source),
-                metric=metric, direction=direction,
+                data_summary=data_summary,
+                source_text=_read_source(source),
+                metric=metric,
+                direction=direction,
             )
             baseline_model = _candidate_model(baseline_candidate)
             console.print(
@@ -622,8 +682,13 @@ def run(
             baseline_model = run_setup.starting_model
 
         orchestrator = Orchestrator(
-            model_target, Proposer(client), LocalExecutor(), terminator, memory,
-            data_summary=data_summary, baseline_model=baseline_model,
+            model_target,
+            Proposer(client),
+            LocalExecutor(),
+            terminator,
+            memory,
+            data_summary=data_summary,
+            baseline_model=baseline_model,
             baseline_candidate=baseline_candidate,
         )
         result = orchestrator.run()
@@ -642,6 +707,9 @@ def run(
         # agent, so `best` is decided by recorded scores and honours the Critic.
         from iterate.deliver import prompt_record
 
+        final_score = _rescore_winner_on_full_holdout(
+            result, full_dataset, model_target, console=console
+        )
         record = prompt_record.write(
             run_dir,
             task=str(task),
@@ -649,6 +717,7 @@ def run(
             direction=direction,
             model_under_test=model_target.model_under_test,
             baseline_prompt=model_target.baseline_prompt,
+            final_score=final_score,
             baseline_score=(
                 result.baseline.metrics.primary_value
                 if result.baseline.metrics is not None
@@ -664,7 +733,12 @@ def run(
     # ─── Notebook deliverable (full record is already in Memory) ───────────
     if notebooks != "none":
         _write_notebooks(
-            result, mode=notebooks, run_dir=run_dir, data_path=str(data), target=target, metric=metric
+            result,
+            mode=notebooks,
+            run_dir=run_dir,
+            data_path=str(data),
+            target=target,
+            metric=metric,
         )
 
     # ─── Summary ───────────────────────────────────────────────────────────
@@ -672,6 +746,60 @@ def run(
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+
+def _rescore_winner_on_full_holdout(
+    result: Any, full_dataset: Any, loop_target: Any, *, console: Any
+) -> dict[str, Any] | None:
+    """Measure the winning prompt once on the WHOLE holdout.
+
+    The search scored every candidate on a cheap slice so the comparison could be
+    paired and affordable. That slice carries real sampling error — at 100 records
+    around ±0.03 — so it is fine for choosing between prompts and not fine as the
+    number a user quotes. This pays for one full pass, on the winner only, and that
+    is the figure `prompts.yaml` reports.
+
+    Never raises: a re-score that fails leaves the loop's number in place with a
+    note, rather than losing a finished run to a last-minute model call.
+    """
+    from iterate.core import codegen
+    from iterate.core.prompting import Prompt
+    from iterate.targets.prompt import PromptTarget
+
+    best = result.best
+    if best is None or best.result is None or full_dataset.n_test <= loop_target._dataset.n_test:
+        return None
+    raw = best.result.artifacts.get(codegen.PROMPT_JSON)
+    if not raw:
+        return None
+    try:
+        winner = Prompt.from_dict(json.loads(raw))
+    except (ValueError, TypeError):
+        return None
+
+    console.print(
+        f"[dim]re-scoring the winning prompt on all {full_dataset.n_test} holdout "
+        f"records for the final number[/dim]"
+    )
+    full_target = PromptTarget(
+        full_dataset,
+        metric=loop_target._metric,
+        average=loop_target._average,
+        task=loop_target._task,
+        target_backend=loop_target._target_backend,
+        target_model=loop_target._target_model,
+        target_base_url=loop_target._target_base_url,
+        cache_path=loop_target._cache_path,
+        starting_prompt=winner,
+    )
+    try:
+        final = full_target.baseline()
+    except Exception as exc:
+        console.print(f"[dim]final re-score failed ({type(exc).__name__}); keeping the loop score[/dim]")
+        return None
+    if final.metrics is None:
+        return None
+    return {"score": final.metrics.primary_value, "n": full_dataset.n_test}
 
 
 def _read_starting_prompt(path: Path) -> Any:
@@ -910,6 +1038,7 @@ def _prior_best(memory: Memory, target_name: str, direction: str) -> Experiment 
     succeeded = [e for e in history if e.result and e.result.succeeded and e.result.metrics]
     if not succeeded:
         return None
+
     def _score(experiment: Experiment) -> float:
         assert experiment.result is not None
         assert experiment.result.metrics is not None
@@ -932,9 +1061,7 @@ def _check_baseline_divergence(
         )
 
 
-def _save_best_model(
-    target: ModelTarget, result: RunResult, metric: str, path: Path
-) -> None:
+def _save_best_model(target: ModelTarget, result: RunResult, metric: str, path: Path) -> None:
     """Persist the winning approach + a sidecar best.json.
 
     Spec winner → refit and pickle the fitted pipeline (joblib). Code winner →
@@ -1017,12 +1144,23 @@ def _render_experiment(
         else:
             note = None
         return build_session_notebook(
-            cells, title=title, metric=metric, score=score, baseline_score=baseline_score,
-            hypothesis=exp.hypothesis, findings=exp.digest, honesty_note=note,
+            cells,
+            title=title,
+            metric=metric,
+            score=score,
+            baseline_score=baseline_score,
+            hypothesis=exp.hypothesis,
+            findings=exp.digest,
+            honesty_note=note,
         )
     return build_notebook(
-        exp, data_path=data_path, target=target, metric=metric,
-        baseline_score=baseline_score, is_best=is_best, leaderboard=leaderboard,
+        exp,
+        data_path=data_path,
+        target=target,
+        metric=metric,
+        baseline_score=baseline_score,
+        is_best=is_best,
+        leaderboard=leaderboard,
     )
 
 
@@ -1048,16 +1186,24 @@ def _write_experiment_notebook(
         name = f"iter_{exp.iteration:02d}_{slug(exp.candidate.description)}.ipynb"
         save_notebook(
             _render_experiment(
-                exp, is_best=False, baseline_score=baseline_score,
-                metric=metric, data_path=data_path, target=target,
+                exp,
+                is_best=False,
+                baseline_score=baseline_score,
+                metric=metric,
+                data_path=data_path,
+                target=target,
             ),
             run_dir / "notebooks" / name,
         )
     if is_best and exp.result is not None and exp.result.succeeded:
         save_notebook(
             _render_experiment(
-                exp, is_best=True, baseline_score=baseline_score,
-                metric=metric, data_path=data_path, target=target,
+                exp,
+                is_best=True,
+                baseline_score=baseline_score,
+                metric=metric,
+                data_path=data_path,
+                target=target,
             ),
             run_dir / "best.ipynb",
         )
@@ -1088,8 +1234,12 @@ def _write_notebooks(
             written.append(
                 save_notebook(
                     _render_experiment(
-                        exp, is_best=is_best, baseline_score=baseline_score,
-                        metric=metric, data_path=data_path, target=target,
+                        exp,
+                        is_best=is_best,
+                        baseline_score=baseline_score,
+                        metric=metric,
+                        data_path=data_path,
+                        target=target,
                     ),
                     run_dir / "notebooks" / name,
                 )
@@ -1099,8 +1249,12 @@ def _write_notebooks(
         written.append(
             save_notebook(
                 _render_experiment(
-                    result.best, is_best=True, baseline_score=baseline_score,
-                    metric=metric, data_path=data_path, target=target,
+                    result.best,
+                    is_best=True,
+                    baseline_score=baseline_score,
+                    metric=metric,
+                    data_path=data_path,
+                    target=target,
                     leaderboard=result.history,
                 ),
                 run_dir / "best.ipynb",

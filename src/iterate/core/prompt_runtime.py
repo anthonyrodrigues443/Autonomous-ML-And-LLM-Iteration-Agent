@@ -33,6 +33,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -219,6 +220,16 @@ def _one(
     return UNPARSEABLE, prompt_tokens, completion_tokens, last_error
 
 
+def _humanise(seconds: float) -> str:
+    """A duration a person can act on, not a float."""
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{minutes:.0f} min"
+    return f"{minutes / 60:.1f} hours"
+
+
 def ask(
     prompt: Prompt,
     rows: Sequence[Mapping[str, Any]],
@@ -279,8 +290,41 @@ def ask(
             cache.put(key, answer)
 
     if rows:
+        # A pass over a few hundred records is minutes of model calls with nothing
+        # to show for it. The first live run printed NOTHING for nine minutes while
+        # the baseline scored, which reads as a hang; a heartbeat every 10% costs
+        # nothing and tells the user it is moving.
+        step = max(1, len(rows) // 10)
+        # Enough completed calls to project from without waiting long to say
+        # anything. The first few are the slowest (a cold model loads), so this is a
+        # pessimistic estimate, which is the right direction to be wrong in.
+        probe = min(5, len(rows))
+        started = time.monotonic()
+        done = 0
+        lock = threading.Lock()
+
+        def tracked(index: int) -> None:
+            handle(index)
+            nonlocal done
+            with lock:
+                done += 1
+                if done == probe and len(rows) > probe:
+                    # An unbounded wait is the actual pain; a known 16 minutes is a
+                    # decision the user can make. Measured per pass rather than
+                    # guessed for the whole run, because how many passes the agent
+                    # will take is not knowable up front.
+                    per_call = (time.monotonic() - started) / done
+                    log.info(
+                        "prompt pass: %d records at ~%.1fs each -> about %s remaining",
+                        len(rows),
+                        per_call,
+                        _humanise(per_call * (len(rows) - done)),
+                    )
+                if done % step == 0 or done == len(rows):
+                    log.info("prompt pass: %d/%d records", done, len(rows))
+
         with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(rows)))) as pool:
-            list(pool.map(handle, range(len(rows))))
+            list(pool.map(tracked, range(len(rows))))
 
     return [a if a is not None else UNPARSEABLE for a in answers]
 

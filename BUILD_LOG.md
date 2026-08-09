@@ -314,7 +314,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 |---|---|---|---|
 | Mon Aug 3 | **Eval suite FIRST** (Tony's call after the v0.4 certification): the headroom table from EVAL_LOG becomes a runnable corpus, so a release is measured rather than argued about. Then the v0.5 work below | `evals/` + corpus + runner | done (built Sat Aug 8) |
 | Tue Aug 4 | Loop integration: prompt lever classes for the supervisor ladder, coder session writes prompt variants + scoring cells, guard stack audited for the new path (duplicate gates hash prompt text, dead-ends transfer) | wiring + tests | done (built Sat Aug 8) |
-| Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | |
+| Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | done (built Sun Aug 9) |
 | Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | |
 | Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | |
 | Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | |
@@ -492,6 +492,38 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-09 | Sprint 3 Day 3 | Five live runs, and what only running finds
+
+**Task:** the toxicity example end to end, which turned into the day the prompt path was actually made to work. Five runs on gemma4:12b against 1500 balanced Jigsaw comments. Every run found something no unit test had imagined, and every finding is now a unit test.
+
+**The headline: the agent improves a prompt, and the number is stable.** Baseline f1 0.8611 from the minimal prompt. Best across three completed runs: 0.8822, 0.8824, 0.8814 — **+0.021, reproduced three times independently**. What it writes is recognisably good work: it read the actual misses ("piss off", "sick in the head", sarcasm), named the pattern, and added one sentence defining toxicity as personal attacks, insults, profanity or hostility. It also noticed a false positive going the other way, which is the harder half.
+
+**Run 1 died at scoring, on two rows out of three hundred.** Two answers came back unusable, so predictions carried a third value, sklearn read the union of true and predicted as multiclass, `average='binary'` raised, and the baseline failed — which aborts the run. Two bad answers cost everything. The fix was chosen by measuring four options: passing `labels=` still raises (sklearn types the target before it reads labels); letting macro absorb the sentinel scores 0.533 instead of 0.800; naming the true labels gives 0.800; and mapping the sentinel to the POSITIVE class gives 0.857, i.e. **garbage would have paid**. So scoring names which labels count rather than rewriting what the model said, behind an `open_vocabulary` flag only the prompt path sets, with a test asserting tabular scoring is byte-identical.
+
+**Run 2 proved I had fixed the wrong agent.** The supervisor briefed "one-hot encode categorical 'comment', fit HistGradientBoostingClassifier". It read a column of comment text as a high-cardinality categorical, because I had parameterised the CODER and left the supervisor — which sits upstream and decides what gets tried — entirely tabular. In the Day 2 PR I had flagged "Researcher and Critic still use tabular framing" as the known gap. I named the wrong two agents. The prompt family now has its own ladder (read the mistakes, define the hard case, few-shot, output discipline, repair, reframe) opening with "THERE IS NO MODEL TO TRAIN", and the tabular lever ledger and dead-lever guard are switched off for it rather than mistranslated.
+
+**Also from run 2: the budget was calibrated for a different unit of work.** A tabular cell is a fit, seconds. A prompt cell is one model call per record, minutes. Three cells died at the 120s timeout and both sessions blew their 300s kernel budget on timeouts alone, never submitting. Raised to 600s and 1800s for the prompt family.
+
+**Run 3 worked, and run 4 shipped an empty deliverable.** All three iterations submitted and beat the baseline — then `prompts.yaml` came out containing only the baseline. `submit()` writes `prompt.json` correctly and `score_code_job` reads it, but the LIVE path is the coder's, which reads its outputs directly and only ever looked for predictions.csv. The prompt was written to disk and dropped on the floor. Same class of miss as the supervisor, twice in two days: **fix the path you are looking at, miss the one that actually runs.**
+
+**Run 4 exposed two performance defects, one of them self-inflicted.** The answer cache held exactly 298 entries at the start of a 100-minute run and 298 at the end: `cache_path` went into meta.json relative, and the kernel runs in its own temp cwd, so every session built a throwaway cache and re-paid for the baseline in full. And cells were overrunning a 600s limit by 200s, because `get_iopub_msg(timeout=...)` bounds the GAP between messages, not the cell — so the progress heartbeat I added that morning to fix "nine minutes of silence looks like a hang" had quietly disabled the timeout guard. Fix A broke guard B inside a single day.
+
+**Run 5 confirmed three of four fixes and killed the fourth.** Cache 298 -> 3140. Timeouts 818.9/838.4/698.5/811.0s -> four at exactly 600.0s. The Ollama warning fired. But the `BASE` alias failed: the model produced a FOURTH spelling of BASELINE_PROMPT. Alias whack-a-mole was the wrong shape — the live namespace was already appended to every observation and it still fumbled, because a listing to scan is not the same as being told which name was wrong. Replaced with a `NameError` hint that names the miss and the closest defined match, placed before the traceback. General, not prompt-specific: a mistyped variable is an every-path mistake.
+
+**Run 5 also leaked a tabular lever into a prompt run** — iteration 3 was titled `untried lever: categorical-encoding`. When a brief is rejected twice the harness substitutes a deterministic fallback "novel by construction", and that table was still tabular. Compounding it, the anti-baseline-rebrief nudge told the supervisor to prefer "Levers NOT yet tried" and name a lever class, neither of which exists here, so it could not comply, the guard fired twice, and the fallback handed it nonsense. Both now have prompt-family versions.
+
+**Measured, not assumed: Ollama serialises.** 4 calls sequential 13.8s; 8 calls at 8-wide 25.1s. **1.10x from 8 workers** — the pool is a queue. 3.2s per call means a 300-record pass is 16 minutes whatever the concurrency. Not an iterate bug, but it is the difference between a 105-minute run and a 13-minute one, so the prompt path now says so once per run with the number in it.
+
+**Two changes that came out of the arithmetic rather than a crash.** At n=300 and accuracy 0.88 the standard error on a single score is ±0.019 and the 95% interval ±0.037 — while the improvement being measured is +0.020. Meanwhile run-to-run reproducibility of the same move is ±0.001. Those are different quantities: ranking two prompts on the same records is paired and reliable, but quoting "+2 points" from 300 comments is not supported. So candidates are now ranked on a fixed 100-record slice (same records every time, so the comparison stays paired) and **the winner alone is re-scored on the full holdout**, which is the number `prompts.yaml` leads with. Submit cost drops from 900 calls to 600 and the headline figure is measured on more data than any intermediate one. Second change: `ask()` projects an ETA from its first five calls, because an unbounded wait is the actual pain and a known sixteen minutes is a decision.
+
+**One proposal was dropped under review.** Early-exit on a losing candidate sounded like a saving until Tony asked how it differed from patience. It does differ — patience stops the search, early exit stops a measurement — but it would produce partial scores that are not comparable to full ones, which breaks the one-ruler discipline the whole project rests on, and the loop-holdout change already eats most of the saving. Dropped.
+
+**Examples landed:** `toxicity_jigsaw` and `intent_clinc150` are no longer placeholders. Each has a `prepare.py` that downloads and builds its eval set (no account needed for either) plus a README explaining the prep choices. The data is gitignored — the toxicity set is 750 genuinely abusive comments and a script rebuilds it in seconds, which is not something to carry in a public repo.
+
+**Gates:** 743 unit tests (was 720), ruff clean repo-wide, mypy --strict clean.
+
+**Standing lesson from the day:** every one of these bugs was findable by a unit test I did not think to write. Live runs are for discovery; the moment something is found it becomes a test and never needs a run again. Five runs was right for a brand-new path where each one found something new, and that rate should now fall.
 
 ### 2026-08-08 | Sprint 3 Day 2 | `PromptTarget`: the second problem type, on the same machine
 

@@ -92,12 +92,17 @@ class Supervisor:
         temperature: float = 0.4,
         max_tokens: int = 1024,
         max_retries: int = 1,
+        # Which ladder to walk. The tabular one is not the prompt one with words
+        # swapped: on the first live prompt run it read a column of comment text as
+        # a high-cardinality categorical and briefed one-hot encoding.
+        family: str = "tabular",
     ) -> None:
         self._client = client
         self._metric = metric
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._max_retries = max_retries
+        self._family = family
 
     def decide(
         self,
@@ -128,6 +133,7 @@ class Supervisor:
             direction=direction(self._metric),
             score=baseline.metrics.primary_value,
             history=history,
+            family=self._family,
         )
         guidance = _guidance_message(user_guidance, standing_rules)
         if guidance is not None:
@@ -139,7 +145,8 @@ class Supervisor:
             messages.append(
                 Message(
                     role="user",
-                    content=_PROMPTS["research_prefix"] + _word_cut(research.strip(), _RESEARCH_CHARS),
+                    content=_PROMPTS["research_prefix"]
+                    + _word_cut(research.strip(), _RESEARCH_CHARS),
                 )
             )
         detail = ""
@@ -153,7 +160,9 @@ class Supervisor:
             last_attempt = attempt == self._max_retries
             try:
                 response = self._client.chat(
-                    messages, tools=[PLAN_NEXT], temperature=self._temperature,
+                    messages,
+                    tools=[PLAN_NEXT],
+                    temperature=self._temperature,
                     max_tokens=self._max_tokens,
                 )
             except Exception as exc:  # the backend is an I/O boundary; never fatal here
@@ -176,7 +185,15 @@ class Supervisor:
                 # re-emitted the same lever on the retry, and the known re-commission
                 # was accepted (detection without conversion).
                 violation: tuple[str, str, bool] | None = None  # (log reason, nudge, seen)
-                if dead_reason := dead_lever_reason(decision.brief, self._metric):
+                # The dead-lever guard is about tabular levers that a ranking metric
+                # cannot move (class weighting, threshold tuning). Those levers do
+                # not exist on the prompt path, so the check can only misfire there.
+                dead_reason = (
+                    None
+                    if self._family == "prompt"
+                    else dead_lever_reason(decision.brief, self._metric)
+                )
+                if dead_reason:
                     violation = (
                         f"dead lever for this metric — {dead_reason}",
                         _PROMPTS["dead_lever_nudge"].format(reason=dead_reason),
@@ -186,7 +203,11 @@ class Supervisor:
                 elif _is_baseline_rebrief(decision.title, decision.brief):
                     violation = (
                         f"baseline re-brief ({decision.title!r})",
-                        _PROMPTS["baseline_rebrief_nudge"],
+                        _PROMPTS[
+                            "prompt_baseline_rebrief_nudge"
+                            if self._family == "prompt"
+                            else "baseline_rebrief_nudge"
+                        ],
                         rebrief_nudged,
                     )
                     rebrief_nudged = True
@@ -226,12 +247,20 @@ class Supervisor:
                     lint_nudged = True
                 if violation is not None:
                     reason, nudge, seen = violation
-                    fallback = _fallback_move(history, self._metric) if seen or last_attempt else None
+                    if seen or last_attempt:
+                        fallback = (
+                            _prompt_fallback_move(history)
+                            if self._family == "prompt"
+                            else _fallback_move(history, self._metric)
+                        )
+                    else:
+                        fallback = None
                     if fallback is not None:
                         title, move = fallback
                         log.info(
                             "supervisor: %s persisted; falling back to an untried lever (%s)",
-                            reason, title,
+                            reason,
+                            title,
                         )
                         decision = SupervisorDecision(stop=False, title=title, brief=move)
                     elif not (seen or last_attempt):
@@ -272,7 +301,10 @@ class Supervisor:
         for _ in range(2):
             try:
                 response = self._client.chat(
-                    messages, tools=[ROUTE_MESSAGE], temperature=0.0, max_tokens=256,
+                    messages,
+                    tools=[ROUTE_MESSAGE],
+                    temperature=0.0,
+                    max_tokens=256,
                 )
             except Exception as exc:  # never let a chat line hurt the run
                 log.warning("supervisor: route_message backend error: %s", exc)
@@ -326,7 +358,9 @@ class Supervisor:
         for _ in range(4):
             try:
                 response = self._client.chat(
-                    messages, tools=[READ_NOTEBOOK], temperature=self._temperature,
+                    messages,
+                    tools=[READ_NOTEBOOK],
+                    temperature=self._temperature,
                     max_tokens=self._max_tokens,
                 )
             except Exception as exc:
@@ -338,7 +372,9 @@ class Supervisor:
                 messages.append(Message(role="assistant", tool_calls=[call]))
                 messages.append(
                     Message(
-                        role="tool", name=call.name, tool_call_id=call.id,
+                        role="tool",
+                        name=call.name,
+                        tool_call_id=call.id,
                         content=_render_experiment(history, call.arguments.get("iteration")),
                     )
                 )
@@ -349,7 +385,9 @@ class Supervisor:
                 messages.append(Message(role="assistant", tool_calls=[call]))
                 messages.append(
                     Message(
-                        role="tool", name=call.name, tool_call_id=call.id,
+                        role="tool",
+                        name=call.name,
+                        tool_call_id=call.id,
                         content="(tool budget spent — answer now in plain text)",
                     )
                 )
@@ -411,9 +449,7 @@ def _guidance_message(guidance: str | None, rules: Sequence[str]) -> str | None:
         parts.append(_PROMPTS["guidance_prefix"] + _word_cut(guidance.strip(), _GUIDANCE_CHARS))
     kept = [r.strip() for r in rules if r.strip()][-_RULES_SHOWN:]
     if kept:
-        parts.append(
-            _PROMPTS["rules_prefix"] + "; ".join(_word_cut(r, _RULE_CHARS) for r in kept)
-        )
+        parts.append(_PROMPTS["rules_prefix"] + "; ".join(_word_cut(r, _RULE_CHARS) for r in kept))
     return "\n".join(parts) or None
 
 
@@ -480,9 +516,12 @@ def _render_experiment(history: list[Experiment], iteration: object) -> str:
     if exp.digest is not None:
         d = exp.digest
         parts.append(
-            "digest: helped=" + ("; ".join(d.what_helped) or "-")
-            + " | hurt=" + ("; ".join(d.what_hurt) or "-")
-            + " | takeaway=" + (d.takeaway or "-")
+            "digest: helped="
+            + ("; ".join(d.what_helped) or "-")
+            + " | hurt="
+            + ("; ".join(d.what_hurt) or "-")
+            + " | takeaway="
+            + (d.takeaway or "-")
         )
     cells = exp.candidate.changes.get("cells")
     if isinstance(cells, list):
@@ -649,7 +688,25 @@ _DEAD_END_ITEM_CHARS = 90
 # "PowerTransformer application: no change" and "PowerTransformer on numerics: hurt"
 # read as the SAME dead idea.
 _DEAD_END_STOPWORDS = frozenset(
-    ["score", "feature", "features", "improvement", "change", "model", "added", "adding", "caused", "likely", "without", "measurable", "decreased", "lowered", "applied", "application", "threshold"]
+    [
+        "score",
+        "feature",
+        "features",
+        "improvement",
+        "change",
+        "model",
+        "added",
+        "adding",
+        "caused",
+        "likely",
+        "without",
+        "measurable",
+        "decreased",
+        "lowered",
+        "applied",
+        "application",
+        "threshold",
+    ]
 )
 _DEAD_END_TOKEN = re.compile(r"[a-z_]{5,}")
 
@@ -658,9 +715,7 @@ def _idea_tokens(text: str) -> frozenset[str]:
     # split camelCase and snake_case into atomic words, so "tenure_monthly
     # interaction" groups with "Interaction feature (tenure * MonthlyCharges)"
     spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text).replace("_", " ").lower()
-    return frozenset(
-        t for t in _DEAD_END_TOKEN.findall(spaced) if t not in _DEAD_END_STOPWORDS
-    )
+    return frozenset(t for t in _DEAD_END_TOKEN.findall(spaced) if t not in _DEAD_END_STOPWORDS)
 
 
 # Phrasings that claim an API or parameter DOES NOT EXIST — when the run's own
@@ -668,8 +723,15 @@ def _idea_tokens(text: str) -> frozenset[str]:
 # must not enter the dead-ends channel (live: "HGB lacks class_weight" banked while
 # the prior session printed a successful class_weight fit).
 _FALSE_API_CLAIM = (
-    "lacks", "does not have", "doesn't have", "no such", "not supported",
-    "does not accept", "doesn't accept", "does not support", "doesn't support",
+    "lacks",
+    "does not have",
+    "doesn't have",
+    "no such",
+    "not supported",
+    "does not accept",
+    "doesn't accept",
+    "does not support",
+    "doesn't support",
 )
 
 
@@ -685,8 +747,7 @@ def _best_holdout(history: list[Experiment]) -> tuple[float, str] | None:
     if not scores:
         return None
     metrics = next(
-        e.result.metrics for e in history
-        if e.result is not None and e.result.metrics is not None
+        e.result.metrics for e in history if e.result is not None and e.result.metrics is not None
     )
     assert metrics is not None
     if metrics.direction == "minimize":
@@ -751,7 +812,8 @@ def _dead_ends(history: list[Experiment]) -> str:
         for hurt in entries:
             # settled entries are pre-cut with their suffix protected; cap the rest
             text = (
-                hurt.strip() if " — settled:" in hurt
+                hurt.strip()
+                if " — settled:" in hurt
                 else _word_cut(hurt.strip(), _DEAD_END_ITEM_CHARS)
             )
             if not text:
@@ -830,9 +892,7 @@ def _carried_threshold(code: str) -> str | None:
     disarmed the re-tune guard in a live run). A literal is the answer; a variable
     is followed to its last literal assignment; anything else resolves to None."""
     lines = code.splitlines()
-    proba_vars = {
-        m.group(1).lower() for line in lines if (m := _PROBA_ASSIGN.match(line))
-    }
+    proba_vars = {m.group(1).lower() for line in lines if (m := _PROBA_ASSIGN.match(line))}
     for line in reversed(lines):
         low = line.lower()
         if ">" not in low:
@@ -846,9 +906,7 @@ def _carried_threshold(code: str) -> str | None:
             return literal.group(1)
         variable = _THRESHOLD_VARIABLE.search(low)
         if variable:
-            assign = re.compile(
-                rf"^\s*{re.escape(variable.group(1))}\s*=\s*(0?\.\d+)\s*(?:#.*)?$"
-            )
+            assign = re.compile(rf"^\s*{re.escape(variable.group(1))}\s*=\s*(0?\.\d+)\s*(?:#.*)?$")
             for earlier in reversed(lines):
                 match = assign.match(earlier.lower())
                 if match:
@@ -880,9 +938,17 @@ def _to_decision(args: dict[str, Any]) -> SupervisorDecision:
 
 
 def _build_messages(
-    *, data_summary: str, metric: str, direction: str, score: float, history: list[Experiment]
+    *,
+    data_summary: str,
+    metric: str,
+    direction: str,
+    score: float,
+    history: list[Experiment],
+    family: str = "tabular",
 ) -> list[Message]:
-    system = _PROMPTS["system"].format(
+    prompt_family = family == "prompt"
+    key = "prompt_system" if prompt_family else "system"
+    system = _PROMPTS[key].format(
         metric=metric, direction=direction, metric_note=metric_guidance(metric)
     )
     if history:
@@ -890,15 +956,22 @@ def _build_messages(
         lines = _format_history(recent, metric)
         # the ledger scans the FULL history: a lever tried before the display
         # window is still tried.
-        extras = "".join(
-            block + "\n\n"
-            for block in (_technique_table(recent, metric), _lever_ledger(history))
-            if block
+        # The lever ledger is a list of TABULAR lever classes matched against
+        # sklearn identifiers in executed code. On a prompt run it can only ever
+        # report "Levers NOT yet tried: imbalance-or-threshold, categorical-
+        # encoding, ..." — advertising moves that do not exist on this path. Left
+        # out entirely rather than mistranslated; a prompt-specific ledger is its
+        # own piece of work.
+        blocks = (
+            (_technique_table(recent, metric),)
+            if prompt_family
+            else (_technique_table(recent, metric), _lever_ledger(history))
         )
+        extras = "".join(block + "\n\n" for block in blocks if block)
         history_section = _PROMPTS["history_header"] + "\n" + "\n".join(lines) + "\n\n" + extras
     else:
         history_section = "No experiments yet — brief the first one.\n\n"
-    user = _PROMPTS["user_template"].format(
+    user = _PROMPTS["prompt_user_template" if prompt_family else "user_template"].format(
         data_summary=data_summary,
         metric=metric,
         score=f"{score:.4f}",
@@ -1064,7 +1137,13 @@ def _recommissions_a_measured_lost_technique(
 
 _MOVE_FLOAT = re.compile(r"0?\.\d{2,4}")
 _SCORE_CLAIM_CONTEXT = (
-    "best", "previous", "achieved", "scored", "top-performing", "top performing", "winning",
+    "best",
+    "previous",
+    "achieved",
+    "scored",
+    "top-performing",
+    "top performing",
+    "winning",
 )
 
 
@@ -1157,6 +1236,48 @@ def run_ledger(history: list[Experiment]) -> ledger.Ledger:
     )
 
 
+# The prompt family's equivalent of _CANONICAL_MOVES, in ladder order.
+#
+# Without these the fallback reached into the TABULAR table and a live prompt run
+# was handed "untried lever: categorical-encoding" as its third experiment. It
+# scored, only because the coder ignored the nonsense and did something sensible.
+# The fallback exists to be novel BY CONSTRUCTION; novel nonsense is not the deal.
+#
+# "Tried" is judged on the brief titles here, not on code markers: a prompt change
+# leaves no sklearn identifier in a cell for the tabular ledger to match on.
+_PROMPT_MOVES: dict[str, str] = {
+    "define-the-hard-case": (
+        "name the one kind of input the misses cluster on and add a single sentence "
+        "to the system message saying how to judge it"
+    ),
+    "few-shot": (
+        "add 3 to 6 examples drawn from TRAINING rows, chosen to cover the confusions "
+        "the mistakes revealed rather than the easy cases"
+    ),
+    "output-discipline": (
+        "make the answer format unmistakable so no reply comes back unusable"
+    ),
+    "decision-rule": (
+        "state the rule the correct answers imply, as a rule, instead of describing "
+        "the task"
+    ),
+    "role-framing": (
+        "give the model a role that matches the judgement it is being asked to make"
+    ),
+}
+
+
+def _prompt_fallback_move(history: list[Experiment]) -> tuple[str, str] | None:
+    """A prompt move never briefed this run, or None when they are all spent."""
+    briefed = " ".join(
+        f"{e.candidate.description} {e.hypothesis}".casefold() for e in history
+    )
+    for lever, move in _PROMPT_MOVES.items():
+        if lever not in briefed:
+            return f"untried move: {lever}", f"next: {lever}: {move}."
+    return None
+
+
 def _fallback_move(history: list[Experiment], metric: str = "") -> tuple[str, str] | None:
     """A harness-composed (title, move) from the first lever class never tried this
     run, or None when every class is tried. The last resort after a guard fires
@@ -1235,7 +1356,9 @@ def _format_history(history: list[Experiment], metric: str) -> list[str]:
             elif exp.candidate.changes.get("lever_unmeasured"):
                 # The commissioned lever never executed successfully — the score
                 # belongs to the carried pipeline, not the briefed idea.
-                outcome += " [commissioned lever never executed — the score is the carried pipeline's]"
+                outcome += (
+                    " [commissioned lever never executed — the score is the carried pipeline's]"
+                )
         elif result is not None and result.error:
             outcome = f"FAILED ({result.error.splitlines()[0][:60]})"
         else:
@@ -1267,7 +1390,12 @@ _LEVER_MARKERS: dict[str, tuple[str, ...]] = {
     "imbalance-or-threshold": ("class_weight", "scale_pos_weight", "smote", "threshold"),
     "interactions-or-ratios": ("polynomialfeatures", "interaction", "ratio", "_per_"),
     "feature-selection": ("selectkbest", "selectfrommodel", "rfe(", "feature_importances"),
-    "ensembling": ("votingclassifier", "stackingclassifier", "votingregressor", "stackingregressor"),
+    "ensembling": (
+        "votingclassifier",
+        "stackingclassifier",
+        "votingregressor",
+        "stackingregressor",
+    ),
     "hyperparameter-search": ("gridsearchcv", "randomizedsearchcv", "halvinggridsearchcv"),
     # Estimator identity: without this class every guard was blind to model swaps —
     # a run orbited GB/RF swaps re-stamping settled scores three times. The default
@@ -1275,8 +1403,15 @@ _LEVER_MARKERS: dict[str, tuple[str, ...]] = {
     # text is neutralized via _neutralize_hgb so "gradientboosting" cannot match
     # inside "histgradientboosting".
     "model-swap": (
-        "randomforest", "extratrees", "gradientboosting", "xgb", "lgbm", "lightgbm",
-        "catboost", "logisticregression", "kneighbors",
+        "randomforest",
+        "extratrees",
+        "gradientboosting",
+        "xgb",
+        "lgbm",
+        "lightgbm",
+        "catboost",
+        "logisticregression",
+        "kneighbors",
     ),
 }
 
