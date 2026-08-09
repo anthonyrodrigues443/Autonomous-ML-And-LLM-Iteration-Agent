@@ -38,7 +38,7 @@ from iterate.adapters.compute.base import CodeJob
 from iterate.core import codegen
 from iterate.core.prompt_runtime import UNPARSEABLE, AskStats, make_ask
 from iterate.core.prompting import Prompt, baseline_prompt
-from iterate.core.scoring import score
+from iterate.core.scoring import score, task_for_metric
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
 if TYPE_CHECKING:
@@ -136,6 +136,26 @@ def majority_answer(dataset: TabularDataset) -> str:
     return str(counts.index[0]) if len(counts) else ""
 
 
+def numeric_range(dataset: TabularDataset) -> tuple[float | None, float | None]:
+    """The range the TRAINING answers actually span."""
+    values = pd.to_numeric(dataset.train_target, errors="coerce").dropna()
+    return (float(values.min()), float(values.max())) if len(values) else (None, None)
+
+
+def median_answer(dataset: TabularDataset) -> float:
+    """The floor for a numeric target, and what an unusable answer becomes.
+
+    Measured before choosing, the same way the label case was. Of four options on a
+    300-row rating task with 10% refusals: DROPPING the unparseable rows scored
+    BETTER than answering them honestly (rmse 0.691 against 0.701, pearson 0.894
+    against 0.890) — so refusing the hard rows would be a winning strategy.
+    Substituting the median costs 0.10 rmse against an honest answer, and unlike a
+    worst-case substitution it cannot let a handful of refusals swamp the score.
+    """
+    values = pd.to_numeric(dataset.train_target, errors="coerce").dropna()
+    return float(values.median()) if len(values) else 0.0
+
+
 class PromptTarget:
     """An LLM prompt scored against a labelled eval set on a sealed holdout."""
 
@@ -159,7 +179,13 @@ class PromptTarget:
         self._metric = metric
         self._average = average
         self._task = task
-        self._labels = label_set(dataset)
+        self._task_kind = task_for_metric(metric)
+        self._labels = label_set(dataset) if self._task_kind == "classification" else None
+        # Bounds come from the TRAINING answers, so the tool cannot express a rating
+        # outside the range the data actually uses — the numeric counterpart of the
+        # label enum. Holdout values are never consulted; a range widened by the
+        # answer key would be a leak.
+        self._numeric_range = numeric_range(dataset) if self._task_kind == "regression" else None
         self._target_backend = target_backend
         self._target_model = target_model
         self._target_base_url = target_base_url
@@ -240,6 +266,13 @@ class PromptTarget:
             "labels": self._labels,
             "metric": self._metric,
             "family": "prompt",
+            # The session must ask and score the SAME way the host does. Without
+            # these the in-kernel helpers fell back to the label tool and the
+            # classification scorer, so on a regression run the agent iterated
+            # against a different ruler than the one deciding its score.
+            "task_kind": self._task_kind,
+            "numeric_range": list(self._numeric_range) if self._numeric_range else None,
+            "median": median_answer(self._dataset) if self._task_kind == "regression" else None,
             "target_backend": self._target_backend,
             "target_model": self._target_model,
             "target_base_url": self._target_base_url,
@@ -284,6 +317,7 @@ class PromptTarget:
         ask = make_ask(
             columns=list(self._dataset.features),
             labels=self._labels,
+            numeric_range=self._numeric_range,
             backend=self._target_backend,
             model=self._target_model,
             base_url=self._target_base_url,
@@ -317,19 +351,33 @@ class PromptTarget:
                 logs=stats.summary(),
             )
 
-        values = score(
-            "classification",
-            self._dataset.test_target.astype(str),
-            answers,
-            average=self._average,
-            include=(self._metric,),
-            # A model that will not answer usably yields a sentinel, which is a
-            # value the target column never contains. It has to count as wrong
-            # rather than register as a new class — untagged, ONE such answer in
-            # 300 turns a binary target multiclass and the metric refuses to score
-            # at all. Measured on the first live run.
-            open_vocabulary=True,
-        )
+        if self._task_kind == "regression":
+            # An unusable answer becomes the training median. Measured across four
+            # options: DROPPING the unparseable rows scores BETTER than answering
+            # them honestly, so refusing the hard ones would be a winning strategy.
+            # The median penalises without letting a few refusals swamp the score.
+            floor = median_answer(self._dataset)
+            numeric = [floor if a == UNPARSEABLE else float(a) for a in answers]
+            values = score(
+                "regression",
+                pd.to_numeric(self._dataset.test_target, errors="coerce").to_numpy(),
+                numeric,
+                include=(self._metric,),
+            )
+        else:
+            values = score(
+                "classification",
+                self._dataset.test_target.astype(str),
+                answers,
+                average=self._average,
+                include=(self._metric,),
+                # A model that will not answer usably yields a sentinel, which is a
+                # value the target column never contains. It has to count as wrong
+                # rather than register as a new class — untagged, ONE such answer in
+                # 300 turns a binary target multiclass and the metric refuses to
+                # score at all. Measured on the first live run.
+                open_vocabulary=True,
+            )
         return ExperimentResult(
             experiment_id=experiment_id,
             metrics=Metrics(

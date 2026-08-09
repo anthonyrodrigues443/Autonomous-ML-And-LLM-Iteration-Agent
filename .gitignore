@@ -285,3 +285,7 @@ examples/toxicity_jigsaw/train.raw.csv
 examples/toxicity_jigsaw/data.csv
 examples/intent_clinc150/data_full.json
 examples/intent_clinc150/data.csv
+examples/hate_speech_davidson/labeled_data.csv
+examples/hate_speech_davidson/data.csv
+examples/sts_benchmark/stsb.jsonl
+examples/sts_benchmark/data.csv

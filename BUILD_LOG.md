@@ -493,6 +493,40 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-08-09 | Sprint 3 Day 5 | Regression: the second thing prompts are actually used for
+
+**Task:** Tony's scope call — v0.5 ships classification AND regression, because the LLM tasks people actually put in production are the two that produce something structured enough to act on. "If a photo task is there, companies want the colours he is wearing from an enum and a rating, because only then can they do something." Free-form generation was the gap I had been aiming at and it was the wrong one.
+
+**Most of it was already there.** 16 regression metrics with correct directions, and the registry has always accepted hand-curated non-sklearn entries — `brier`, `mae`, `mse` and `rmse` are exactly that. The blocker was one hardcoded word: `PromptTarget` called `score("classification", ...)`. `ModelTarget` had derived the task from the metric since v0.1.
+
+**The decision I refused to guess: what is an unusable answer worth in a numeric target?** For labels this mattered enormously — mapping the sentinel to the positive class scored 0.857 against an honest 0.800, so garbage would have paid. Measured the same way here, on a 300-row rating task with 10% refusals:
+
+| handling | rmse | pearson | |
+|---|---|---|---|
+| model answered every row (honest) | 0.701 | 0.890 | the bar |
+| **drop the unparseable rows** | **0.691** | **0.894** | **flatters — refusing wins** |
+| substitute the training mean | 0.802 | 0.848 | penalises |
+| substitute the training median | 0.800 | 0.849 | penalises |
+| substitute the worst case | 1.387 | 0.607 | penalises |
+
+**Dropping is the trap, and it is the option that looks most reasonable.** A prompt that refuses on the rows it finds hard scores BETTER than one that answers them honestly, on both metric families. I had expected the mean to be the danger, since the mean is the best constant guess under rmse; it is not, because an honest answer beats the mean. Chose the **median**: it penalises on both families and, unlike worst-case, a handful of refusals cannot swamp the score (30 refusals move rmse from 0.70 to 1.39 and drown out everything the prompt did).
+
+**Kendall, Pearson and Spearman — and they are not in sklearn.** Tony asked whether the metric vocabulary was sklearn-only. It never was, but the three correlations are genuinely absent from sklearn's scorer catalogue, so they are curated on scipy, which is already a hard dependency. Two design points fell out:
+
+*They are selectable but NOT in the always-computed panel.* Adding them to PANEL changed the recorded metric set of every regression run that has ever happened, which a test caught immediately. History has to stay comparable, so they live in a new `CURATED_EXTRAS` that joins the REGISTRY without joining the panel.
+
+*A test asserted every metric names an importable SKLEARN function.* That was true until today. The constraint it was protecting is real — the agent is told the symbol so it can compute the metric itself, and v0.4 burned 16 cells on a name that did not exist — but sklearn was incidental to it. Metrics now carry a `module`, and the test checks importability wherever the function lives.
+
+**Why correlations matter for a rating task, in one measurement:** a prompt that ranks every item correctly but rates everyone three points high scores **pearson 1.000 and rmse 3.000**. For a rating that first verdict is usually the useful one, because a constant offset can be calibrated away and the ordering cannot. And the likeliest failure — answering the same number to everything — makes scipy call the correlation undefined, so it is guarded to 0.0 rather than nan, which would either crash the run or compare falsely against every real score.
+
+**A numeric answer tool, the counterpart of the enum.** `{"type": "number", "minimum": …, "maximum": …}` built from the TRAINING answers, so a rating outside the observed range is not something the model can express. Bounds from training only: a range widened by the holdout would tell the model which values the answer key uses. Number parsing refuses more than it accepts — "GPT-3 rates it 4" and "between 3 and 4" both come back unusable, because naming two numbers invents a precision the model did not express.
+
+**The supervisor needed a third ladder, not a translated second one.** "Define the hard case" names an edge between two answers, and a number has no answers to sit between. The scoring ladder's rungs are what actually moves a rating prompt: describe what the endpoints MEAN, anchor with examples spanning the range, fix a consistent lean, fix predictions bunching in the middle. Selected by `task_for_metric`, so the metric picks the ladder.
+
+**`examples/sts_benchmark/`:** 800 sentence pairs scored 0 to 5. Chosen because it is not a contrived scoring example — it IS the standard one, and Pearson and Spearman are its canonical metrics, so the correlations get used on the dataset the field already measures them with. First example with two input columns, so multi-column rendering finally runs.
+
+**Gates:** 782 unit tests (was 762), ruff clean repo-wide, mypy --strict clean.
+
 ### 2026-08-09 | Sprint 3 Day 4 | The second example, and the boundary it forced
 
 **Task:** CLINC150, whose real job was never "another example" — it was to break what the binary task hid. Twenty answers instead of two, hierarchical label names, and a metric that cannot be won on the easy classes.

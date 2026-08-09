@@ -145,6 +145,10 @@ class MetricSpec:
     # optimize "average_precision" and leaving it to guess the import cost 16
     # failed cells across the v0.4 certification runs.
     sklearn_func: str = ""
+    # Where `sklearn_func` can be imported from. Defaults to sklearn.metrics because
+    # almost everything is there; the correlations are not in sklearn at all, and an
+    # agent told to compute "pearson" needs to know it comes from scipy.
+    module: str = "sklearn.metrics"
     # Binary-only metrics are skipped on a multiclass target rather than raising:
     # multiclass Brier landed after the scikit-learn>=1.5 floor this package ships.
     binary_only: bool = False
@@ -187,6 +191,37 @@ def _scalar(value: Any) -> float:
 
 def _mse(i: Inputs) -> float:
     return float(mean_squared_error(i.y_true, i.y_pred))
+
+
+def _correlation(name: str) -> Callable[[Inputs], float]:
+    """A rank/linear agreement metric from scipy, guarded for the constant case.
+
+    Not in sklearn's scorer catalogue at all — these are curated the same way
+    `rmse` and `brier` are. They matter for rating tasks in a way error metrics do
+    not: a prompt that ranks every item correctly but rates everyone three points
+    high scores pearson 1.000 and rmse 3.000, and for a rating that first verdict is
+    usually the useful one, because an offset can be calibrated away.
+
+    A CONSTANT prediction returns 0.0 rather than nan. Answering "5" to everything
+    is the likeliest failure of a rating prompt, and scipy calls the correlation
+    undefined there — which would either crash the run or, worse, propagate a nan
+    that compares falsely against every real score.
+    """
+
+    def compute(i: Inputs) -> float:
+        from scipy import stats
+
+        y_true = np.asarray(i.y_true, dtype=float)
+        y_pred = np.asarray(i.y_pred, dtype=float)
+        if y_pred.std() == 0 or y_true.std() == 0:
+            return 0.0
+        func = {"pearson": stats.pearsonr, "spearman": stats.spearmanr, "kendall": stats.kendalltau}[
+            name
+        ]
+        value = float(func(y_true, y_pred)[0])
+        return 0.0 if math.isnan(value) else value
+
+    return compute
 
 
 PANEL: dict[str, MetricSpec] = {
@@ -341,7 +376,34 @@ def _derive_from_sklearn() -> dict[str, MetricSpec]:
 
 # Curated entries win: PANEL's computes are the ones with their own tests, their
 # own shape validation, and the binary/multiclass handling this project needs.
-REGISTRY: dict[str, MetricSpec] = {**_derive_from_sklearn(), **PANEL}
+# Selectable as a primary metric, but NOT in the always-computed panel.
+#
+# Rank and linear agreement, from scipy — sklearn offers none of the three as
+# scorers. They matter for rating tasks in a way error metrics do not: a prompt
+# that ranks every item correctly but rates everyone three points high scores
+# pearson 1.000 and rmse 3.000, and for a rating the first verdict is usually the
+# useful one because an offset can be calibrated away.
+#
+# Deliberately kept OUT of PANEL. The panel is what every run always computes, so
+# adding to it would change the recorded metric set of every regression run that
+# has ever happened and make old history incomparable to new — for three numbers
+# most tabular runs do not want.
+CURATED_EXTRAS: dict[str, MetricSpec] = {
+    "pearson": MetricSpec(
+        "regression", "maximize", False, _correlation("pearson"), sklearn_func="pearsonr",
+        module="scipy.stats"
+    ),
+    "spearman": MetricSpec(
+        "regression", "maximize", False, _correlation("spearman"), sklearn_func="spearmanr",
+        module="scipy.stats"
+    ),
+    "kendall": MetricSpec(
+        "regression", "maximize", False, _correlation("kendall"), sklearn_func="kendalltau",
+        module="scipy.stats"
+    ),
+}
+
+REGISTRY: dict[str, MetricSpec] = {**_derive_from_sklearn(), **PANEL, **CURATED_EXTRAS}
 
 CLASSIFICATION_METRICS = frozenset(
     name for name, spec in REGISTRY.items() if spec.task == "classification"
@@ -390,6 +452,12 @@ def threshold_free(metric: str) -> bool:
     every time. Class weighting is the same story about ten times weaker.
     """
     return requires_proba(metric)
+
+
+def metric_module(metric: str) -> str:
+    """Where a metric's function can be imported from."""
+    spec = REGISTRY.get(metric)
+    return spec.module if spec is not None else "sklearn.metrics"
 
 
 def sklearn_function(metric: str) -> str:
@@ -516,6 +584,7 @@ def score(
 __all__ = [
     "AVERAGES",
     "CLASSIFICATION_METRICS",
+    "CURATED_EXTRAS",
     "LABEL_METRICS",
     "PANEL",
     "PANEL_METRICS",
@@ -526,6 +595,7 @@ __all__ = [
     "MetricSpec",
     "direction",
     "metric_guidance",
+    "metric_module",
     "requires_proba",
     "resolve_average",
     "score",

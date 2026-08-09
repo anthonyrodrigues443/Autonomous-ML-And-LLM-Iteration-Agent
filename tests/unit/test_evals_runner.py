@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -43,7 +44,7 @@ def test_a_released_version_runs_in_its_own_environment() -> None:
     argv = command_for("0.4.0", DATASET, CONDITIONS)
 
     assert "--no-project" in argv
-    assert "iterate==0.4.0" in argv
+    assert "iterate-ai==0.4.0" in argv
 
 
 def test_the_metric_is_always_explicit() -> None:
@@ -96,3 +97,41 @@ def test_each_cell_gets_its_own_directory(tmp_path: Path) -> None:
     other_version = cell_dir("0.4.0", "churn", 1, tmp_path)
 
     assert len({first, second, other_version}) == 3
+
+
+def test_a_released_version_uses_the_distribution_name() -> None:
+    """`iterate-ai` is the distribution; `iterate` is only the console script and
+    the import. Getting it wrong failed cell 1 of the first grid with "no version of
+    iterate==0.1.3", which reads like a missing release rather than a wrong name."""
+    argv = command_for("0.1.3", DATASET, CONDITIONS)
+
+    assert "iterate-ai==0.1.3" in argv
+    assert "iterate==0.1.3" not in argv
+
+
+def test_a_run_that_never_created_a_database_is_recorded_not_raised(tmp_path: Path) -> None:
+    """`run_cell` promises never to raise so a long sweep survives one bad cell.
+    sqlite3.Error is not an OSError, so a run that died before creating its database
+    raised straight through and killed a 24-cell sweep on the first one.
+    """
+    from evals.runner import CellSpec, run_cell
+
+    dataset = Dataset(
+        name="missing",
+        path=tmp_path / "nope.csv",
+        target="y",
+        metric="f1",
+    )
+    spec = CellSpec(version="dev", dataset=dataset, repeat=1)
+
+    # No CSV, so the subprocess fails instantly and writes no memory.db.
+    (tmp_path / "nope.csv").write_text("a,y\n1,x\n", encoding="utf-8")
+    record = run_cell(
+        spec,
+        replace(CONDITIONS, timeout_minutes=1),
+        work_dir=tmp_path / "work",
+        repo_root=tmp_path,
+    )
+
+    assert record.status != "ok"
+    assert record.error  # the reason is recorded rather than thrown
