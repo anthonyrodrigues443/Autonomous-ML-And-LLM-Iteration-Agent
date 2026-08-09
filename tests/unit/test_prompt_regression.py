@@ -164,3 +164,62 @@ def test_an_unusable_answer_becomes_the_median_never_a_free_pass() -> None:
     refused_rmse = score("regression", truth, refused_two, include=("rmse",))["rmse"]
 
     assert refused_rmse > honest_rmse, "refusing must never score better than answering"
+
+
+def test_the_session_asks_and_scores_the_way_the_host_does(
+    ratings: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The gap my other tests missed: they exercised PromptTarget.baseline(), not
+    the SESSION, and the session is how real runs happen.
+
+    Its `ask` fell back to the label tool and its `evaluate` hardcoded
+    'classification', so on a regression run the agent iterated against a different
+    ruler than the one deciding its score.
+    """
+    import json
+
+    from iterate.core import codegen
+    from iterate.schemas.experiment import Candidate
+
+    class Scripted:
+        model = "scripted"
+
+        def chat(self, messages: list[Message], *, tools: Any = None, **kw: Any) -> ChatResponse:
+            # record what tool shape the session offered
+            Scripted.seen = tools[0].parameters["properties"]["value"]
+            return ChatResponse(
+                model="scripted",
+                tool_calls=[ToolCall(id="1", name="answer", arguments={"value": 2.5})],
+            )
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", lambda *a, **k: Scripted())
+
+    target = PromptTarget(
+        ratings, metric="pearson", task="rate it", target_backend="ollama", target_model="s"
+    )
+    job = target.build_code_job(
+        Candidate(description="x", changes={"code": "pass"}, rationale="r")
+    )
+    for name, blob in job.inputs.items():
+        (tmp_path / name).write_bytes(blob)
+    monkeypatch.chdir(tmp_path)
+
+    meta = json.loads(job.inputs[codegen.META_JSON])
+    assert meta["task_kind"] == "regression"
+    assert meta["numeric_range"] is not None
+    assert meta["median"] is not None
+
+    namespace: dict[str, Any] = {}
+    exec(codegen.prompt_session_preamble(), namespace)
+
+    sample = namespace["X_train"].head(4)
+    answers = namespace["ask"](namespace["BASE"], sample)
+
+    # the session offered a NUMBER tool, not an enum
+    assert Scripted.seen["type"] == "number"
+    assert "minimum" in Scripted.seen
+
+    # and scored with the run's regression metric rather than a classification one
+    value = namespace["evaluate"](answers, namespace["y_train"].head(4))
+    assert isinstance(value, float)
+    assert -1.0 <= value <= 1.0  # a correlation, not an f1

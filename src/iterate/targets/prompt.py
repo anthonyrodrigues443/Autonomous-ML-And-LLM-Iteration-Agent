@@ -266,6 +266,13 @@ class PromptTarget:
             "labels": self._labels,
             "metric": self._metric,
             "family": "prompt",
+            # The session must ask and score the SAME way the host does. Without
+            # these the in-kernel helpers fell back to the label tool and the
+            # classification scorer, so on a regression run the agent iterated
+            # against a different ruler than the one deciding its score.
+            "task_kind": self._task_kind,
+            "numeric_range": list(self._numeric_range) if self._numeric_range else None,
+            "median": median_answer(self._dataset) if self._task_kind == "regression" else None,
             "target_backend": self._target_backend,
             "target_model": self._target_model,
             "target_base_url": self._target_base_url,
