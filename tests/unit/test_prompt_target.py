@@ -556,3 +556,164 @@ def test_the_rebrief_nudge_points_at_the_prompt_ladder() -> None:
     assert "READ THE MISTAKES" in nudge
     assert "lever" not in nudge.casefold()
     assert "few-shot" in nudge
+
+
+# ─── Day 4: what the second example broke ──────────────────────────────────
+
+
+def test_a_label_containing_another_label_still_resolves() -> None:
+    """Measured on the real CLINC intents: "time" is a substring of "timer", so the
+    clear reply "the intent is timer" matched two labels and was thrown away. Two
+    answers were binary-only luck — no two-label set collides, so this could not
+    surface until the second example."""
+    from iterate.core.prompt_runtime import coerce
+
+    labels = ["time", "timer", "transfer", "balance"]
+
+    assert coerce("the intent is timer", labels) == "timer"
+    assert coerce("this is a time question", labels) == "time"
+
+
+def test_a_reply_naming_two_different_labels_is_still_ambiguous() -> None:
+    """The longest-match rule must not turn genuine ambiguity into a confident
+    answer — that would be worse than unparseable, because it is invisible."""
+    from iterate.core.prompt_runtime import UNPARSEABLE, coerce
+
+    labels = ["time", "timer", "transfer", "balance"]
+
+    assert coerce("either transfer or timer", labels) == UNPARSEABLE
+    assert coerce("balance or transfer, unclear", labels) == UNPARSEABLE
+
+
+def test_a_label_inside_a_longer_word_does_not_match() -> None:
+    from iterate.core.prompt_runtime import UNPARSEABLE, coerce
+
+    assert coerce("timers", ["time", "timer"]) == UNPARSEABLE
+    assert coerce("the timekeeper", ["time"]) == UNPARSEABLE
+
+
+@pytest.mark.parametrize(
+    ("answers", "expected"),
+    [
+        (["toxic", "clean"] * 30, "closed_set"),
+        ([f"intent_{i % 20}" for i in range(200)], "closed_set"),
+        ([i % 10 + 1 for i in range(60)], "closed_set"),
+        ([i * 0.37 for i in range(60)], "numeric"),
+        ([f"a unique summary {i}" for i in range(60)], "free_text"),
+        ([f"intent_{i % 150}" for i in range(3000)], "closed_set"),
+    ],
+    ids=["binary", "20-intents", "rating-1-10", "continuous", "free-text", "150-intents"],
+)
+def test_the_answer_column_is_read_correctly(
+    answers: list[Any], expected: str, tmp_path: Path
+) -> None:
+    """A count alone cannot separate 48 intents from 48 one-off sentences, so the
+    share of rows carrying their own answer decides it too."""
+    import pandas as pd
+
+    from iterate.targets.prompt import target_kind
+
+    path = tmp_path / "d.csv"
+    pd.DataFrame({"t": [f"c{i}" for i in range(len(answers))], "y": answers}).to_csv(
+        path, index=False
+    )
+
+    assert target_kind(load_csv(path, target="y", stratify=False)) == expected
+
+
+def test_a_rating_column_leaves_the_task_to_the_metric() -> None:
+    """A 1-to-10 rating is honestly ten ordered classes or a score, depending on how
+    you measure it. Deciding from the dtype here would overrule the user — and for a
+    rating, classification scores 9-vs-10 the same as 1-vs-10."""
+    from iterate.core.scoring import task_for_metric
+
+    assert task_for_metric("f1_macro") == "classification"
+    assert task_for_metric("rmse") == "regression"
+
+
+def test_the_submission_must_come_from_the_model_under_test() -> None:
+    """Nothing stopped a later cell overwriting predictions.csv with a hardcoded
+    rule while prompt.json still sat there. That would score well and would not be
+    prompt engineering at all. Verifiable, so it is a hard rejection rather than a
+    Critic opinion — the same rule as "a leak vetoes, a mirage only flags".
+    """
+    import hashlib
+
+    answers = ["toxic", "not toxic", "toxic"]
+    honest = "\n".join(answers).encode()
+    digest = hashlib.sha256("\n".join(answers).encode()).hexdigest()
+    prompt_json = json.dumps(
+        {"system": "s", "user_template": "{input}", "answers_sha256": digest}
+    ).encode()
+
+    assert codegen.submission_was_swapped(prompt_json, honest) is None
+    swapped = "\n".join(["toxic"] * 3).encode()
+    assert codegen.submission_was_swapped(prompt_json, swapped) is not None
+
+
+def test_a_submission_with_no_fingerprint_is_not_accused() -> None:
+    """Absence of evidence is not evidence. An older run, or a hand-written
+    submission, must pass rather than be rejected on a missing field."""
+    plain = json.dumps({"system": "s", "user_template": "{input}"}).encode()
+
+    assert codegen.submission_was_swapped(plain, b"toxic\nnot toxic") is None
+    assert codegen.submission_was_swapped(None, b"toxic") is None
+    assert codegen.submission_was_swapped(b"not json at all", b"toxic") is None
+
+
+def test_submit_records_what_the_model_answered() -> None:
+    preamble = codegen.prompt_session_preamble()
+
+    assert "answers_sha256" in preamble
+    assert "sha256" in preamble
+
+
+def test_the_critic_asks_prompt_questions_on_a_prompt_run() -> None:
+    """It ran on all three experiments of a live run and returned clean verdicts —
+    correctly, but while asking about scalers and target encoding, which cannot
+    happen on this path."""
+    from iterate.prompts import PROMPTS
+
+    prompt_side = PROMPTS["critic"]["prompt_system"]
+    tabular_side = PROMPTS["critic"]["system"]
+
+    assert "lookup" in prompt_side
+    assert "keyword match" in prompt_side
+    for tabular_only in ("scaler", "target encoding", "fit_transform"):
+        assert tabular_only not in prompt_side
+    assert "scaler" in tabular_side
+
+
+def test_the_researcher_searches_for_prompting_literature() -> None:
+    from iterate.prompts import PROMPTS
+
+    queries = PROMPTS["researcher"]["prompt_queries_system"]
+
+    assert "TABULAR" not in queries
+    assert "few-shot" in queries
+    assert "fine-tuning" in queries  # named as a NON-lever, so it is not searched for
+
+
+def test_a_large_closed_set_keeps_its_kind_but_loses_the_enum(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bug my own check found: conflating "too many for an enum" with "not a
+    closed set" refused full CLINC150 — 150 intents in 2400 rows — as free text.
+    The ratio decides the kind; the cap only decides whether an enum is feasible,
+    and dropping the enum has to be said out loud because it removes the guarantee
+    that an answer is in the set.
+    """
+    import pandas as pd
+
+    from iterate.targets.prompt import label_set, target_kind
+
+    path = tmp_path / "many.csv"
+    pd.DataFrame(
+        {"t": [f"c{i}" for i in range(3000)], "y": [f"intent_{i % 150}" for i in range(3000)]}
+    ).to_csv(path, index=False)
+    dataset = load_csv(path, target="y", stratify=False)
+
+    assert target_kind(dataset) == "closed_set"
+    with caplog.at_level("WARNING"):
+        assert label_set(dataset) is None
+    assert "more than the 50-item answer tool" in caplog.text

@@ -1,0 +1,6 @@
+data = "examples/toxicity_jigsaw/data.csv"
+target = "label"
+metric = "f1"
+task = "decide whether this Wikipedia comment is toxic"
+source = "Jigsaw Toxic Comment Classification (HuggingFace mirror)"
+notes = "The binary prompt example. A minimal prompt measured at f1 0.8611 on gemma4:12b across three runs."

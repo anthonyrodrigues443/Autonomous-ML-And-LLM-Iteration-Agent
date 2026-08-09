@@ -5,12 +5,21 @@ Public-dataset demos that ship with `iterate`.
 | Example | Target family | Dataset | Status |
 |---|---|---|---|
 | `churn_tabular/` | `ModelTarget` | Public Kaggle churn dataset (Telco) | **working, the headline demo** |
-| `toxicity_jigsaw/` | `PromptTarget` | Jigsaw Toxic Comment Classification (public) | placeholder, lands with v0.5 (prompt iteration) |
-| `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | placeholder, lands with v0.5 |
+| `toxicity_jigsaw/` | `PromptTarget` | Jigsaw Toxic Comment Classification (public) | **working**, binary |
+| `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | **working** — but measured at f1_macro 0.989 for a minimal prompt, so it has almost no headroom |
+| `hate_speech_davidson/` | `PromptTarget` | Davidson hate / offensive / neither (public) | **working, the prompt example worth running** |
 
-The two `PromptTarget` directories are intentionally empty for now: `PromptTarget`
-does not exist yet (roadmap v0.5, sprint 3). They mark where the pluggability proof
-will live so the layout does not churn later.
+### Which prompt example to run
+
+**`hate_speech_davidson`.** Measured headroom of 0.096 against a 0.586 baseline: the
+model genuinely cannot separate hate speech from merely offensive without being told
+where the line falls, and 29.5% of the raw rows had the three annotators disagree.
+That contested boundary is where prompt wording earns its keep.
+
+`intent_clinc150` is kept because multiclass is worth exercising, but a minimal
+prompt already scores 0.989 on it — about one error in a hundred. There is nothing
+for prompt iteration to find, so a run there demonstrates the plumbing and not the
+capability. Ceilings for all of these live in [evals/RESULTS.md](../evals/RESULTS.md).
 
 ## These datasets are also the eval corpus
 

@@ -90,6 +90,44 @@ engineering, this ceiling underestimates. Adding feature treatments (target
 encoding, interactions, scaling) is `v2` of the sweep, and until then the sweep
 version in `method` is what says which kind of ceiling a number is.
 
+## Two kinds of ceiling
+
+A `task` line in a dataset's `dataset.toml` marks it as a PROMPT dataset and selects
+a different sweep. Both answer the same question — what is achievable here, with no
+LLM deciding — and both are lower bounds.
+
+**Tabular: model families.** Nine estimators through the real `ModelTarget`.
+
+**Prompt: techniques.** Six standard prompt moves, built mechanically from the task
+line, the label set and rows sampled from TRAINING data:
+
+```
+minimal · define-the-labels · few-shot · reasoning · expert-role · define-plus-few-shot
+```
+
+Nothing here is hand-written for a particular dataset, which is what keeps it a fair
+floor rather than a target someone tuned. Model families transfer between datasets;
+prompt wording does not, so only the FORM is fixed.
+
+Few-shot examples come from training rows only. Taken from the holdout they would
+raise the bar using answers the agent is never allowed to see, and every capture
+fraction measured against that ceiling would be wrong.
+
+**It cost about 80 minutes for two datasets** (6 techniques x 200 records x 2, at
+~3.2s a call on a local 12B). The answer cache makes a re-measure free.
+
+Measured 2026-08-09:
+
+| dataset | baseline | ceiling | best technique | headroom |
+|---|---|---|---|---|
+| toxicity_jigsaw | 0.8398 | 0.8681 | define-plus-few-shot | 0.028 |
+| hate_speech_davidson | 0.5862 | 0.6822 | few-shot | 0.096 |
+
+Two things worth knowing from that first run. `define-the-labels` ALONE scored worse
+than minimal on both datasets — telling a small model to be precise about boundaries
+without showing it any is actively harmful. And the best technique differs by
+dataset, so there is no single prompt shape to hardcode.
+
 ## Two corpora, one word
 
 - **the benchmark corpus** (`datasets/`) — real data, ceilings, LLM runs, hours

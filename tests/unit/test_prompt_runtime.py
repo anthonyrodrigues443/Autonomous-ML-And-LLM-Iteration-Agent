@@ -348,3 +348,16 @@ def test_ollama_gets_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
     make_ask(columns=["text"], labels=LABELS, backend="ollama", model="gemma4:12b")(PROMPT, ROWS)
 
     assert seen["api_key"] is None
+
+
+def test_a_contained_label_does_not_swallow_a_genuine_ambiguity() -> None:
+    """The regression my own longest-match fix introduced, and the reason coercion
+    scans by POSITION rather than comparing labels to each other.
+
+    "toxic" is a substring of "not toxic", so comparing labels made a reply naming
+    both look like a single confident answer. A confident wrong answer is worse than
+    an unparseable one because it is invisible.
+    """
+    assert coerce("could be toxic or not toxic", ["toxic", "not toxic"]) == UNPARSEABLE
+    assert coerce("not toxic", ["toxic", "not toxic"]) == "not toxic"
+    assert coerce("I think this is toxic", ["toxic", "not toxic"]) == "toxic"

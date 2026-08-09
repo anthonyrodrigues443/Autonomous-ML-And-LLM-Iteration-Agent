@@ -626,6 +626,23 @@ critic:
 
     Be conservative in both. A false leak report throws away a real result. Report leak=false and mirage=false whenever the evidence is not in front of you. Call review_experiment; respond with nothing else.
 
+  # The PROMPT family's counterpart. The tabular questions are about pipelines —
+  # scalers fitted on combined frames, target encoding over all rows — none of which
+  # can happen here, so it was spending a call per experiment asking things that
+  # could not apply. The holdout answers never enter the session, so the classic
+  # leak is structurally impossible; what CAN go wrong is different.
+  # Placeholders: {metric}, {direction}
+  prompt_system: |-
+    You review one finished PROMPT experiment for HONESTY, not for quality. The score is '{metric}' ({direction}) measured on a sealed holdout whose answers were never inside the session. Someone else already decided whether the number is an improvement; your job is whether the number can be believed.
+
+    What you are reading is a session that wrote a prompt, ran it over records via `ask`, and submitted with `submit(prompt)`. The holdout's answers are not on the machine, so a prompt cannot contain them and the classic leak cannot happen. Do not go looking for it.
+
+    LEAK — was the score produced by something other than the prompt? Look for: predictions written by a rule, a lookup or a keyword match rather than by the model's answers; the holdout rows filtered, reordered or truncated before submitting; a prompt that hardcodes the answer for specific inputs it will be tested on. Only report what you can point at in the code shown. A prompt that states a general rule ("comments quoting abuse to condemn it are not toxic") is GOOD PROMPT ENGINEERING, not a leak, however specific it sounds.
+
+    MIRAGE — is the gain likely to be luck? The host states below whether the holdout beat the sample the session measured on; trust that over your own reading. Report a mirage only when the host says the holdout is BETTER and the gap is large relative to the wobble in the trail. Few-shot examples chosen from the SAME rows the session measured on are the common cause here, and worth flagging.
+
+    Be conservative in both. A false leak report throws away a real result. Report leak=false and mirage=false whenever the evidence is not in front of you. Call review_experiment; respond with nothing else.
+
   # Placeholders: {metric}, {score}, {previous_best}, {val_trail}, {comparison}, {code}
   user_template: |-
     Holdout {metric}: {score}
@@ -729,6 +746,22 @@ researcher:
     Write 2 or 3 SHORT search queries (4 to 8 words each), each attacking a DIFFERENT angle of this specific problem. Ground every query in the actual data profile below: its size, its class balance, the kinds of columns it really has. A query about image augmentation or text embeddings is wasted here, and so is a query about a column this dataset does not contain.
 
     Good queries name a technique family plus the data condition that motivates it ("target encoding high cardinality categorical", "class imbalance tabular boosting", "feature interactions gradient boosted trees"). Bad queries are generic ("machine learning", "improve accuracy") or name a specific library.
+
+    Do not repeat an angle already exhausted this run. Call plan_queries; respond with nothing else.
+
+  # The PROMPT family's counterpart. The tabular wording says "TABULAR dataset" and
+  # steers toward encodings and boosting, so on a prompt run it searched for
+  # techniques that cannot be applied. This asks the literature the question the
+  # run is actually asking.
+  # Placeholders: {metric}, {direction}
+  prompt_queries_system: |-
+    You turn a PROMPT-ENGINEERING problem into literature search queries. A fixed model is being asked to answer one question per record, and you are optimizing '{metric}' ({direction}) by changing the PROMPT — nothing else about the model can change.
+
+    Write 2 or 3 SHORT search queries (4 to 8 words each), each attacking a DIFFERENT angle. Ground every query in the actual task and the mistakes below. A query about fine-tuning, training data or model architecture is wasted here: none of those are levers.
+
+    Good queries name a prompting technique plus the condition that motivates it ("few-shot example selection classification", "chain of thought short classification tasks", "label definition ambiguity annotation guidelines", "calibrating LLM classifiers rubric"). Bad queries are generic ("prompt engineering", "improve accuracy") or name a product.
+
+    Annotation-guideline and inter-annotator-agreement literature is often the most useful thing here: the same edge cases that make humans disagree are the ones the model gets wrong, and those papers state the rules explicitly.
 
     Do not repeat an angle already exhausted this run. Call plan_queries; respond with nothing else.
 

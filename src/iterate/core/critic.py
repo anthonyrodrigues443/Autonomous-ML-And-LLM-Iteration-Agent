@@ -114,12 +114,14 @@ class Critic:
         client: LLMClient,
         *,
         metric: str,
+        family: str = "tabular",
         direction: str,
         temperature: float = 0.2,
         max_tokens: int = 512,
     ) -> None:
         self._client = client
         self._metric = metric
+        self._family = family
         self._direction = direction
         self._temperature = temperature
         self._max_tokens = max_tokens
@@ -162,7 +164,9 @@ class Critic:
         messages = [
             Message(
                 role="system",
-                content=_PROMPTS["system"].format(
+                content=_PROMPTS[
+                    "prompt_system" if self._family == "prompt" else "system"
+                ].format(
                     metric=self._metric, direction=self._direction
                 ),
             ),

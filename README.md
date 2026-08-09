@@ -16,7 +16,7 @@ iterate run --data examples/churn_tabular/data.clean.csv --target Churn
 # (--metric is optional now: omit it and the agent picks one from your data, and says why)
 ```
 
-`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 652 unit tests across 51 files run in CI on every push.
+`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 762 unit tests across 57 files run in CI on every push.
 
 | v0.4 today | On the roadmap |
 |---|---|
@@ -53,7 +53,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 | v0.2 | **Sandboxed code-gen + the multi-agent cell-by-cell system** (Supervisor, coding agent, Summarizer) + notebook deliverable + the deterministic guard stack | shipped |
 | v0.3 | **Interactive runs**: terminal UI (live transcript + input box), plain-English chat with queued delivery, pause / resume / stop, notebook Q&A, standing rules | shipped |
 | v0.4 | **Researcher + Critic specialists**: literature-grounded proposals with real citations, leak review before a score banks; agent picks the metric + starting model; probability metrics | shipped |
-| v0.5 | `PromptTarget`: agentic prompt iteration | planned |
+| v0.5 | **`PromptTarget`: agentic prompt iteration** — you give a labelled eval set and a one-line task, the agent writes a prompt, reads what it got wrong, and rewrites it. Classification and regression | in progress |
 | v0.6 | `DLModelTarget`: vision transfer learning, validated on a local RTX 4050 | planned |
 | v0.7 | **Cost-constrained recommendation** + serving profile + `iterate cost` | planned |
 | v0.9 | Infer features/target from the data + a description; **MCP discovery** of the data/code itself (absorbs the v0.8 milestone) | planned |
@@ -166,7 +166,7 @@ Useful flags: `--max-iterations`, `--patience`, `--until` (wall-clock bound), `-
 |---|---|---|
 | `ModelTarget` | Trains a tabular model, scores it on a sealed holdout | **shipped (v0.1, code-gen in v0.2)** |
 | `DLModelTarget` | Transfer-learns a vision model, scores it | planned (v0.6) |
-| `PromptTarget` | Runs an LLM prompt against an eval set, scores outputs | planned (v0.5) |
+| `PromptTarget` | Runs an LLM prompt against a labelled eval set, one model call per record, scored on a sealed holdout | v0.5 |
 
 All inherit from `BenchmarkTarget`. Same iteration loop, different execution path. (LLMs are **prompt-iteration only**; we don't fine-tune foundation models.)
 
@@ -219,7 +219,7 @@ src/iterate/
 | Persistent memory across sessions | ✗ | log only | ✗ | ✗ | **✓ shipped** |
 | Bounded autonomy (deadline / patience) | ✗ | ✗ | ✗ | partial | **✓ shipped** |
 | Auditable reasoning trail (runnable notebooks) | ✗ | ✗ | ✗ | basic | **✓ shipped** |
-| Iterates LLM prompts | ✗ | ✗ | eval only | ✗ | planned v0.5 |
+| Iterates LLM prompts | ✗ | ✗ | eval only | ✗ | v0.5 |
 | Iterates DL / vision models | partial | ✗ | ✗ | partial | planned v0.6 |
 | Literature-aware proposals | ✗ | ✗ | ✗ | partial | ✓ |
 | Cost-to-serve-aware optimization | ✗ | ✗ | ✗ | ✗ | planned v0.7 |

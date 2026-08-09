@@ -1,0 +1,6 @@
+data = "examples/hate_speech_davidson/data.csv"
+target = "label"
+metric = "f1_macro"
+task = "decide whether this tweet is hate speech, merely offensive, or neither"
+source = "Davidson et al., hate-speech-and-offensive-language (GitHub)"
+notes = "Chosen for measured headroom: 29.5% of the raw rows had the three annotators disagree, so the hate-vs-offensive boundary is genuinely contested and prompt wording decides it."
