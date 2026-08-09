@@ -14,12 +14,25 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from evals import ceilings as ceilings_mod
 from evals import config as config_mod
-from evals import corpus, report
-from evals.runner import CellSpec, command_for, run_cell
+from evals import corpus, prompt_ceilings, report
+from evals.runner import CellSpec, command_for, run_cell, supports_dataset
 from evals.store import STATUS_OK, Store
+
+
+def _say(*args: Any, **kwargs: Any) -> None:
+    """print, always flushed.
+
+    A ceiling sweep is hours, and `print` to a redirected file is block-buffered —
+    so `make eval-ceilings > log` showed NOTHING for 76 minutes while working
+    perfectly. Same failure as the prompt path's silent baseline, reintroduced here
+    because this module prints rather than logs.
+    """
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
 
 
 def _harness_sha() -> str:
@@ -44,7 +57,7 @@ def _available(names: list[str] | None) -> list[corpus.Dataset]:
     selected = corpus.select(names)
     missing = [d for d in selected if not d.available]
     for dataset in missing:
-        print(f"  skip {dataset.name}: no data at {dataset.path}")
+        _say(f"  skip {dataset.name}: no data at {dataset.path}")
     return [d for d in selected if d.available]
 
 
@@ -55,7 +68,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     versions = _split(args.versions) or config.versions
     datasets = _available(_split(args.datasets))
     if not datasets:
-        print("no datasets available; nothing to sweep")
+        _say("no datasets available; nothing to sweep")
         return 1
 
     work_dir = Path(args.work_dir)
@@ -67,25 +80,30 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             for version in versions
             for dataset in datasets
             for repeat in range(1, conditions.repeats + 1)
-            if (version, dataset.name, dataset.content_hash(), repeat) not in done
+            if supports_dataset(version, dataset)
+            and (version, dataset.name, dataset.content_hash(), repeat) not in done
         ]
+        for version in versions:
+            skipped = [d.name for d in datasets if not supports_dataset(version, d)]
+            if skipped:
+                _say(f"  {version}: skipping {', '.join(skipped)} (predates PromptTarget)")
 
-        print(
+        _say(
             f"{len(todo)} cells to run "
             f"({len(versions)} versions x {len(datasets)} datasets x {conditions.repeats} repeats, "
             f"{len(done)} already recorded)"
         )
         if args.dry_run:
             for spec in todo:
-                print(f"  {spec.version} {spec.dataset.name} #{spec.repeat}")
-                print(f"    {' '.join(command_for(spec.version, spec.dataset, conditions))}")
+                _say(f"  {spec.version} {spec.dataset.name} #{spec.repeat}")
+                _say(f"    {' '.join(command_for(spec.version, spec.dataset, conditions))}")
             return 0
         if not todo:
             return 0
 
         sweep_id = store.start_sweep(conditions, harness_sha=_harness_sha(), note=args.note)
         for index, spec in enumerate(todo, start=1):
-            print(
+            _say(
                 f"[{index}/{len(todo)}] {spec.version} {spec.dataset.name} #{spec.repeat} ... ",
                 end="",
                 flush=True,
@@ -94,7 +112,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             store.record_cell(sweep_id, cell)
             minutes = (cell.duration_seconds or 0) / 60
             detail = f"best={cell.best:.4f}" if cell.best is not None else "no improvement"
-            print(f"{cell.status} ({detail}, {minutes:.0f}m)")
+            _say(f"{cell.status} ({detail}, {minutes:.0f}m)")
         store.finish_sweep(sweep_id)
 
     return cmd_report(args)
@@ -104,7 +122,7 @@ def cmd_ceilings(args: argparse.Namespace) -> int:
     config = config_mod.load()
     datasets = _available(_split(args.datasets))
     if not datasets:
-        print("no datasets available; nothing to measure")
+        _say("no datasets available; nothing to measure")
         return 1
 
     with Store(args.store) as store:
@@ -112,32 +130,49 @@ def cmd_ceilings(args: argparse.Namespace) -> int:
             data_hash = dataset.content_hash()
             existing = store.get_ceiling(dataset.name, data_hash, dataset.metric)
             if existing and not args.force:
-                print(
+                _say(
                     f"{dataset.name}: have {existing.ceiling:.4f} from {existing.measured_at[:10]}"
                 )
                 continue
 
-            print(f"{dataset.name} ({dataset.metric}) sweeping:")
+            kind = "prompt techniques" if dataset.is_prompt_task else "model families"
+            _say(f"{dataset.name} ({dataset.metric}) sweeping {kind}:")
 
-            def show(result: ceilings_mod.SpecResult) -> None:
+            def show(result: Any) -> None:
+                label = getattr(result, "label", None) or result.name
                 value = (
                     f"{result.score:.4f}"
                     if result.score is not None
                     else f"skip ({result.error[:60]})"
                 )
-                print(f"    {result.label:<60} {value}  {result.seconds:.0f}s")
+                _say(f"    {label:<44} {value}  {result.seconds:.0f}s")
 
             try:
-                ceiling, _ = ceilings_mod.sweep(
-                    dataset, threads=config.conditions.sweep_threads, on_progress=show
-                )
+                if dataset.is_prompt_task:
+                    # One model call per record per technique — the slow one, but it
+                    # is the only thing that makes a prompt run's number readable,
+                    # and the answer cache makes a re-measure free.
+                    ceiling, _ = prompt_ceilings.sweep(
+                        dataset,
+                        task=dataset.task,
+                        target_backend=config.conditions.backend,
+                        target_model=config.conditions.model,
+                        cache_path=str(
+                            (config_mod.REPO_ROOT / ".iterate" / "prompt-answers.db").resolve()
+                        ),
+                        on_progress=show,
+                    )
+                else:
+                    ceiling, _ = ceilings_mod.sweep(
+                        dataset, threads=config.conditions.sweep_threads, on_progress=show
+                    )
             except Exception as exc:
-                print(f"  FAILED: {type(exc).__name__}: {exc}")
+                _say(f"  FAILED: {type(exc).__name__}: {exc}")
                 continue
 
             store.put_ceiling(ceiling)
             gap = f", baseline {ceiling.baseline:.4f}" if ceiling.baseline is not None else ""
-            print(f"  ceiling {ceiling.ceiling:.4f}{gap}")
+            _say(f"  ceiling {ceiling.ceiling:.4f}{gap}")
     return 0
 
 
@@ -147,26 +182,26 @@ def cmd_report(args: argparse.Namespace) -> int:
         markdown = report.build(store, config)
     out = Path(args.out)
     out.write_text(markdown, encoding="utf-8")
-    print(f"wrote {out}")
+    _say(f"wrote {out}")
     return 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
     config = config_mod.load()
-    print(f"conditions: {config.conditions.fingerprint()}  model={config.conditions.model}")
-    print(f"versions:   {', '.join(config.versions)}")
-    print("datasets:")
+    _say(f"conditions: {config.conditions.fingerprint()}  model={config.conditions.model}")
+    _say(f"versions:   {', '.join(config.versions)}")
+    _say("datasets:")
     with Store(args.store) as store:
         cells = store.cells(config.conditions.fingerprint())
         for dataset in corpus.load():
             if not dataset.available:
-                print(f"  {dataset.name:<24} MISSING  {dataset.path}")
+                _say(f"  {dataset.name:<24} MISSING  {dataset.path}")
                 continue
             data_hash = dataset.content_hash()
             ceiling = store.get_ceiling(dataset.name, data_hash, dataset.metric)
             done = sum(1 for c in cells if c.dataset == dataset.name and c.status == STATUS_OK)
             bar = f"{ceiling.ceiling:.4f}" if ceiling else "unmeasured"
-            print(
+            _say(
                 f"  {dataset.name:<24} {dataset.metric:<20} hash={data_hash} "
                 f"ceiling={bar:<12} cells={done}"
             )

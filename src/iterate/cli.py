@@ -161,6 +161,13 @@ def run(
     target_backend: str | None = typer.Option(
         None, "--target-backend", help="Backend for the model under test. Defaults to --backend."
     ),
+    allow_free_text: bool = typer.Option(
+        False,
+        "--allow-free-text",
+        help="Prompt runs only: score a free-text answer column on EXACT string "
+        "matches. Off by default because a correct answer worded differently scores "
+        "as wrong, which produces a confident and meaningless zero.",
+    ),
     loop_holdout: int = typer.Option(
         100,
         "--loop-holdout",
@@ -431,6 +438,7 @@ def run(
             # 100-minute run and 298 at the end, with three sessions re-paying for
             # the same baseline measurement in full.
             cache_path=(Path(settings.iterate_runs_dir).parent / "prompt-answers.db").resolve(),
+            allow_free_text=allow_free_text,
         )
     else:
         model_target = ModelTarget(dataset, metric=metric, average=average)
@@ -470,12 +478,18 @@ def run(
         # Same no-think client as the other strict roles: the Researcher must emit
         # a single structured tool call, and a thinking trace crowds that out.
         # Cached beside the runs so a re-run on the same data pays nothing.
-        critic_agent = Critic(client, metric=metric, direction=direction) if critique else None
+        critic_agent = Critic(
+            client,
+            metric=metric,
+            direction=direction,
+            family="prompt" if is_prompt_run else "tabular",
+        ) if critique else None
         researcher = (
             Researcher(
                 client,
                 metric=metric,
                 direction=direction,
+                family="prompt" if is_prompt_run else "tabular",
                 cache_dir=Path(settings.iterate_runs_dir).parent / "research",
             )
             if research
@@ -841,9 +855,24 @@ def _build_prompt_target(
     model: str | None,
     base_url: str | None,
     cache_path: Path,
+    allow_free_text: bool = False,
 ) -> Any:
     from iterate.core.scoring import requires_proba
-    from iterate.targets.prompt import PromptTarget
+    from iterate.targets.prompt import PromptTarget, target_kind
+
+    if target_kind(dataset) == "free_text" and not allow_free_text:
+        # Refused BEFORE the run rather than scored afterwards. Exact-string
+        # matching rates three genuinely correct summaries at 0.0000, so without
+        # this a summarisation dataset gets a confident, meaningless zero — worse
+        # than an error, because it looks like an answer.
+        distinct = int(dataset.train_target.dropna().nunique())
+        raise typer.BadParameter(
+            f"the answer column has {distinct} distinct values and almost every row "
+            "differs, which reads as free text. A prompt run scores one answer "
+            "against a known set or a number; iterate has no metric for free-form "
+            "text yet, and exact-string matching would score correct answers as "
+            "wrong. Pass --allow-free-text to score on exact matches anyway."
+        )
 
     if requires_proba(metric):
         # Checked before anything runs, in the same spirit as validating a metric

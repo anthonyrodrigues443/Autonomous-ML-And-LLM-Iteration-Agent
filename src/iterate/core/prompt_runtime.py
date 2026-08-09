@@ -31,6 +31,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -177,8 +178,26 @@ def coerce(text: str | None, labels: Sequence[str] | None) -> str:
         if normalised == str(label).strip().casefold():
             return str(label)
 
-    hits = [str(label) for label in labels if str(label).strip().casefold() in normalised]
-    return hits[0] if len(hits) == 1 else UNPARSEABLE
+    # Scanned by POSITION, longest alternative first, rather than by comparing
+    # labels to one another. Two failures shaped this:
+    #
+    #   "the intent is timer"        -> "time" also matched, so a clear reply was
+    #                                   thrown away as ambiguous (real CLINC labels)
+    #   "could be toxic or not toxic" -> comparing labels made "toxic" look like a
+    #                                   substring of "not toxic" and swallowed a
+    #                                   genuine ambiguity into a confident answer
+    #
+    # A positional scan gets both right: at the one place "timer" appears only
+    # "timer" is taken, while "toxic ... not toxic" yields two matches at two
+    # places. Word boundaries stop "time" matching inside "timekeeper".
+    ordered = sorted((str(label).strip() for label in labels), key=len, reverse=True)
+    pattern = "|".join(re.escape(label.casefold()) for label in ordered)
+    found = re.findall(rf"(?<!\w)(?:{pattern})(?!\w)", normalised)
+    distinct = set(found)
+    if len(distinct) != 1:
+        return UNPARSEABLE
+    matched = distinct.pop()
+    return next(str(label) for label in labels if str(label).strip().casefold() == matched)
 
 
 def _one(

@@ -221,8 +221,16 @@ def prompt_session_preamble() -> str:
         "def submit(prompt):\n"
         "    answers = ask(prompt, X_holdout)\n"
         f"    pd.Series(answers).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
+        # The fingerprint of what the MODEL actually answered, written alongside the
+        # prompt. Nothing stops a later cell overwriting predictions.csv with a
+        # hardcoded rule while prompt.json still sits there — that would score well
+        # and not be prompt engineering at all. The host compares this against the
+        # predictions it reads, so a swapped submission is detectable rather than
+        # merely discouraged.
+        "    import hashlib as _hl\n"
+        "    _digest = _hl.sha256(chr(10).join(str(a) for a in answers).encode()).hexdigest()\n"
         f"    with open({PROMPT_JSON!r}, 'w') as _f:\n"
-        "        json.dump(prompt.as_dict(), _f)\n"
+        "        json.dump({**prompt.as_dict(), 'answers_sha256': _digest}, _f)\n"
         "    print('submitted', len(answers), 'answers for the holdout')\n"
         "    return answers\n"
         "def finish(*args, **kwargs):\n"
@@ -318,6 +326,35 @@ def fallback_baseline(task: str, *, with_proba: bool = False) -> str:
         f"pd.Series(_fb_model.predict(_fb_Xh)).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
         + proba_line
         + "print('fallback baseline banked', len(_fb_Xh), 'predictions')\n"
+    )
+
+
+def submission_was_swapped(prompt_json: bytes | None, predictions: bytes | None) -> str | None:
+    """Why the scored predictions are not the ones `submit()` produced, or None.
+
+    `submit()` records the sha256 of the answers the model gave. If predictions.csv
+    no longer matches, a later cell replaced it — a hardcoded rule, a lookup, a
+    hand-edited file. That would score, and it would not be prompt engineering.
+
+    Absent fingerprint means an older or hand-written submission, which is not
+    evidence of anything and passes.
+    """
+    if not prompt_json or not predictions:
+        return None
+    try:
+        recorded = json.loads(prompt_json).get("answers_sha256")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not recorded:
+        return None
+    import hashlib
+
+    actual = hashlib.sha256(predictions.decode(errors="replace").strip().encode()).hexdigest()
+    if actual == recorded:
+        return None
+    return (
+        "predictions.csv does not match the answers submit() produced, so the "
+        "submitted predictions did not come from the model under test"
     )
 
 

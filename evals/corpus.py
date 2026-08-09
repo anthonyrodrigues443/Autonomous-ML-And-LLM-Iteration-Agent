@@ -46,6 +46,14 @@ class Dataset:
     metric: str
     source: str = ""
     notes: str = ""
+    # Present only on a PROMPT dataset: the one-line job description a run is given.
+    # Its presence is what tells the harness to sweep prompt techniques for this
+    # dataset's ceiling rather than model families.
+    task: str = ""
+
+    @property
+    def is_prompt_task(self) -> bool:
+        return bool(self.task.strip())
 
     @property
     def available(self) -> bool:
@@ -93,6 +101,7 @@ def _load_one(spec_path: Path) -> Dataset:
         metric=str(raw["metric"]),
         source=str(raw.get("source", "")),
         notes=str(raw.get("notes", "")),
+        task=str(raw.get("task", "")),
     )
 
 

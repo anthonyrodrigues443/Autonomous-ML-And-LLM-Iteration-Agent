@@ -109,3 +109,46 @@ def test_the_users_prompt_becomes_the_baseline(eval_csv: Path, tmp_path: Path) -
     target = _target(eval_csv, prompt_file=path)
 
     assert target.baseline_prompt.system == "my production prompt"
+
+
+def test_a_free_text_answer_column_is_refused_before_the_run(tmp_path: Path) -> None:
+    """Exact-string matching rates three genuinely correct summaries at 0.0000. A
+    confident meaningless zero is worse than an error, because it looks like an
+    answer."""
+    lines = ["text,summary"] + [f"input {i},a distinct summary of item {i}" for i in range(60)]
+    path = tmp_path / "summaries.csv"
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+    with pytest.raises(typer.BadParameter, match="free text"):
+        _build_prompt_target(
+            load_csv(path, target="summary", stratify=False),
+            metric="f1",
+            average=None,
+            task="summarise the input",
+            prompt_file=None,
+            backend="ollama",
+            model="gemma4:12b",
+            base_url=None,
+            cache_path=tmp_path / "answers.db",
+        )
+
+
+def test_free_text_can_be_forced_with_eyes_open(tmp_path: Path) -> None:
+    lines = ["text,summary"] + [f"input {i},a distinct summary of item {i}" for i in range(60)]
+    path = tmp_path / "summaries.csv"
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+    target = _build_prompt_target(
+        load_csv(path, target="summary", stratify=False),
+        metric="f1",
+        average=None,
+        task="summarise the input",
+        prompt_file=None,
+        backend="ollama",
+        model="gemma4:12b",
+        base_url=None,
+        cache_path=tmp_path / "answers.db",
+        allow_free_text=True,
+    )
+
+    assert target.labels is None  # no enum to constrain with

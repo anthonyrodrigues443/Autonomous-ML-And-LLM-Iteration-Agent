@@ -32,6 +32,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+import pandas as pd
+
 from iterate.adapters.compute.base import CodeJob
 from iterate.core import codegen
 from iterate.core.prompt_runtime import UNPARSEABLE, AskStats, make_ask
@@ -50,8 +52,52 @@ log = logging.getLogger(__name__)
 
 # Above this many distinct answers the target is treated as free text rather than a
 # closed label set, so the answer tool stops constraining and parsing takes over.
+# The enum the answer tool can carry before a prompt is mostly a list of options.
 _MAX_LABELS = 50
+# Above this share of rows carrying their own distinct answer, the column is one-off
+# text rather than a set of categories — 48 unique summaries in 60 rows is not a
+# 48-class problem, and a count alone cannot tell the two apart.
+_MOSTLY_UNIQUE = 0.5
 _OUTPUT_TAIL_CHARS = 2000
+
+
+class UnscorableTargetError(Exception):
+    """The answer column is something this target has no honest way to score."""
+
+
+def target_kind(dataset: TabularDataset) -> str:
+    """`closed_set`, `numeric`, or `free_text` — what the answer column IS.
+
+    Deliberately NOT the same question as "classification or regression". That one
+    is settled by the metric, as it is everywhere else in this codebase
+    (`task_for_metric`), because a 1-to-10 rating is honestly either: ten ordered
+    classes if you score it with f1, a score if you score it with rmse or a
+    correlation. Deciding it here from the dtype would quietly overrule the user.
+
+    What this DOES decide is whether the target can be scored at all. Two signals,
+    because a count alone cannot separate 48 intents from 48 one-off sentences:
+
+    * more distinct answers than the enum can carry, AND
+    * nearly every row carrying its own answer
+
+    Both true means free text, which is not something this target can score
+    honestly — exact-string matching rates three correct summaries at 0.0000.
+    """
+    from iterate.adapters.data.tabular import looks_like_classification
+
+    target = dataset.train_target.dropna()
+    distinct = int(target.nunique())
+    rows = max(1, len(target))
+
+    if pd.api.types.is_numeric_dtype(target) and not looks_like_classification(target):
+        return "numeric"
+    # The RATIO decides this, not the count. Conflating the two refused full
+    # CLINC150 — 150 intents across 2400 rows, ratio 0.06 — as free text, which is
+    # plainly wrong: it is a closed set, just a big one. Whether those answers FIT
+    # in an enum is a separate question, answered by `label_set`.
+    if distinct / rows <= _MOSTLY_UNIQUE:
+        return "closed_set"
+    return "numeric" if pd.api.types.is_numeric_dtype(target) else "free_text"
 
 
 def label_set(dataset: TabularDataset) -> list[str] | None:
@@ -61,9 +107,27 @@ def label_set(dataset: TabularDataset) -> list[str] | None:
     into every call, including labels that appear nowhere in training. A label the
     training data never shows is one the agent has no way to know about, and the
     model should not be handed it either.
+
+    None when the target is not a closed set — the answer tool then stops
+    constraining and coercion does the work instead.
     """
+    if target_kind(dataset) != "closed_set":
+        return None
     values = sorted({str(v) for v in dataset.train_target.dropna().unique()})
-    return values if 0 < len(values) <= _MAX_LABELS else None
+    if len(values) > _MAX_LABELS:
+        # A real closed set, too large to put in every call. Dropping the enum is
+        # the right call — the prompt would otherwise be mostly a list of options —
+        # but it removes the guarantee that an answer is IN the set, so coercion
+        # takes over and the user is told rather than left to find out.
+        log.warning(
+            "%d distinct answers is more than the %d-item answer tool can carry, so "
+            "replies are matched by text instead of constrained. Expect more "
+            "unparseable answers; narrowing the label set usually scores better.",
+            len(values),
+            _MAX_LABELS,
+        )
+        return None
+    return values
 
 
 def majority_answer(dataset: TabularDataset) -> str:

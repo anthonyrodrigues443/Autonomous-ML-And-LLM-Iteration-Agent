@@ -397,14 +397,17 @@ class CodingAgent:
             # nothing in it but the baseline. Measured: a run improved f1 three
             # times and delivered none of the three prompts.
             if (submitted := self._kernel.read_output(codegen.PROMPT_JSON)) is not None:
-                result = result.model_copy(
-                    update={
-                        "artifacts": {
-                            **result.artifacts,
-                            codegen.PROMPT_JSON: submitted.decode(errors="replace"),
-                        }
-                    }
-                )
+                artifacts = {**result.artifacts, codegen.PROMPT_JSON: submitted.decode(errors="replace")}
+                if swapped := codegen.submission_was_swapped(submitted, preds):
+                    # The predictions on disk are not the ones `submit()` produced,
+                    # so whatever is being scored did not come from the model under
+                    # test. A hardcoded rule submitted this way would score well and
+                    # not be prompt engineering at all. Verifiable, so it is a hard
+                    # rejection rather than a Critic opinion — a leak vetoes, a
+                    # suspicion only flags.
+                    log.warning("coder[%s]: %s", experiment_id, swapped)
+                    result = result.model_copy(update={"error": swapped, "metrics": None})
+                result = result.model_copy(update={"artifacts": artifacts})
             if result.error:
                 forensics = _failure_forensics(cells)
                 if forensics:

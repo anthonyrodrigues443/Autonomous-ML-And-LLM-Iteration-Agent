@@ -318,7 +318,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | |
 | Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | |
 | Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | |
-| Sun Aug 9 | **Release v0.5.0** per the standing checklist; examples/ README de-placeholdered; "CSV path until v0.5/v0.6" rows updated | v0.5.0 out | |
+| Sun Aug 9 | **Release v0.5.0** — SLIPPED to Tue Aug 11 (Tony's call 2026-08-09): v0.5 ships classification AND regression together rather than half the promise. "Prompt iteration for ML tasks" is a claim worth a two-day slip | v0.5.0 out | slipped |
 
 ---
 
@@ -492,6 +492,51 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-09 | Sprint 3 Day 4 | The second example, and the boundary it forced
+
+**Task:** CLINC150, whose real job was never "another example" — it was to break what the binary task hid. Twenty answers instead of two, hierarchical label names, and a metric that cannot be won on the easy classes.
+
+**It broke three things before a single line was written for it.** Checking the real labels first found each one.
+
+**1. Coercion, fixed twice.** `time` is a substring of `timer`, so the clear reply "the intent is timer" matched two labels and was discarded as ambiguous. Two-label sets never collide, which is why this could not appear until the second example. My first fix — prefer the longest match — then broke the most common binary pair there is: "could be toxic or not toxic" resolved confidently to "not toxic", because comparing labels made "toxic" look like a mere substring. **A confident wrong answer is worse than an unparseable one, because it is invisible.** My own earlier test caught it. Coercion now scans by POSITION with longest-alternative-first, which gets both right, and nine cases are pinned.
+
+**2. Free text scored a confident zero.** Three genuinely correct summaries, scored the way `PromptTarget` scores: **0.0000**, because the only thing measured was exact string equality. Nothing crashed; it just handed back a meaningless number. Now refused before the run with a message saying why, `--allow-free-text` to override. The boundary belongs in the code, not only in the README, because the boundary IS the product decision.
+
+**3. A 1-to-10 rating was being read as ten classes.** Which scores predicting 9 against a truth of 10 exactly as badly as predicting 1. Fixed by NOT deciding it here: `target_kind` answers "what is this column" (closed set / numeric / free text) and the METRIC answers "classification or regression", as it does everywhere else. A rating is ten ordered classes under f1 and a score under rmse, and both are legitimate — deciding from the dtype would overrule the user.
+
+**Task detection delegates rather than duplicates.** `looks_like_classification` already makes the discrete-versus-continuous call for the tabular split. Writing a second copy is the bug this project hit three times in one sprint, so the prompt path calls it and adds only the third case the tabular path never needed.
+
+**A bug I introduced and caught the same hour.** Conflating "too many answers for an enum" with "not a closed set" refused full CLINC150 — 150 intents across 2400 rows, ratio 0.06 — as free text. The RATIO decides the kind; the CAP only decides whether an enum is feasible. Separated, and the enum being dropped is now said out loud, because it removes the guarantee that an answer is in the set. Full 150-intent CLINC is therefore supported honestly: it works, with a stated cost.
+
+**The Critic was never broken — I misread silence.** It ran on all three experiments of every run and returned clean verdicts, which produce no log line. What was wrong is that it spent a call per experiment asking about scalers fitted on combined frames and target encoding over all rows, none of which can happen here. It now asks the questions that apply.
+
+**And checking it exposed a real hole.** Nothing stopped a cell overwriting predictions.csv AFTER `submit()` with a hardcoded keyword rule, while prompt.json sat there looking legitimate. That scores well and is not prompt engineering at all. `submit()` now records a sha256 of what the model answered and the host compares it to the predictions it reads. Verifiable, so it is a hard rejection rather than a Critic opinion — a leak vetoes, a suspicion only flags.
+
+**The Researcher stops searching for the wrong literature.** Its queries said "TABULAR dataset" and steered toward encodings and boosting. The prompt version names fine-tuning and architecture as NON-levers so they are not searched for, and points at annotation-guideline work — the same edge cases that make human annotators disagree are the ones the model gets wrong, and those papers state the rules explicitly.
+
+**Metric vocabulary, since it came up:** the registry was never sklearn-only. Four entries (`brier`, `mae`, `mse`, `rmse`) are hand-curated and are not sklearn scorers. Adding scipy correlations on Day 5 is the same pattern, not a departure. What stays fixed is that the model picks WHICH metric while the registry owns WHICH WAY — direction drives what banks as best, and a model getting it backwards optimises away from the goal for a whole run with nothing looking wrong.
+
+**Then the day turned, because a run on CLINC scored 0.9890 against a 0.9890 baseline.** That reads as total failure and is nothing of the kind: a minimal prompt already gets one error in a hundred on 20-intent CLINC, so there was nothing for prompt iteration to find. Which exposed the real gap — **the prompt path had no ceiling**, so no prompt result was readable. Toxicity had gone 0.8611 to 0.8824 and nobody could say whether that was most of the available gain or a tenth of it. Exactly what Day 1 fixed for tabular, never built for prompts.
+
+**The prompt ceiling sweep, and why its list is shaped differently.** Model families transfer between tabular datasets; prompt WORDING does not. So the sweep fixes the FORM and builds the content mechanically from what the harness already knows — the task line, the label set, rows sampled from training data. Six techniques: minimal, define-the-labels, few-shot, reasoning, expert-role, define-plus-few-shot. Nothing hand-written per dataset, which is what keeps it a fair floor rather than a target someone tuned. Few-shot examples come from TRAINING rows only, stated in the code because it is the one place a ceiling sweep could quietly cheat: holdout examples would raise the bar using answers the agent may never see, and every capture fraction measured against it would be wrong.
+
+**Measured (6 techniques x 200 records x 2 datasets, ~80 minutes):**
+
+| dataset | baseline | ceiling | best technique | headroom |
+|---|---|---|---|---|
+| toxicity_jigsaw | 0.8398 | 0.8681 | define-plus-few-shot | 0.028 |
+| hate_speech_davidson | 0.5862 | 0.6822 | few-shot | 0.096 |
+
+**And it changes what Day 3 can claim.** The agent scored 0.8824 on toxicity across three independent runs (0.8822 / 0.8824 / 0.8814). The best standard technique reaches 0.8681. **The agent goes PAST a competent technique sweep, not merely past a bare baseline** — the same shape as laptop price in v0.4, and a materially stronger claim than "+0.021". Two caveats on the record: the ceiling is 200 records against the agent's 300, so not perfectly like for like until the re-score work applies to both; and a ceiling is a lower bound by construction.
+
+**Two findings from the sweep worth keeping.** `define-the-labels` ALONE scored WORSE than minimal on both datasets (0.8136 vs 0.8398; 0.5417 vs 0.5862) — telling a 12B to be precise about boundaries without showing it any makes it overthink. And the best technique DIFFERS by dataset: toxicity wants define-plus-few-shot, Davidson wants few-shot alone and adding the definition costs it 0.09. So there is no single prompt shape to hardcode, which is the first honest argument this project has for why an agent iterating per dataset is the right product at all.
+
+**A new example, chosen by measurement rather than by name.** `hate_speech_davidson`: 29.5% of the raw rows had the three annotators disagree about whether a tweet was hate speech, merely offensive, or neither. That contested boundary is precisely where prompt wording decides the answer, and it shows in the numbers — 0.096 of headroom against CLINC's ~0.011. CLINC stays, because multiclass is worth exercising, but it is documented as demonstrating the plumbing and not the capability.
+
+**Also fixed: `make eval-ceilings` produced no output for 76 minutes while working perfectly.** `print` to a redirected file is block-buffered. The same "silence reads as a hang" failure fixed for the prompt path that morning, reintroduced in the eval harness because it prints rather than logs. All 19 print sites now flush.
+
+**Gates:** 762 unit tests, 5 new integration tests exercising both shipped examples on real data, ruff clean repo-wide, mypy --strict clean.
 
 ### 2026-08-09 | Sprint 3 Day 3 | Five live runs, and what only running finds
 

@@ -79,6 +79,20 @@ def supports(version: str, flag: str) -> bool:
     return parse_version(version) >= _MIN_VERSION.get(flag, (0, 0, 0))
 
 
+# PromptTarget landed in v0.5. Before that the CLI had no --task, so a prompt
+# dataset handed to an older version does not fail — it runs as a TABULAR problem
+# with the input text read as a high-cardinality categorical, and records a
+# meaningless number under a real dataset name. Worse than an error.
+FIRST_PROMPT_VERSION = (0, 5, 0)
+
+
+def supports_dataset(version: str, dataset: Dataset) -> bool:
+    """False when this version cannot honestly run this dataset."""
+    if not dataset.is_prompt_task:
+        return True
+    return parse_version(version) >= FIRST_PROMPT_VERSION
+
+
 def cell_dir(version: str, dataset_name: str, repeat: int, work_dir: Path | None = None) -> Path:
     return (work_dir or WORK_DIR) / version / dataset_name / f"repeat-{repeat}"
 

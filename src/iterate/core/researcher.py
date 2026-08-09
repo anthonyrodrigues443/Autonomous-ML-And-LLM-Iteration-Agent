@@ -168,6 +168,7 @@ class Researcher:
         *,
         metric: str = "",
         direction: str = "",
+        family: str = "tabular",
         sources: Sequence[PaperSource] | None = None,
         cache_dir: Any | None = None,
         temperature: float = 0.3,
@@ -176,6 +177,7 @@ class Researcher:
         self._client = client
         self._metric = metric
         self._direction = direction
+        self._family = family
         self._sources: Sequence[PaperSource] = (
             sources
             if sources is not None
@@ -244,7 +246,9 @@ class Researcher:
         messages = [
             Message(
                 role="system",
-                content=_PROMPTS["queries_system"].format(
+                content=_PROMPTS[
+                    "prompt_queries_system" if self._family == "prompt" else "queries_system"
+                ].format(
                     metric=self._metric, direction=self._direction
                 ),
             ),
