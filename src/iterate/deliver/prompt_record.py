@@ -107,8 +107,16 @@ def build(
     baseline_prompt: Prompt,
     baseline_score: float | None,
     history: Sequence[Experiment],
+    final_score: dict[str, Any] | None = None,
 ) -> str:
-    """Render the whole record. Pure, so it is testable without a run."""
+    """Render the whole record. Pure, so it is testable without a run.
+
+    `final_score` is the winner re-measured on the WHOLE holdout after the search
+    ended. The per-version scores come from the cheap slice every candidate was
+    ranked on, which is the right basis for choosing between them and the wrong
+    basis for quoting one. When it is present it leads the file, because it is the
+    only number here a user should put in a sentence.
+    """
     entries: list[dict[str, Any]] = [
         {
             "version": "v0",
@@ -140,13 +148,21 @@ def build(
     for index, entry in enumerate(entries):
         entry["best"] = index == best
 
-    document = {
+    document: dict[str, Any] = {
         "task": task,
         "metric": metric,
         "direction": direction,
         "model_under_test": model_under_test,
-        "versions": entries,
     }
+    if final_score is not None:
+        document["best_score_on_full_holdout"] = round(float(final_score["score"]), 4)
+        document["full_holdout_records"] = int(final_score["n"])
+        document["note"] = (
+            "Per-version scores below are on the smaller slice every candidate was "
+            "ranked against. best_score_on_full_holdout above is the winner measured "
+            "on the whole holdout and is the number to quote."
+        )
+    document["versions"] = entries
     body = str(yaml.safe_dump(document, sort_keys=False, allow_unicode=True, width=100))
     return "".join(f"# {line}\n" for line in _HEADER.splitlines()) + "\n" + body
 

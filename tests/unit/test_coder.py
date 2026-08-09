@@ -867,3 +867,39 @@ def test_validate_probabilities_mirrors_the_parser() -> None:
     assert _validate_probabilities(b"0.1\n0.9\n", 2) is None
     assert _validate_probabilities(None, 2) is not None
     assert "expected 2" in (_validate_probabilities(b"0.1\n", 2) or "")
+
+
+def test_a_misspelled_name_gets_named_and_corrected() -> None:
+    """Measured across two live runs: one variable was misspelled four different
+    ways (BASEL_PROMPT, BASELINES_PROMPT, BASELIN_PROMPT), each costing a cell —
+    while the live namespace was ALREADY appended to every observation. A listing
+    the model has to scan is not the same as being told which name was wrong.
+    """
+    from iterate.core.coder import name_error_hint
+
+    namespace = "X_train DataFrame (1200, 1)\nBASELINE_PROMPT Prompt\nBASE Prompt\n"
+
+    hint = name_error_hint("NameError: name 'BASELIN_PROMPT' is not defined", namespace)
+
+    assert "BASELIN_PROMPT" in hint
+    assert "BASELINE_PROMPT" in hint
+
+
+def test_the_hint_stays_quiet_when_it_has_nothing_useful() -> None:
+    """A wrong suggestion is worse than none: it sends the next cell somewhere new."""
+    from iterate.core.coder import name_error_hint
+
+    assert name_error_hint("NameError: name 'zzzz' is not defined", "X_train DataFrame\n") == ""
+    assert name_error_hint("ValueError: could not convert", "X_train DataFrame\n") == ""
+    assert name_error_hint(None, "X_train DataFrame\n") == ""
+
+
+def test_the_hint_is_not_prompt_specific() -> None:
+    """A mistyped variable is an every-path mistake."""
+    from iterate.core.coder import name_error_hint
+
+    hint = name_error_hint(
+        "NameError: name 'X_trian' is not defined", "X_train DataFrame (100, 5)\ny_train Series\n"
+    )
+
+    assert "X_train" in hint

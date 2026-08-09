@@ -19,6 +19,7 @@ will produce it from run history next.
 from __future__ import annotations
 
 import ast
+import difflib
 import hashlib
 import logging
 import re
@@ -108,9 +109,7 @@ def _carried_lines(starting_code: str | None) -> frozenset[str]:
     )
 
 
-def lever_executed(
-    cells: list[Cell], markers: tuple[str, ...], starting_code: str | None
-) -> bool:
+def lever_executed(cells: list[Cell], markers: tuple[str, ...], starting_code: str | None) -> bool:
     """True when the briefed lever's markers appear on a NEW line of a SUCCESSFULLY
     executed agent cell — the post-session verdict on whether the commissioned lever
     was actually measured (an errored attempt does not count as measured)."""
@@ -356,7 +355,10 @@ class CodingAgent:
                 family=self._family,
             )
             self._drive(
-                messages, cells, n_test=dataset.n_test, experiment_id=experiment_id,
+                messages,
+                cells,
+                n_test=dataset.n_test,
+                experiment_id=experiment_id,
                 brief_markers=tuple(brief_markers or ()),
                 seen_digests=frozenset(seen_digests or ()),
                 carried=_carried_lines(starting_code),
@@ -372,7 +374,9 @@ class CodingAgent:
             )
             if unusable:
                 self._bank_floor(
-                    cells, starting_code=starting_code, n_test=dataset.n_test,
+                    cells,
+                    starting_code=starting_code,
+                    n_test=dataset.n_test,
                     experiment_id=experiment_id,
                 )
                 preds = self._kernel.read_output(codegen.PREDICTIONS_CSV)
@@ -384,7 +388,23 @@ class CodingAgent:
                 experiment_id=experiment_id,
                 probabilities_csv=probs,
                 average=self._average,
+                open_vocabulary=self._family == "prompt",
             )
+            # The prompt path's real deliverable. `submit()` writes it beside the
+            # predictions in the same call, but the LIVE path reads its outputs
+            # here, not through `score_code_job` — so without this the winning
+            # prompts never reach the experiment record and prompts.yaml ships with
+            # nothing in it but the baseline. Measured: a run improved f1 three
+            # times and delivered none of the three prompts.
+            if (submitted := self._kernel.read_output(codegen.PROMPT_JSON)) is not None:
+                result = result.model_copy(
+                    update={
+                        "artifacts": {
+                            **result.artifacts,
+                            codegen.PROMPT_JSON: submitted.decode(errors="replace"),
+                        }
+                    }
+                )
             if result.error:
                 forensics = _failure_forensics(cells)
                 if forensics:
@@ -470,7 +490,8 @@ class CodingAgent:
             if time.monotonic() - session_start >= self._wall_ceiling_seconds:
                 log.info(
                     "coder[%s]: wall-clock ceiling (%.0fs) reached after %d cells; ending session",
-                    experiment_id, self._wall_ceiling_seconds,
+                    experiment_id,
+                    self._wall_ceiling_seconds,
                     sum(1 for c in cells if c.source == "agent"),
                 )
                 break
@@ -486,7 +507,9 @@ class CodingAgent:
                 warned = True
             _fit_context(messages, self._context_budget_chars)
             response = self._client.chat(
-                messages, tools=[RUN_CELL, FINISH], temperature=self._temperature,
+                messages,
+                tools=[RUN_CELL, FINISH],
+                temperature=self._temperature,
                 max_tokens=self._max_tokens,
             )
             call = next(
@@ -622,13 +645,23 @@ class CodingAgent:
                 status = "ok"
             log.info(
                 "coder[%s]: cell %d %s (%.1fs, %.0f/%.0fs budget)",
-                experiment_id, n_agent_cells, status, spent, work, self._deadline_seconds,
+                experiment_id,
+                n_agent_cells,
+                status,
+                spent,
+                work,
+                self._deadline_seconds,
             )
             if self._controller is not None:
                 self._controller.emit(
-                    "cell", code=code, index=n_agent_cells, status=status, seconds=spent,
+                    "cell",
+                    code=code,
+                    index=n_agent_cells,
+                    status=status,
+                    seconds=spent,
                     ok=not (cell_result.error or cell_result.timed_out),
-                    budget_spent=work, budget_total=self._deadline_seconds,
+                    budget_spent=work,
+                    budget_total=self._deadline_seconds,
                 )
             obs = _observation(cell_result)
             if note:
@@ -646,12 +679,12 @@ class CodingAgent:
                 if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                     log.info(
                         "coder[%s]: %d consecutive failed cells (timeouts included); ending session early",
-                        experiment_id, consecutive_errors,
+                        experiment_id,
+                        consecutive_errors,
                     )
                     return
                 obs = (
-                    _PROMPTS["timeout_nudge"].format(seconds=int(self._cell_timeout))
-                    + "\n\n" + obs
+                    _PROMPTS["timeout_nudge"].format(seconds=int(self._cell_timeout)) + "\n\n" + obs
                 )
             elif cell_result.error:
                 consecutive_errors += 1
@@ -661,7 +694,8 @@ class CodingAgent:
                     # — the submission guarantee banks a floor.
                     log.info(
                         "coder[%s]: %d consecutive errored cells; ending session early",
-                        experiment_id, consecutive_errors,
+                        experiment_id,
+                        consecutive_errors,
                     )
                     return
                 sig = _error_signature(cell_result.error)
@@ -673,7 +707,13 @@ class CodingAgent:
             if not cell_result.timed_out:
                 namespace = self._kernel.namespace_summary()
                 if namespace:
-                    obs += "\n\nVariables defined now (build on these; don't re-import or re-load):\n"
+                    # The correction goes FIRST, where a misspelling is read, rather
+                    # than being left for the model to spot in the listing below.
+                    if hint := name_error_hint(cell_result.error, namespace):
+                        obs = hint + "\n\n" + obs
+                    obs += (
+                        "\n\nVariables defined now (build on these; don't re-import or re-load):\n"
+                    )
                     obs += namespace
             messages.append(_tool_msg(call, obs))
 
@@ -711,10 +751,14 @@ class CodingAgent:
                 codegen.RESET_INPUTS + code, timeout=self._cell_timeout
             )
             cells.append(_cell(code, cell_result, "fallback"))
-            if _validate_predictions(self._kernel.read_output(codegen.PREDICTIONS_CSV), n_test) is None:
+            if (
+                _validate_predictions(self._kernel.read_output(codegen.PREDICTIONS_CSV), n_test)
+                is None
+            ):
                 log.info(
                     "coder[%s]: session ended without a valid submission; banked the %s as a floor",
-                    experiment_id, label,
+                    experiment_id,
+                    label,
                 )
                 return
         log.warning(
@@ -755,6 +799,33 @@ class CodingAgent:
         return retried, f"({package!r} was auto-installed and the cell re-ran)", spent
 
 
+_NAME_ERROR = re.compile(r"name '([A-Za-z_][A-Za-z0-9_]*)' is not defined")
+
+
+def name_error_hint(error: str | None, namespace: str) -> str:
+    """For a NameError, name the miss and the closest thing that IS defined.
+
+    The live namespace was already appended to every observation, and a model
+    still misspelled one variable four different ways across two runs
+    (BASEL_PROMPT, BASELINES_PROMPT, BASELIN_PROMPT). A list at the end of an
+    observation is not the same as being told which name was wrong: this puts the
+    correction next to the error, which is where it gets read. General on purpose —
+    a mistyped variable is not a prompt-path mistake.
+    """
+    match = _NAME_ERROR.search(error or "")
+    if not match:
+        return ""
+    missing = match.group(1)
+    defined = [line.split()[0] for line in namespace.splitlines() if line.strip()]
+    close = difflib.get_close_matches(missing, defined, n=3, cutoff=0.6)
+    if not close:
+        return ""
+    return (
+        f"{missing!r} does not exist. You almost certainly meant: {', '.join(close)}. "
+        "Use the exact name; do not define it yourself."
+    )
+
+
 def _build_messages(
     *,
     data_summary: str,
@@ -792,9 +863,7 @@ def _build_messages(
         # Built by concatenation, not str.format — the code may contain braces.
         starting_point = (
             f"\nBEST APPROACH SO FAR{score} — start from this and apply the brief's "
-            "change; do NOT rebuild from scratch:\n```python\n"
-            + starting_code.strip()
-            + "\n```\n"
+            "change; do NOT rebuild from scratch:\n```python\n" + starting_code.strip() + "\n```\n"
         )
     else:
         starting_point = ""
@@ -861,8 +930,13 @@ def _observation(result: CellResult) -> str:
 
 def _cell(code: str, result: CellResult, source: str, *, thinking: str | None = None) -> Cell:
     return Cell(
-        code=code, stdout=result.stdout, stderr=result.stderr, error=result.error,
-        source=source, outputs=list(result.outputs), thinking=thinking,
+        code=code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        error=result.error,
+        source=source,
+        outputs=list(result.outputs),
+        thinking=thinking,
         timed_out=result.timed_out,
     )
 
@@ -880,13 +954,18 @@ def _failure_forensics(cells: list[Cell]) -> str:
         hot = next((ln.strip() for ln in code.splitlines() if ".fit(" in ln), None)
         if hot is None:
             hot = next(
-                (ln.strip() for ln in code.splitlines()
-                 if ln.strip() and not ln.strip().startswith("#")),
+                (
+                    ln.strip()
+                    for ln in code.splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ),
                 "",
             )
         parts.append(f"{len(timeouts)} cell(s) timed out; last killed: {hot[:80]!r}")
     if errors:
-        parts.append(f"{len(errors)} cell(s) errored; last: {_error_signature(errors[-1].error or '')}")
+        parts.append(
+            f"{len(errors)} cell(s) errored; last: {_error_signature(errors[-1].error or '')}"
+        )
     return "; ".join(parts)
 
 

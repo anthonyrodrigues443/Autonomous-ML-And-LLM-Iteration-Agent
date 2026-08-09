@@ -28,6 +28,8 @@ computed instantly from the training column with no model involved at all.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from iterate.adapters.compute.base import CodeJob
@@ -43,6 +45,8 @@ if TYPE_CHECKING:
     from iterate.adapters.compute.runner import RunResult
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.schemas.experiment import Candidate
+
+log = logging.getLogger(__name__)
 
 # Above this many distinct answers the target is treated as free text rather than a
 # closed label set, so the answer tool stops constraining and parsing takes over.
@@ -147,6 +151,7 @@ class PromptTarget:
             run_result.outputs.get(codegen.PREDICTIONS_CSV),
             metric=self._metric,
             experiment_id=experiment_id,
+            open_vocabulary=True,
         )
         artifacts = dict(result.artifacts)
         if (submitted := run_result.outputs.get(codegen.PROMPT_JSON)) is not None:
@@ -180,6 +185,32 @@ class PromptTarget:
         }
         return json.dumps(payload).encode()
 
+    _warned_about_parallelism = False
+
+    def _warn_if_serialised(self) -> None:
+        """Say so, once, when the concurrency is probably not real.
+
+        Measured on a default local Ollama: 8 workers gave a 1.10x speedup — 3.44s
+        per call sequential against 3.14s at 8-wide. The server answers one request
+        at a time unless OLLAMA_NUM_PARALLEL is set, so the worker pool is only a
+        queue and a 300-record pass costs 300 sequential calls whatever the pool
+        size. Not a bug in iterate, but it is the difference between a four-minute
+        pass and a thirty-second one, and a user cannot fix what they cannot see.
+        """
+        if PromptTarget._warned_about_parallelism or self._target_backend != "ollama":
+            return
+        if os.environ.get("OLLAMA_NUM_PARALLEL"):
+            return
+        PromptTarget._warned_about_parallelism = True
+        log.info(
+            "OLLAMA_NUM_PARALLEL is not set, so the server answers one request at a "
+            "time and the %d concurrent workers are only a queue. Restarting ollama "
+            "with OLLAMA_NUM_PARALLEL=%d makes a pass roughly that many times "
+            "faster (measured without it: 1.10x from 8 workers).",
+            self._max_workers,
+            self._max_workers,
+        )
+
     def _evaluate(self, prompt: Prompt, *, experiment_id: str) -> ExperimentResult:
         """Run one prompt over the sealed holdout, host-side.
 
@@ -196,6 +227,13 @@ class PromptTarget:
             max_workers=self._max_workers,
         )
         rows = self._dataset.test_features.to_dict(orient="records")
+        log.info(
+            "%s: running the prompt over %d holdout records (one model call each, %d at a time)",
+            experiment_id,
+            len(rows),
+            self._max_workers,
+        )
+        self._warn_if_serialised()
         stats = AskStats()
         try:
             answers = ask(prompt, rows, stats=stats)
@@ -221,6 +259,12 @@ class PromptTarget:
             answers,
             average=self._average,
             include=(self._metric,),
+            # A model that will not answer usably yields a sentinel, which is a
+            # value the target column never contains. It has to count as wrong
+            # rather than register as a new class — untagged, ONE such answer in
+            # 300 turns a binary target multiclass and the metric refuses to score
+            # at all. Measured on the first live run.
+            open_vocabulary=True,
         )
         return ExperimentResult(
             experiment_id=experiment_id,

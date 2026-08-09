@@ -194,3 +194,35 @@ def test_write_puts_the_file_in_the_run_directory(tmp_path: Path) -> None:
 
     assert path.name == "prompts.yaml"
     assert yaml.safe_load(path.read_text())["model_under_test"] == "m"
+
+
+def test_the_full_holdout_number_leads_the_file() -> None:
+    """Per-version scores come from the cheap slice the search ranked on. That is the
+    right basis for choosing between prompts and the wrong basis for quoting one, so
+    the winner's full-holdout score is stated separately and first."""
+    text = prompt_record.build(
+        task="t",
+        metric="f1",
+        direction="maximize",
+        model_under_test="gemma4:12b",
+        baseline_prompt=BASELINE,
+        baseline_score=0.86,
+        history=[_experiment(description="one change", score=0.91, system="A")],
+        final_score={"score": 0.8814123, "n": 300},
+    )
+    document = yaml.safe_load(text)
+
+    assert document["best_score_on_full_holdout"] == pytest.approx(0.8814)
+    assert document["full_holdout_records"] == 300
+    assert "number to quote" in document["note"]
+    # the loop score is still recorded, just not presented as the headline
+    assert document["versions"][1]["score"] == pytest.approx(0.91)
+
+
+def test_no_final_score_means_no_misleading_headline() -> None:
+    """A run that used the full holdout throughout, or whose re-score failed, must
+    not gain a field implying a measurement that never happened."""
+    document = _build([_experiment(description="x", score=0.9, system="A")])
+
+    assert "best_score_on_full_holdout" not in document
+    assert "note" not in document

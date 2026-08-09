@@ -8,6 +8,7 @@ is opt-in.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -279,3 +280,35 @@ def test_cell_result_ok_logic() -> None:
     assert CellResult("", "").ok
     assert not CellResult("", "", error="boom").ok
     assert not CellResult("", "", timed_out=True).ok
+
+
+@pytest.mark.unit
+def test_a_chatty_cell_still_hits_the_cell_timeout() -> None:
+    """`timeout` bounds the CELL, not the gap between its messages.
+
+    Waiting the full timeout for each NEXT message resets the clock on every print,
+    so a cell that reports progress can run indefinitely. Measured on the prompt
+    path: a heartbeat every 10% of a pass let cells reach 838s against a 600s limit
+    and consume a whole session's budget.
+    """
+    from iterate.adapters.compute.kernel import LocalKernel
+
+    kernel = LocalKernel()
+    kernel.start({})
+    try:
+        started = time.monotonic()
+        result = kernel.run_cell(
+            "import time\n"
+            "for _i in range(200):\n"
+            "    print('still working', _i, flush=True)\n"
+            "    time.sleep(0.2)\n",
+            timeout=2.0,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        kernel.close()
+
+    assert result.timed_out, "a cell printing steadily was never cut off"
+    # The cell wants 40s. Bounded by its own deadline it must stop near 2s, with
+    # slack for kernel round-trips rather than for the 0.2s print interval.
+    assert elapsed < 15.0, f"cell ran {elapsed:.1f}s against a 2s timeout"

@@ -203,6 +203,10 @@ def prompt_session_preamble() -> str:
         "base_url=_meta.get('target_base_url'), cache_path=_meta.get('cache_path'), "
         "max_workers=int(_meta.get('max_workers') or 8))\n"
         "BASELINE_PROMPT = Prompt(**_meta['baseline_prompt'])\n"
+        # Three sessions across two live runs died a cell each to NameError on
+        # BASEL_PROMPT / BASELINES_PROMPT. The name is long and a 12B fumbles it; a
+        # short alias costs one line and removes a recurring wasted turn.
+        "BASE = BASELINE_PROMPT\n"
         "def ask(prompt, rows):\n"
         "    frame = rows.to_dict(orient='records') if hasattr(rows, 'to_dict') else list(rows)\n"
         "    stats = AskStats()\n"
@@ -212,7 +216,7 @@ def prompt_session_preamble() -> str:
         "def evaluate(answers, truth):\n"
         "    truth = [str(t) for t in (truth.tolist() if hasattr(truth, 'tolist') else truth)]\n"
         "    values = _score('classification', truth, [str(a) for a in answers], "
-        "include=(_metric,))\n"
+        "include=(_metric,), open_vocabulary=True)\n"
         "    return values[_metric]\n"
         "def submit(prompt):\n"
         "    answers = ask(prompt, X_holdout)\n"
@@ -227,7 +231,37 @@ def prompt_session_preamble() -> str:
         "print('loaded:', X_train.shape, 'train /', X_holdout.shape, 'holdout; answers:', "
         "(_labels if _labels else 'free text'))\n"
         "print('task:', TASK)\n"
+        # A worked example, PRINTED rather than only described in the instructions.
+        # The first live prompt run called .split() on a Prompt and then handed one
+        # to re.sub: the wording said what the objects were and never showed one
+        # being used, and the session died without submitting.
+        "print(chr(10).join(" + repr(_WORKED_EXAMPLE) + "))\n"
     )
+
+
+# Shown by the preamble as the session's first output, so the shape of a correct
+# cell is on screen before the model writes one.
+_WORKED_EXAMPLE = [
+    "",
+    "HOW TO WORK — copy this shape:",
+    "  sample  = X_train.head(120)              # a SAMPLE; a full pass is minutes",
+    "  truth   = y_train.head(120)",
+    "  answers = ask(BASE, sample)              # BASE is short for BASELINE_PROMPT",
+    "  print(evaluate(answers, truth))          # scores with THIS run's metric",
+    "",
+    "  wrong = [(sample.iloc[i].to_dict(), t, a)",
+    "           for i, (t, a) in enumerate(zip(truth, answers)) if str(t) != str(a)]",
+    "  for row, t, a in wrong[:10]: print(t, '!=', a, '|', row)",
+    "",
+    "  better = Prompt(system=BASE.system + chr(10) + 'your one change',",
+    "                  user_template=BASE.user_template)",
+    "  print(evaluate(ask(better, sample), truth))   # SAME sample, like for like",
+    "  submit(better)                                # then call the finish tool",
+    "",
+    "A Prompt is an OBJECT, not a string: read .system and .user_template and build",
+    "a new one with Prompt(...). String methods on it will raise.",
+    "",
+]
 
 
 # Prepended to every agent cell: restores the canonical inputs from the pristine
@@ -486,8 +520,14 @@ def score_predictions(
     experiment_id: str,
     probabilities_csv: bytes | None = None,
     average: str | None = None,
+    open_vocabulary: bool = False,
 ) -> ExperimentResult:
     """Score a script's predictions against the held-back holdout labels.
+
+    `open_vocabulary` is set by the prompt path, where a submitted answer can be a
+    value the target column never contains. It makes such an answer count as wrong
+    instead of registering as a new class — one of them in 300 is otherwise enough
+    to turn a binary target multiclass and make the metric refuse to score.
 
     A missing/empty/wrong-length predictions file is a captured failure (a
     non-success `ExperimentResult`), never an exception — same contract as a bad
@@ -533,6 +573,7 @@ def score_predictions(
             y_proba=y_proba,
             average=average,
             include=(metric,),
+            open_vocabulary=open_vocabulary,
         )
     except Exception as exc:
         if y_proba is not None and not needs_proba:
@@ -544,6 +585,7 @@ def score_predictions(
                     y_pred,
                     average=average,
                     include=(metric,),
+                    open_vocabulary=open_vocabulary,
                 )
             except Exception:
                 return _failed(
