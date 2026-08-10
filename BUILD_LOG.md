@@ -525,6 +525,19 @@ The inspect session gets its own system prompt rather than the coder's with a se
 
 This is the one change in the list carrying the June EDA-ledger risk, so it ships behind a before/after with the decision rule written down in advance: **keep only if lever diversity holds.** A score that rises while the supervisor collapses onto one lever is the June pattern presenting itself as a win.
 
+**Tabular re-certification: the loop changes cost nothing.** The standing release checklist says re-run the trajectory quality bar on the floor model if the release touched the loop, and v0.5 touched it in five places (the coder's four family parameters, the supervisor's three ladders, the multiclass guard, the Summarizer's inputs, the inspect step). Same dataset and same model as the v0.4 flagship run, laptop price on gemma4:12b, 6 iterations.
+
+| | rmse | gain | capture |
+|---|---|---|---|
+| baseline | 411.8904 | | |
+| ceiling (`brute_force_sweep_v1`, 9 models) | 248.8509 | headroom 163.0395 | |
+| v0.4 certification run | 321.5600 | 90.3304 | 55.4% |
+| **v0.5 re-certification** | **320.1858** | **91.7046** | **56.2%** |
+
+Marginally better, which is the answer the bar was asked for: nothing in five days of loop changes degraded the agent. The trajectory holds too — 411.89 → 427.08 → 334.46 → 334.32 → 325.62 → **320.19** → 328.58, with monotone improvement across iterations 2 to 5, and five distinct lever classes in six iterations (target encoding, numeric transformation, feature selection, model swap, imbalance-or-threshold). No collapse onto one lever.
+
+**The waste was labelled, not silent, which is the other half of the bar.** The identical gate fired twice, the lever gate three times, and six cells errored inside sessions that still finished. Every one of those is a guard doing its job on a 12B floor model rather than a run quietly banking a re-run as a result.
+
 **Also closed:** carry-in 2 (the Researcher, Critic and Summarizer had no styled TUI events and reached the transcript as dim ambient lines, indistinguishable from routine chatter), carry-in 3 (research cache files record the query that produced them, with backward-compatible reads of the old bare-list format), carry-in 4 (multiclass threshold guard, measured first: a threshold move is worth +0.0036 on binary f1_macro and exactly +0.0000 on multiclass, which is what makes it a dead lever worth naming), carry-in 6 (the flaky TUI test now waits on a condition rather than a fixed 0.3s).
 
 ---
