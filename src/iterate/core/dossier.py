@@ -48,7 +48,22 @@ _DATA_WORDS = (
     "cardinality",
     "rows",
     "columns",
+    # Added with the free inspect step, whose prompt asks for exactly these: the
+    # extractor is what decides which of the printed lines survive into the
+    # planning context, so a word the step is told to print has to be a word the
+    # extractor recognises.
+    "count",
+    "distribution",
+    "skew",
+    "corr",
+    "duplicat",
+    "constant",
 )
+# Word-bounded, and `_` counts as a boundary so "val_f1: 0.55" is still a score.
+# The substring form of this test discarded "missing values: 11", "value_counts:
+# ..." and "interval columns: 4" — the most common EDA output there is — because
+# each contains the letters "val".
+_RESULT_WORD = re.compile(r"(?<![a-z])(?:val|validation|scores?)(?![a-z])")
 _MAX_FACTS = 12
 _MAX_FAILURES = 6
 _LINE_CAP = 160
@@ -112,7 +127,7 @@ def _error_signature(error: str) -> str:
     return lines[-1][:_LINE_CAP] if lines else ""
 
 
-def _data_facts(cells: list[dict[str, Any]]) -> list[str]:
+def data_facts_from_cells(cells: list[dict[str, Any]]) -> list[str]:
     """Lines the session printed that state something about the data.
 
     Quoted verbatim (trimmed), never rewritten. A line qualifies if it carries a
@@ -130,7 +145,7 @@ def _data_facts(cells: list[dict[str, Any]]) -> list[str]:
             if not (_SHAPE.search(line) or any(w in low for w in _DATA_WORDS)):
                 continue
             # A validation score is a result, not a data fact; it has its own field.
-            if "val" in low or "score" in low:
+            if _RESULT_WORD.search(low):
                 continue
             if line in seen:
                 continue
@@ -181,7 +196,7 @@ def build(experiment: Any) -> Dossier:
 
     return Dossier(
         techniques=techniques,
-        data_facts=_data_facts(agent_cells),
+        data_facts=data_facts_from_cells(agent_cells),
         val_trail=_val_trail(agent_cells),
         failures=failures[:_MAX_FAILURES],
         score=score,
@@ -191,4 +206,4 @@ def build(experiment: Any) -> Dossier:
     )
 
 
-__all__ = ["Dossier", "build"]
+__all__ = ["Dossier", "build", "data_facts_from_cells"]

@@ -315,9 +315,9 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Mon Aug 3 | **Eval suite FIRST** (Tony's call after the v0.4 certification): the headroom table from EVAL_LOG becomes a runnable corpus, so a release is measured rather than argued about. Then the v0.5 work below | `evals/` + corpus + runner | done (built Sat Aug 8) |
 | Tue Aug 4 | Loop integration: prompt lever classes for the supervisor ladder, coder session writes prompt variants + scoring cells, guard stack audited for the new path (duplicate gates hash prompt text, dead-ends transfer) | wiring + tests | done (built Sat Aug 8) |
 | Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | done (built Sun Aug 9) |
-| Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | |
-| Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | |
-| Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | |
+| Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | done (built Sun Aug 9) |
+| Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | done (built Sun Aug 9: 5 live gemma4:12b runs) |
+| Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | done (built Mon Aug 10: all 7 carry-ins closed, see entry) |
 | Sun Aug 9 | **Release v0.5.0** — SLIPPED to Tue Aug 11 (Tony's call 2026-08-09): v0.5 ships classification AND regression together rather than half the promise. "Prompt iteration for ML tasks" is a claim worth a two-day slip | v0.5.0 out | slipped |
 
 ---
@@ -492,6 +492,40 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-10 | Sprint 3 Day 6 | The carry-in list, closed
+
+**Task:** Tony's bar for the release — "1 to 6 actually do it all then only we will do the v0.5 release since it was promised that way". All seven v0.4 certification carry-ins, not the cheap ones.
+
+**Carry-in 7 turned out to be a question about the eval suite, not about the agent.** It read "the agent misses thin margins (churn 1.6%, mobile 2.1%)". The Aug 9 sweep could not confirm it: `brute_force_sweep_v1` measured churn, heart and mobile at EXACTLY zero headroom, three of five tabular datasets unreadable. v1 varies the estimator with the preprocessing fixed, so a margin living in how the columns are encoded is invisible to it however many models it tries.
+
+So the fix was a second axis. `evals/treatments.py` sweeps eight feature treatments through the agent's OWN code path — `build_code_job` writes the same sealed holdout, the same runner executes it, `score_code_job` applies the same ruler — which means a treatment that wins is a thing the agent could actually have written, not a number from a privileged script.
+
+| dataset | baseline | v1 (models) | v2 (treatments) | headroom | best treatment |
+|---|---|---|---|---|---|
+| churn | 0.6449 | 0.6449 | 0.6467 | +0.28% | frequency-encoding |
+| heart_risk | 0.8967 | 0.8967 | 0.9000 | +0.37% | calibrated |
+| mobile_price | 0.9450 | 0.9450 | 0.9550 | +1.06% | numeric-interactions |
+
+**The answer to carry-in 7: the margins are real, they are 2-5x smaller than the hand estimate, and every one of them is a FEATURE TREATMENT rather than a model swap.** So the v0.4 reading ("the agent misses thin margins") was the wrong diagnosis of a real symptom. It did not miss a model. On the datasets where anything was available, what was available was an encoding. That is a fact about where to point the lever ladder, and it is now measured rather than anecdotal. The corpus no longer has an unreadable dataset.
+
+**A real bug fell out of building it: no probability metric could be scored on the sandbox code path.** `build_code_job` listed only `predictions.csv` as an output, so the `probabilities.csv` the script correctly wrote was never collected and `score_code_job` never passed it. Every `average_precision` / `roc_auc` / `log_loss` candidate under `--sandbox e2b` scored as a hard failure — two of the eight certification datasets are scored that way. Measured before and after on churn: `code-gen contract: average_precision needs probabilities` became 0.6362. It survived two releases because nothing tested `ModelTarget`'s two `SupportsCodeGen` methods at all; there are now tests that do.
+
+**A second real bug, found by a test I expected to pass.** The dossier's data-fact extractor skipped any line containing the substring `"val"`, meaning to skip validation scores. It also skipped `missing values: 11`, `unique values in PaymentMethod: 4`, `value_counts: ...` and `interval columns: 3` — the most common EDA output there is. Every one of those facts was printed by a session, dropped by the extractor, and never reached the supervisor. Now word-bounded (`_` counts as a boundary, so `val_f1: 0.55` is still a score), and the word list gained the six things the new inspect step is told to print.
+
+**The free inspect step shipped, and the three things that cut it from v0.4 turned out to be consequences of one wrong assumption.** The cut said it needed a fourth `AttemptOutcome`, must not burn patience, must not count toward `max_iterations`. All three follow from modelling an inspection as an EXPERIMENT. It is not one, and the schema says so: `ExperimentResult` rejects a result with neither metrics nor an error, which is the model refusing to represent an unscored run as an outcome.
+
+Modelled instead as what it actually resembles — a Researcher pass — it needs none of them. The supervisor asks with `want_inspect` (one more field on the emit it already makes, exactly like `want_research`), the harness runs an unscored session that only prints, and the facts fold into the next `decide()` as text. No experiment, no memory record, no terminator interaction, no fourth outcome. The only budget it can spend is wall-clock, capped at `max_inspect_calls=2`.
+
+The inspect session gets its own system prompt rather than the coder's with a sentence added. The coding prompt is dense with instructions to fit a model and submit predictions, and on a floor model those get followed — here, training anything is the failure mode.
+
+**The Summarizer now authors the dossier**, the other half of carry-in 5. Two changes, both of which alter what reaches the supervisor: the harness's verified observations go into the Summarizer's prompt above the raw cells, and empty insight fields are seeded from them. Seeding is ADDITIVE to an empty field only — observation is a floor under the digest, never a correction of it, because the machine can see what happened and only the model can see why. The deterministic fallback stays pure: it runs precisely when the LLM could not be trusted to have run at all.
+
+This is the one change in the list carrying the June EDA-ledger risk, so it ships behind a before/after with the decision rule written down in advance: **keep only if lever diversity holds.** A score that rises while the supervisor collapses onto one lever is the June pattern presenting itself as a win.
+
+**Also closed:** carry-in 2 (the Researcher, Critic and Summarizer had no styled TUI events and reached the transcript as dim ambient lines, indistinguishable from routine chatter), carry-in 3 (research cache files record the query that produced them, with backward-compatible reads of the old bare-list format), carry-in 4 (multiclass threshold guard, measured first: a threshold move is worth +0.0036 on binary f1_macro and exactly +0.0000 on multiclass, which is what makes it a dead lever worth naming), carry-in 6 (the flaky TUI test now waits on a condition rather than a fixed 0.3s).
+
+---
 
 ### 2026-08-09 | Sprint 3 Day 5 | Regression: the second thing prompts are actually used for
 

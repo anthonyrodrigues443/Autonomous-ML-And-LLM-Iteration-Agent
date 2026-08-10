@@ -223,3 +223,64 @@ def test_a_boolean_column_does_not_abort_the_baseline(tmp_path: Path) -> None:
     result = ModelTarget(ds, metric="f1").baseline()
     assert result.succeeded, result.error
     assert result.metrics is not None
+
+
+# ─── the code-gen path (SupportsCodeGen) ──────────────────────────────────────
+# Nothing exercised these two methods, which is how a probability-primary metric
+# came to be unscoreable on the sandbox path for two releases: the script wrote
+# `probabilities.csv` correctly, `build_code_job` never asked for it back, and
+# every average_precision / roc_auc / log_loss candidate under `--sandbox e2b`
+# scored as a hard failure.
+
+_PROBA_CODE = """
+def train_and_predict(X_train, y_train, X_holdout):
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.preprocessing import OrdinalEncoder
+    cat = X_train.select_dtypes(exclude="number").columns.tolist()
+    enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+    tr, ho = X_train.copy(), X_holdout.copy()
+    if cat:
+        tr[cat] = enc.fit_transform(tr[cat])
+        ho[cat] = enc.transform(ho[cat])
+    model = HistGradientBoostingClassifier(random_state=0).fit(tr, y_train)
+    return model.predict(ho), model.predict_proba(ho)
+"""
+
+_LABELS_ONLY_CODE = """
+def train_and_predict(X_train, y_train, X_holdout):
+    return [0] * len(X_holdout)
+"""
+
+
+def _run_code(target: ModelTarget, code: str) -> ExperimentResult:
+    from iterate.adapters.compute.runner import LocalCodeRunner
+
+    job = target.build_code_job(Candidate(description="c", changes={"code": code}, rationale="r"))
+    run = LocalCodeRunner().run(
+        job.script, inputs=job.inputs, outputs=job.outputs, timeout=300
+    )
+    assert run.succeeded, run.stderr
+    return target.score_code_job(run, "exp")
+
+
+def test_a_probability_metric_is_scoreable_on_the_code_path(tmp_path: Path) -> None:
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    target = ModelTarget(ds, metric="average_precision", name="clf")
+
+    result = _run_code(target, _PROBA_CODE)
+
+    assert result.error is None, result.error
+    assert result.metrics is not None
+    assert 0.0 <= result.metrics.primary_value <= 1.0
+
+
+def test_labels_only_code_still_scores_a_label_metric(tmp_path: Path) -> None:
+    """Probabilities are asked for unconditionally, so the file being absent must
+    stay ordinary rather than becoming a missing-output failure."""
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    target = ModelTarget(ds, metric="accuracy", name="clf")
+
+    result = _run_code(target, _LABELS_ONLY_CODE)
+
+    assert result.error is None, result.error
+    assert result.metrics is not None

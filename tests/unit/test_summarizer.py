@@ -52,7 +52,7 @@ def _digest_call(**fields: Any) -> ChatResponse:
 def _experiment(*, score: float | None = 0.61) -> Experiment:
     cells = [
         {"code": "# preamble", "stdout": "loaded", "error": None, "source": "preamble", "outputs": []},
-        {"code": "print(X_train.nunique())", "stdout": "PaymentMethod 4", "error": None,
+        {"code": "print(X_train.nunique())", "stdout": "PaymentMethod unique: 4", "error": None,
          "source": "agent", "outputs": []},
         {"code": _FIT_CODE, "stdout": "Validation f1: 0.55\nValidation f1: 0.61",
          "error": None, "source": "agent", "outputs": []},
@@ -135,3 +135,89 @@ def test_llm_exception_degrades_to_skeleton() -> None:
     digest = Summarizer(_RaisingLLM([]), metric="f1").summarize(_experiment(score=0.61))
     assert digest.score == 0.61  # a backend failure never costs the run a digest
     assert digest.takeaway == ""
+
+
+# ─── the Summarizer authoring the dossier (carry-in 5) ────────────────────────
+# Grounding the digest in what the harness verified, rather than only in what a
+# 12B chose to write down. Both halves change what reaches the supervisor's
+# planning context, which is why they are separable and measured.
+
+
+def _errored_experiment() -> Experiment:
+    exp = _experiment()
+    cells = list(exp.candidate.changes["cells"])
+    cells.append(
+        {
+            "code": "import category_encoders",
+            "stdout": "",
+            "error": "ModuleNotFoundError: No module named 'category_encoders'",
+            "source": "agent",
+            "outputs": [],
+        }
+    )
+    exp.candidate.changes["cells"] = cells
+    return exp
+
+
+def test_the_summarizer_is_shown_what_the_harness_observed() -> None:
+    llm = _FakeLLM([_digest_call(takeaway="t")])
+
+    Summarizer(llm, metric="f1").summarize(_experiment())
+
+    user = llm.calls[0][-1].content
+    assert "What the harness observed" in user
+    assert "validation: 0.5500 -> 0.6100" in user
+
+
+def test_observations_are_withheld_when_the_switch_is_off() -> None:
+    """The before arm of the measurement has to be reachable from the same build."""
+    llm = _FakeLLM([_digest_call(takeaway="t")])
+
+    Summarizer(llm, metric="f1", observed=False).summarize(_experiment())
+
+    assert "What the harness observed" not in llm.calls[0][-1].content
+
+
+def test_an_empty_insight_field_is_seeded_from_observation() -> None:
+    """data_insights is the field a weak model most often leaves empty, and the one
+    the supervisor most needs."""
+    llm = _FakeLLM([_digest_call(takeaway="t")])
+
+    digest = Summarizer(llm, metric="f1").summarize(_experiment())
+
+    assert digest.data_insights
+
+
+def test_an_error_the_model_omitted_still_reaches_what_hurt() -> None:
+    """A session that errored and recovered reads as a clean success in a
+    model-written digest, so the next supervisor re-proposes the thing that broke."""
+    llm = _FakeLLM([_digest_call(takeaway="t", what_hurt=[])])
+
+    digest = Summarizer(llm, metric="f1").summarize(_errored_experiment())
+
+    assert any("category_encoders" in item for item in digest.what_hurt)
+    assert all("(observed)" in item for item in digest.what_hurt)
+
+
+def test_seeding_never_overwrites_what_the_model_wrote() -> None:
+    """Observation is a floor under the digest, not a correction of it: the machine
+    can see what happened, only the model can see why."""
+    llm = _FakeLLM(
+        [_digest_call(takeaway="t", data_insights=["PaymentMethod has 4 levels"],
+                      what_hurt=["the import failed because the package is absent"])]
+    )
+
+    digest = Summarizer(llm, metric="f1").summarize(_errored_experiment())
+
+    assert digest.data_insights == ["PaymentMethod has 4 levels"]
+    assert digest.what_hurt == ["the import failed because the package is absent"]
+
+
+def test_the_fallback_skeleton_carries_no_seeded_insights() -> None:
+    """The fallback runs precisely when the LLM could not be trusted to have run at
+    all, so it stays the pure deterministic record."""
+    digest = Summarizer(_RaisingLLM([]), metric="f1").summarize(_errored_experiment())
+
+    assert digest.data_insights == []
+    assert digest.what_hurt == []
+    assert digest.score == 0.61

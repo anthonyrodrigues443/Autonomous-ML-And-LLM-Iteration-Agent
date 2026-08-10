@@ -84,6 +84,28 @@ _COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 
+# What a specialist's line looks like in the log, and how to style it. Matched on
+# the message because these agents are orchestrated by the harness rather than
+# emitting through the event channel; giving them real events would mean threading
+# a callback through run_supervised, which is a bigger change than the problem.
+_SPECIALIST_MARKS: tuple[tuple[str, str], ...] = (
+    ("researched", "bold cyan"),
+    ("critic:", "bold yellow"),
+    ("summarizer:", "bold blue"),
+    ("dropped what-helped claims", "bold yellow"),
+    ("rejected a", "bold yellow"),
+)
+
+
+def _specialist_style(message: str) -> str:
+    """The style for a specialist's line, or "" when it is ordinary chatter."""
+    lowered = message.casefold()
+    for mark, style in _SPECIALIST_MARKS:
+        if mark in lowered:
+            return style
+    return ""
+
+
 class _WidgetLogHandler(logging.Handler):
     """Routes log records into the app's log pane; a broken UI never kills the run."""
 
@@ -100,6 +122,14 @@ class _WidgetLogHandler(logging.Handler):
             if message.startswith("coder[") and ": cell " in message:
                 return
             if message.startswith("agent loop: iteration") and "->" in message:
+                return
+            if style := _specialist_style(message):
+                # Carry-in from the v0.4 certification: only brief, cell and score
+                # had styled events, so the two headline v0.4 specialists reached
+                # the transcript as dim ambient lines, visually indistinguishable
+                # from routine chatter. They do the most interesting work in a run
+                # and were the hardest thing in it to see.
+                self._app.post_line(Text(message, style=style))
                 return
             self._app.post_line(Text(message, style="dim"))
 

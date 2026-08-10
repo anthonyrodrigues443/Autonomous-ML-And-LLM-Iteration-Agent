@@ -189,7 +189,12 @@ class ModelTarget:
         return CodeJob(
             script=codegen.assemble_script(code),
             inputs=codegen.build_inputs(self._dataset),
-            outputs=[codegen.PREDICTIONS_CSV],
+            # Probabilities are asked for unconditionally and are OPTIONAL on
+            # arrival: the script only writes them when the function returns the
+            # 2-tuple, and both runners skip a file that is not there. Asking only
+            # when the metric needs them would still be wrong for the panel, which
+            # scores probability metrics as bonuses next to a label primary.
+            outputs=[codegen.PREDICTIONS_CSV, codegen.PROBABILITIES_CSV],
             packages=codegen.required_imports(code),
         )
 
@@ -204,6 +209,7 @@ class ModelTarget:
         result = codegen.score_predictions(
             self._dataset,
             run_result.outputs.get(codegen.PREDICTIONS_CSV),
+            probabilities_csv=run_result.outputs.get(codegen.PROBABILITIES_CSV),
             metric=self._metric,
             experiment_id=experiment_id,
         )

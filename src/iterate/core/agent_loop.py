@@ -82,6 +82,7 @@ def run_supervised(
     researcher: Researcher | None = None,
     critic: Critic | None = None,
     max_research_calls: int = 3,
+    max_inspect_calls: int = 2,
     on_experiment: Callable[..., None] | None = None,
     controller: RunController | None = None,
 ) -> RunResult:
@@ -101,6 +102,14 @@ def run_supervised(
     run, so a supervisor that keeps asking cannot spend the budget on literature
     instead of experiments. A failed pass yields no findings and the run proceeds
     ungrounded.
+
+    The FREE INSPECT step rides the same seam for the same reason. When the
+    supervisor asks (``want_inspect``), the harness runs an unscored session that
+    only prints facts about the data and folds them into the next ``decide()``. It
+    records no experiment, so nothing here touches the terminator: no patience is
+    spent, ``max_iterations`` is untouched, and the only budget it can consume is
+    wall-clock, bounded by ``max_inspect_calls``. Exploration stops costing a
+    scored iteration, which is the whole point of it.
 
     ``on_experiment`` (optional) is invoked after EVERY completed experiment —
     success or failure — with ``experiment=, baseline=, is_best=, run_id=`` keyword
@@ -129,6 +138,10 @@ def run_supervised(
     wants_research = False  # the supervisor's ask, carried to the next iteration
     research_calls = 0
     last_findings: Findings | None = None
+    wants_inspect = False  # the same ask, for a free look at the data
+    inspect_calls = 0
+    last_inspection = ""  # facts persist once printed — re-reading them is free
+    last_brief = ""  # the plan the supervisor had when it asked to look first
     if controller is not None:
         # Q&A is scoped to THIS run: current_run is appended in place below, so
         # the closure always sees exactly the experiments the user is watching —
@@ -189,6 +202,22 @@ def run_supervised(
                             "agent loop: researched %d papers -> %d suggestions",
                             findings.papers_seen, len(findings.suggestions),
                         )
+                if wants_inspect and inspect_calls < max_inspect_calls:
+                    inspect_calls += 1
+                    wants_inspect = False
+                    observed = make_coder().inspect(
+                        dataset=dataset,
+                        brief=last_brief,
+                        experiment_id=f"inspect-{inspect_calls:02d}",
+                    )
+                    if observed:
+                        last_inspection = observed
+                        log.info(
+                            "agent loop: inspected the data -> %d facts (free, unscored)",
+                            len(observed.splitlines()),
+                        )
+                if last_inspection:
+                    extra["inspection"] = last_inspection
                 # Memory already holds every recorded experiment (line below records each
                 # one) — adding current_run would feed this run's experiments in twice.
                 decision = supervisor.decide(
@@ -202,6 +231,8 @@ def run_supervised(
                     **extra,
                 )
                 wants_research = decision.want_research
+                wants_inspect = decision.want_inspect
+                last_brief = decision.brief
             except SupervisorError as exc:
                 log.warning("agent loop: iteration %d supervisor failed: %s", iteration, exc)
                 memory.record_proposer_failure(run_id, iteration, "supervisor", str(exc))

@@ -903,3 +903,61 @@ def test_the_hint_is_not_prompt_specific() -> None:
     )
 
     assert "X_train" in hint
+
+
+# ─── the free inspect step (carry-in 5) ───────────────────────────────────────
+# Cut from v0.4 for a blast radius it turned out not to have: modelling it as an
+# experiment is what demanded a fourth AttemptOutcome and the patience carve-outs.
+# It submits nothing, so it produces no experiment and touches no terminator.
+
+_PRINT_FACTS = """
+print("class balance:", y_train.value_counts(normalize=True).round(2).to_dict())
+print("unique values in cat:", X_train['cat'].nunique())
+print("fitting model")
+"""
+
+
+def test_an_inspection_returns_the_facts_its_cells_printed(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([_run(_PRINT_FACTS), _finish()])
+
+    findings = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=8).inspect(dataset=ds)
+
+    assert "class balance" in findings
+    assert "unique values in cat" in findings
+    # Progress chatter is not a data fact; the dossier's extractor is what draws
+    # that line, and the inspect step deliberately reuses it rather than redrawing.
+    assert "fitting model" not in findings
+
+
+def test_an_inspection_finishes_without_writing_predictions(tmp_path: Path) -> None:
+    """Every gate on a finish asks a question about a SUBMISSION, and an inspection
+    has none — so a finish is accepted on the model's word."""
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([_run("print('rows:', len(X_train))"), _finish()])
+
+    agent = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=8)
+    findings = agent.inspect(dataset=ds)
+
+    assert "rows:" in findings
+    assert len(fake.calls) == 2  # not re-driven for a missing predictions.csv
+
+
+def test_an_inspection_that_prints_nothing_useful_returns_empty(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    fake = _FakeLLM([_run("print('working on it')"), _finish()])
+
+    assert CodingAgent(fake, LocalKernel(), metric="f1", max_cells=8).inspect(dataset=ds) == ""
+
+
+def test_a_broken_inspection_costs_the_run_nothing(tmp_path: Path) -> None:
+    """A free step must never be able to fail a run: the caller gets "" and moves on."""
+
+    class _DeadKernel(_FakeKernel):
+        def run_cell(self, code: str, *, timeout: float) -> CellResult:
+            raise RuntimeError("kernel died")
+
+    ds = _dataset(tmp_path)
+    agent = CodingAgent(_FakeLLM([]), _DeadKernel([]), metric="f1")  # type: ignore[arg-type]
+
+    assert agent.inspect(dataset=ds) == ""

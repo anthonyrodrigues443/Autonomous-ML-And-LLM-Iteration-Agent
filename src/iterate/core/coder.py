@@ -423,6 +423,73 @@ class CodingAgent:
                 self._controller.live_cells = None
             self._kernel.close()
 
+    def inspect(
+        self,
+        *,
+        dataset: TabularDataset,
+        brief: str = "",
+        experiment_id: str = "inspect",
+        max_cells: int = 6,
+    ) -> str:
+        """A free look at the data: run cells that PRINT, return what they printed.
+
+        Not an experiment, and deliberately not shaped like one. It writes no
+        predictions, banks no floor, is never scored, and produces no `Experiment`
+        — the schema forbids a result with neither metrics nor an error, which is
+        the schema saying an unscored run is not an outcome. So the findings travel
+        the same seam the Researcher's do: text folded into the next `decide()`.
+
+        That is what makes the step cheap enough to be free. The three blockers
+        that cut it from v0.4 (a fourth `AttemptOutcome`, keeping patience and
+        `max_iterations` untouched) were all consequences of modelling it as an
+        experiment, and none of them survive this shape. What remains is the cap,
+        which the caller owns.
+
+        Returns "" when the session printed nothing worth carrying, so a failed
+        inspection costs the run a few seconds and nothing else.
+        """
+        from iterate.core.proposer import summarize_dataset
+
+        cells: list[Cell] = []
+        if self._controller is not None:
+            self._controller.live_cells = cells
+        inputs = codegen.build_inputs(dataset)
+        if self._extra_inputs:
+            inputs.update(self._extra_inputs)
+        self._kernel.start(inputs)
+        try:
+            pre = self._session_preamble()
+            pre_result = self._kernel.run_cell(pre, timeout=self._cell_timeout)
+            cells.append(_cell(pre, pre_result, "preamble"))
+            messages = [
+                Message(role="system", content=_PROMPTS["inspect_system"]),
+                Message(
+                    role="user",
+                    content=_PROMPTS["inspect_user_template"].format(
+                        data_summary=summarize_dataset(dataset),
+                        metric=self._metric,
+                        brief=brief.strip() or "(no particular question — profile the data)",
+                        preamble_output=_observation(pre_result),
+                    ),
+                ),
+            ]
+            self._drive(
+                messages,
+                cells,
+                n_test=dataset.n_test,
+                experiment_id=experiment_id,
+                inspect=True,
+                max_cells=max_cells,
+            )
+        except Exception as exc:  # a free step must never be able to cost the run
+            log.warning("coder[%s]: inspection failed: %s", experiment_id, exc)
+            return ""
+        finally:
+            if self._controller is not None:
+                self._controller.live_cells = None
+            self._kernel.close()
+        return _inspection_findings(cells)
+
     def _drive(
         self,
         messages: list[Message],
@@ -433,6 +500,8 @@ class CodingAgent:
         brief_markers: tuple[str, ...] = (),
         seen_digests: frozenset[str] = frozenset(),
         carried: frozenset[str] = frozenset(),
+        inspect: bool = False,
+        max_cells: int | None = None,
     ) -> None:
         """The tool loop: run_cell → feed output back → repeat, until a VERIFIED finish
         or the deadline. The deadline charges KERNEL-EXECUTION seconds only — LLM
@@ -448,7 +517,11 @@ class CodingAgent:
         The lever gate fires when none of the brief's lever-class markers appear in
         any executed cell; the identical gate fires when the submitted bytes hash to
         ANY earlier experiment's submission (not just the best — a later run wasted
-        4 of 10 iterations on sibling duplicates the best-only check could not see)."""
+        4 of 10 iterations on sibling duplicates the best-only check could not see).
+
+        ``inspect`` is the free-look session: it writes no predictions, so a finish
+        is accepted on the model's word and every gate above it is skipped. Those
+        gates all ask a question about a SUBMISSION, and an inspection has none."""
         work = 0.0  # kernel-execution seconds spent — the budget the deadline bounds
         warned = False
         improve_nudged = False
@@ -459,7 +532,7 @@ class CodingAgent:
         consecutive_errors = 0  # errored cells since the last successful one
         truncation_rejections = 0  # consecutive truncated cells rejected unexecuted
         session_start = time.monotonic()
-        for _ in range(self._max_cells):
+        for _ in range(max_cells if max_cells is not None else self._max_cells):
             if self._controller is not None:
                 # The interactive boundary, FIRST — a pending pause is honored
                 # before the session-ending checks below so its clock credit is in
@@ -523,6 +596,8 @@ class CodingAgent:
                 continue
             messages.append(Message(role="assistant", tool_calls=[call]))
             if call.name == FINISH.name:
+                if inspect:
+                    return  # nothing to verify: an inspection submits nothing
                 # Verified finish: only end if valid predictions were actually written.
                 preds = self._kernel.read_output(codegen.PREDICTIONS_CSV)
                 reason = _validate_predictions(preds, n_test)
@@ -881,6 +956,29 @@ def _build_messages(
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
+
+def _inspection_findings(cells: list[Cell]) -> str:
+    """What the inspection printed, as lines a supervisor can plan from.
+
+    Reuses the dossier's extractor rather than defining a second idea of what
+    counts as a data fact: the same rule that keeps "fitting model" out of a digest
+    keeps it out of here, and a fact reads identically whichever step produced it.
+
+    Deduped and capped, because this text lands in the planning prompt and the June
+    revert is what dense planning context did to a 12B.
+    """
+    from iterate.core.dossier import data_facts_from_cells
+
+    agent_cells = [
+        {"stdout": cell.stdout, "code": cell.code}
+        for cell in cells
+        if cell.source == "agent" and cell.stdout
+    ]
+    facts = data_facts_from_cells(agent_cells)[:_INSPECTION_FACTS]
+    return "\n".join(f"- {fact}" for fact in facts)
+
+
+_INSPECTION_FACTS = 8
 
 _ELIDED = "(this earlier cell's output was elided to fit the context window — rely on more recent cells and the variables list)"
 
