@@ -117,6 +117,13 @@ The corpus now has no unreadable dataset. `put_ceiling` keeps the better of the 
 sweeps, so a dataset's stored ceiling is the max over both axes and the `method`
 column says which one produced it.
 
+**Neither sweep dominates, which is the argument for running both.** Across the six
+tabular datasets, v2 raised four ceilings (churn, heart_risk, mobile_price, and
+diamonds from 537.14 to 527.48) and v1 still holds two — adult_income (0.7259 vs
+v2's 0.7218) and laptop_price (248.85 vs v2's 323.73, on a metric where lower wins).
+A dataset's headroom lives on one axis or the other, and there is no way to know
+which without looking at both.
+
 ## Two kinds of ceiling
 
 A `task` line in a dataset's `dataset.toml` marks it as a PROMPT dataset and selects
