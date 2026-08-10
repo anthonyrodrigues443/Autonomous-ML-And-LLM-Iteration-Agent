@@ -124,6 +124,13 @@ v2's 0.7218) and laptop_price (248.85 vs v2's 323.73, on a metric where lower wi
 A dataset's headroom lives on one axis or the other, and there is no way to know
 which without looking at both.
 
+**And both together are still a lower bound, measurably.** A live v0.5 run on churn
+reached 0.6651 against this table's 0.6467 — eleven times the headroom the sweep
+found — with a `BaggingClassifier` over tuned `HistGradientBoosting`. Neither sweep
+does hyperparameter search or ensembling-over-boosting, so neither can see that
+margin. That is `v3`, and until it exists a churn capture fraction should be read as
+"of what a fixed sweep could find", not "of what is there".
+
 ## Two kinds of ceiling
 
 A `task` line in a dataset's `dataset.toml` marks it as a PROMPT dataset and selects
