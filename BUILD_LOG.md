@@ -493,6 +493,45 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-08-11 | Sprint 3 Day 7 | The regression half, actually run
+
+**Task:** v0.5 promises classification AND regression on the prompt path, and the two-day slip was taken for exactly that. But the regression half had never been run live end to end, and `sts_benchmark` was the only one of the nine corpus datasets with no measured ceiling — so the claim in the release notes had no number behind it. Not a release gate (Monday's tabular re-certification satisfied that), but "we ship regression" with zero live regression runs is the kind of thing that comes back.
+
+**The ceiling first, because a prompt result without one is unreadable.** That was the lesson CLINC taught on Day 5 and it was only ever fixed for classification. The rating task needs its own six techniques, because the moves that shift a number are not the moves that shift a label — a scale has no answers to sit between.
+
+| technique | pearson |
+|---|---|
+| minimal | 0.8917 |
+| describe-the-scale | 0.8467 |
+| anchored-examples | 0.9478 |
+| use-the-whole-range | 0.8787 |
+| reasoning | 0.8969 |
+| **scale-plus-examples** | **0.9510** |
+
+Ceiling 0.9510 over a 0.8917 baseline, so 0.0593 of headroom — between toxicity's 0.028 and Davidson's 0.096.
+
+**Describing the boundary ALONE is now harmful three datasets out of three.** `define-the-labels` scored below minimal on both classification sets, and `describe-the-scale` does the same here. It was a finding about label sets; it is a finding about rating scales too. Paired with examples the same description wins or nearly does, which is the shape toxicity showed. Davidson stays the counter-case where the definition costs 0.09, so the best technique still differs by dataset.
+
+**The live run: baseline 0.8690, best 0.9326 on the full 160 holdout, +0.0636.** Four iterations, stopped on patience.
+
+| iter | brief | pearson (ranking slice) |
+|---|---|---|
+| base | minimal prompt | 0.8690 |
+| **1** | **Baseline Measurement** | **0.9222** |
+| 2 | Describe Scale (Rung 2) | 0.9201 |
+| 3 | Describe Scale (Rung 2) | 0.9165 |
+| 4 | Scale Definition for Objects | 0.9211 |
+
+**The winning edit was output discipline, and no technique in the sweep contains it.** "You must provide a decimal score between 0 and 5." A minimal prompt makes gemma4:12b answer in whole numbers, which throws away most of the resolution Pearson needs on a continuous target. That single line is most of the +0.0636. Six standard techniques, none of them mentions decimals — so this is a lever the mechanical sweep structurally cannot find, which is the cleanest argument yet for an agent iterating per dataset rather than a fixed technique list.
+
+Against the sweep: the agent gained +0.0636 on 160 records, the best of six techniques gained +0.0593 on 200. Different slices, so not like for like — the same caveat already on the record for toxicity — but the agent is at least matching a competent sweep and found a move outside its vocabulary.
+
+**A first reading I had to correct, because it was wrong and it changed the conclusion.** Watching the run live I called iterations 2 and 3 a reproduction of the sweep's "describing the scale is harmful" result. Reading the actual prompts afterwards killed that: ALL FOUR versions describe the scale and anchor it with examples, including the winner. None of them was the bare technique. What separates them is density — v1 carries one extra rule, v3 carries three CRITICAL RULES and is both the densest and the worst. The ranking is monotone in how much instruction got piled on, which is the **same mechanism as the Summarizer revert measured the day before**: denser context degrades a floor model. Two measurements on unrelated surfaces pointing the same way is worth more than either alone, and I would have missed it by trusting the lever names in the log instead of reading what was written.
+
+**The gap it exposed: the prompt path has no dead-lever guard, and this run is the first evidence of what that costs.** Iterations 2, 3 and 4 are three refinements of one lever, all three lost to iteration 1, and nothing stopped the repeat. The duplicate gate hashes prompt TEXT, so two wordings of the same move sail through it — the two rejections it did fire were baseline re-briefs. The tabular lever ledger and dead-lever guard were deliberately switched off for this family on Day 3, recorded then as "switched off rather than mistranslated", which was the right call with no evidence. There is evidence now. Re-homed to v0.6, not improvised the day of a release, for the same reason the deterministic inspect step was.
+
+**Not a feature.** Nothing under `src/iterate` changed today. This is evidence for a claim v0.5 makes, plus one honest limitation found by making it.
+
 ### 2026-08-10 | Sprint 3 Day 6 | The carry-in list, closed
 
 **Task:** Tony's bar for the release — "1 to 6 actually do it all then only we will do the v0.5 release since it was promised that way". All seven v0.4 certification carry-ins, not the cheap ones.
