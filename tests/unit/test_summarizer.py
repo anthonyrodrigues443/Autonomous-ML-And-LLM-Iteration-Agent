@@ -136,11 +136,13 @@ def test_llm_exception_degrades_to_skeleton() -> None:
     assert digest.score == 0.61  # a backend failure never costs the run a digest
     assert digest.takeaway == ""
 
-
-# ─── the Summarizer authoring the dossier (carry-in 5) ────────────────────────
-# Grounding the digest in what the harness verified, rather than only in what a
-# 12B chose to write down. Both halves change what reaches the supervisor's
-# planning context, which is why they are separable and measured.
+# ─── the Summarizer authoring the dossier: BUILT, MEASURED, REVERTED ──────────
+# A same-model before/after on churn (gemma4:12b, 6 iterations each) showed the
+# change carried no benefit and a score regression, so it is not in the code and
+# there is nothing here to test. What IS tested is the property the revert
+# restores: the digest's insight fields come from the model, never from the
+# harness's observations, so the planning context stays as lean as it was.
+# Measurement in BUILD_LOG 2026-08-10.
 
 
 def _errored_experiment() -> Experiment:
@@ -159,65 +161,22 @@ def _errored_experiment() -> Experiment:
     return exp
 
 
-def test_the_summarizer_is_shown_what_the_harness_observed() -> None:
+def test_the_harness_observations_do_not_reach_the_summarizer_prompt() -> None:
+    """Reverted 2026-08-10 after the before/after. Pinned so it cannot creep back
+    in without a measurement, which is the actual lesson of the June revert."""
     llm = _FakeLLM([_digest_call(takeaway="t")])
 
     Summarizer(llm, metric="f1").summarize(_experiment())
 
-    user = llm.calls[0][-1].content
-    assert "What the harness observed" in user
-    assert "validation: 0.5500 -> 0.6100" in user
+    assert "What the harness observed" not in (llm.calls[0][-1].content or "")
 
 
-def test_observations_are_withheld_when_the_switch_is_off() -> None:
-    """The before arm of the measurement has to be reachable from the same build."""
-    llm = _FakeLLM([_digest_call(takeaway="t")])
-
-    Summarizer(llm, metric="f1", observed=False).summarize(_experiment())
-
-    assert "What the harness observed" not in llm.calls[0][-1].content
-
-
-def test_an_empty_insight_field_is_seeded_from_observation() -> None:
-    """data_insights is the field a weak model most often leaves empty, and the one
-    the supervisor most needs."""
-    llm = _FakeLLM([_digest_call(takeaway="t")])
-
-    digest = Summarizer(llm, metric="f1").summarize(_experiment())
-
-    assert digest.data_insights
-
-
-def test_an_error_the_model_omitted_still_reaches_what_hurt() -> None:
-    """A session that errored and recovered reads as a clean success in a
-    model-written digest, so the next supervisor re-proposes the thing that broke."""
+def test_an_insight_field_the_model_left_empty_stays_empty() -> None:
+    """The digest is what the model wrote. An error the model omitted is lost, and
+    that is the accepted cost: seeding it back measured worse than losing it."""
     llm = _FakeLLM([_digest_call(takeaway="t", what_hurt=[])])
 
     digest = Summarizer(llm, metric="f1").summarize(_errored_experiment())
 
-    assert any("category_encoders" in item for item in digest.what_hurt)
-    assert all("(observed)" in item for item in digest.what_hurt)
-
-
-def test_seeding_never_overwrites_what_the_model_wrote() -> None:
-    """Observation is a floor under the digest, not a correction of it: the machine
-    can see what happened, only the model can see why."""
-    llm = _FakeLLM(
-        [_digest_call(takeaway="t", data_insights=["PaymentMethod has 4 levels"],
-                      what_hurt=["the import failed because the package is absent"])]
-    )
-
-    digest = Summarizer(llm, metric="f1").summarize(_errored_experiment())
-
-    assert digest.data_insights == ["PaymentMethod has 4 levels"]
-    assert digest.what_hurt == ["the import failed because the package is absent"]
-
-
-def test_the_fallback_skeleton_carries_no_seeded_insights() -> None:
-    """The fallback runs precisely when the LLM could not be trusted to have run at
-    all, so it stays the pure deterministic record."""
-    digest = Summarizer(_RaisingLLM([]), metric="f1").summarize(_errored_experiment())
-
-    assert digest.data_insights == []
     assert digest.what_hurt == []
-    assert digest.score == 0.61
+    assert digest.data_insights == []

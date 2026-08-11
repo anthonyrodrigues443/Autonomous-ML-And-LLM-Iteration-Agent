@@ -486,7 +486,7 @@ def run(
             family=supervisor_family,
             multiclass=n_classes > 2,
         )
-        summarizer = Summarizer(client, metric=metric, observed=_summarizer_reads_observations())
+        summarizer = Summarizer(client, metric=metric)
         # Same no-think client as the other strict roles: the Researcher must emit
         # a single structured tool call, and a thinking trace crowds that out.
         # Cached beside the runs so a re-run on the same data pays nothing.
@@ -1359,18 +1359,3 @@ def _render_summary(result: RunResult, metric: str) -> None:
 
 if __name__ == "__main__":
     app()
-
-
-def _summarizer_reads_observations() -> bool:
-    """Measurement switch for the Summarizer-authors-the-dossier before/after.
-
-    Grounding the digest in the harness's observations changes what reaches the
-    supervisor's planning context, and the June EDA-ledger revert is what happens
-    when that ships unmeasured: a same-model before/after showed additive context
-    collapsing gemma4:12b onto one lever for 5-6 of 10 iterations. So the two arms
-    have to be runnable from one build.
-
-    TEMPORARY. It comes out with the verdict, in either direction — a permanent
-    flag here would mean two supported behaviours and no decision.
-    """
-    return os.environ.get("ITERATE_SUMMARIZER_OBSERVED", "1") != "0"

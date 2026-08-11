@@ -31,8 +31,6 @@ if TYPE_CHECKING:
 _PROMPTS = PROMPTS["summarizer"]
 _CELL_OUTPUT_TAIL = 600  # per-cell stdout shown to the summarizer
 _SESSION_CAP = 16000  # total session text handed to the summarizer (one bounded call)
-_OBSERVED_CAP = 4  # observed items seeded into any one digest field
-                   # — the supervisor reads every digest, so this is per-iteration context
 
 
 def _build_tool() -> ToolSpec:
@@ -69,11 +67,9 @@ class Summarizer:
         temperature: float = 0.3,
         max_tokens: int = 1024,
         max_retries: int = 1,
-        observed: bool = True,
     ) -> None:
         self._client = client
         self._metric = metric
-        self._observed = observed
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._max_retries = max_retries
@@ -91,7 +87,6 @@ class Summarizer:
             techniques=skeleton.techniques,
             val_trail=skeleton.val_trail,
             session=session,
-            observed=record.render() if self._observed else "",
         )
         for _ in range(self._max_retries + 1):
             try:
@@ -103,8 +98,7 @@ class Summarizer:
                 return skeleton
             call = next((c for c in response.tool_calls if c.name == SUMMARIZE.name), None)
             if call is not None:
-                digest = _merge(skeleton, call.arguments)
-                return _seed_insights(digest, record) if self._observed else digest
+                return _merge(skeleton, call.arguments)
             messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
         return skeleton  # the model never called the tool; skeleton is still useful
 
@@ -175,37 +169,6 @@ def _merge(skeleton: ExperimentDigest, args: dict[str, Any]) -> ExperimentDigest
     )
 
 
-def _seed_insights(digest: ExperimentDigest, record: dossier.Dossier) -> ExperimentDigest:
-    """Fill empty insight fields from what the machine observed.
-
-    The Summarizer authoring the dossier means the digest is no longer only what a
-    12B chose to write down. Two fields get a floor:
-
-    `data_insights` gains the facts the cells actually printed, which is the field
-    a weak model most often returns empty — and the one the supervisor most needs,
-    because a fact about the data is what distinguishes a next move from a guess.
-
-    `what_hurt` gains the deduped error signatures. A session that errored and then
-    recovered reads as a clean success in a model-written digest, so the next
-    supervisor re-proposes the thing that broke. This is the observation that most
-    directly stops a repeat.
-
-    Only ever ADDITIVE to an empty field. A model that wrote something specific
-    keeps it: observation is a floor under the digest, not a correction of it,
-    because the machine can see what happened and only the model can see why.
-    """
-    facts = [f for f in record.data_facts if f]
-    failures = [f"{f} (observed)" for f in record.failures if f]
-    if not facts and not failures:
-        return digest
-    return digest.model_copy(
-        update={
-            "data_insights": digest.data_insights or facts[:_OBSERVED_CAP],
-            "what_hurt": digest.what_hurt or failures[:_OBSERVED_CAP],
-        }
-    )
-
-
 def _build_messages(
     *,
     metric: str,
@@ -214,7 +177,6 @@ def _build_messages(
     techniques: list[str],
     val_trail: str,
     session: str,
-    observed: str = "",
 ) -> list[Message]:
     system = _PROMPTS["system"].format(metric=metric)
     user = _PROMPTS["user_template"].format(
@@ -224,10 +186,6 @@ def _build_messages(
         techniques=", ".join(techniques) or "(none detected)",
         val_trail=val_trail or "(none printed)",
         session=session,
-        # The machine's own read of the session, above the raw cells. The cells are
-        # what happened; this is what the harness could verify happened, and a model
-        # that disagrees with it is hallucinating rather than interpreting.
-        observed=_PROMPTS["observed_block"].format(observed=observed) if observed else "",
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 

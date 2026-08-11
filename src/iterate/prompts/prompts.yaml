@@ -767,31 +767,19 @@ summarizer:
     Keep every item short and concrete. Empty lists are fine when the session shows nothing for a field, but the takeaway is always required. Call the summarize_experiment tool; respond with nothing else.
 
   # User message — the finished session to digest.
-  # Placeholders: {metric}, {description}, {score}, {techniques}, {val_trail},
-  # {observed}, {session}
+  # Placeholders: {metric}, {description}, {score}, {techniques}, {val_trail}, {session}
   user_template: |-
     Experiment: {description}
     Final score ({metric}): {score}
     Components detected: {techniques}
     Validation scores printed, in order: {val_trail}
-    {observed}
+
     The session, cell by cell (code, a tail of what each printed, and any error):
     ---
     {session}
     ---
 
     Distill this one experiment now by calling summarize_experiment.
-
-  # The harness's own read of the session, rendered above the raw cells. Kept as a
-  # separate block so it is visibly the machine talking, not more session text:
-  # anything here was verified by code, so a digest that contradicts it is wrong.
-  # Placeholders: {observed}
-  observed_block: |2-
-
-    What the harness observed in this session (verified, not inferred — do not contradict it):
-    ---
-    {observed}
-    ---
 
   retry_nudge: "Respond ONLY by calling the summarize_experiment tool. No prose."
 

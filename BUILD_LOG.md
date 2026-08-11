@@ -525,9 +525,32 @@ Modelled instead as what it actually resembles — a Researcher pass — it need
 
 The inspect session gets its own system prompt rather than the coder's with a sentence added. The coding prompt is dense with instructions to fit a model and submit predictions, and on a floor model those get followed — here, training anything is the failure mode.
 
+**The inspect step is inert on the floor model, and so is a v0.4 feature nobody had checked.** A feature the model never asks for is dead code however well it is wired, so I probed it: gemma4:12b set `want_inspect` **zero** times across 18 live iterations in three runs, and zero times across three targeted probes including one built to invite it (34 unlabelled numeric columns, three iterations without improvement).
+
+Probing `want_research` in the same call is what made it a finding rather than a disappointment. **It never fires either.** It shipped in v0.4 described as reaching the run "when the supervisor asks for it", and on the floor model the supervisor has never once asked — every research pass in every run on record is the automatic iteration-1 pass. So the limitation is the PATTERN, not my new field: a floor model emitting one structured call leaves optional booleans at their default.
+
+Both ship. They are correct, tested, free when unset, and work on any model that sets them. What changes is the documentation, which now says plainly that on gemma4:12b neither fires. The deterministic version — the harness deciding to inspect from the data profile instead of asking — is the shape this codebase normally reaches for ("deterministic guards over prompt nudges", banked in June), and it is re-homed to v0.6 rather than improvised on release eve.
+
 **The Summarizer now authors the dossier**, the other half of carry-in 5. Two changes, both of which alter what reaches the supervisor: the harness's verified observations go into the Summarizer's prompt above the raw cells, and empty insight fields are seeded from them. Seeding is ADDITIVE to an empty field only — observation is a floor under the digest, never a correction of it, because the machine can see what happened and only the model can see why. The deterministic fallback stays pure: it runs precisely when the LLM could not be trusted to have run at all.
 
-This is the one change in the list carrying the June EDA-ledger risk, so it ships behind a before/after with the decision rule written down in advance: **keep only if lever diversity holds.** A score that rises while the supervisor collapses onto one lever is the June pattern presenting itself as a win.
+This is the one change in the list carrying the June EDA-ledger risk, so it shipped behind a before/after with the decision rule written down in advance: keep only if lever diversity holds.
+
+**It was measured and reverted the same day.** Churn, gemma4:12b, 6 iterations per arm, one variable:
+
+| | arm 0 (withheld) | arm 1 (observations on) |
+|---|---|---|
+| best average_precision | **0.6651** | 0.6507 |
+| gain vs baseline | +0.0202 | +0.0058 |
+| distinct lever classes | 5 | 5 |
+| most-repeated lever | 2 of 6 | 2 of 6 |
+| data_insights across digests | 13 | **16** (+23%) |
+| what_hurt items across digests | 9 | **13** (+44%) |
+
+**Diversity held, and I reverted anyway.** The rule as written would have passed it, and the rule as written was incomplete: it names the June SYMPTOM (lever collapse) and not the June MECHANISM (a denser planning prompt degrading a floor model). The mechanism is right there in the last two rows — the change measurably grew what reaches the supervisor, and the score moved the wrong way by 0.0144. A change with no measured benefit, a regression in the predicted direction, on the highest-risk surface in the codebase, the night before a release, ships on hope rather than evidence.
+
+What it does NOT establish is that the change is bad: n=1 per arm cannot separate 0.0144 from a 12B's run-to-run variance. So it is re-homed to v0.6 with 3 repeats per arm, not closed. The seeding never fired for `what_hurt` in either arm (the model always filled it), so the +44% there is the model writing more BECAUSE it read the observed block — which is the density effect, not the seeding.
+
+**Correction to the decision rule, banked:** "keep only if lever diversity holds" is a necessary condition stated as a sufficient one. A context change now also has to show a benefit to earn its place. Absence of the known failure mode is not evidence of value.
 
 **Tabular re-certification: the loop changes cost nothing.** The standing release checklist says re-run the trajectory quality bar on the floor model if the release touched the loop, and v0.5 touched it in five places (the coder's four family parameters, the supervisor's three ladders, the multiclass guard, the Summarizer's inputs, the inspect step). Same dataset and same model as the v0.4 flagship run, laptop price on gemma4:12b, 6 iterations.
 
