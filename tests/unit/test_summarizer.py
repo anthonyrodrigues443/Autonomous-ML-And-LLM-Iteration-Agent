@@ -52,7 +52,7 @@ def _digest_call(**fields: Any) -> ChatResponse:
 def _experiment(*, score: float | None = 0.61) -> Experiment:
     cells = [
         {"code": "# preamble", "stdout": "loaded", "error": None, "source": "preamble", "outputs": []},
-        {"code": "print(X_train.nunique())", "stdout": "PaymentMethod 4", "error": None,
+        {"code": "print(X_train.nunique())", "stdout": "PaymentMethod unique: 4", "error": None,
          "source": "agent", "outputs": []},
         {"code": _FIT_CODE, "stdout": "Validation f1: 0.55\nValidation f1: 0.61",
          "error": None, "source": "agent", "outputs": []},
@@ -135,3 +135,48 @@ def test_llm_exception_degrades_to_skeleton() -> None:
     digest = Summarizer(_RaisingLLM([]), metric="f1").summarize(_experiment(score=0.61))
     assert digest.score == 0.61  # a backend failure never costs the run a digest
     assert digest.takeaway == ""
+
+# ─── the Summarizer authoring the dossier: BUILT, MEASURED, REVERTED ──────────
+# A same-model before/after on churn (gemma4:12b, 6 iterations each) showed the
+# change carried no benefit and a score regression, so it is not in the code and
+# there is nothing here to test. What IS tested is the property the revert
+# restores: the digest's insight fields come from the model, never from the
+# harness's observations, so the planning context stays as lean as it was.
+# Measurement in BUILD_LOG 2026-08-10.
+
+
+def _errored_experiment() -> Experiment:
+    exp = _experiment()
+    cells = list(exp.candidate.changes["cells"])
+    cells.append(
+        {
+            "code": "import category_encoders",
+            "stdout": "",
+            "error": "ModuleNotFoundError: No module named 'category_encoders'",
+            "source": "agent",
+            "outputs": [],
+        }
+    )
+    exp.candidate.changes["cells"] = cells
+    return exp
+
+
+def test_the_harness_observations_do_not_reach_the_summarizer_prompt() -> None:
+    """Reverted 2026-08-10 after the before/after. Pinned so it cannot creep back
+    in without a measurement, which is the actual lesson of the June revert."""
+    llm = _FakeLLM([_digest_call(takeaway="t")])
+
+    Summarizer(llm, metric="f1").summarize(_experiment())
+
+    assert "What the harness observed" not in (llm.calls[0][-1].content or "")
+
+
+def test_an_insight_field_the_model_left_empty_stays_empty() -> None:
+    """The digest is what the model wrote. An error the model omitted is lost, and
+    that is the accepted cost: seeding it back measured worse than losing it."""
+    llm = _FakeLLM([_digest_call(takeaway="t", what_hurt=[])])
+
+    digest = Summarizer(llm, metric="f1").summarize(_errored_experiment())
+
+    assert digest.what_hurt == []
+    assert digest.data_insights == []

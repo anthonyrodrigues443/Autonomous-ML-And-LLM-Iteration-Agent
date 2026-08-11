@@ -8,6 +8,7 @@ import logging
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import quote_plus
 
@@ -76,7 +77,10 @@ class _Cache:
         if path is None or not path.exists():
             return None
         try:
-            rows = json.loads(path.read_text())
+            payload = json.loads(path.read_text())
+            # A bare list is the pre-v0.5 format, which recorded no query. Still
+            # readable, so an existing cache is not invalidated by the change.
+            rows = payload["papers"] if isinstance(payload, dict) else payload
             return [Paper(**row) for row in rows]
         except Exception:  # a corrupt or stale-schema entry is a cache miss
             return None
@@ -87,7 +91,23 @@ class _Cache:
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps([p.__dict__ for p in papers]))
+            # The QUERY is recorded alongside the papers. The file name is a hash,
+            # so without this the question that produced a result was written down
+            # nowhere: auditing "why did it search for that" meant inferring the
+            # question from the answers, and a tool whose pitch is literature
+            # awareness should be able to show its own search trail.
+            path.write_text(
+                json.dumps(
+                    {
+                        "query": query,
+                        "source": source,
+                        "limit": limit,
+                        "fetched_at": datetime.now(UTC).isoformat(),
+                        "papers": [p.__dict__ for p in papers],
+                    },
+                    indent=2,
+                )
+            )
         except OSError:  # a read-only or full disk must not sink a run
             log.debug("research cache write failed for %s", path)
 

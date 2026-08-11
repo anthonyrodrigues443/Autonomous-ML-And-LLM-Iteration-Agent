@@ -479,7 +479,13 @@ def run(
             supervisor_family = (
                 "prompt_scoring" if task_for_metric(metric) == "regression" else "prompt"
             )
-        supervisor = Supervisor(client, metric=metric, family=supervisor_family)
+        n_classes = int(dataset.train_target.nunique()) if not is_prompt_run else 0
+        supervisor = Supervisor(
+            client,
+            metric=metric,
+            family=supervisor_family,
+            multiclass=n_classes > 2,
+        )
         summarizer = Summarizer(client, metric=metric)
         # Same no-think client as the other strict roles: the Researcher must emit
         # a single structured tool call, and a thinking trace crowds that out.

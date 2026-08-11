@@ -174,3 +174,33 @@ def test_facts_and_failures_are_capped() -> None:
     d = dossier.build(_experiment([_cell(many), *errors]))
     assert len(d.data_facts) <= 12
     assert len(d.failures) <= 6
+
+
+def test_the_result_filter_does_not_eat_ordinary_data_facts() -> None:
+    """The substring form of this test ("val" in line) discarded the three most
+    common EDA outputs there are, because each contains those letters. A fact the
+    session printed and the extractor dropped is a fact the supervisor never sees.
+    """
+    kept = dossier.build(
+        _experiment(
+            [
+                _cell(
+                    "missing values: 11\n"
+                    "unique values in PaymentMethod: 4\n"
+                    "interval columns: 3\n"
+                )
+            ]
+        )
+    ).data_facts
+
+    assert len(kept) == 3
+
+
+def test_validation_scores_are_still_kept_out_of_the_data_facts() -> None:
+    """They are a result, not a data fact, and they have their own field."""
+    d = dossier.build(
+        _experiment([_cell("rows 1000\nValidation f1: 0.55\nval_f1: 0.61\nval score 0.58")])
+    )
+
+    assert d.data_facts == ["rows 1000"]
+    assert d.val_trail == [0.55, 0.61, 0.58]

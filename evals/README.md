@@ -83,12 +83,53 @@ first run proved why: the automated sweep found a far better ceiling than the ha
 sweep on laptop price, and a slightly worse one on churn. Overwriting would have
 thrown away real knowledge in the second case.
 
-**Known gap, `brute_force_sweep_v1` varies the MODEL, not the FEATURES.** The Aug 2
-hand sweep varied both, which is why it found small margins on churn, heart and
-mobile where this one finds none. On datasets where the win lives in feature
-engineering, this ceiling underestimates. Adding feature treatments (target
-encoding, interactions, scaling) is `v2` of the sweep, and until then the sweep
-version in `method` is what says which kind of ceiling a number is.
+**Closed 2026-08-10: `feature_treatment_sweep_v2`.** v1 varies the MODEL with the
+preprocessing fixed, so it returned a ceiling exactly equal to the baseline on churn,
+heart and mobile — zero headroom on three of five tabular datasets, which is not a
+readable result. The margin on those datasets lives in how the columns are ENCODED,
+and no number of estimators can see it.
+
+```
+python -m evals.run ceilings --datasets churn --treatments --force
+```
+
+v2 sweeps eight feature treatments through the agent's own CODE path (`build_code_job`
+→ the same runner → `score_code_job`), so a treatment that wins here is a thing the
+agent could actually have written:
+
+```
+ordinal-encoding · native-categorical · target-encoding · frequency-encoding
+numeric-interactions · seed-ensemble · balanced-classes | log-target
+```
+
+Target encoding is out-of-fold. The in-fold version is the classic leak, and it would
+raise the ceiling with a score no honest agent could reach.
+
+Measured 2026-08-10 — every dataset that read as zero headroom has some:
+
+| dataset | baseline | v1 (models) | v2 (treatments) | headroom | best treatment |
+|---|---|---|---|---|---|
+| churn | 0.6449 | 0.6449 | **0.6467** | +0.28% | frequency-encoding |
+| heart_risk | 0.8967 | 0.8967 | **0.9000** | +0.37% | calibrated |
+| mobile_price | 0.9450 | 0.9450 | **0.9550** | +1.06% | numeric-interactions |
+
+The corpus now has no unreadable dataset. `put_ceiling` keeps the better of the two
+sweeps, so a dataset's stored ceiling is the max over both axes and the `method`
+column says which one produced it.
+
+**Neither sweep dominates, which is the argument for running both.** Across the six
+tabular datasets, v2 raised four ceilings (churn, heart_risk, mobile_price, and
+diamonds from 537.14 to 527.48) and v1 still holds two — adult_income (0.7259 vs
+v2's 0.7218) and laptop_price (248.85 vs v2's 323.73, on a metric where lower wins).
+A dataset's headroom lives on one axis or the other, and there is no way to know
+which without looking at both.
+
+**And both together are still a lower bound, measurably.** A live v0.5 run on churn
+reached 0.6651 against this table's 0.6467 — eleven times the headroom the sweep
+found — with a `BaggingClassifier` over tuned `HistGradientBoosting`. Neither sweep
+does hyperparameter search or ensembling-over-boosting, so neither can see that
+margin. That is `v3`, and until it exists a churn capture fraction should be read as
+"of what a fixed sweep could find", not "of what is there".
 
 ## Two kinds of ceiling
 
@@ -96,13 +137,24 @@ A `task` line in a dataset's `dataset.toml` marks it as a PROMPT dataset and sel
 a different sweep. Both answer the same question — what is achievable here, with no
 LLM deciding — and both are lower bounds.
 
-**Tabular: model families.** Nine estimators through the real `ModelTarget`.
+**Tabular: model families, then feature treatments.** Nine estimators through the
+real `ModelTarget` (v1), and eight feature treatments through the code path (v2,
+`--treatments`). Two axes, because a margin lives on one or the other and v1 alone
+could not tell "nothing to find" from "not looking there".
 
 **Prompt: techniques.** Six standard prompt moves, built mechanically from the task
 line, the label set and rows sampled from TRAINING data:
 
 ```
 minimal · define-the-labels · few-shot · reasoning · expert-role · define-plus-few-shot
+```
+
+A rating task gets its own six, because the moves that shift a number are not the
+moves that shift a label — a scale has no answers to sit between:
+
+```
+minimal · describe-the-scale · anchored-examples · use-the-whole-range
+        · reasoning · scale-plus-examples
 ```
 
 Nothing here is hand-written for a particular dataset, which is what keeps it a fair
@@ -116,17 +168,26 @@ fraction measured against that ceiling would be wrong.
 **It cost about 80 minutes for two datasets** (6 techniques x 200 records x 2, at
 ~3.2s a call on a local 12B). The answer cache makes a re-measure free.
 
-Measured 2026-08-09:
+Measured 2026-08-09, and the rating task 2026-08-11:
 
 | dataset | baseline | ceiling | best technique | headroom |
 |---|---|---|---|---|
 | toxicity_jigsaw | 0.8398 | 0.8681 | define-plus-few-shot | 0.028 |
 | hate_speech_davidson | 0.5862 | 0.6822 | few-shot | 0.096 |
+| sts_benchmark | 0.8917 | 0.9510 | scale-plus-examples | 0.059 |
 
-Two things worth knowing from that first run. `define-the-labels` ALONE scored worse
-than minimal on both datasets — telling a small model to be precise about boundaries
-without showing it any is actively harmful. And the best technique differs by
-dataset, so there is no single prompt shape to hardcode.
+**Describing the boundary, alone, is harmful — three datasets out of three.**
+`define-the-labels` scored below minimal on both classification sets, and
+`describe-the-scale` scored 0.8467 against minimal's 0.8917 here. Telling a small
+model to be precise about a boundary without showing it one makes it overthink, and
+that now holds for a rating scale and not only for a label set.
+
+**Paired with examples, the same description is the winner or near it.** Toxicity
+wants define-plus-few-shot; STS-B wants scale-plus-examples, narrowly over anchored
+examples alone (0.9510 vs 0.9478). Davidson is the counter-case where adding the
+definition to few-shot costs 0.09. So the best technique still differs by dataset,
+which is the argument for an agent iterating per dataset rather than a prompt shape
+someone hardcodes.
 
 ## Two corpora, one word
 

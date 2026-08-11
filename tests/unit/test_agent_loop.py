@@ -633,3 +633,122 @@ def test_snapshot_reflects_finished_work_for_the_hard_quit() -> None:
     assert len(snap.history) == 1
     assert snap.best is not None
     assert snap.best.result.metrics.primary_value == 0.60
+
+
+# ─── the free inspect step (carry-in 5) ───────────────────────────────────────
+
+
+class _InspectingSupervisor(_FakeSupervisor):
+    """Records what reached each decide(), and asks to look before deciding."""
+
+    def __init__(self, decisions: list[SupervisorDecision]) -> None:
+        super().__init__(decisions)
+        self.seen_inspection: list[str] = []
+
+    def decide(  # type: ignore[override]
+        self, *, data_summary: str, baseline: object, history: list,
+        carried_best: object = None, inspection: str = "", **kwargs: object,
+    ) -> SupervisorDecision:
+        self.seen_inspection.append(inspection)
+        return super().decide(
+            data_summary=data_summary, baseline=baseline, history=history,
+            carried_best=carried_best,
+        )
+
+
+class _InspectingCoder(_FakeCoder):
+    """One instance serves every session in these tests, so the counts are totals.
+
+    An inspection takes its own `make_coder()` — the coder owns a kernel, and the
+    inspect session starts and closes one — so a per-iteration fake would run dry
+    exactly when the step is exercised.
+    """
+
+    def __init__(self, result: ExperimentResult, findings: str = "- rows 1000") -> None:
+        super().__init__(result)
+        self._findings = findings
+        self.inspections = 0
+
+    def inspect(self, *, dataset: object, brief: str = "", experiment_id: str = "i") -> str:
+        self.inspections += 1
+        return self._findings
+
+
+def _loop_shared(supervisor: object, coder: object, terminator: object):
+    from iterate.core.agent_loop import run_supervised
+
+    return run_supervised(
+        target=_FakeTarget(),  # type: ignore[arg-type]
+        dataset=object(),  # type: ignore[arg-type]
+        supervisor=supervisor,  # type: ignore[arg-type]
+        make_coder=lambda: coder,  # type: ignore[arg-type,return-value]
+        terminator=terminator,  # type: ignore[arg-type]
+        memory=InMemoryMemory(),
+        data_summary="d",
+    )
+
+
+def test_an_inspection_reaches_the_next_decision() -> None:
+    sup = _InspectingSupervisor(
+        [
+            SupervisorDecision(False, "a", "try a", want_inspect=True),
+            SupervisorDecision(False, "b", "try b"),
+        ]
+    )
+    coder = _InspectingCoder(_result(0.60))
+
+    _loop_shared(sup, coder, MaxIterations(2))
+
+    assert sup.seen_inspection[0] == ""  # nothing asked for yet
+    assert "rows 1000" in sup.seen_inspection[1]
+    assert coder.inspections == 1
+
+
+def test_an_inspection_costs_neither_an_iteration_nor_patience() -> None:
+    """The whole point of the step: exploration stops costing a scored iteration.
+    Two scored experiments run under MaxIterations(2) with an inspection between
+    them, and the run still ends on max_iterations rather than one short."""
+    from iterate.core.terminator import Composite, Patience
+
+    sup = _InspectingSupervisor(
+        [
+            SupervisorDecision(False, "a", "try a", want_inspect=True),
+            SupervisorDecision(False, "b", "try b"),
+        ]
+    )
+    coder = _InspectingCoder(_result(0.60))
+
+    result = _loop_shared(sup, coder, Composite(MaxIterations(2), Patience(2)))
+
+    assert result.stopped_because == "max_iterations"
+    assert len(result.history) == 2  # the inspection is not one of them
+    assert coder.inspections == 1
+
+
+def test_the_inspect_budget_is_capped() -> None:
+    """A supervisor that keeps asking cannot spend the run on looking."""
+    sup = _InspectingSupervisor(
+        [SupervisorDecision(False, f"d{i}", "b", want_inspect=True) for i in range(4)]
+    )
+    coder = _InspectingCoder(_result(0.60))
+
+    _loop_shared(sup, coder, MaxIterations(4))
+
+    assert coder.inspections == 2  # max_inspect_calls
+
+
+def test_an_empty_inspection_is_not_carried_into_the_prompt() -> None:
+    """A step that found nothing must not add an empty block to a planning prompt
+    the June revert showed is sensitive to density."""
+    sup = _InspectingSupervisor(
+        [
+            SupervisorDecision(False, "a", "try a", want_inspect=True),
+            SupervisorDecision(False, "b", "try b"),
+        ]
+    )
+    coder = _InspectingCoder(_result(0.60), findings="")
+
+    _loop_shared(sup, coder, MaxIterations(2))
+
+    assert sup.seen_inspection == ["", ""]
+    assert coder.inspections == 1  # it ran; it just found nothing worth carrying

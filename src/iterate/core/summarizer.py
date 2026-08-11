@@ -75,7 +75,8 @@ class Summarizer:
         self._max_retries = max_retries
 
     def summarize(self, experiment: Experiment) -> ExperimentDigest:
-        skeleton = _skeleton(experiment, self._metric)
+        record = dossier.build(experiment)
+        skeleton = _skeleton(record)
         session = _render_session(experiment)
         if not session:
             return skeleton  # nothing to read (e.g. a pre-run crash): skeleton only
@@ -102,19 +103,16 @@ class Summarizer:
         return skeleton  # the model never called the tool; skeleton is still useful
 
 
-def _skeleton(experiment: Experiment, metric: str) -> ExperimentDigest:
+def _skeleton(record: dossier.Dossier) -> ExperimentDigest:
     """The deterministic part: techniques actually instantiated, the score, and the
     within-session validation trail. Always correct, no LLM.
 
     Read off the dossier rather than recomputed here, so there is exactly one
-    definition of what a session can be observed to have done. The insight fields
-    (data_insights / what_helped / what_hurt) stay empty on this path on purpose:
-    they flow into the supervisor's planning context, and seeding them from
-    observation is a context change that needs its own before/after measurement
-    (see the June EDA-ledger revert). That decision belongs to Day 4, where the
-    Summarizer graduates to authoring the dossier.
+    definition of what a session can be observed to have done. This stays the pure
+    fallback: the insight fields are empty here even when the Summarizer authors
+    the dossier, because a fallback runs precisely when the LLM could not be
+    trusted to have run at all.
     """
-    record = dossier.build(experiment)
     return ExperimentDigest(
         techniques=record.techniques,
         score=record.score,

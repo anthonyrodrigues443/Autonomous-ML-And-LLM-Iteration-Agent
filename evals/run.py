@@ -18,7 +18,7 @@ from typing import Any
 
 from evals import ceilings as ceilings_mod
 from evals import config as config_mod
-from evals import corpus, prompt_ceilings, report
+from evals import corpus, prompt_ceilings, report, treatments
 from evals.runner import CellSpec, command_for, run_cell, supports_dataset
 from evals.store import STATUS_OK, Store
 
@@ -135,7 +135,12 @@ def cmd_ceilings(args: argparse.Namespace) -> int:
                 )
                 continue
 
-            kind = "prompt techniques" if dataset.is_prompt_task else "model families"
+            if dataset.is_prompt_task:
+                kind = "prompt techniques"
+            elif args.treatments:
+                kind = "feature treatments"
+            else:
+                kind = "model families"
             _say(f"{dataset.name} ({dataset.metric}) sweeping {kind}:")
 
             def show(result: Any) -> None:
@@ -162,6 +167,11 @@ def cmd_ceilings(args: argparse.Namespace) -> int:
                         ),
                         on_progress=show,
                     )
+                elif args.treatments:
+                    # The other axis. v1 varies the estimator with the preprocessing
+                    # fixed, so a margin living in how the columns are encoded is
+                    # invisible to it however many models it tries.
+                    ceiling, _ = treatments.sweep(dataset, on_progress=show)
                 else:
                     ceiling, _ = ceilings_mod.sweep(
                         dataset, threads=config.conditions.sweep_threads, on_progress=show
@@ -232,6 +242,12 @@ def build_parser() -> argparse.ArgumentParser:
         "ceilings", parents=[common], help="measure the brute-force ceiling per dataset"
     )
     ceilings.add_argument("--force", action="store_true", help="re-measure datasets that have one")
+    ceilings.add_argument(
+        "--treatments",
+        action="store_true",
+        help="sweep feature treatments (v2) instead of model families (v1); "
+        "the stored ceiling keeps whichever is better",
+    )
     ceilings.set_defaults(func=cmd_ceilings)
 
     report_cmd = sub.add_parser(

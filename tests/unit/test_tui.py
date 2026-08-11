@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 import pytest
 from textual.widgets import Input
@@ -107,7 +108,14 @@ async def test_worker_thread_can_own_a_sqlite_memory(tmp_path) -> None:
 
     app = IterateTUI(run_fn, ctrl, title="t")
     async with app.run_test() as pilot:
-        await pilot.pause(0.3)
+        # Waits on the CONDITION, not a duration. A fixed pause(0.3) is a guess at
+        # how long a worker thread needs to open sqlite and write two rows, and it
+        # failed a release PR once on a slower runner then passed on a re-run with
+        # no code change. This finishes the instant the worker does and still
+        # survives a machine ten times slower.
+        deadline = time.monotonic() + 10.0
+        while app.result is None and app.error is None and time.monotonic() < deadline:
+            await pilot.pause(0.02)
     assert app.error is None, f"worker-thread Memory failed: {app.error}"
     assert isinstance(app.result, str)
     assert app.result
@@ -225,3 +233,24 @@ async def test_typed_stop_quits_immediately_when_the_hook_is_bound() -> None:
         await pilot.pause()
     assert app.quit_requested
     release.set()
+
+
+def test_the_specialists_are_visible_in_the_transcript() -> None:
+    """Carry-in from the v0.4 certification: only brief, cell and score had styled
+    events, so the Researcher and Critic — the two headline v0.4 specialists —
+    reached the transcript as dim ambient lines indistinguishable from routine
+    chatter. They do the most interesting work in a run and were the hardest thing
+    in it to see."""
+    from iterate.ui.tui import _specialist_style
+
+    assert _specialist_style("agent loop: researched 10 papers -> 3 suggestions")
+    assert _specialist_style("critic: rejected iteration 2 for a proven leak")
+    assert _specialist_style("agent loop: dropped what-helped claims contradicted by the verdict")
+
+
+def test_ordinary_chatter_stays_dim() -> None:
+    """The styling only means something if most lines do not have it."""
+    from iterate.ui.tui import _specialist_style
+
+    assert not _specialist_style("coder[iter-01]: session ended without a valid submission")
+    assert not _specialist_style("loaded: (1200, 1) train / (300, 1) holdout")

@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 # Bumped when the technique list changes, so a stored ceiling says which sweep
 # produced it and an old one can be spotted.
 METHOD = "prompt_technique_sweep_v1"
+# The scoring list is separate: see `scoring_techniques`.
+SCORING_METHOD = "prompt_scoring_sweep_v1"
 
 # One model call per record per technique, so the whole sweep is
 # len(TECHNIQUES) x RECORDS calls. Enough records to rank techniques against each
@@ -82,6 +84,59 @@ def _examples(dataset: object, columns: Sequence[str], k: int) -> str:
     for (_, row), answer in zip(train_x.iterrows(), train_y, strict=False):
         lines.append(f"Input:\n{render_all(row.to_dict(), columns)}\nAnswer: {answer}")
     return "\n\n".join(lines)
+
+
+def scoring_techniques(
+    task: str, dataset: object, columns: Sequence[str], low: float, high: float
+) -> dict[str, Prompt]:
+    """The fixed list for a NUMERIC target.
+
+    Not the classification list with words changed. "Define the labels" names an
+    edge between two answers and a number has none; what moves a rating prompt is
+    the scale being described, anchored, and its extremes made usable. A model
+    handed a bare range invents its own scale and then compresses toward the middle.
+    """
+    from iterate.core.prompting import render_all
+
+    base = f"{task.strip()}\n\nAnswer with a number between {low:g} and {high:g}."
+
+    train_x = dataset.train_features.head(_FEW_SHOT)  # type: ignore[attr-defined]
+    train_y = dataset.train_target.head(_FEW_SHOT)  # type: ignore[attr-defined]
+    worked = "\n\n".join(
+        f"Input:\n{render_all(row.to_dict(), columns)}\nAnswer: {value:g}"
+        for (_, row), value in zip(train_x.iterrows(), train_y, strict=False)
+    )
+
+    return {
+        "minimal": Prompt(system=base, user_template="{input}"),
+        "describe-the-scale": Prompt(
+            system=base
+            + f"\n\nSay what the endpoints mean before deciding: {low:g} is the "
+            f"extreme low end and {high:g} the extreme high end, with the midpoint "
+            "meaning a genuine halfway case.",
+            user_template="{input}",
+        ),
+        "anchored-examples": Prompt(
+            system=base + "\n\nWorked examples:\n\n" + worked, user_template="{input}"
+        ),
+        "use-the-whole-range": Prompt(
+            system=base
+            + "\n\nUse the whole range. Commit to a value near an extreme when the "
+            "case warrants it rather than retreating to the middle.",
+            user_template="{input}",
+        ),
+        "reasoning": Prompt(
+            system=base + "\n\nWork out what the record actually says before choosing a number.",
+            user_template="{input}",
+        ),
+        "scale-plus-examples": Prompt(
+            system=base
+            + f"\n\n{low:g} is the extreme low end and {high:g} the extreme high end. "
+            "Use the whole range.\n\nWorked examples:\n\n"
+            + worked,
+            user_template="{input}",
+        ),
+    }
 
 
 def techniques(task: str, dataset: object, columns: Sequence[str]) -> dict[str, Prompt]:
@@ -158,7 +213,16 @@ def sweep(
     best: float | None = None
     best_name = ""
 
-    for name, prompt in techniques(task, loaded, columns).items():
+    from iterate.core.scoring import task_for_metric
+    from iterate.targets.prompt import numeric_range
+
+    if task_for_metric(dataset.metric) == "regression":
+        low, high = numeric_range(loaded)
+        chosen = scoring_techniques(task, loaded, columns, low or 0.0, high or 1.0)
+    else:
+        chosen = techniques(task, loaded, columns)
+
+    for name, prompt in chosen.items():
         started = time.monotonic()
         target = PromptTarget(
             loaded,
@@ -196,7 +260,10 @@ def sweep(
             ceiling=best,
             direction=direction,
             baseline=baseline,
-            method=f"{METHOD} (best: {best_name}, {records} records)",
+            method=(
+                f"{SCORING_METHOD if task_for_metric(dataset.metric) == 'regression' else METHOD}"
+                f" (best: {best_name}, {records} records)"
+            ),
             measured_at=datetime.now(UTC).isoformat(),
             detail=json.dumps(
                 [

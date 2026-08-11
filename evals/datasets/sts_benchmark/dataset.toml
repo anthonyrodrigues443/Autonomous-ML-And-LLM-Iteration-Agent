@@ -1,0 +1,6 @@
+data = "examples/sts_benchmark/data.csv"
+target = "similarity"
+metric = "pearson"
+task = "rate how similar these two sentences are, from 0 to 5"
+source = "STS Benchmark via nyu-mll/glue (HuggingFace)"
+notes = "The regression example. Pearson is the field's canonical metric for it, which is why the correlations added in v0.5 get exercised on the dataset they were designed for."

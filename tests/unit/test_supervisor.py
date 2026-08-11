@@ -1335,3 +1335,35 @@ def test_answer_grounds_on_the_dataset_profile_and_live_session() -> None:
     assert "16 categorical" in flat
     assert "RUNNING RIGHT NOW" in flat
     assert "Training fold shape: (4506, 19)" in flat
+
+
+def test_a_threshold_lever_is_dead_on_multiclass_whatever_the_metric() -> None:
+    """Carry-in 4, measured 2026-08-10 before shipping the guard, per the standing
+    rule that no guard ships unmeasured.
+
+    Across 57 class-prior reweightings on a 4-class target the BEST achievable move
+    was +0.0000 on both f1_macro and accuracy — against +0.0036 and +0.0022 on the
+    same experiment run as binary. The prediction is an argmax over classes, so
+    there is no single decision threshold to tune, whatever the metric.
+    """
+    from iterate.core.supervisor import dead_lever_reason
+
+    brief = "next: imbalance-or-threshold: tune the decision threshold on validation"
+
+    # accuracy is NOT threshold-free, so the binary guard lets this through
+    assert dead_lever_reason(brief, "accuracy") is None
+    # but on multiclass it cannot move the number at all
+    reason = dead_lever_reason(brief, "accuracy", multiclass=True)
+    assert reason is not None
+    assert "argmax" in reason
+
+
+def test_the_binary_threshold_guard_is_unchanged() -> None:
+    """The measured binary case still moves f1 by ~0.02, so the lever stays legal
+    there — the new guard must not widen into it."""
+    from iterate.core.supervisor import dead_lever_reason
+
+    brief = "next: imbalance-or-threshold: tune the decision threshold on validation"
+
+    assert dead_lever_reason(brief, "f1") is None  # legal on binary f1
+    assert dead_lever_reason(brief, "roc_auc") is not None  # ranking metric, still dead

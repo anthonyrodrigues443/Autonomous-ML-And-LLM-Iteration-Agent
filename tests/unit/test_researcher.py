@@ -10,7 +10,10 @@ No network: the paper sources are fakes, and the LLM is a scripted fake.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from iterate.adapters.research import Paper
 from iterate.core.researcher import Findings, Researcher, Suggestion, credited
@@ -220,3 +223,45 @@ def test_crediting_needs_more_than_one_shared_word() -> None:
 def test_no_findings_credits_nothing() -> None:
     assert credited(None, "next: anything") == []
     assert credited(Findings(), "next: anything") == []
+
+
+def test_the_research_cache_records_the_query_that_produced_it(tmp_path: Path) -> None:
+    """The filename is a hash, so before this the question was written down nowhere.
+    Auditing "why did it search for that" meant inferring the question from the
+    answers — for a tool whose pitch is literature awareness."""
+    import json
+
+    from iterate.adapters.research.papers import Paper, _Cache
+
+    cache = _Cache(tmp_path)
+    paper = Paper(
+        title="T", identifier="arXiv:1", abstract="a", year=2024, cited_by=3, source="arxiv"
+    )
+
+    cache.put("arxiv", "few-shot example selection", 5, [paper])
+    saved = json.loads(next(tmp_path.glob("*.json")).read_text())
+
+    assert saved["query"] == "few-shot example selection"
+    assert saved["source"] == "arxiv"
+    assert saved["fetched_at"]
+    assert len(saved["papers"]) == 1
+    assert cache.get("arxiv", "few-shot example selection", 5) == [paper]
+
+
+def test_a_pre_v05_cache_file_is_still_readable(tmp_path: Path) -> None:
+    """A format change must not silently invalidate every cached search and send a
+    run back to the network for results it already has."""
+    import hashlib
+    import json
+
+    from iterate.adapters.research.papers import _Cache
+
+    key = hashlib.sha256(b"arxiv|5|legacy").hexdigest()[:20]
+    (tmp_path / f"arxiv-{key}.json").write_text(
+        json.dumps(
+            [{"title": "T", "identifier": "i", "abstract": "a", "year": 2024,
+              "cited_by": 1, "source": "arxiv"}]
+        )
+    )
+
+    assert _Cache(tmp_path).get("arxiv", "legacy", 5) is not None

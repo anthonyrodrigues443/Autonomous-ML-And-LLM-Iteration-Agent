@@ -309,6 +309,39 @@ coder:
     {preamble_output}
 
     Do this now, ONE action per cell, printing the one result each cell produces and reading it before the next. Begin with a dtype-split SETUP cell that computes num_cols and cat_cols in one cell — the profile already gives their cardinality, class balance, and missingness, so do NOT add a cell to re-derive those. If a 'BEST APPROACH SO FAR' block appears above, do NOT paste it as one cell: find its score line, then rebuild it incrementally as separate cells (reproduce each step and read its output), then apply the brief's ONE change to beat that score. Otherwise build the strong simple baseline (one-hot, median-impute, a gradient-boosted tree) one small cell at a time: carve the validation split from the training data FIRST, fit each transform on the training fold only and transform both folds into NEW variables, combine each fold into one named matrix, fit and score one model, transform X_holdout with the SAME fitted objects, then write holdout predictions to '{predictions_csv}'. Never bundle transform, fit, and write into one cell. After your first valid submission, keep improving one measured change at a time, reusing the variables already in memory, until the budget warning, then call the finish tool.
+  # The FREE look. A separate system message rather than the coding one with a
+  # sentence bolted on: the coder's prompt is dense with instructions to write a
+  # model and submit predictions, and on a floor model those instructions get
+  # followed whatever else is added. Here, training anything is the failure mode.
+  inspect_system: |-
+    You are inspecting a dataset. You are NOT training a model and NOT making predictions, and an attempt to do either wastes the step.
+
+    Your only job is to run a few small cells that PRINT facts about the data, then finish. Good things to print: class balance, the cardinality of each categorical column, missing-value counts, the distribution or skew of the target, how strongly individual features relate to the target, and anything odd (constant columns, duplicated rows, an ID-like column, an implausible range).
+
+    Rules:
+    - Print, never plot. Nothing here can render an image.
+    - Keep each cell small and print its result immediately; output you do not print is lost.
+    - State numbers, not opinions. "PaymentMethod has 4 levels, the largest 34%" is useful; "the data looks clean" is not.
+    - Do not fit, train, cross-validate, or write any file.
+    - Call finish once you have printed enough to choose a modelling lever from. A few good cells beat a long session.
+
+    Call run_cell to execute a cell, or finish when you are done. Respond with nothing else.
+
+  # Placeholders: {data_summary}, {metric}, {brief}, {preamble_output}
+  inspect_user_template: |-
+    Dataset profile the harness already computed:
+    {data_summary}
+
+    The run is scored on {metric}.
+
+    What the strategist wants to understand before briefing the next experiment:
+    {brief}
+
+    The data is already loaded. The preamble printed:
+    {preamble_output}
+
+    Inspect now. Print what you find, then finish.
+
   retry_nudge: >-
     Respond ONLY by calling the run_cell tool (with a `code` string) or the finish
     tool. No prose.
@@ -589,6 +622,11 @@ supervisor:
   rules_prefix: "USER RULES (standing instructions from the human — every brief must respect them): "
   research_prefix: "Literature findings for this dataset (each with the paper that supports it) — you may brief one of these, or ignore them if a better move is already clear: "
 
+  # The free look you asked for. Deliberately worded as facts rather than as
+  # advice: an inspection prints what is true about the data, and choosing the
+  # lever from it is still the supervisor's job.
+  inspection_prefix: "What a free inspection of the data just printed (facts, not suggestions) — brief the lever these facts call for: "
+
   # Classifies ONE chat line; the harness executes the routing.
   route_system: |-
     You route ONE message a human typed into a live ML iteration run. Decide what it is and call route_message with exactly one kind:
@@ -630,6 +668,13 @@ supervisor:
         iterations have not improved on the best. false when you already know the
         move worth making; research costs a call and adds nothing when the path is
         clear.
+      want_inspect: >-
+        true to spend a FREE look at the data before committing the next
+        experiment: an unscored session that only prints things (distributions,
+        cardinalities, class balance, a correlation) and trains nothing. Costs no
+        iteration and no patience. Use it when you do not yet know which lever the
+        data calls for; false once you do, because an inspection that confirms what
+        you already planned has bought nothing.
       brief: |-
         The "next:" move handed to the coding agent: 1-2 lines opening "next:", exactly ONE move naming the technique and its lever class, with one reason citing a profile fact or a past number; effect in plain words, never a predicted number. Do NOT write a "so far:" summary — the harness composes that slot from the recorded history and discards anything you write before "next:". Example: next: imbalance-or-threshold: class balance 73/27, metric f1, keep the best pipeline and train with class_weight balanced so the majority class stops dominating. On experiment 1 brief the plain baseline only (one-hot, median-impute, HistGradientBoosting), nothing else: no extra models, features, or tuning. After experiment 1, keep the best configuration and add exactly one change; never repeat a scored approach. Required unless stopping.
 

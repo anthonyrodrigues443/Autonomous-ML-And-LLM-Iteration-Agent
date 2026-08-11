@@ -54,6 +54,13 @@ class SupervisorDecision:
     # strict roles at all (LIMITATIONS). The harness reads this and runs the
     # Researcher before the next decide().
     want_research: bool = False
+    # The supervisor's ASK for a FREE look at the data before committing an
+    # iteration to a guess. Same shape and same reason as want_research: one more
+    # field on the emit it already makes, never a tool it drives, so plan_next
+    # stays ONE structured call. The harness runs an unscored session, digests it,
+    # and comes back to decide() with the findings in history — no score is
+    # recorded, no patience is spent, and the run's iteration budget is untouched.
+    want_inspect: bool = False
 
 
 def _build_tool() -> ToolSpec:
@@ -71,6 +78,10 @@ def _build_tool() -> ToolSpec:
                 "want_research": {
                     "type": "boolean",
                     "description": fields["want_research"],
+                },
+                "want_inspect": {
+                    "type": "boolean",
+                    "description": fields["want_inspect"],
                 },
             },
             "required": ["stop", "brief"],
@@ -96,6 +107,10 @@ class Supervisor:
         # swapped: on the first live prompt run it read a column of comment text as
         # a high-cardinality categorical and briefed one-hot encoding.
         family: str = "tabular",
+        # Whether the target has more than two classes. A threshold lever is a
+        # measured no-op there whatever the metric, which the metric alone cannot
+        # tell us.
+        multiclass: bool = False,
     ) -> None:
         self._client = client
         self._metric = metric
@@ -103,6 +118,7 @@ class Supervisor:
         self._max_tokens = max_tokens
         self._max_retries = max_retries
         self._family = family
+        self._multiclass = multiclass
 
     def decide(
         self,
@@ -114,6 +130,7 @@ class Supervisor:
         user_guidance: str | None = None,
         standing_rules: Sequence[str] = (),
         research: str = "",
+        inspection: str = "",
     ) -> SupervisorDecision:
         """Plan the next experiment. ``carried_best`` is the loop's CURRENT best —
         the experiment whose code the coder will actually receive as its starting
@@ -147,6 +164,14 @@ class Supervisor:
                     role="user",
                     content=_PROMPTS["research_prefix"]
                     + _word_cut(research.strip(), _RESEARCH_CHARS),
+                )
+            )
+        if inspection.strip():
+            messages.append(
+                Message(
+                    role="user",
+                    content=_PROMPTS["inspection_prefix"]
+                    + _word_cut(inspection.strip(), _INSPECTION_CHARS),
                 )
             )
         detail = ""
@@ -190,8 +215,10 @@ class Supervisor:
                 # not exist on the prompt path, so the check can only misfire there.
                 dead_reason = (
                     None
-                    if self._family == "prompt"
-                    else dead_lever_reason(decision.brief, self._metric)
+                    if self._family.startswith("prompt")
+                    else dead_lever_reason(
+                        decision.brief, self._metric, multiclass=self._multiclass
+                    )
                 )
                 if dead_reason:
                     violation = (
@@ -405,6 +432,7 @@ _RULE_CHARS = 90
 # Research findings are one line per suggestion (max 3), so this caps a pass at
 # roughly the size of a standing-rules block rather than a page of prose.
 _RESEARCH_CHARS = 420
+_INSPECTION_CHARS = 700  # facts are terser than prose, and this is the point of the step
 _RULES_SHOWN = 3
 
 
@@ -933,7 +961,11 @@ def _to_decision(args: dict[str, Any]) -> SupervisorDecision:
     if not stop and not brief:
         raise SupervisorError("plan_next returned neither stop nor a brief")
     return SupervisorDecision(
-        stop=stop, title=title, brief=brief, want_research=_coerce_bool(args.get("want_research"))
+        stop=stop,
+        title=title,
+        brief=brief,
+        want_research=_coerce_bool(args.get("want_research")),
+        want_inspect=_coerce_bool(args.get("want_inspect")),
     )
 
 
@@ -1202,7 +1234,7 @@ _CANONICAL_MOVES: dict[str, str] = {
 _THRESHOLD_LEVERS = frozenset({"imbalance-or-threshold"})
 
 
-def dead_lever_reason(brief: str, metric: str) -> str | None:
+def dead_lever_reason(brief: str, metric: str, *, multiclass: bool = False) -> str | None:
     """Why this brief commissions a lever that CANNOT move this metric, or None.
 
     Added after the v0.4 certification runs. Telling the supervisor in its prompt
@@ -1212,9 +1244,23 @@ def dead_lever_reason(brief: str, metric: str) -> str | None:
     exactly: guards beat prompt nudges on weak models. So it becomes a guard, and
     the prompt note stays as the explanation the retry needs.
     """
+    move = _move_text(brief)
+    if multiclass:
+        # Measured 2026-08-10, the carry-in this closes: across 57 class-prior
+        # reweightings on a 4-class target, the BEST achievable move was +0.0000 on
+        # both f1_macro and accuracy, against +0.0036 and +0.0022 on the same
+        # experiment run as binary. There is no single threshold when the
+        # prediction is an argmax over classes, so the lever cannot move the number
+        # by construction — regardless of which metric is being optimised.
+        for lever in _THRESHOLD_LEVERS:
+            if lever in move:
+                return (
+                    f"{lever} cannot move a MULTICLASS target: the prediction is an "
+                    "argmax over classes, so there is no single decision threshold "
+                    "to tune. Measured at exactly +0.0000 across the whole range"
+                )
     if not threshold_free(metric):
         return None
-    move = _move_text(brief)
     for lever in _THRESHOLD_LEVERS:
         if lever in move:
             return (

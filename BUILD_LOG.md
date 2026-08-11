@@ -315,9 +315,9 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Mon Aug 3 | **Eval suite FIRST** (Tony's call after the v0.4 certification): the headroom table from EVAL_LOG becomes a runnable corpus, so a release is measured rather than argued about. Then the v0.5 work below | `evals/` + corpus + runner | done (built Sat Aug 8) |
 | Tue Aug 4 | Loop integration: prompt lever classes for the supervisor ladder, coder session writes prompt variants + scoring cells, guard stack audited for the new path (duplicate gates hash prompt text, dead-ends transfer) | wiring + tests | done (built Sat Aug 8) |
 | Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | done (built Sun Aug 9) |
-| Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | |
-| Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | |
-| Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | |
+| Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | done (built Sun Aug 9) |
+| Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | done (built Sun Aug 9: 5 live gemma4:12b runs) |
+| Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | done (built Mon Aug 10: all 7 carry-ins resolved — 6 shipped, and carry-in 5's second half built, measured and reverted on the evidence, see entry) |
 | Sun Aug 9 | **Release v0.5.0** — SLIPPED to Tue Aug 11 (Tony's call 2026-08-09): v0.5 ships classification AND regression together rather than half the promise. "Prompt iteration for ML tasks" is a claim worth a two-day slip | v0.5.0 out | slipped |
 
 ---
@@ -492,6 +492,121 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-08-11 | Sprint 3 Day 7 | The regression half, actually run
+
+**Task:** v0.5 promises classification AND regression on the prompt path, and the two-day slip was taken for exactly that. But the regression half had never been run live end to end, and `sts_benchmark` was the only one of the nine corpus datasets with no measured ceiling — so the claim in the release notes had no number behind it. Not a release gate (Monday's tabular re-certification satisfied that), but "we ship regression" with zero live regression runs is the kind of thing that comes back.
+
+**The ceiling first, because a prompt result without one is unreadable.** That was the lesson CLINC taught on Day 5 and it was only ever fixed for classification. The rating task needs its own six techniques, because the moves that shift a number are not the moves that shift a label — a scale has no answers to sit between.
+
+| technique | pearson |
+|---|---|
+| minimal | 0.8917 |
+| describe-the-scale | 0.8467 |
+| anchored-examples | 0.9478 |
+| use-the-whole-range | 0.8787 |
+| reasoning | 0.8969 |
+| **scale-plus-examples** | **0.9510** |
+
+Ceiling 0.9510 over a 0.8917 baseline, so 0.0593 of headroom — between toxicity's 0.028 and Davidson's 0.096.
+
+**Describing the boundary ALONE is now harmful three datasets out of three.** `define-the-labels` scored below minimal on both classification sets, and `describe-the-scale` does the same here. It was a finding about label sets; it is a finding about rating scales too. Paired with examples the same description wins or nearly does, which is the shape toxicity showed. Davidson stays the counter-case where the definition costs 0.09, so the best technique still differs by dataset.
+
+**The live run: baseline 0.8690, best 0.9326 on the full 160 holdout, +0.0636.** Four iterations, stopped on patience.
+
+| iter | brief | pearson (ranking slice) |
+|---|---|---|
+| base | minimal prompt | 0.8690 |
+| **1** | **Baseline Measurement** | **0.9222** |
+| 2 | Describe Scale (Rung 2) | 0.9201 |
+| 3 | Describe Scale (Rung 2) | 0.9165 |
+| 4 | Scale Definition for Objects | 0.9211 |
+
+**The winning edit was output discipline, and no technique in the sweep contains it.** "You must provide a decimal score between 0 and 5." A minimal prompt makes gemma4:12b answer in whole numbers, which throws away most of the resolution Pearson needs on a continuous target. That single line is most of the +0.0636. Six standard techniques, none of them mentions decimals — so this is a lever the mechanical sweep structurally cannot find, which is the cleanest argument yet for an agent iterating per dataset rather than a fixed technique list.
+
+Against the sweep: the agent gained +0.0636 on 160 records, the best of six techniques gained +0.0593 on 200. Different slices, so not like for like — the same caveat already on the record for toxicity — but the agent is at least matching a competent sweep and found a move outside its vocabulary.
+
+**A first reading I had to correct, because it was wrong and it changed the conclusion.** Watching the run live I called iterations 2 and 3 a reproduction of the sweep's "describing the scale is harmful" result. Reading the actual prompts afterwards killed that: ALL FOUR versions describe the scale and anchor it with examples, including the winner. None of them was the bare technique. What separates them is density — v1 carries one extra rule, v3 carries three CRITICAL RULES and is both the densest and the worst. The ranking is monotone in how much instruction got piled on, which is the **same mechanism as the Summarizer revert measured the day before**: denser context degrades a floor model. Two measurements on unrelated surfaces pointing the same way is worth more than either alone, and I would have missed it by trusting the lever names in the log instead of reading what was written.
+
+**The gap it exposed: the prompt path has no dead-lever guard, and this run is the first evidence of what that costs.** Iterations 2, 3 and 4 are three refinements of one lever, all three lost to iteration 1, and nothing stopped the repeat. The duplicate gate hashes prompt TEXT, so two wordings of the same move sail through it — the two rejections it did fire were baseline re-briefs. The tabular lever ledger and dead-lever guard were deliberately switched off for this family on Day 3, recorded then as "switched off rather than mistranslated", which was the right call with no evidence. There is evidence now. Re-homed to v0.6, not improvised the day of a release, for the same reason the deterministic inspect step was.
+
+**Not a feature.** Nothing under `src/iterate` changed today. This is evidence for a claim v0.5 makes, plus one honest limitation found by making it.
+
+### 2026-08-10 | Sprint 3 Day 6 | The carry-in list, closed
+
+**Task:** Tony's bar for the release — "1 to 6 actually do it all then only we will do the v0.5 release since it was promised that way". All seven v0.4 certification carry-ins, not the cheap ones.
+
+**Carry-in 7 turned out to be a question about the eval suite, not about the agent.** It read "the agent misses thin margins (churn 1.6%, mobile 2.1%)". The Aug 9 sweep could not confirm it: `brute_force_sweep_v1` measured churn, heart and mobile at EXACTLY zero headroom, three of five tabular datasets unreadable. v1 varies the estimator with the preprocessing fixed, so a margin living in how the columns are encoded is invisible to it however many models it tries.
+
+So the fix was a second axis. `evals/treatments.py` sweeps eight feature treatments through the agent's OWN code path — `build_code_job` writes the same sealed holdout, the same runner executes it, `score_code_job` applies the same ruler — which means a treatment that wins is a thing the agent could actually have written, not a number from a privileged script.
+
+| dataset | baseline | v1 (models) | v2 (treatments) | headroom | best treatment |
+|---|---|---|---|---|---|
+| churn | 0.6449 | 0.6449 | 0.6467 | +0.28% | frequency-encoding |
+| heart_risk | 0.8967 | 0.8967 | 0.9000 | +0.37% | calibrated |
+| mobile_price | 0.9450 | 0.9450 | 0.9550 | +1.06% | numeric-interactions |
+
+Sweeping the other three tabular datasets settled a second question: **neither sweep dominates.** v2 also raised diamonds (537.14 to 527.48), while v1 still holds adult_income (0.7259 against v2's 0.7218) and laptop_price (248.85 against 323.73). Four ceilings from treatments, two from model families. A dataset's headroom lives on one axis or the other and there is no way to know which without looking at both, which is why v2 is an addition rather than a replacement.
+
+**The answer to carry-in 7, corrected the same day by a live run.** The first reading of the table above was "the margins are real but 2-5x smaller than the hand estimate, and each one is a feature treatment rather than a model swap". A live v0.5 churn run then reached **0.6651**, against a baseline of 0.6449 and a v2 ceiling of 0.6467 — **eleven times the headroom the sweep could find**, and more than the 1.6% the v0.4 hand pass estimated. Its winning move was a `BaggingClassifier` over tuned `HistGradientBoosting` with a power transform, which is neither a model family in v1 nor a treatment in v2.
+
+So the corrected answer is sharper and less flattering to my own sweep. **The margins are real and LARGER than any brute-force sweep here has found; both sweeps are weak lower bounds on churn, because neither does hyperparameter search or ensembling-over-boosting.** And carry-in 7's premise does not reproduce under v0.5: on churn the agent does not miss the thin margin, it finds an order of magnitude more of it than a competent sweep does. The code was read for leakage precisely because a 1122% capture is when to be suspicious — transformers are fit on the train sub-split only, the holdout is transformed and never fitted, and its labels never leave the host.
+
+What survives from the first reading is the part the sweeps CAN speak to: of the headroom a fixed sweep can find, all of it on these three datasets is in feature treatments rather than model choice. The corpus no longer has an unreadable dataset, and the honest label on every ceiling is still "lower bound", now with a measured example of how loose that bound can be. A hyperparameter-and-ensembling axis is `v3`.
+
+**A real bug fell out of building it: no probability metric could be scored on the sandbox code path.** `build_code_job` listed only `predictions.csv` as an output, so the `probabilities.csv` the script correctly wrote was never collected and `score_code_job` never passed it. Every `average_precision` / `roc_auc` / `log_loss` candidate under `--sandbox e2b` scored as a hard failure — two of the eight certification datasets are scored that way. Measured before and after on churn: `code-gen contract: average_precision needs probabilities` became 0.6362. It survived two releases because nothing tested `ModelTarget`'s two `SupportsCodeGen` methods at all; there are now tests that do.
+
+**A second real bug, found by a test I expected to pass.** The dossier's data-fact extractor skipped any line containing the substring `"val"`, meaning to skip validation scores. It also skipped `missing values: 11`, `unique values in PaymentMethod: 4`, `value_counts: ...` and `interval columns: 3` — the most common EDA output there is. Every one of those facts was printed by a session, dropped by the extractor, and never reached the supervisor. Now word-bounded (`_` counts as a boundary, so `val_f1: 0.55` is still a score), and the word list gained the six things the new inspect step is told to print.
+
+**The free inspect step shipped, and the three things that cut it from v0.4 turned out to be consequences of one wrong assumption.** The cut said it needed a fourth `AttemptOutcome`, must not burn patience, must not count toward `max_iterations`. All three follow from modelling an inspection as an EXPERIMENT. It is not one, and the schema says so: `ExperimentResult` rejects a result with neither metrics nor an error, which is the model refusing to represent an unscored run as an outcome.
+
+Modelled instead as what it actually resembles — a Researcher pass — it needs none of them. The supervisor asks with `want_inspect` (one more field on the emit it already makes, exactly like `want_research`), the harness runs an unscored session that only prints, and the facts fold into the next `decide()` as text. No experiment, no memory record, no terminator interaction, no fourth outcome. The only budget it can spend is wall-clock, capped at `max_inspect_calls=2`.
+
+The inspect session gets its own system prompt rather than the coder's with a sentence added. The coding prompt is dense with instructions to fit a model and submit predictions, and on a floor model those get followed — here, training anything is the failure mode.
+
+**The inspect step is inert on the floor model, and so is a v0.4 feature nobody had checked.** A feature the model never asks for is dead code however well it is wired, so I probed it: gemma4:12b set `want_inspect` **zero** times across 18 live iterations in three runs, and zero times across three targeted probes including one built to invite it (34 unlabelled numeric columns, three iterations without improvement).
+
+Probing `want_research` in the same call is what made it a finding rather than a disappointment. **It never fires either.** It shipped in v0.4 described as reaching the run "when the supervisor asks for it", and on the floor model the supervisor has never once asked — every research pass in every run on record is the automatic iteration-1 pass. So the limitation is the PATTERN, not my new field: a floor model emitting one structured call leaves optional booleans at their default.
+
+Both ship. They are correct, tested, free when unset, and work on any model that sets them. What changes is the documentation, which now says plainly that on gemma4:12b neither fires. The deterministic version — the harness deciding to inspect from the data profile instead of asking — is the shape this codebase normally reaches for ("deterministic guards over prompt nudges", banked in June), and it is re-homed to v0.6 rather than improvised on release eve.
+
+**The Summarizer now authors the dossier**, the other half of carry-in 5. Two changes, both of which alter what reaches the supervisor: the harness's verified observations go into the Summarizer's prompt above the raw cells, and empty insight fields are seeded from them. Seeding is ADDITIVE to an empty field only — observation is a floor under the digest, never a correction of it, because the machine can see what happened and only the model can see why. The deterministic fallback stays pure: it runs precisely when the LLM could not be trusted to have run at all.
+
+This is the one change in the list carrying the June EDA-ledger risk, so it shipped behind a before/after with the decision rule written down in advance: keep only if lever diversity holds.
+
+**It was measured and reverted the same day.** Churn, gemma4:12b, 6 iterations per arm, one variable:
+
+| | arm 0 (withheld) | arm 1 (observations on) |
+|---|---|---|
+| best average_precision | **0.6651** | 0.6507 |
+| gain vs baseline | +0.0202 | +0.0058 |
+| distinct lever classes | 5 | 5 |
+| most-repeated lever | 2 of 6 | 2 of 6 |
+| data_insights across digests | 13 | **16** (+23%) |
+| what_hurt items across digests | 9 | **13** (+44%) |
+
+**Diversity held, and I reverted anyway.** The rule as written would have passed it, and the rule as written was incomplete: it names the June SYMPTOM (lever collapse) and not the June MECHANISM (a denser planning prompt degrading a floor model). The mechanism is right there in the last two rows — the change measurably grew what reaches the supervisor, and the score moved the wrong way by 0.0144. A change with no measured benefit, a regression in the predicted direction, on the highest-risk surface in the codebase, the night before a release, ships on hope rather than evidence.
+
+What it does NOT establish is that the change is bad: n=1 per arm cannot separate 0.0144 from a 12B's run-to-run variance. So it is re-homed to v0.6 with 3 repeats per arm, not closed. The seeding never fired for `what_hurt` in either arm (the model always filled it), so the +44% there is the model writing more BECAUSE it read the observed block — which is the density effect, not the seeding.
+
+**Correction to the decision rule, banked:** "keep only if lever diversity holds" is a necessary condition stated as a sufficient one. A context change now also has to show a benefit to earn its place. Absence of the known failure mode is not evidence of value.
+
+**Tabular re-certification: the loop changes cost nothing.** The standing release checklist says re-run the trajectory quality bar on the floor model if the release touched the loop, and v0.5 touched it in five places (the coder's four family parameters, the supervisor's three ladders, the multiclass guard, the Summarizer's inputs, the inspect step). Same dataset and same model as the v0.4 flagship run, laptop price on gemma4:12b, 6 iterations.
+
+| | rmse | gain | capture |
+|---|---|---|---|
+| baseline | 411.8904 | | |
+| ceiling (`brute_force_sweep_v1`, 9 models) | 248.8509 | headroom 163.0395 | |
+| v0.4 certification run | 321.5600 | 90.3304 | 55.4% |
+| **v0.5 re-certification** | **320.1858** | **91.7046** | **56.2%** |
+
+Marginally better, which is the answer the bar was asked for: nothing in five days of loop changes degraded the agent. The trajectory holds too — 411.89 → 427.08 → 334.46 → 334.32 → 325.62 → **320.19** → 328.58, with monotone improvement across iterations 2 to 5, and five distinct lever classes in six iterations (target encoding, numeric transformation, feature selection, model swap, imbalance-or-threshold). No collapse onto one lever.
+
+**The waste was labelled, not silent, which is the other half of the bar.** The identical gate fired twice, the lever gate three times, and six cells errored inside sessions that still finished. Every one of those is a guard doing its job on a 12B floor model rather than a run quietly banking a re-run as a result.
+
+**Also closed:** carry-in 2 (the Researcher, Critic and Summarizer had no styled TUI events and reached the transcript as dim ambient lines, indistinguishable from routine chatter), carry-in 3 (research cache files record the query that produced them, with backward-compatible reads of the old bare-list format), carry-in 4 (multiclass threshold guard, measured first: a threshold move is worth +0.0036 on binary f1_macro and exactly +0.0000 on multiclass, which is what makes it a dead lever worth naming), carry-in 6 (the flaky TUI test now waits on a condition rather than a fixed 0.3s).
+
+---
 
 ### 2026-08-09 | Sprint 3 Day 5 | Regression: the second thing prompts are actually used for
 
