@@ -2,7 +2,7 @@
 
 Internal. Not a product feature. Regenerate with `make eval-report`.
 
-- generated: 2026-08-10 12:48 UTC
+- generated: 2026-08-11 07:58 UTC
 - model: `gemma4:12b` on `ollama`
 - budget: 10 iterations, patience 3, 2 repeats per cell
 - conditions fingerprint: `25143ee9f9b7`
@@ -28,6 +28,7 @@ Each cell is the median across repeats of the fraction of AVAILABLE gain the age
 | heart_risk | average_precision | `f30b84b747c1d263` | 0.8967 | 0.9000 | feature_treatment_sweep_v2 (best: calibrated, 8 treatments) | 2026-08-10 |
 | laptop_price | rmse | `e5cd3296b994d10e` | 411.8904 | 248.8509 | brute_force_sweep_v1 (9 models) | 2026-08-08 |
 | mobile_price | accuracy | `f9e8cd3154b8684a` | 0.9450 | 0.9550 | feature_treatment_sweep_v2 (best: numeric-interactions, 8 treatments) | 2026-08-10 |
+| sts_benchmark | pearson | `88cc4884f9357b7a` | 0.8917 | 0.9510 | prompt_scoring_sweep_v1 (best: scale-plus-examples, 200 records) | 2026-08-11 |
 | toxicity_jigsaw | f1 | `e0d3d7a24cbab067` | 0.8398 | 0.8681 | prompt_technique_sweep_v1 (best: define-plus-few-shot, 200 records) | 2026-08-09 |
 
 ## Cell detail

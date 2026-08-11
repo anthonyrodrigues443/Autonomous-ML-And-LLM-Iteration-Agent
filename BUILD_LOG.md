@@ -317,7 +317,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Wed Aug 5 | `examples/toxicity_jigsaw/`: Jigsaw toxic-comment prompt iteration end-to-end | example + integration test | done (built Sun Aug 9) |
 | Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | done (built Sun Aug 9) |
 | Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | done (built Sun Aug 9: 5 live gemma4:12b runs) |
-| Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | done (built Mon Aug 10: all 7 carry-ins closed, see entry) |
+| Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | done (built Mon Aug 10: all 7 carry-ins resolved — 6 shipped, and carry-in 5's second half built, measured and reverted on the evidence, see entry) |
 | Sun Aug 9 | **Release v0.5.0** — SLIPPED to Tue Aug 11 (Tony's call 2026-08-09): v0.5 ships classification AND regression together rather than half the promise. "Prompt iteration for ML tasks" is a claim worth a two-day slip | v0.5.0 out | slipped |
 
 ---

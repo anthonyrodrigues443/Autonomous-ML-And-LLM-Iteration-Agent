@@ -149,6 +149,14 @@ line, the label set and rows sampled from TRAINING data:
 minimal · define-the-labels · few-shot · reasoning · expert-role · define-plus-few-shot
 ```
 
+A rating task gets its own six, because the moves that shift a number are not the
+moves that shift a label — a scale has no answers to sit between:
+
+```
+minimal · describe-the-scale · anchored-examples · use-the-whole-range
+        · reasoning · scale-plus-examples
+```
+
 Nothing here is hand-written for a particular dataset, which is what keeps it a fair
 floor rather than a target someone tuned. Model families transfer between datasets;
 prompt wording does not, so only the FORM is fixed.
@@ -160,17 +168,26 @@ fraction measured against that ceiling would be wrong.
 **It cost about 80 minutes for two datasets** (6 techniques x 200 records x 2, at
 ~3.2s a call on a local 12B). The answer cache makes a re-measure free.
 
-Measured 2026-08-09:
+Measured 2026-08-09, and the rating task 2026-08-11:
 
 | dataset | baseline | ceiling | best technique | headroom |
 |---|---|---|---|---|
 | toxicity_jigsaw | 0.8398 | 0.8681 | define-plus-few-shot | 0.028 |
 | hate_speech_davidson | 0.5862 | 0.6822 | few-shot | 0.096 |
+| sts_benchmark | 0.8917 | 0.9510 | scale-plus-examples | 0.059 |
 
-Two things worth knowing from that first run. `define-the-labels` ALONE scored worse
-than minimal on both datasets — telling a small model to be precise about boundaries
-without showing it any is actively harmful. And the best technique differs by
-dataset, so there is no single prompt shape to hardcode.
+**Describing the boundary, alone, is harmful — three datasets out of three.**
+`define-the-labels` scored below minimal on both classification sets, and
+`describe-the-scale` scored 0.8467 against minimal's 0.8917 here. Telling a small
+model to be precise about a boundary without showing it one makes it overthink, and
+that now holds for a rating scale and not only for a label set.
+
+**Paired with examples, the same description is the winner or near it.** Toxicity
+wants define-plus-few-shot; STS-B wants scale-plus-examples, narrowly over anchored
+examples alone (0.9510 vs 0.9478). Davidson is the counter-case where adding the
+definition to few-shot costs 0.09. So the best technique still differs by dataset,
+which is the argument for an agent iterating per dataset rather than a prompt shape
+someone hardcodes.
 
 ## Two corpora, one word
 
