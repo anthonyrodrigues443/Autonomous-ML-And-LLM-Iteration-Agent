@@ -39,6 +39,7 @@ class FakeClient:
         self._model = model
         self.calls: list[list[Message]] = []
         self.tools_seen: list[list[ToolSpec] | None] = []
+        self.caps_seen: list[int | None] = []
         self._lock = threading.Lock()
 
     @property
@@ -56,6 +57,7 @@ class FakeClient:
         with self._lock:
             self.calls.append(messages)
             self.tools_seen.append(tools)
+            self.caps_seen.append(max_tokens)
             reply = self._replies[min(len(self.calls) - 1, len(self._replies) - 1)]
         if isinstance(reply, Exception):
             raise reply
@@ -92,6 +94,47 @@ def test_a_tool_call_answer_is_used_directly() -> None:
     answers = ask(PROMPT, ROWS, client_factory=lambda: client, columns=["text"], labels=LABELS)
 
     assert answers == ["toxic", "toxic"]
+
+
+def test_a_record_call_is_capped_so_one_runaway_row_cannot_eat_a_cell() -> None:
+    """One record that never stops generating held seven queued workers and killed
+    a 600s cell, twice, on a live run. A label is under 20 tokens; the cap is a
+    bound a well-behaved model never meets."""
+    client = FakeClient([_tool_reply("toxic")])
+
+    ask(PROMPT, ROWS, client_factory=lambda: client, columns=["text"], labels=LABELS)
+
+    assert client.caps_seen == [64, 64]
+
+
+def test_a_numeric_record_call_gets_the_same_small_cap() -> None:
+    client = FakeClient([_tool_reply("3")])
+
+    ask(
+        PROMPT,
+        ROWS,
+        client_factory=lambda: client,
+        columns=["text"],
+        numeric_range=(0, 5),
+    )
+
+    assert client.caps_seen == [64, 64]
+
+
+def test_free_text_is_bounded_not_sized() -> None:
+    """A summary can legitimately run long, so free text gets room. It still gets a
+    ceiling, because the failure is a model that does not stop, not one that is
+    verbose."""
+    client = FakeClient([_text_reply("a short summary")])
+
+    ask(PROMPT, ROWS, client_factory=lambda: client, columns=["text"], labels=None)
+
+    assert client.caps_seen == [512, 512]
+
+
+def test_a_cut_off_reply_still_resolves_when_the_label_landed() -> None:
+    """What the cap produces on a rambling model: the label, then silence."""
+    assert coerce("Looking at the tone here, this one is toxic. Now the next tw", LABELS) == "toxic"
 
 
 def test_prose_around_a_label_still_resolves() -> None:
