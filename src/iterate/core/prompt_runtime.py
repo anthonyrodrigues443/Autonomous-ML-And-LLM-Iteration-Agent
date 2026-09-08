@@ -59,6 +59,9 @@ _ANSWER_TOOL = "answer"
 _DEFAULT_WORKERS = 8
 _DEFAULT_RETRIES = 2
 
+_ANSWER_MAX_TOKENS = 64
+_FREE_TEXT_MAX_TOKENS = 512
+
 
 @dataclass
 class AskStats:
@@ -265,9 +268,11 @@ def _one(
     prompt_tokens = 0
     completion_tokens = 0
 
+    cap = _ANSWER_MAX_TOKENS if labels or numeric_range else _FREE_TEXT_MAX_TOKENS
+
     for _ in range(retries + 1):
         try:
-            reply = client.chat(messages, tools=tools, temperature=0.0)
+            reply = client.chat(messages, tools=tools, temperature=0.0, max_tokens=cap)
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             continue

@@ -493,6 +493,28 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-09-08 | Sprint 3 release gate | One record ate a cell
+
+**Task:** the v0.5 certification run on `tweet_irony` (Tony's, sequential, nothing else on Ollama) died the way the contended one had: two 600s cells killed, the session out of budget at 1200/1800s, the majority-answer fallback banked. This time there was no contention to blame, so the cause had to be in the harness.
+
+**What Ollama's log said.** Cell 2 finished 27 record calls at about 2.3s each. Cells 3 and 4 finished almost none:
+
+| window | record calls finished | one call's prompt | tokens it generated |
+|---|---|---|---|
+| cell 2, no few-shot | 27 | ~330 | short |
+| cell 3, 150 rows | 3 | 386 | 8,111 |
+| cell 4, 60 rows | 0 | 386 | 6,562 |
+
+One record per cell. The coder's cell 3 introduced a few-shot block written as one `Tweet ... Result: ironic` line per example, and on one tweet gemma4:12b answered and then kept extending the pattern for ten minutes at 13 tokens a second. Ollama runs with `OLLAMA_NUM_PARALLEL=1` by default, so the other seven workers queued behind that one call until the cell was killed at 600s. Twice.
+
+**The defect.** `_one` in `prompt_runtime.py` sent the record call with no token cap. The plumbing was already there: the Ollama client maps `max_tokens` to `num_predict`, the OpenAI-compatible client passes it through, and the coder has used it since v0.2. The record path was the only caller leaving it unset.
+
+**The fix.** Closed-set and numeric answers are capped at 64 tokens (a label in a tool call is under 20), free text at 512. A cut-off reply is one wrong row, which is the rule this module already states: a prompt that provokes unusable output is a worse prompt. Four tests in `test_prompt_runtime.py`; the suite is 807.
+
+**Why it never showed before.** Three prompt runs and four technique sweeps had passed through the same code and none of them used that few-shot layout. Rare, and total when it hits, which is the profile of a defect a certification run exists to find.
+
+**Secondary, machine-side.** The Ollama runner was holding 18 GB on a 24 GB Mac with the system swapping (context checkpoints at 119 MiB each, up to 32 of them). That slows every call and is not the harness's to fix; restart Ollama before a long run.
+
 ### 2026-08-11 | Sprint 3 Day 7 | The regression half, actually run
 
 **Task:** v0.5 promises classification AND regression on the prompt path, and the two-day slip was taken for exactly that. But the regression half had never been run live end to end, and `sts_benchmark` was the only one of the nine corpus datasets with no measured ceiling — so the claim in the release notes had no number behind it. Not a release gate (Monday's tabular re-certification satisfied that), but "we ship regression" with zero live regression runs is the kind of thing that comes back.
