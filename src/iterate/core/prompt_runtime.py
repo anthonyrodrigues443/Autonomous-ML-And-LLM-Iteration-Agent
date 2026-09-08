@@ -59,16 +59,6 @@ _ANSWER_TOOL = "answer"
 _DEFAULT_WORKERS = 8
 _DEFAULT_RETRIES = 2
 
-# How much one record call may generate. A label or a number inside a tool call is
-# under 20 tokens, so a well-behaved model never meets this. The bound exists for
-# the one that does not stop: given a few-shot block laid out as
-# "Tweet: ... | Result: ironic", gemma4:12b answered and then kept extending the
-# pattern, 8,111 tokens from a 386-token prompt, ten minutes at 13 tokens a second.
-# Ollama serves one request at a time by default, so that single record held seven
-# queued workers and ate a whole 600s cell, twice, and the session ended on the
-# fallback. A cut-off reply costs one wrong row, which is the right price for a
-# prompt that provokes it. Free text is bounded rather than sized: a summary can
-# legitimately run long, but not without limit.
 _ANSWER_MAX_TOKENS = 64
 _FREE_TEXT_MAX_TOKENS = 512
 
