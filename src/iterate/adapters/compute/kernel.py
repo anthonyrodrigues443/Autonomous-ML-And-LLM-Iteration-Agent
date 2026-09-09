@@ -1,24 +1,9 @@
-"""Stateful kernels — the substrate for cell-by-cell execution.
+"""Stateful kernels: a live namespace that persists across cells.
 
-A `StatefulKernel` keeps a live namespace across cells: the coding agent runs one
-cell, sees its real output, then runs the next *in the same session* (variables,
-imports, fitted objects all persist). This is what lets the agent inspect the data
-and build on what it sees, instead of writing a whole pipeline blind.
-
-Two venues, one protocol:
-- `LocalKernel` — a real IPython kernel via `jupyter_client`, on this machine. No
-  isolation (generated code runs with the user's permissions); offline, the free
-  default driver's venue.
-- `E2BKernel` — one ephemeral e2b sandbox reused across cells (its `run_code` keeps
-  kernel state), isolated.
-
-Both: `start(inputs)` writes the input files (train/holdout features/meta) and boots
-the kernel; `run_cell` executes a cell and returns its streams + any error (never
-raises on a failing cell — a traceback is captured and fed back); `read_output`
-reads a named file the session produced (e.g. predictions.csv); `close` tears down.
-
-**Sealed-holdout invariant:** the holdout *labels* are never written into the
-kernel's working dir — only holdout features cross in. Scoring stays host-side.
+`LocalKernel` is an IPython kernel on this machine with no isolation; `E2BKernel`
+is one sandbox reused across cells. `run_cell` never raises on a failing cell; the
+traceback is returned. Holdout labels are never written into the kernel's working
+directory, so scoring stays host-side.
 """
 
 from __future__ import annotations
@@ -145,15 +130,9 @@ class LocalKernel:
         for name, content in inputs.items():
             (self._workdir / name).write_bytes(content)
 
-        # Pin the kernel to THIS interpreter. `start_new_kernel()` resolves the
-        # machine's registered "python3" kernelspec, which on a typical mac is
-        # /Library/Developer/CommandLineTools/usr/bin/python3 — a completely
-        # different environment from the one iterate is installed in. The agent
-        # would write code against whatever libraries happen to live there (or
-        # none), while the harness scores with the pinned ones, and `install()`
-        # below pip-installs into sys.executable, so auto-installed packages never
-        # reached the kernel at all. Measured on this machine: kernel had python
-        # 3.9.6 / sklearn 1.6.1, harness had 3.12.12 / 1.8.0.
+        # Pin the kernel to THIS interpreter. The registered "python3" kernelspec
+        # can be a different environment, and `install()` pip-installs into
+        # sys.executable.
         km = KernelManager(kernel_name="python3")
         spec = km.kernel_spec
         if spec is not None:  # no python3 kernelspec at all: fall back to default
@@ -174,12 +153,8 @@ class LocalKernel:
         err: list[str] = []
         error: str | None = None
         outputs: list[dict[str, Any]] = []
-        # `timeout` bounds the CELL, not the gap between its messages. Waiting
-        # `timeout` for each next message resets the clock on every print, so a
-        # chatty cell can run forever: measured on the prompt path, where a progress
-        # heartbeat every 10% of a pass let cells reach 838s against a 600s limit
-        # and eat a whole session's budget. The per-message wait is now whatever is
-        # LEFT of the cell's own deadline.
+        # `timeout` bounds the CELL. The per-message wait is what is left of the
+        # cell's deadline, or a chatty cell resets the clock on every print.
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -284,13 +259,8 @@ class E2BKernel:
     ) -> None:
         self._api_key = api_key
         self._work_dir = work_dir
-        # e2b sandboxes default to a 300s lifetime; a cell-by-cell session (LLM
-        # latency between cells is NOT sandbox-execution time) easily outlives that
-        # and the sandbox would die mid-session. We renew a sliding lease on every
-        # cell instead — alive while the session works, auto-reaped ~lease_seconds
-        # after the last activity (so a crash leaves at most one lease of orphan
-        # cost, not hours). 900s comfortably exceeds any single cell + think-gap and
-        # stays under the 3600s Hobby-plan cap.
+        # A sliding lease renewed on every cell: the default 300s sandbox lifetime
+        # is shorter than a session, and a crash then orphans at most one lease.
         self._lease_seconds = lease_seconds
         self._sandbox_factory = sandbox_factory
         self._sandbox: Any = None

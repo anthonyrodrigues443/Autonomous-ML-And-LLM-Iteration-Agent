@@ -1,17 +1,7 @@
-"""Model factory — build any estimator from an installed, allow-listed ML library.
+"""Model factory: build an estimator from an allow-listed library by import path.
 
-A candidate names a model by import path + params; we instantiate it. This is NOT a
-hand-curated list — any estimator in scikit-learn, XGBoost, or LightGBM is fair game,
-chosen by the Proposer's research. Models from *uninstalled* libraries or custom code
-need the sandboxed code-gen path (v0.2), not this factory.
-
-Spec shape (from `Candidate.changes`):
-
-    {"model": "lightgbm.LGBMClassifier", "params": {"num_leaves": 64}}
-
-`model` is optional (defaults to HistGradientBoosting for the task) and `params` is
-optional. The import path must live under an allow-listed library, and `random_state`
-is injected (for determinism) only when the estimator accepts it.
+Spec shape: ``{"model": "lightgbm.LGBMClassifier", "params": {...}}``, both keys
+optional. `random_state` is injected only when the estimator accepts it.
 """
 
 from __future__ import annotations

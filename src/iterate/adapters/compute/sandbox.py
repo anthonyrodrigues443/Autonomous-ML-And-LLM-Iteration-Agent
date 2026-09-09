@@ -1,20 +1,8 @@
-"""Sandbox execution venue (v0.2) — runs the agent's generated training code.
+"""Sandbox execution venue: runs the agent's generated code, never the user's.
 
-Routes by candidate type:
-
-- **code candidate** (``changes = {"code": ...}``) → the target assembles a
-  `CodeJob`, the injected `CodeRunner` runs it (local subprocess or e2b sandbox),
-  and the target scores the predictions. The venue is whichever runner was passed:
-  `LocalCodeRunner` for ``--compute local``, `E2BCodeRunner` for ``--compute e2b``.
-- **baseline / spec candidate** → run in-process (the spec path is our own trusted
-  factory code), via the shared `run_in_process` helper.
-
-Every failure mode — a runner that can't boot, a crashing or timed-out script, a
-target that doesn't support code — is captured on `ExperimentResult.error`, never
-raised, so a bad candidate never crashes the loop.
-
-**Security boundary (permanent):** this runs the agent's OWN generated code only,
-never the user's source. User-provided source is read as text by the Reconstructor.
+A code candidate goes through the injected `CodeRunner`; a baseline or spec
+candidate runs in-process. Every failure is captured on `ExperimentResult.error`,
+never raised.
 """
 
 from __future__ import annotations

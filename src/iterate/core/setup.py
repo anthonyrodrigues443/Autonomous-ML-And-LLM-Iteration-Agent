@@ -1,25 +1,9 @@
 """Resolving how a run will be measured, when the user did not say.
 
-The first input dial to turn since v0.1: `--metric` becomes optional. What replaces
-it is not "the agent decides" but a narrow, guarded sequence:
-
-1. an explicit `--metric` always wins, unchanged;
-2. otherwise the Researcher proposes a metric and a starting model, judged over the
-   same papers its technique suggestions came from;
-3. whatever it proposes is validated against the registry and against the target
-   column before anything is built;
-4. anything that fails validation falls back to the deterministic default, which is
-   exactly what v0.3 would have done.
-
-So the agent can only ever UPGRADE the default. It cannot produce a run that fails
-to start, and it cannot pick a metric that does not apply to the target it was
-given. The whole point of the dial is to remove an input, not to add a way to be
-wrong.
-
-The resolved metric is then FIXED for the run. Every score in Memory and every
-cross-run baseline carry-over is measured with one ruler; a metric that changed
-mid-run would leave the history silently incomparable and break the prior-best
-inheritance a later run depends on.
+An explicit `--metric` always wins. Otherwise the Researcher proposes a metric and
+a starting model, both validated against the registry and the target column, and
+anything that fails validation falls back to the deterministic default. The result
+is FIXED for the run.
 """
 
 from __future__ import annotations

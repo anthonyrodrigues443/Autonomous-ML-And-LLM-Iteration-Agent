@@ -1,20 +1,9 @@
 """Stop conditions for the agentic loop.
 
-The Orchestrator delegates "should I stop?" to a `Terminator` each iteration. A
-terminator is stateful (some — patience, plateau — need to track history), so
-`update_and_check` is one method: feed the current `LoopState`, return a stop
-reason string or `None` to continue. One method removes a class of ordering bugs
-(notify-then-check vs check-then-notify).
-
-Concretes shipped Day 3:
-- `MaxIterations(n)` — hard iteration cap.
-- `Patience(k)` — k consecutive non-improvements (proposer_error counts).
-- `Deadline(seconds)` — wall-clock budget.
-- `Plateau(window, epsilon)` — spread across the last `window` succeeded scores < ε.
-- `Composite(*terminators)` — calls all (each accumulates state correctly),
-  returns the first non-None reason.
-
-`default_terminator()` gives a sane Composite for typical use.
+`update_and_check` is one method, feed the `LoopState` and get a stop reason or
+`None`, because terminators are stateful and a separate notify step invites
+ordering bugs. `Composite` calls every terminator so each accumulates state, and
+returns the first reason.
 """
 
 from __future__ import annotations

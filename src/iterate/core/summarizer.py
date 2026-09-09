@@ -1,18 +1,8 @@
-"""The Summarizer — distills ONE finished experiment notebook into a compact,
-structured `ExperimentDigest`.
+"""The Summarizer: distills ONE finished session into an `ExperimentDigest`.
 
-This is the specialist the Supervisor's docstring anticipated: the tool boundary
-graduating into its own agent. It runs once, right after an experiment completes,
-reads that one session (the cells the coder ran and what they printed), and writes
-a digest. The digest, not the notebook, is what crosses to the next experiment:
-the Supervisor reasons over many small digests instead of holding raw notebooks,
-which would bloat context and induce hallucination by mid-run.
-
-A deterministic skeleton (the components actually instantiated, the score, the
-within-session validation trail) is filled in by code; the LLM adds the insight
-fields (what the data showed, what helped or hurt, what to try next). If the LLM
-call fails for any reason the skeleton is returned alone, so a digest failure can
-never kill the run.
+A deterministic skeleton is filled in by code and the LLM adds the insight fields.
+If the call fails the skeleton is returned alone, so a digest failure never kills
+the run.
 """
 
 from __future__ import annotations

@@ -493,6 +493,29 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-09-09 | Sprint 3 release gate | Comments say the constraint, the log says why
+
+**Task:** a ten-line comment block above two constants in `prompt_runtime.py` was the visible case; a scan of `src/iterate` found the same pattern 59 times: 26 comment blocks of six lines or more (four of ten or more) and 33 docstrings of fifteen lines or more, concentrated in supervisor, coder, cli, scoring and kernel. Each carried one of three things that belong here rather than in code: a measurement, an anecdote from a live run, or an argument for a design already made.
+
+**The rule applied.** A comment stays when it states a constraint the code cannot show: an ordering, a failure case a regex guards against, a thread-safety rule. Everything else was cut. Module docstrings are one paragraph, what the module is and the one rule a caller must know. Function docstrings are the return value and the constraint.
+
+| | before | after |
+|---|---|---|
+| comment blocks of 6+ lines | 26 | 0 |
+| docstrings of 15+ lines | 33 | 0 |
+| comment lines | 885 | 748 |
+| source lines | 13,560 | 12,970 |
+
+**Proof of no behaviour change.** The AST of every file, with docstrings stripped, is byte-identical before and after. ruff clean, 807 unit tests unchanged.
+
+**Measurements that lived only in code, now recorded here so nothing is lost.**
+- Multiclass threshold levers (2026-08-10): across 57 class-prior reweightings on a 4-class target the best achievable move was +0.0000 on both f1_macro and accuracy, against +0.0036 and +0.0022 for the same experiment run as binary. An argmax has no single threshold.
+- The identical-submission gate exists because live runs produced six byte-identical submissions in a row, and a later run wasted 4 of 10 iterations on sibling duplicates a best-only check could not see.
+- The prompt path reads `submit()`'s outputs on the live path, not through `score_code_job`; before that was wired, a run improved f1 three times and delivered none of the three prompts.
+- Boolean columns: SimpleImputer rejects bool dtype, and a frame mixing bool with string columns takes the numeric path and dies on the first string. The baseline aborted before iteration 1 on any dataset with a yes/no column stored as a real boolean; the fix is casting to object before imputing.
+- Free text is not scoreable by this target: exact-string matching rates three correct summaries at 0.0000, which is why `target_kind` needs both the cardinality signal and the one-answer-per-row signal before it calls a column free text.
+- The e2b sandbox default lifetime is 300s, shorter than a cell-by-cell session; the kernel renews a 900s sliding lease per cell, under the 3600s Hobby-plan cap, so a crash orphans at most one lease.
+
 ### 2026-09-08 | Sprint 3 release gate | One record ate a cell
 
 **Task:** the v0.5 certification run on `tweet_irony` (Tony's, sequential, nothing else on Ollama) died the way the contended one had: two 600s cells killed, the session out of budget at 1200/1800s, the majority-answer fallback banked. This time there was no contention to blame, so the cause had to be in the harness.

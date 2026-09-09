@@ -1,22 +1,9 @@
-"""The tried/untried ledger — what this run has already spent itself on.
+"""The tried/untried ledger: what this run has already spent itself on.
 
-Two dimensions, both deterministic, neither read by an LLM:
-
-* **lever classes** — the coarse families the supervisor briefs one of (encoding,
-  class-weight, model-swap …), detected by marker strings in submitted code. This
-  computation already existed inline inside the supervisor's fallback move; it is
-  lifted here so it has a name, a test, and one definition.
-* **components** — the classes a session actually instantiated, AST-extracted by
-  `codegen.components_used`. Finer than a lever class and not string-matched, so
-  it answers "was `TargetEncoder` ever built" rather than "did the word encoding
-  appear somewhere".
-
-Deliberately NOT rendered into the supervisor's planning prompt. A same-model A/B
-in June measured additive supervisor context regressing the floor model (0.6325 to
-~0.61, collapsing onto one lever 5-6 of 10 iterations) and the feature was
-reverted. The capability wanted here — stop re-trying what is exhausted — is worth
-having, but as an input to deterministic machinery rather than as another paragraph
-a 12B has to hold in its head. The banked lesson was guards over prompt nudges.
+Two deterministic dimensions: lever classes, detected by marker strings in
+submitted code, and components, the classes a session instantiated, AST-extracted.
+An input to guards, deliberately not rendered into the supervisor's planning
+prompt.
 """
 
 from __future__ import annotations

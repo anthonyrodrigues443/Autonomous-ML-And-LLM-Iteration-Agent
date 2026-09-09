@@ -1,21 +1,9 @@
-"""The CodeProposer — the LLM that WRITES the next experiment as code.
+"""The CodeProposer: the LLM that writes the next experiment as code, emitting
+``changes = {"code": "<source>"}``.
 
-Sibling of `Proposer` and `Reconstructor`: same `LLMClient` protocol, same
-tool-calling + retry machinery, different intent. Where the spec `Proposer` picks
-an allow-listed estimator and emits ``changes = {"model", "params"}``, the
-CodeProposer writes a `train_and_predict` function and emits
-``changes = {"code": "<source>"}``. Both produce a plain `Candidate`; the executor
-routes on the presence of ``"code"`` (`core.codegen.is_code_candidate`).
-
-There is deliberately NO library allow-list on this path: the agent imports
-whatever it wants and we install its imports before running (Day-5 executor wiring;
-the deterministic `core.codegen.required_imports` extractor it relies on already
-exists). Before a candidate is accepted, its code passes a cheap static check
-(`core.codegen.validate_train_and_predict`) so malformed snippets become a targeted
-re-prompt rather than a wasted run.
-
-Security boundary is unchanged: this runs the agent's OWN generated code in the
-sandbox, never any user-supplied source.
+No library allow-list on this path; imports are installed before the run. A
+candidate passes `validate_train_and_predict` before it is accepted, so a
+malformed snippet becomes a re-prompt rather than a wasted run.
 """
 
 from __future__ import annotations

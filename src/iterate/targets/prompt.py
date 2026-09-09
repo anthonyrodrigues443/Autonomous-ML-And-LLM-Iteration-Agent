@@ -1,28 +1,9 @@
-"""`PromptTarget` — the second problem type, on the same machine as the first.
+"""`PromptTarget`: the second problem type, on the same machine as the first.
 
-A prompt eval set IS tabular: input columns plus a column holding the right answer.
-So this target reuses `TabularDataset`, the same deterministic split, the same
-sealed holdout, the same `core.scoring` ruler and the same predictions contract that
-`ModelTarget` uses. The supervised loop, the Supervisor, the Researcher, the Critic
-and the Summarizer all work unchanged, because none of them ever knew what a target
-was made of.
-
-**The only difference is what happens per record.** Tabular fits a model once and
-predicts many rows. This makes one LLM call per record, with the record substituted
-into the prompt, and stores the structured reply as that row's prediction.
-
-Two consequences worth naming:
-
-*The sealed holdout is already safe, structurally.* `codegen.build_inputs` writes
-train.csv WITH answers and holdout.csv WITHOUT them, so holdout answers never enter
-the session. The prompt-path version of fitting on the test set — mining the answer
-key for few-shot examples — is therefore not something the agent is prevented from
-doing, it is something it cannot see how to do.
-
-*The safety net must not be an LLM pass.* v0.4 learned that a fallback slower than
-the thing it catches produces nothing exactly when it is needed, which is why the
-tabular floor became logistic regression. Here the floor is the majority answer,
-computed instantly from the training column with no model involved at all.
+A prompt eval set is tabular, so this reuses `TabularDataset`, the same split, the
+same sealed holdout and the same scoring. The only difference is one LLM call per
+record. Holdout answers never enter the session, and the floor is the majority
+training answer, computed with no model involved.
 """
 
 from __future__ import annotations
@@ -66,22 +47,12 @@ class UnscorableTargetError(Exception):
 
 
 def target_kind(dataset: TabularDataset) -> str:
-    """`closed_set`, `numeric`, or `free_text` — what the answer column IS.
+    """`closed_set`, `numeric`, or `free_text`: what the answer column IS.
 
-    Deliberately NOT the same question as "classification or regression". That one
-    is settled by the metric, as it is everywhere else in this codebase
-    (`task_for_metric`), because a 1-to-10 rating is honestly either: ten ordered
-    classes if you score it with f1, a score if you score it with rmse or a
-    correlation. Deciding it here from the dtype would quietly overrule the user.
-
-    What this DOES decide is whether the target can be scored at all. Two signals,
-    because a count alone cannot separate 48 intents from 48 one-off sentences:
-
-    * more distinct answers than the enum can carry, AND
-    * nearly every row carrying its own answer
-
-    Both true means free text, which is not something this target can score
-    honestly — exact-string matching rates three correct summaries at 0.0000.
+    Not "classification or regression", which the metric settles. Free text needs
+    both signals, more distinct answers than the enum can carry AND nearly every
+    row carrying its own, because a count alone cannot separate 48 intents from
+    48 one-off sentences.
     """
     from iterate.adapters.data.tabular import looks_like_classification
 

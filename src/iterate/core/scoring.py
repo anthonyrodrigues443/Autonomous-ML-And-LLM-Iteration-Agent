@@ -1,30 +1,10 @@
-"""Metric scoring — the single ruler every execution path is judged by.
+"""Metric scoring: the single ruler every execution path is judged by.
 
-Both the spec path (`ModelTarget`) and the code-gen path (`core.codegen`) score
-through these functions, so "improvement" stays an apples-to-apples comparison
-no matter how a candidate was run. Keep all metric computation here; nothing
-should reimplement it.
-
-Every metric is one row in `REGISTRY`, carrying its task, its direction, whether
-it needs probabilities, and how to compute it. Adding a metric is that row and
-nothing else — the exported frozensets, `direction()`, `task_for_metric()` and
-`requires_proba()` are all derived from it. That single source of truth is the
-point: the panel, the direction table and the CLI's own copy of the metric names
-used to be three independent lists, and they drifted (the CLI called every
-classification metric a maximize metric, which would have inverted the whole loop
-the moment log-loss became selectable).
-
-Probability metrics are a bonus panel: pass `y_proba` and the classification panel
-gains ROC-AUC, PR-AUC, log-loss and (binary only) Brier alongside the label
-metrics, which are always computed so a run's history stays comparable across
-iterations that did and didn't emit probabilities. `y_proba` shape follows the
-task — one positive-class probability per row for binary, one row per sample by
-one column per class for multiclass.
-
-Policy lives in the callers, not here: this module raises on malformed
-probabilities rather than deciding whether that should sink an experiment. Whether
-a bad probability file is fatal depends on `requires_proba(primary_metric)`, which
-only the caller knows.
+Every metric is one row in `REGISTRY`; the exported frozensets, `direction()`,
+`task_for_metric()` and `requires_proba()` are derived from it. Label metrics are
+always computed; pass `y_proba` (one column for binary, one per class for
+multiclass) to add the probability panel. Malformed probabilities raise here, and
+whether that sinks an experiment is the caller's decision.
 """
 
 from __future__ import annotations
@@ -260,20 +240,9 @@ PANEL: dict[str, MetricSpec] = {
     ),
 }
 
-# ─── the wider vocabulary, derived from sklearn rather than hand-written ─────
-#
-# PANEL above is what every run computes: a small, comparable, always-present set.
-# REGISTRY below is what a run may SELECT as its primary, and it is derived from
-# sklearn's own scorer registry so the vocabulary is not a list somebody has to
-# remember to extend. The Researcher can propose Matthews correlation or balanced
-# accuracy and the harness already knows both.
-#
-# Crucially, DIRECTION is derived too, never guessed. sklearn's scorers are all
-# "higher is better" by construction, with loss metrics carrying a -1 sign (the
-# `neg_` naming convention). That sign is the direction, straight from the library
-# that defines the metric. An LLM proposing a metric therefore still cannot invert
-# the loop, because it never supplies the direction — which is the whole reason
-# direction stayed out of the model's hands in the first place.
+# PANEL is what every run computes; REGISTRY is what a run may select as primary,
+# derived from sklearn's scorer registry. Direction is derived too, from the sign
+# sklearn gives loss scorers, so a proposed metric can never invert the loop.
 _CLASSIFICATION_MODULES = frozenset({"_classification", "_ranking", "_scorer"})
 _REGRESSION_MODULES = frozenset({"_regression"})
 
@@ -358,12 +327,8 @@ def _derive_from_sklearn() -> dict[str, MetricSpec]:
             # A metric we cannot hand an importable function for is not offerable.
             continue
         needs_proba = response != "predict"
-        # Registered WITHOUT sklearn's "neg_" prefix. That prefix marks a scorer
-        # whose VALUE is negated so higher-is-better; we call the underlying score
-        # function directly and report the raw quantity with direction="minimize"
-        # instead. Keeping the prefix would print `neg_root_mean_squared_error =
-        # 2.12` — a positive number under a name that promises a negative one. The
-        # sign convention still does its job: it is where `direction` comes from.
+        # Registered without the "neg_" prefix: the raw quantity is reported with
+        # direction="minimize" rather than a negated value under a negative name.
         out[name.removeprefix("neg_")] = MetricSpec(
             task,
             "maximize" if sign > 0 else "minimize",
@@ -374,20 +339,9 @@ def _derive_from_sklearn() -> dict[str, MetricSpec]:
     return out
 
 
-# Curated entries win: PANEL's computes are the ones with their own tests, their
-# own shape validation, and the binary/multiclass handling this project needs.
-# Selectable as a primary metric, but NOT in the always-computed panel.
-#
-# Rank and linear agreement, from scipy — sklearn offers none of the three as
-# scorers. They matter for rating tasks in a way error metrics do not: a prompt
-# that ranks every item correctly but rates everyone three points high scores
-# pearson 1.000 and rmse 3.000, and for a rating the first verdict is usually the
-# useful one because an offset can be calibrated away.
-#
-# Deliberately kept OUT of PANEL. The panel is what every run always computes, so
-# adding to it would change the recorded metric set of every regression run that
-# has ever happened and make old history incomparable to new — for three numbers
-# most tabular runs do not want.
+# Curated entries win over the derived ones. Rank and linear agreement come from
+# scipy, selectable as primary but kept OUT of PANEL: adding to the panel would
+# change the recorded metric set of every regression run ever made.
 CURATED_EXTRAS: dict[str, MetricSpec] = {
     "pearson": MetricSpec(
         "regression", "maximize", False, _correlation("pearson"), sklearn_func="pearsonr",

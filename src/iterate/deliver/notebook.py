@@ -73,18 +73,9 @@ def build_session_notebook(
 ) -> NotebookNode:
     """Render a cell-by-cell coding session as a runnable notebook.
 
-    Each `Cell` (code + captured stdout/error) becomes a code cell, with a short
-    markdown note showing what it printed or the error — so the notebook *is* the
-    session: the data inspection, the feature engineering, the dead ends, in order.
-    When a cell carries the model's `thinking` (think mode), it is rendered as a
-    markdown reasoning block right above the code it produced — the model's own
-    "why" narrating the session, and the raw material for debugging the prompt.
-
-    ``hypothesis`` (the supervisor's brief, which opens with the run's so-far
-    knowledge) renders as a Hypothesis cell up top; ``findings`` (the Summarizer's
-    digest, dict or `ExperimentDigest`) renders as a Findings cell at the end — so
-    every notebook reads as hypothesis -> staged work -> findings, and the
-    knowledge each notebook inherits and hands on is visible in the artifact.
+    Each `Cell` becomes a code cell with a markdown note of what it printed, and a
+    cell's `thinking` renders as a reasoning block above its code. ``hypothesis``
+    opens the notebook and ``findings`` closes it.
     """
     nb = new_notebook()
     head = [f"# {title}", ""]

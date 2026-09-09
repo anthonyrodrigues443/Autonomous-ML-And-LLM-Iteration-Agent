@@ -1,29 +1,9 @@
-"""Code runners — physically execute a Python script and return its outputs.
+"""Code runners: execute a script under a mandatory timeout and return its
+streams, exit code and named output files.
 
-The low-level primitive under v0.2's sandbox: given a script + input files, run
-it under a mandatory timeout and return stdout / stderr / exit code + the named
-output files. Two venues, one `CodeRunner` protocol:
-
-- `LocalCodeRunner` — runs the script in a subprocess on this machine (the
-  `--compute local` path). No isolation: generated code runs with the user's
-  permissions. Explicit opt-in only.
-- `E2BCodeRunner` — runs it in an ephemeral e2b sandbox (isolated; needs an
-  `E2B_API_KEY`). `e2b_code_interpreter` ships in core, but is lazy-imported so the
-  rest of the module costs nothing to load; the sandbox factory is injectable for
-  testing without a key.
-
-Both place `inputs` in the script's working directory, run it, and read back the
-files named in `outputs`. The code-gen *contract* (what a training script reads
-and writes) is defined separately (Day 3); this is only the execution primitive.
-
-Honest scope notes:
-- A timeout is mandatory on every run.
-- Network egress-deny for the e2b runner is NOT yet enforced (it needs a custom
-  e2b sandbox template); flagged rather than assumed. The local runner offers no
-  isolation at all.
-- `E2BCodeRunner` is written to the documented e2b API and unit-tested with a
-  fake sandbox, but not yet live-verified (no key in dev); the exact calls may
-  need small fixes when first run against real e2b (Day 5).
+`LocalCodeRunner` is a subprocess with no isolation. `E2BCodeRunner` is an
+ephemeral sandbox; the client is lazy-imported and the sandbox factory is
+injectable. Network egress-deny is not enforced on either.
 """
 
 from __future__ import annotations

@@ -222,12 +222,8 @@ class ModelTarget:
             # warning — keep it quiet too so the loop's output stays clean.
             with _silence_native_stdio():
                 predictions = pipeline.predict(self._dataset.test_features)
-                # Probabilities are free here (the fitted pipeline is in hand), so the
-                # spec path always offers them when the estimator can produce them —
-                # a probability primary scores, and a label primary gets the panel as
-                # a bonus. Estimators without predict_proba (SVC default, Ridge) fall
-                # back to labels only, and a probability primary then fails scoring
-                # with a clear reason rather than silently reporting nothing.
+                # Offered whenever the estimator can produce them. Without
+                # predict_proba a probability primary fails scoring with a reason.
                 probabilities = (
                     pipeline.predict_proba(self._dataset.test_features)
                     if hasattr(pipeline, "predict_proba")
@@ -319,12 +315,8 @@ class ModelTarget:
         if categorical:
             encode = Pipeline(
                 [
-                    # Cast to object BEFORE imputing. SimpleImputer rejects bool
-                    # dtype outright, and a frame mixing bool with string columns
-                    # makes it take the numeric path and die on the first string
-                    # ("could not convert string to float: 'Female'"). Any dataset
-                    # with a yes/no column stored as a real boolean hit this, and
-                    # the baseline aborted the whole run before iteration 1.
+                    # Cast to object BEFORE imputing: SimpleImputer rejects bool, and
+                    # bool mixed with strings sends it down the numeric path.
                     ("as_object", FunctionTransformer(_as_object, feature_names_out="one-to-one")),
                     ("impute", SimpleImputer(strategy="most_frequent")),
                     ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
