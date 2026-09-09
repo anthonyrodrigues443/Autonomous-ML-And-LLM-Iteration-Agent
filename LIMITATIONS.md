@@ -48,8 +48,8 @@ infer features/target + MCP discovery (absorbs v0.8) · v1.0 one-sentence input 
 
 | Limitation (today) | Lifted at | Notes |
 |---|---|---|
-| Tabular CSV only as input. | **v0.5 / v0.6** | Prompts (v0.5), vision/DL (v0.6). |
-| Classification + regression tasks only. | **v0.5 / v0.6** | Expands with prompt + vision targets. |
+| Tabular CSV and labelled prompt eval sets only as input; no images yet. | **v0.6** | Prompts landed in v0.5; vision/DL is v0.6. |
+| Classification + regression tasks only, for models and for prompts. | **v0.6 for vision; by-design for prompts** | Vision lands in v0.6. On the prompt path free-form generation is refused rather than scored (see the prompt rows above). |
 | Single local CSV (`load_csv`); no Kaggle / HuggingFace / DB / MCP sources. | **v0.9** (partial) | v0.9 ships MCP discovery over filesystem + Postgres; Kaggle/HuggingFace loaders and the Notion/github servers are tracked on the backlog. |
 | Integer regression targets (a price, a count, a year) load correctly. | **fixed v0.4** | An integer target was always read as a class label, so the diamonds dataset's 11,602 distinct prices became 11,602 classes and the stratified split raised before the run could start: the file could not be loaded at all. The distinct-value cap now applies to integer targets as well as float ones. Nothing that previously worked changes, because every working dataset has 20 or fewer distinct target values; the only targets affected are ones that used to crash. Recorded as a backlog item on Day 5 and deferred on the reasoning that a fix would change existing splits, which measurement later showed to be wrong. |
 | Single target column; no multi-target / multi-label. | TBD | When needed; not scheduled. |
