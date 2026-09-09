@@ -88,40 +88,15 @@ def run_supervised(
 ) -> RunResult:
     """Run the Supervisor + Coder loop until the terminator (or supervisor) stops.
 
-    ``summarizer`` (optional) distills each finished experiment into a compact
-    `ExperimentDigest` attached to the experiment before it is recorded, so the next
-    Supervisor reasons over digests instead of raw notebooks (cross-notebook
-    knowledge transfer). It never raises; a failed digest is simply absent.
-
-    ``researcher`` (optional) grounds a brief in retrievable literature. The harness
-    orchestrates it, exactly as it does the Summarizer — the supervisor never calls
-    another agent; it ASKS, via ``want_research`` on the emit it already makes, and
-    the harness runs the pass before the next ``decide()``. Two deterministic guards
-    sit around that judgement: iteration 1 always researches (there is no history to
-    reason from, so there is nothing to ask), and ``max_research_calls`` caps the
-    run, so a supervisor that keeps asking cannot spend the budget on literature
-    instead of experiments. A failed pass yields no findings and the run proceeds
-    ungrounded.
-
-    The FREE INSPECT step rides the same seam for the same reason. When the
-    supervisor asks (``want_inspect``), the harness runs an unscored session that
-    only prints facts about the data and folds them into the next ``decide()``. It
-    records no experiment, so nothing here touches the terminator: no patience is
-    spent, ``max_iterations`` is untouched, and the only budget it can consume is
-    wall-clock, bounded by ``max_inspect_calls``. Exploration stops costing a
-    scored iteration, which is the whole point of it.
-
-    ``on_experiment`` (optional) is invoked after EVERY completed experiment —
-    success or failure — with ``experiment=, baseline=, is_best=, run_id=`` keyword
-    arguments. The CLI uses it to save each iteration's notebook the moment it
-    finishes, so a crash or Ctrl-C mid-run still leaves every finished iteration's
-    deliverable on disk. A failing hook is logged and never kills the run.
-
-    ``controller`` (optional) is the interactive seam: the loop binds the message
-    interpreter onto it (the Supervisor classifies each typed line; the harness
-    routes it), checkpoints at every iteration boundary (pause/resume/stop, with
-    the run deadline suspended while paused), and folds drained guidance + standing
-    rules into ``decide``. ``None`` keeps today's non-interactive behavior."""
+    The optional collaborators never raise into the loop. ``summarizer`` attaches a
+    digest to each experiment before it is recorded. ``researcher`` runs when the
+    supervisor asks via ``want_research``, always on iteration 1, and at most
+    ``max_research_calls`` times. ``want_inspect`` runs an unscored session that
+    records no experiment and spends no patience, capped by ``max_inspect_calls``.
+    ``on_experiment`` is called after EVERY completed experiment with
+    ``experiment=, baseline=, is_best=, run_id=``. ``controller`` is the interactive
+    seam: checkpoints at every iteration boundary, deadline suspended while paused,
+    drained guidance and rules folded into ``decide``."""
     baseline = run_in_process(target)  # spec default = the bar to beat
     if not baseline.succeeded or baseline.metrics is None:
         log.warning("agent loop: baseline failed (%s); aborting", baseline.error)

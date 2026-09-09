@@ -1,25 +1,9 @@
-"""The Researcher specialist — literature grounding for the next experiment.
+"""The Researcher: literature grounding for the next experiment.
 
-Two focused LLM calls with a deterministic retrieval step between them:
-
-1. ``plan_queries`` turns the host-computed data profile into 2-3 search queries.
-2. the harness searches OpenAlex + arXiv and dedupes.
-3. ``suggest_techniques`` picks which retrieved papers are worth an experiment.
-
-Split because a specialist with one narrow job tool-calls far more reliably on a
-weak model than one call juggling search, judgement and citation (DECISIONS,
-2026-06-01). The middle step is plain HTTP: retrieval is deterministic, judgement
-is the model's.
-
-**Citations are selected, never authored.** The model picks a paper by its INDEX in
-the list it was shown, and the harness resolves that index to the identifier the
-API returned. It is structurally incapable of emitting a DOI that was not fetched.
-Prompting a model not to invent citations is a request; indexing makes it
-impossible, and a fabricated citation in a tool that advertises "literature-aware
-proposals" is the worst bug this project could ship.
-
-Like the Summarizer, this never raises. No network, an unhelpful model, a failed
-tool call — all of it returns empty findings and the run proceeds ungrounded.
+``plan_queries`` writes the search queries, the harness searches OpenAlex and arXiv,
+``suggest_techniques`` picks papers by INDEX in the list it was shown, so it cannot
+emit an identifier that was not fetched. Never raises; a failure returns empty
+findings.
 """
 
 from __future__ import annotations

@@ -48,18 +48,10 @@ class SupervisorDecision:
     stop: bool
     title: str  # short label for the leaderboard
     brief: str  # the instruction handed to the coding agent (summary + strategy)
-    # The supervisor's ASK for literature grounding before the next experiment. A
-    # field on the emit it already makes, deliberately not a tool the supervisor
-    # drives: plan_next stays ONE structured call, which is why thinking is off for
-    # strict roles at all (LIMITATIONS). The harness reads this and runs the
-    # Researcher before the next decide().
+    # Asks are fields on the one structured emit, never tools the supervisor
+    # drives. The harness runs the Researcher, or an unscored inspect session,
+    # before the next decide(); neither records a score or spends patience.
     want_research: bool = False
-    # The supervisor's ASK for a FREE look at the data before committing an
-    # iteration to a guess. Same shape and same reason as want_research: one more
-    # field on the emit it already makes, never a tool it drives, so plan_next
-    # stays ONE structured call. The harness runs an unscored session, digests it,
-    # and comes back to decide() with the findings in history — no score is
-    # recorded, no patience is spent, and the run's iteration budget is untouched.
     want_inspect: bool = False
 
 
@@ -203,16 +195,11 @@ class Supervisor:
                 decision = _to_decision(call.arguments)
                 if decision.stop or not history:
                     return decision  # experiment 1 has no so-far slot to ground
-                # Guards, in order. Each violation gets ONE corrective retry; if the
-                # retry violates again (or the budget is spent), the harness composes
-                # a deterministic fallback brief from an untried lever class instead
-                # of accepting the violation — a live run's guard fired, the model
-                # re-emitted the same lever on the retry, and the known re-commission
-                # was accepted (detection without conversion).
+                # Guards, in order. One corrective retry per violation; a second
+                # violation, or a spent budget, gets a deterministic fallback brief
+                # from an untried lever class rather than the violation.
                 violation: tuple[str, str, bool] | None = None  # (log reason, nudge, seen)
-                # The dead-lever guard is about tabular levers that a ranking metric
-                # cannot move (class weighting, threshold tuning). Those levers do
-                # not exist on the prompt path, so the check can only misfire there.
+                # Tabular levers only; on the prompt path the check can only misfire.
                 dead_reason = (
                     None
                     if self._family.startswith("prompt")
@@ -993,14 +980,9 @@ def _build_messages(
     if history:
         recent = history[-_HISTORY_LIMIT:]
         lines = _format_history(recent, metric)
-        # the ledger scans the FULL history: a lever tried before the display
-        # window is still tried.
-        # The lever ledger is a list of TABULAR lever classes matched against
-        # sklearn identifiers in executed code. On a prompt run it can only ever
-        # report "Levers NOT yet tried: imbalance-or-threshold, categorical-
-        # encoding, ..." — advertising moves that do not exist on this path. Left
-        # out entirely rather than mistranslated; a prompt-specific ledger is its
-        # own piece of work.
+        # The ledger scans the FULL history, not the display window. Tabular only:
+        # its levers are matched on sklearn identifiers, which a prompt cell never
+        # contains.
         blocks = (
             (_technique_table(recent, metric),)
             if prompt_family
@@ -1225,33 +1207,20 @@ _CANONICAL_MOVES: dict[str, str] = {
 }
 
 
-# Levers that act on the DECISION THRESHOLD rather than on the ranking. Measured
-# across five datasets: threshold tuning moves f1 by ~0.02 and moves
-# average_precision / roc_auc by exactly 0.0000, every time; class weighting is the
-# same story about ten times weaker. On a threshold-free metric these are not weak
-# moves, they are no-ops, so the harness stops offering them rather than trusting a
-# 12B to work it out. Both v0.4 certification runs spent iteration 2 here.
+# Levers on the decision threshold, not the ranking: no-ops on a threshold-free
+# metric.
 _THRESHOLD_LEVERS = frozenset({"imbalance-or-threshold"})
 
 
 def dead_lever_reason(brief: str, metric: str, *, multiclass: bool = False) -> str | None:
     """Why this brief commissions a lever that CANNOT move this metric, or None.
 
-    Added after the v0.4 certification runs. Telling the supervisor in its prompt
-    that a threshold lever is a no-op on a ranking metric was not enough — the note
-    reaches the prompt and gemma4:12b briefed imbalance weighting anyway, on
-    iteration 2, in three runs out of three. That is the banked June lesson
-    exactly: guards beat prompt nudges on weak models. So it becomes a guard, and
-    the prompt note stays as the explanation the retry needs.
+    A guard, not only a prompt note: the note alone did not stop the model.
     """
     move = _move_text(brief)
     if multiclass:
-        # Measured 2026-08-10, the carry-in this closes: across 57 class-prior
-        # reweightings on a 4-class target, the BEST achievable move was +0.0000 on
-        # both f1_macro and accuracy, against +0.0036 and +0.0022 on the same
-        # experiment run as binary. There is no single threshold when the
-        # prediction is an argmax over classes, so the lever cannot move the number
-        # by construction — regardless of which metric is being optimised.
+        # An argmax over classes has no single threshold, so the lever cannot move
+        # the number by construction, whatever the metric.
         for lever in _THRESHOLD_LEVERS:
             if lever in move:
                 return (
@@ -1289,15 +1258,8 @@ def run_ledger(history: list[Experiment]) -> ledger.Ledger:
     )
 
 
-# The prompt family's equivalent of _CANONICAL_MOVES, in ladder order.
-#
-# Without these the fallback reached into the TABULAR table and a live prompt run
-# was handed "untried lever: categorical-encoding" as its third experiment. It
-# scored, only because the coder ignored the nonsense and did something sensible.
-# The fallback exists to be novel BY CONSTRUCTION; novel nonsense is not the deal.
-#
-# "Tried" is judged on the brief titles here, not on code markers: a prompt change
-# leaves no sklearn identifier in a cell for the tabular ledger to match on.
+# The prompt family's equivalent of _CANONICAL_MOVES, in ladder order. "Tried" is
+# judged on brief titles: a prompt change leaves no sklearn identifier to match.
 _PROMPT_MOVES: dict[str, str] = {
     "define-the-hard-case": (
         "name the one kind of input the misses cluster on and add a single sentence "

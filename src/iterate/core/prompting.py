@@ -1,24 +1,9 @@
 """What a prompt IS, how a row gets into it, and the baseline it starts from.
 
-The prompt is the artifact a `PromptTarget` run optimises, the way a pipeline is
-what a `ModelTarget` run optimises. It is deliberately two plain strings — a system
-message and a user template with placeholders — rather than a structured bundle of
-levers. Few-shot examples, output rules and role framing are all things the agent
-writes INTO those strings, so the solution space stays open and the harness never
-has to grow a field every time a prompting technique is invented.
-
-Two rules here are load-bearing.
-
-*The baseline must not be a strawman.* A deliberately terrible starting prompt
-scores near zero and makes every later change look like a triumph, which is the
-same failure as measuring against a ceiling that is too low. So the baseline states
-the task, states the allowed answers, asks for one, and stops: the simplest prompt a
-competent person writes in ten seconds.
-
-*Substitution happens once.* A record's own text routinely contains braces, and a
-naive `str.format` (or a second pass over already-substituted text) would try to
-interpret them as placeholders — turning a user's data into a crash or, worse, into
-prompt structure. Every placeholder is resolved in a single regex pass.
+A prompt is two plain strings, a system message and a user template, so every
+technique is something the agent writes INTO them. The baseline must not be a
+strawman: it states the task and the allowed answers, and stops. Substitution
+happens in a single regex pass, because a record's own text can contain braces.
 """
 
 from __future__ import annotations

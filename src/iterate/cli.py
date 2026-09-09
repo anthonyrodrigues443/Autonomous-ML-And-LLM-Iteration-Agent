@@ -363,12 +363,9 @@ def run(
             "(get a free key at e2b.dev)."
         )
 
-    # ─── Configure logging so per-iteration messages stream live. ──────────
-    # The TUI owns logging for its lifetime (a stdout handler would vanish into
-    # the alternate screen); it installs its own pane handler in run_in_tui.
-    # Interactivity needs FOREGROUND tty ownership, not just a tty: a
-    # backgrounded job (`iterate run ... &`) that reads its controlling tty gets
-    # SIGTTIN and the OS suspends the whole process — the run itself.
+    # The TUI installs its own log handler; a stdout handler would vanish into the
+    # alternate screen. Interactivity needs FOREGROUND tty ownership: a backgrounded
+    # job reading its tty gets SIGTTIN and the whole process is suspended.
     interactive_tty = _stdin_owns_tty()
     use_tui = code and not plain and interactive_tty and sys.stdout.isatty()
     if not use_tui:
@@ -389,13 +386,8 @@ def run(
         if think
         else client
     )
-    # ─── How this run is measured ──────────────────────────────────────────
-    # Resolved BEFORE the target is built, because ModelTarget, the Supervisor, the
-    # Summarizer, the Critic and the coder are all constructed around a metric. An
-    # explicit --metric is used as given; otherwise the Researcher proposes one over
-    # the papers it fetched for this problem, and anything that fails validation
-    # falls back to what v0.3 would have done. The result is then FIXED for the run:
-    # one ruler, or the history and the cross-run baseline stop being comparable.
+    # The metric is resolved BEFORE the target is built, since every role is
+    # constructed around it, and then fixed for the run.
     run_setup = _resolve_setup(
         dataset=dataset,
         explicit=metric,
@@ -431,12 +423,8 @@ def run(
             backend=target_backend or backend,
             model=target_model or model,
             base_url=base_url,
-            # ABSOLUTE. This path is written into meta.json and read back inside
-            # the kernel, which runs in its own temp working directory — a relative
-            # path resolved THERE, so every session built a fresh cache in scratch
-            # space and threw it away. Measured: 298 entries at the start of a
-            # 100-minute run and 298 at the end, with three sessions re-paying for
-            # the same baseline measurement in full.
+            # ABSOLUTE: the kernel reads this from meta.json in its own temp working
+            # directory, where a relative path would resolve to a throwaway cache.
             cache_path=(Path(settings.iterate_runs_dir).parent / "prompt-answers.db").resolve(),
             allow_free_text=allow_free_text,
         )
@@ -465,12 +453,9 @@ def run(
     )
 
     if code:
-        # ─── Cell-by-cell: Supervisor briefs → Coding agent runs a kernel session ──
-        # Each session gets a fixed kernel-execution budget (no cell cap; LLM latency
-        # is not charged). --until bounds the WHOLE run via the terminator above —
-        # it is not a single experiment's budget.
-        # Supervisor and Summarizer are tool-only structured-output roles, so they use
-        # the no-think client even when --think is set (thinking crowds out the call).
+        # --until bounds the WHOLE run via the terminator; a session's budget is
+        # kernel-execution seconds. Tool-only roles use the no-think client even
+        # under --think, because thinking crowds out the call.
         if not is_prompt_run:
             supervisor_family = "tabular"
         else:
@@ -511,13 +496,9 @@ def run(
         # prompt well under it so the system prompt is never what truncates.
         context_budget = 48_000 if backend == "ollama" else 400_000
 
-        # ─── Interactive chat (v0.3): type anything, anytime ──────────────────
-        # Default face on a terminal: the TUI (scrollable log pane + pinned input
-        # box), where the Input widget feeds the controller. With --plain (or a
-        # tty stdin but piped stdout), a daemon thread reads stdin lines instead.
-        # Control words act immediately; other messages queue with a timing-only
-        # ack and are interpreted at the next safe boundary (the loop binds the
-        # interpreter). Non-tty (scripts/CI) keeps exactly the old behavior.
+        # Interactive input: the TUI on a terminal, a stdin thread under --plain or
+        # piped stdout, nothing when not a tty. Control words act immediately;
+        # other messages wait for the next safe boundary.
         controller: RunController | None = None
         if interactive_tty:
             from iterate.core.interactive import RunController as _RunController

@@ -1,23 +1,9 @@
-"""The deterministic experiment dossier — what a finished session can be known to
-have done, without asking an LLM.
+"""The deterministic experiment dossier: what a finished session did, with no LLM.
 
-The Summarizer already turns a session into an `ExperimentDigest`, but that record
-is LLM-authored: a degraded or failed summarizer call loses the whole experiment's
-knowledge, and every field is a claim rather than an observation. This module
-extracts the part that needs no judgment — what the session printed, what it
-instantiated, what it scored, how it failed — so that record always exists.
-
-The hard rule here is that a dossier NEVER invents. Every fact it carries is a line
-the session actually printed or a value computed from the cell records, quoted or
-counted, never paraphrased. That is what makes it safe as the Summarizer's input
-(v0.4 Day 4) and as its fallback: a fallback that could hallucinate would be worse
-than no fallback at all.
-
-Deliberately NOT wired into the supervisor's planning prompt. A same-model A/B in
-June measured additive supervisor context regressing the floor model (best 0.6325
-to ~0.61, collapsing onto one lever 5-6 of 10 iterations) and the feature was
-reverted; the banked lesson is deterministic machinery over prompt nudges. This
-record earns its keep by feeding the Summarizer and the ledger, not by being read.
+A dossier NEVER invents. Every fact is a line the session printed or a value
+computed from the cell records, which is what makes it safe as the Summarizer's
+input and fallback. It feeds the Summarizer and the ledger and is deliberately not
+rendered into the supervisor's planning prompt.
 """
 
 from __future__ import annotations

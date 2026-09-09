@@ -1,18 +1,8 @@
 """Persistent memory for the agentic loop.
 
-The Orchestrator records each experiment + each Proposer failure through a
-`Memory` instance. `history(target_name)` returns every Experiment ever recorded
-for that target — across all runs — which is what the Proposer reads to know what
-has already been tried. The point: the agent's memory survives `iterate run`
-exiting, so the next run picks up where the last left off.
-
-Two implementations ship:
-- `InMemoryMemory` — dict-backed, ephemeral, used by tests and any caller that
-  doesn't want persistence.
-- `SqliteMemory(path)` — backed by a single sqlite file on disk (default
-  `.iterate/memory.db`). No server, no auth — file permissions control access.
-
-Both implement the same `Memory` protocol; nothing upstream knows which it got.
+`history(target_name)` returns every Experiment ever recorded for that target,
+across runs. `InMemoryMemory` is ephemeral; `SqliteMemory(path)` is one sqlite
+file with no server and no auth.
 """
 
 from __future__ import annotations

@@ -1,21 +1,8 @@
-"""The code-gen contract — how a generated training script is run and scored.
+"""The code-gen contract: how generated code is run and scored.
 
-v0.2 lets the agent write its own model code instead of naming an installed
-estimator. To keep that safe and comparable, the agent does NOT write file I/O:
-it provides one function,
-
-    def train_and_predict(X_train, y_train, X_holdout):
-        # any imports, preprocessing, model — returns one prediction per X_holdout row
-        return predictions
-
-and we wrap it in a fixed harness that loads the data and writes the predictions.
-The harness owns the plumbing (correct by construction); the LLM owns only the
-modelling. The sealed holdout stays sealed: the script receives `X_holdout`
-*features* but never the labels — we hold those and score the returned
-predictions through `core.scoring`, identically to the spec path.
-
-A code-candidate is an ordinary `Candidate` whose ``changes = {"code": "<the
-train_and_predict source>"}``; the executor routes on the presence of ``"code"``.
+The agent writes modelling code, never file I/O; a fixed harness loads the data
+and writes the predictions. The script receives holdout features and never the
+labels. A code candidate is a `Candidate` whose ``changes`` carries ``"code"``.
 """
 
 from __future__ import annotations
@@ -104,33 +91,14 @@ def assemble_script(code: str) -> str:
 
 
 def session_preamble() -> str:
-    """The first (trusted, host-authored) cell of a cell-by-cell session: loads the
-    data into ``X_train`` / ``y_train`` / ``X_holdout`` (holdout FEATURES only — the
-    labels stay host-side) and prints the shapes. The coder builds from here.
+    """The trusted first cell of a session: loads ``X_train`` / ``y_train`` /
+    ``X_holdout`` (features only) and prints the shapes.
 
-    Also defines a ``finish()`` shim: models conflate the finish TOOL with a kernel
-    function and append ``finish()`` to otherwise-perfect cells. Without the shim
-    that's a NameError that marks the whole cell failed and burns turns re-running
-    it; with it, the cell completes and the printed guidance redirects the model to
-    the tool.
-
-    Finally it snapshots the inputs into ``_pristine_inputs`` so the harness can
-    restore ``X_train``/``y_train``/``X_holdout`` before every agent cell — a weak
-    model can otherwise corrupt the canonical data in place (e.g.
-    ``X_train[cols] = imputer.fit_transform(...)``) and silently poison every later
-    attempt in the session.
-
-    It also seeds the global RNGs (``random`` + ``numpy``). Estimators left at
-    ``random_state=None`` draw from numpy's global RNG, so seeding once here makes a
-    session reproducible: the rendered notebook re-executes to the SAME score the
-    run reported, instead of drifting by the model's run-to-run variance.
-
-    The thread caps come FIRST, before any import loads a BLAS/OpenMP runtime:
-    generated code runs in a raw kernel, and Week 2 measured sklearn's
-    HistGradientBoosting at ~200x slower under thread oversubscription on Apple
-    Silicon (the v0.1 spec path caps threads via threadpoolctl; this is the same
-    lesson applied to the cell-by-cell session). A live v0.3 run lost an
-    iteration to fit cells hitting the 120s cell timeout for exactly this."""
+    It also defines a ``finish()`` shim so a model that calls the tool as a
+    function does not fail the cell, snapshots the inputs so the harness can
+    restore them before every agent cell, and seeds the global RNGs so the
+    rendered notebook re-executes to the same score. The thread caps come FIRST,
+    before any import loads a BLAS runtime."""
     return (
         "import os\n"
         "for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', "
@@ -155,25 +123,11 @@ def session_preamble() -> str:
 
 
 def prompt_session_preamble() -> str:
-    """The prompt path's opening cell.
-
-    Same data contract as the tabular preamble — `X_train` / `y_train` with answers,
-    `X_holdout` features only — plus the three things a prompt session needs and
-    should not have to build:
-
-    ``ask(prompt, rows)`` runs a prompt over records concurrently, with caching and
-    a tool-enforced answer, against the ONE model this run is tuning. The agent
-    writes the prompt; it does not hand-roll the transport, for the same reason the
-    tabular coder does not implement gradient boosting.
-
-    ``evaluate(answers, truth)`` scores with the RUN'S metric. Without it a session
-    reaches for accuracy while the host scores f1, and every "improvement" it
-    measures is measured with a different ruler than the one that decides.
-
-    ``submit(prompt)`` runs the prompt over the holdout and writes BOTH
-    predictions.csv and prompt.yaml in one call. That is what makes it impossible to
-    submit a prompt that did not produce the submitted predictions — a mismatch no
-    after-the-fact validation could reliably catch.
+    """The prompt path's opening cell: the tabular data contract plus three
+    helpers. ``ask`` runs a prompt over records against the one model under test,
+    ``evaluate`` scores with the RUN'S metric, and ``submit`` runs the prompt over
+    the holdout and writes predictions and prompt together, so a prompt cannot be
+    submitted apart from the predictions it produced.
     """
     return (
         "import os\n"
@@ -231,12 +185,8 @@ def prompt_session_preamble() -> str:
         "def submit(prompt):\n"
         "    answers = ask(prompt, X_holdout)\n"
         f"    pd.Series(answers).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
-        # The fingerprint of what the MODEL actually answered, written alongside the
-        # prompt. Nothing stops a later cell overwriting predictions.csv with a
-        # hardcoded rule while prompt.json still sits there — that would score well
-        # and not be prompt engineering at all. The host compares this against the
-        # predictions it reads, so a swapped submission is detectable rather than
-        # merely discouraged.
+        # Fingerprint of what the model answered, so the host can detect a later
+        # cell overwriting predictions.csv while prompt.json still sits there.
         "    import hashlib as _hl\n"
         "    _digest = _hl.sha256(chr(10).join(str(a) for a in answers).encode()).hexdigest()\n"
         f"    with open({PROMPT_JSON!r}, 'w') as _f:\n"
@@ -295,21 +245,10 @@ RESET_INPUTS = (
 
 
 def fallback_baseline(task: str, *, with_proba: bool = False) -> str:
-    """A host-authored, deterministic floor submission for the cell-by-cell path.
-
-    Run as a last-resort cell when a session ends without a valid predictions file
-    (a heavy lever ate the whole budget, or the approach was abandoned), so the
-    iteration degrades to a floor score instead of a total loss. A LINEAR model on
-    purpose: the floor ran a gradient-boosted tree until a live v0.3 session died
-    to fit-cell timeouts and the floor timed out WITH it — the safety net must
-    train in milliseconds under any thread weather. Median-imputed (linear models
-    are not NaN-native), one-hot via get_dummies, seeded.
-
-    ``with_proba`` makes the floor write `probabilities.csv` too. Without it, a run
-    on a probability metric would have an unscoreable safety net: the floor banks
-    labels, scoring needs probabilities, and the iteration is a total loss exactly
-    when the net was supposed to catch it. LogisticRegression is already a
-    probability model, so this costs one extra line of generated code."""
+    """A host-authored floor submission, run when a session ends without a valid
+    predictions file. A LINEAR model on purpose: the safety net must train in
+    milliseconds under any thread weather. ``with_proba`` also writes
+    `probabilities.csv`, or a probability metric would have an unscoreable net."""
     if task == "classification":
         import_line = "from sklearn.linear_model import LogisticRegression\n"
         model = "LogisticRegression(max_iter=1000, random_state=42)"
@@ -571,20 +510,10 @@ def score_predictions(
 ) -> ExperimentResult:
     """Score a script's predictions against the held-back holdout labels.
 
-    `open_vocabulary` is set by the prompt path, where a submitted answer can be a
-    value the target column never contains. It makes such an answer count as wrong
-    instead of registering as a new class — one of them in 300 is otherwise enough
-    to turn a binary target multiclass and make the metric refuse to score.
-
-    A missing/empty/wrong-length predictions file is a captured failure (a
-    non-success `ExperimentResult`), never an exception — same contract as a bad
-    spec candidate.
-
-    Probabilities are where the policy `core.scoring` deliberately refuses to make
-    lives: if the primary metric needs them, a bad probability file sinks the
-    experiment like a bad predictions file. If it doesn't, they are a bonus panel
-    and a bad file is dropped silently — a broken `probabilities.csv` must never
-    cost an otherwise-valid f1 iteration.
+    `open_vocabulary` (the prompt path) makes an answer outside the target's values
+    count as wrong instead of becoming a new class. A missing or malformed
+    predictions file is a captured failure, never an exception. A bad probability
+    file sinks the experiment only when the primary metric needs probabilities.
     """
     if not predictions_csv:
         return _failed(experiment_id, "no predictions file produced")

@@ -1,17 +1,7 @@
-"""The Proposer — the LLM that proposes the next experiment.
+"""The Proposer: the LLM that proposes the next experiment as a model spec.
 
-Given a data summary, the re-measured baseline, the current model, and what's
-already been tried, the Proposer asks the LLM to choose the most appropriate model
-+ hyperparameters for the next `Candidate`. It speaks only the provider-agnostic
-`LLMClient` protocol and gets a structured proposal via a `propose_candidate` tool
-call — with a text-reply retry fallback, because the protocol exposes no
-`tool_choice` and a model may answer in prose.
-
-Reconstructing a baseline from a user-supplied source (md/txt/notebook) reads it as
-text ONLY and never executes it — user-supplied code is untrusted (malware/RCE
-risk), so we rebuild the approach as our own spec and re-measure through our eval.
-That reuses this same machinery and lands later in Week 3. (Note: the e2b sandbox at
-v0.2 runs the agent's OWN generated code, never the user's.)
+A structured proposal comes back through the `propose_candidate` tool call, with a
+text-reply retry because the protocol exposes no `tool_choice`.
 """
 
 from __future__ import annotations

@@ -1,17 +1,8 @@
-"""The Reconstructor — read a user-supplied source (md / txt / notebook / .py) as
-TEXT ONLY and WRITE the baseline approach as a runnable `train_and_predict` function.
+"""The Reconstructor: read a user-supplied source as TEXT ONLY and write the
+baseline approach as a runnable `train_and_predict` function.
 
-Sibling of `Proposer` / `CodeProposer`: same LLM/tool-calling/retry machinery,
-different intent and prompt. The Proposer picks the *next* experiment; the
-Reconstructor reproduces the *user's existing* approach from their source so we can
-run it through our own eval as a comparable baseline.
-
-**Hard security boundary:** user-provided source is *never* executed — not by us,
-not in the e2b sandbox, not ever. The LLM reads it as text and WRITES new code (the
-agent's own, run on the code path like any other candidate) that reproduces the
-approach. Because it emits code rather than an allow-listed spec, it can reproduce
-the source faithfully — real CatBoost, a custom architecture — with no "closest
-equivalent" approximation.
+User-provided source is never executed, not here and not in the sandbox. The LLM
+reads it and writes new code, which runs on the code path like any candidate.
 """
 
 from __future__ import annotations

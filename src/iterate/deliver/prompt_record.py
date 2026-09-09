@@ -1,19 +1,6 @@
-"""`prompts.yaml` — the deliverable of a prompt run.
-
-For a tabular run the artifact you leave with is a fitted model. For a prompt run
-it is the prompt, and a notebook is the wrong place to keep it: it shows the journey
-across dozens of cells but cannot tell you which one held the winner.
-
-The HARNESS writes this file, never the agent. An agent writing its own scoreboard
-can mislabel which prompt was best or drift from what it actually ran; the harness
-already holds every score, so it owns the record. Same reason `best.json` is
-host-written, and the same rule as the dossier: it may be incomplete, it may not be
-wrong.
-
-`best: true` is set here and respects the Critic. An experiment whose score was
-rejected for a proven leak can never be marked best, because that score is not a
-result. Rejected versions still appear, with their reason, since a prompt that
-looked good and was not is worth being able to see.
+"""`prompts.yaml`: the deliverable of a prompt run, written by the harness and
+never by the agent. `best: true` respects the Critic: a version rejected for a
+proven leak still appears, with its reason, and is never marked best.
 """
 
 from __future__ import annotations

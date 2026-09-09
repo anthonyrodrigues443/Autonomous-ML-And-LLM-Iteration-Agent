@@ -1,26 +1,10 @@
-"""The Critic specialist — can this experiment's score be believed?
+"""The Critic: can this experiment's score be believed?
 
-Runs once per finished experiment, after scoring and before the result is allowed
-to bank as the run's best. Two questions, with deliberately different consequences:
-
-* **leak** — a verifiable defect in the submitted code (a transform fitted on the
-  holdout, the target used to build a feature). This VETOES banking, because a
-  number produced by cheating is not a score.
-* **mirage** — a statistical suspicion about the gain, most often a holdout score
-  far above the validation trail the session printed. This FLAGS only.
-
-That asymmetry is the design. A leak is visible in the code and checkable, so
-acting on it is safe. Whether a gain is "real" is a probabilistic judgement, and
-the sealed holdout is already this project's ruler — letting a 12B overrule it
-would put a model back into the control flow that direction, the guard stack and
-duplicate-hashing were all deliberately kept out of. So the Critic can subtract a
-win it can prove was cheated, and can raise a hand about one it merely doubts.
-
-Precedence, unchanged from every other agent here: it can never unseal the holdout,
-never overturn a deterministic guard, and never promote an experiment that did not
-improve. It only ever takes away. Like the Summarizer and the Researcher it never
-raises — a failed review accepts the experiment, because a review is a
-nice-to-have and losing a real result to a flaky LLM call is not.
+Runs after scoring and before a result banks as best. A leak (a verifiable defect
+in the submitted code) VETOES banking; a mirage (a statistical suspicion about the
+gain) only FLAGS. It can never unseal the holdout, overturn a deterministic guard,
+or promote an experiment that did not improve. It never raises; a failed review
+accepts the experiment.
 """
 
 from __future__ import annotations

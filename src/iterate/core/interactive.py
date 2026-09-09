@@ -1,22 +1,10 @@
-"""Interactive run control — the seam between a human at the terminal and the loop.
+"""Interactive run control: the seam between a human at the terminal and the loop.
 
-One ``RunController`` is shared by three parties: a CLI-owned listener thread that
-feeds it the lines the user types, the supervised loop that drains them at safe
-boundaries, and the coding agent that parks at a cell boundary while paused.
-
-The controller itself never touches the console (replies go through an injected
-callback), never calls an LLM (interpretation is an injected callback the loop
-binds, because that is where the Supervisor lives), and never touches Memory
-(sqlite is single-thread). The listener thread only parses the three control
-words and enqueues text; everything heavy happens on the MAIN thread inside
-``checkpoint``, so the rest of the codebase stays single-threaded in practice.
-
-Timing model: a message can only take effect at a boundary — after a cell
-finishes, or just before the next supervisor call — because the main thread
-blocks inside kernel/LLM calls between boundaries. The instant ack is therefore
-TIMING-only ("delivering at the next safe point"); what the message *means* is
-decided later by the interpreter, and the interpreter replies again with the
-real routing.
+One ``RunController`` is fed by a listener thread and drained by the loop at safe
+boundaries. The controller never touches the console, an LLM or Memory; the
+listener thread only parses control words and enqueues text, and everything heavy
+runs on the MAIN thread inside ``checkpoint``. A message takes effect only at a
+boundary, so the instant ack is timing-only.
 """
 
 from __future__ import annotations

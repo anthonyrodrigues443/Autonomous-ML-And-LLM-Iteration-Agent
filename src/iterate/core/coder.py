@@ -1,19 +1,9 @@
-"""The coding agent — drives one experiment as a cell-by-cell kernel session.
+"""The coding agent: one experiment as a cell-by-cell kernel session.
 
-Unlike the one-shot proposer (write a whole `train_and_predict` blind), the coding
-agent works like a human in a notebook: it writes a cell, sees the cell's REAL
-output, then writes the next — in a live `StatefulKernel` whose namespace persists.
-It can inspect the data, engineer features, check intermediate shapes, and fix its
-own errors from the actual traceback, all within one experiment.
-
-It runs a multi-turn tool loop: the LLM calls ``run_cell(code)`` (we execute it and
-feed the output back) or ``finish`` (it has written `predictions.csv`). A trusted
-host-authored preamble loads `X_train`/`y_train`/`X_holdout` first; the holdout
-labels never enter the kernel, and we score the written predictions host-side
-through `core.scoring`, so the sealed-holdout guarantee is unchanged.
-
-For now the `brief` (what to try) is supplied by the caller; the Supervisor agent
-will produce it from run history next.
+A multi-turn tool loop: the LLM calls ``run_cell(code)`` and sees the real output,
+or ``finish`` once `predictions.csv` is written. A host-authored preamble loads the
+inputs first; holdout labels never enter the kernel, and predictions are scored
+host-side through `core.scoring`.
 """
 
 from __future__ import annotations
@@ -276,13 +266,8 @@ class CodingAgent:
         context_budget_chars: int = 400_000,  # prompt cap; oldest observations elide first
         wall_ceiling_seconds: float = 1800.0,  # hard wall-clock bound on one session
         controller: RunController | None = None,  # interactive pause/chat; None = today's behavior
-        # ─── target family (v0.5) ───
-        # What the session opens with, what else lands in its working directory,
-        # which floor catches it, and which instructions it gets. Defaulted so the
-        # tabular path is byte-identical to v0.4: the prompt family supplies all
-        # four, and nothing else about this agent changes. Its job — write cells
-        # until you can submit predictions — is the same job whether a cell fits a
-        # model or calls an LLM.
+        # Target family. Defaults keep the tabular path unchanged; the prompt
+        # family supplies all four.
         preamble: str | None = None,
         extra_inputs: dict[str, bytes] | None = None,
         floor_cell: str | None = None,
@@ -300,13 +285,8 @@ class CodingAgent:
         self._max_cells = max_cells
         self._context_budget_chars = context_budget_chars
         self._controller = controller
-        # The kernel-time deadline deliberately does NOT charge LLM latency (a slow
-        # local model gets the same working budget as a fast cloud one) — but that
-        # leaves a thrashing session unbounded in wall-clock: tiny errored cells
-        # spend almost no kernel time, so max_cells is the only stop and each cell
-        # costs minutes of model latency. This ceiling bounds the real-world time
-        # one experiment can consume; generous enough that healthy sessions (even
-        # think-mode ones) never feel it.
+        # The kernel-time deadline does not charge LLM latency, so a session of
+        # tiny errored cells is unbounded in wall-clock without this.
         self._wall_ceiling_seconds = wall_ceiling_seconds
         self._preamble = preamble
         self._extra_inputs = extra_inputs
@@ -390,21 +370,15 @@ class CodingAgent:
                 average=self._average,
                 open_vocabulary=self._family == "prompt",
             )
-            # The prompt path's real deliverable. `submit()` writes it beside the
-            # predictions in the same call, but the LIVE path reads its outputs
-            # here, not through `score_code_job` — so without this the winning
-            # prompts never reach the experiment record and prompts.yaml ships with
-            # nothing in it but the baseline. Measured: a run improved f1 three
-            # times and delivered none of the three prompts.
+            # The live path reads outputs here, not through `score_code_job`, so
+            # the submitted prompt must be picked up here or it never reaches the
+            # experiment record.
             if (submitted := self._kernel.read_output(codegen.PROMPT_JSON)) is not None:
                 artifacts = {**result.artifacts, codegen.PROMPT_JSON: submitted.decode(errors="replace")}
                 if swapped := codegen.submission_was_swapped(submitted, preds):
-                    # The predictions on disk are not the ones `submit()` produced,
-                    # so whatever is being scored did not come from the model under
-                    # test. A hardcoded rule submitted this way would score well and
-                    # not be prompt engineering at all. Verifiable, so it is a hard
-                    # rejection rather than a Critic opinion — a leak vetoes, a
-                    # suspicion only flags.
+                    # Predictions on disk are not the ones `submit()` produced, so
+                    # they did not come from the model under test. Verifiable, so a
+                    # hard rejection rather than a Critic flag.
                     log.warning("coder[%s]: %s", experiment_id, swapped)
                     result = result.model_copy(update={"error": swapped, "metrics": None})
                 result = result.model_copy(update={"artifacts": artifacts})
@@ -433,20 +407,9 @@ class CodingAgent:
     ) -> str:
         """A free look at the data: run cells that PRINT, return what they printed.
 
-        Not an experiment, and deliberately not shaped like one. It writes no
-        predictions, banks no floor, is never scored, and produces no `Experiment`
-        — the schema forbids a result with neither metrics nor an error, which is
-        the schema saying an unscored run is not an outcome. So the findings travel
-        the same seam the Researcher's do: text folded into the next `decide()`.
-
-        That is what makes the step cheap enough to be free. The three blockers
-        that cut it from v0.4 (a fourth `AttemptOutcome`, keeping patience and
-        `max_iterations` untouched) were all consequences of modelling it as an
-        experiment, and none of them survive this shape. What remains is the cap,
-        which the caller owns.
-
-        Returns "" when the session printed nothing worth carrying, so a failed
-        inspection costs the run a few seconds and nothing else.
+        Not an experiment: no predictions, no floor, no score, no `Experiment`.
+        The findings travel the Researcher's seam, as text folded into the next
+        `decide()`. Returns "" when nothing worth carrying was printed.
         """
         from iterate.core.proposer import summarize_dataset
 
@@ -503,25 +466,15 @@ class CodingAgent:
         inspect: bool = False,
         max_cells: int | None = None,
     ) -> None:
-        """The tool loop: run_cell → feed output back → repeat, until a VERIFIED finish
-        or the deadline. The deadline charges KERNEL-EXECUTION seconds only — LLM
-        latency is free, so a slow local model gets the same working budget as a fast
-        cloud one (`max_cells` backstops a runaway loop). `finish` is rejected unless
-        valid predictions are actually written; a first VALID finish with most of the
-        budget unspent is met once with an improve nudge (the next is accepted).
+        """The tool loop: run_cell, feed the output back, repeat, until a VERIFIED
+        finish or the deadline. The deadline charges kernel-execution seconds only.
 
-        Two no-op gates guard a valid finish, each firing at most once (nudges, not
-        walls — the next finish is accepted). Live runs produced six byte-identical
-        submissions in a row: briefed levers never reached a single code cell, and
-        sessions ended by deliberately re-writing the carried best's predictions.
-        The lever gate fires when none of the brief's lever-class markers appear in
-        any executed cell; the identical gate fires when the submitted bytes hash to
-        ANY earlier experiment's submission (not just the best — a later run wasted
-        4 of 10 iterations on sibling duplicates the best-only check could not see).
-
-        ``inspect`` is the free-look session: it writes no predictions, so a finish
-        is accepted on the model's word and every gate above it is skipped. Those
-        gates all ask a question about a SUBMISSION, and an inspection has none."""
+        `finish` is rejected unless valid predictions are written. Three nudges each
+        fire at most once, and the next finish is accepted: a first valid finish with
+        most of the budget unspent, a submission whose executed cells carry none of
+        the brief's lever markers, and a submission byte-identical to ANY earlier
+        experiment's. An ``inspect`` session writes no predictions, so every gate
+        is skipped."""
         work = 0.0  # kernel-execution seconds spent — the budget the deadline bounds
         warned = False
         improve_nudged = False
@@ -534,17 +487,11 @@ class CodingAgent:
         session_start = time.monotonic()
         for _ in range(max_cells if max_cells is not None else self._max_cells):
             if self._controller is not None:
-                # The interactive boundary, FIRST — a pending pause is honored
-                # before the session-ending checks below so its clock credit is in
-                # place when they run. Pause blocks IN PLACE (the kernel and every
-                # local survive; run()'s finally would kill the kernel on any
-                # return); the paused time shifts the wall-ceiling anchor forward
-                # so a long pause never burns the session. The kernel-time
-                # deadline needs no credit — it only accrues inside cell
-                # execution. A user note lands here as one more user-role message,
-                # exactly like the budget nudge; the loop top is the only safe
-                # injection point (the last message is always a tool result, so
-                # threading stays valid).
+                # Interactive boundary FIRST: a pause blocks in place (a return
+                # would kill the kernel) and shifts the wall-ceiling anchor so the
+                # checks below see the credit. A user note is injected here because
+                # the loop top is the only point where the last message is not a
+                # tool result.
                 self._controller.status = f"session {experiment_id}: at a cell boundary"
                 paused = self._controller.checkpoint(self._kernel)
                 if paused:

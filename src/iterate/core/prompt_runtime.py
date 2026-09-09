@@ -1,28 +1,9 @@
-"""`ask()` — running one prompt across every record, from inside a session cell.
+"""`ask()`: one prompt across every record, from inside a session cell.
 
-This is the prompt path's equivalent of calling scikit-learn. The agent writes the
-prompt, decides the placeholders and writes the evaluation cells; it does not
-hand-roll the transport, exactly as the tabular coder does not implement gradient
-boosting. Four reasons the harness owns the call rather than the generated code:
-
-*Comparability.* A model writing its own HTTP call can quietly change the model,
-the temperature or the endpoint between experiments. Then two experiments differ by
-more than the prompt and the comparison is worthless — the same rule that keeps the
-metric fixed for a whole run.
-
-*Speed.* One call per record, run sequentially, is what makes a prompt loop too slow
-to finish. Calls go out concurrently and every answer is cached, so re-running a
-prompt the session has already tried costs nothing.
-
-*Format.* The allowed answers are a tool schema with an enum, not an instruction in
-the text. Asking a model to reply with one of three labels is a request; giving it a
-tool whose only argument is one of three labels makes anything else impossible. Same
-shape as the Researcher picking a paper by number rather than writing a DOI.
-
-*Failure.* A flaky call, a rate limit or a garbled reply is retried and then recorded
-as an unparseable answer for that row. It never raises, because one bad row must not
-cost the whole experiment — but it does count as wrong, since a prompt that provokes
-unusable output IS a worse prompt and hiding that would reward vagueness.
+The harness owns the call so the model, temperature and endpoint cannot change
+between experiments. Calls run concurrently and every answer is cached. The
+allowed answers are a tool schema, not an instruction. A failed row is retried,
+then recorded as unparseable and scored as wrong; it never raises.
 """
 
 from __future__ import annotations
@@ -226,18 +207,9 @@ def coerce(text: str | None, labels: Sequence[str] | None) -> str:
         if normalised == str(label).strip().casefold():
             return str(label)
 
-    # Scanned by POSITION, longest alternative first, rather than by comparing
-    # labels to one another. Two failures shaped this:
-    #
-    #   "the intent is timer"        -> "time" also matched, so a clear reply was
-    #                                   thrown away as ambiguous (real CLINC labels)
-    #   "could be toxic or not toxic" -> comparing labels made "toxic" look like a
-    #                                   substring of "not toxic" and swallowed a
-    #                                   genuine ambiguity into a confident answer
-    #
-    # A positional scan gets both right: at the one place "timer" appears only
-    # "timer" is taken, while "toxic ... not toxic" yields two matches at two
-    # places. Word boundaries stop "time" matching inside "timekeeper".
+    # Scanned by POSITION, longest alternative first, with word boundaries. Label
+    # comparison gets both of these wrong: "the intent is timer" must not read as
+    # ambiguous with "time", and "toxic or not toxic" must.
     ordered = sorted((str(label).strip() for label in labels), key=len, reverse=True)
     pattern = "|".join(re.escape(label.casefold()) for label in ordered)
     found = re.findall(rf"(?<!\w)(?:{pattern})(?!\w)", normalised)
