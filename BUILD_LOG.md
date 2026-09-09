@@ -67,7 +67,7 @@ Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. **The
 | v0.2.0 | 4-5 | **RELEASED 2026-07-18** | tabular | *(same inputs)*: agent **writes + runs its own training code cell-by-cell** (local kernel default, e2b sandbox flag); Supervisor + CodingAgent + Summarizer; guard stack + certified quality bar; notebook deliverable; per-cell progress + graceful Ctrl-C |
 | v0.3.0 | sprint 1 | **Sun 2026-07-26** | tabular | *(same inputs)*: **full interactive CLI** (pause the loop, chat with the agent, resume); token streaming is the stretch item |
 | v0.4.0 | sprint 2 | **Sun 2026-08-02** | tabular | data + features + target + baseline + deadline  *(Researcher + Critic specialists at the tool boundary; agent picks metric + starting model from research; probability metrics)* |
-| v0.5.0 | sprint 3 | **Sun 2026-08-09** | + prompts | prompt + eval set + deadline |
+| v0.5.0 | sprint 3 | **RELEASED 2026-09-09** (planned Aug 9; slipped to Aug 11 for the regression half, then waited on the certification run) | + prompts | data + target + a task line (+ your current prompt, optional) + deadline: **the same loop on LLM prompts**, classification and regression, sealed holdout, `prompts.yaml` deliverable, eval suite with a measured ceiling per dataset |
 | v0.6.0 | sprint 4 | **Sun 2026-08-16** | + DL / vision | data + target + deadline  *(validated on the RTX 4050)* |
 | v0.7.0 | sprint 5 | **Sun 2026-08-23** | all three | + serving budget / cloud  *(cost-constrained recommendation + serving profile + `iterate cost`)* |
 | v0.9.0 | sprint 6 | **Sun 2026-08-30** | all | data + a one-line description OR one sentence + a data source  *(absorbs v0.8: infers features/target/metric with a confirm pause; MCP discovery over filesystem + Postgres with the gap-fill pause)* |
@@ -297,7 +297,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 ---
 
-## Sprint 3: v0.5, PromptTarget. Mon 2026-08-03 to Sat 2026-08-08, release Sun 2026-08-09
+## Sprint 3: v0.5, PromptTarget. Mon 2026-08-03 to Sat 2026-08-08, release Sun 2026-08-09 (released 2026-09-09)
 
 **Carry-ins from the v0.4 certification (recorded 2026-08-02, ordered by what a user feels first):**
 1. **Eval suite, FIRST in the week.** Day 6 spent an afternoon hand-computing brute-force ceilings per dataset to tell a failing agent from a hard problem, and found seven bugs no unit test caught. Make it a runnable corpus: datasets, measured headroom, a scoring harness. Two things it must fix about the v0.4 method — the ceilings were LOWER BOUNDS from a short sweep, not true maxima, so scoring against public leaderboard positions where they exist would replace guesswork with a number; and the corpus is the CI defence against dataset-shape bugs, since 583 unit tests missed all three (non-UTF-8, boolean columns, integer targets) because every fixture shared the same shape.
@@ -318,7 +318,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | Thu Aug 6 | `examples/intent_clinc150/`: CLINC150 intent classification; genericity fixes the second prompt target surfaces | example + tests | done (built Sun Aug 9) |
 | Fri Aug 7 | Floor-model validation on the prompt path; demo-clean pass | validation | done (built Sun Aug 9: 5 live gemma4:12b runs) |
 | Sat Aug 8 | Buffer + carried items from earlier cut lists if green | fixes | done (built Mon Aug 10: all 7 carry-ins resolved — 6 shipped, and carry-in 5's second half built, measured and reverted on the evidence, see entry) |
-| Sun Aug 9 | **Release v0.5.0** — SLIPPED to Tue Aug 11 (Tony's call 2026-08-09): v0.5 ships classification AND regression together rather than half the promise. "Prompt iteration for ML tasks" is a claim worth a two-day slip | v0.5.0 out | slipped |
+| Sun Aug 9 | **Release v0.5.0** — SLIPPED to Tue Aug 11 (Tony's call 2026-08-09): v0.5 ships classification AND regression together rather than half the promise. "Prompt iteration for ML tasks" is a claim worth a two-day slip | v0.5.0 out | done (released 2026-09-09: the code was complete Aug 11 and the release waited on the certification run, which ran Sep 8-9 and found two defects; see the release entry) |
 
 ---
 
@@ -492,6 +492,24 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-09-09 | Sprint 3 release | v0.5.0 released
+
+**Task:** release mechanics per the standing checklist.
+
+**Release gate (step 1):** v0.5 built a whole new execution path, so the bar was a live certification run by Tony on a dataset chosen for headroom rather than one the sweep had already read as flat: `tweet_irony` (SemEval-2018, 1,200 balanced tweets, the label hashtags verified stripped). It found two defects. The first, one record call generating 8,111 tokens and eating a 600s cell, is fixed in #59 and re-verified on a clean full run: 2,304 Ollama calls, every one HTTP 200, stop on patience, the winner re-scored on the full 240-record holdout. The second, `prompts.yaml` not labelling a fallback or a duplicate, is logged for v0.6. The comment cleanup (#60) rode between the fix and this PR with an AST-identity proof.
+
+**Build gate (step 2):** 807 unit tests, ruff clean at CI scope (`src tests evals`), wheel built and installed into a clean venv, `iterate 0.5.0` verified from the wheel.
+
+**Doc sync (step 3):** README (the today table, the status paragraph, a "What v0.5 adds" section with the four run forms, quick start 3b, the flags line, the targets and comparison tables, the one-line-form note), LIMITATIONS (the two input rows flipped), the release table and the sprint 3 table here.
+
+**Version mechanics (step 4):** 0.4.0 -> 0.5.0 in pyproject, `__init__` and the lockfile. Tag, publish and the GitHub release follow the merge.
+
+**Launch assets (step 5):** X thread (7 tweets, all under 275) and LinkedIn post drafted in LAUNCH_POST.md, feature-first. Demo recorded by Tony from a clean folder on `tweet_irony.csv`.
+
+**What v0.5 shipped:** `PromptTarget` on the same loop, classification and regression; the harness-owned `ask` / `evaluate` / `submit` triple; the sealed-holdout split reused unchanged; `prompts.yaml`; ranking on a fixed slice with the winner re-scored on the full holdout; the technique-sweep ceilings for prompt datasets and the eval suite with a ceiling for all nine corpus datasets; four prompt examples (toxicity, CLINC150 intents, Davidson hate speech, STS-B); all seven v0.4 carry-ins closed.
+
+**Honest state of the evidence:** three live results carry the claim. Toxicity: f1 0.8611 to 0.882, reproduced three times. STS-B: pearson 0.8690 to 0.9326 on the full holdout, where the winning edit (answer with a decimal) is a lever none of the six sweep techniques contains. Irony: 0.7652 to 0.7667 on the ranking slice and 0.756 on the full holdout, against a measured ceiling of 0.7647; on a dataset with 0.02 of headroom the agent reached the sweep's ceiling and did not pass it. The eval suite's version-over-version table is still nearly empty: ceilings exist for every dataset, the per-version cells for 0.4.0 and 0.5.0 do not, and filling them is a day of compute not yet spent. **The calendar:** planned for Aug 9, slipped to Aug 11 for the regression half, then waited four weeks for the certification run. The slip from Aug 11 to Sep 9 was not build time.
 
 ### 2026-09-09 | Sprint 3 release gate | Comments say the constraint, the log says why
 

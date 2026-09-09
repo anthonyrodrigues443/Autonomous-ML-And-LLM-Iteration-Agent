@@ -14,16 +14,21 @@ pip install iterate-ai
 # or any OpenAI-compatible endpoint. Full setup: Quick start below.
 iterate run --data examples/churn_tabular/data.clean.csv --target Churn
 # (--metric is optional now: omit it and the agent picks one from your data, and says why)
+
+# the same loop on an LLM prompt: a labelled eval set plus one line saying what the job is
+# (python examples/toxicity_jigsaw/prepare.py builds that eval set first, no account needed)
+iterate run --data examples/toxicity_jigsaw/data.csv --target label \
+            --task "decide whether this Wikipedia comment is toxic"
 ```
 
-`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook. 807 unit tests across 51 files run in CI on every push.
+`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. In v0.5 the same loop iterates an **LLM prompt**: give it a labelled eval set and one line saying what the job is, and the agent writes a prompt, measures it, reads what it got wrong, and rewrites it. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook, or as `prompts.yaml` on a prompt run. 807 unit tests across 51 files run in CI on every push.
 
-| v0.4 today | On the roadmap |
+| v0.5 today | On the roadmap |
 |---|---|
-| **You no longer pick the metric.** Omit `--metric` and the agent reads your data, searches the literature, and chooses one — then tells you why. An explicit choice always wins | LLM prompt iteration (v0.5), vision transfer learning (v0.6) |
-| **A Critic reviews every experiment for leakage** — a pipeline that fits on the holdout does not get to bank its score, however good it looks | Cost-to-serve recommendations (v0.7) |
-| **A Researcher grounds proposals in real papers** (OpenAlex + arXiv, no API key), citing work it actually retrieved; talk to the run while it runs; the agent writes and runs its own code cell by cell | Inferred inputs + MCP auto-discovery (v0.9), one-sentence input (v1.0) |
-| A deterministic guard stack converts weak-model waste and outranks everything else: a user steer can shape a brief but never bypass a gate, and no agent can overturn a guard; winner ships as a runnable notebook | |
+| **It iterates LLM prompts, not only models.** Pass `--task` with a labelled eval set and the agent writes a prompt, measures it on training rows, reads the misses, and rewrites it. Classification and regression, scored on the same sealed holdout a model gets, delivered as `prompts.yaml` | Vision transfer learning (v0.6) |
+| **You no longer pick the metric.** Omit `--metric` and the agent reads your data, searches the literature, and chooses one, then tells you why. An explicit choice always wins | Cost-to-serve recommendations (v0.7) |
+| **A Critic reviews every experiment for leakage**, so a pipeline that fits on the holdout does not get to bank its score; **a Researcher grounds proposals in real papers** (OpenAlex + arXiv, no API key), citing work it actually retrieved | Inferred inputs + MCP auto-discovery (v0.9), one-sentence input (v1.0) |
+| A deterministic guard stack converts weak-model waste and outranks everything else: a user steer can shape a brief but never bypass a gate, and no agent can overturn a guard; talk to the run while it runs; winner ships as a runnable notebook | |
 
 ## Why I built this
 
@@ -43,7 +48,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 
 ## Status
 
-**v0.4 released: it decides how to measure, and checks whether the win is real.** v0.1 proved the autonomous loop, v0.2 made the agent write and run its own code, v0.3 put you in the loop without stopping it, and v0.4 turns the first input dial: `--metric` is now optional. A Researcher grounds the run in retrievable literature with real citations, and a Critic reviews every experiment for leakage before its score is allowed to count.
+**v0.5 released: the same loop now iterates LLM prompts.** v0.1 proved the autonomous loop, v0.2 made the agent write and run its own code, v0.3 put you in the loop without stopping it, v0.4 made `--metric` optional and added a Researcher and a Critic, and v0.5 adds the second problem type. Pass `--task` and a labelled eval set, and the agent writes a prompt, reads what it got wrong, and rewrites it, for classification and for regression, scored on the same sealed holdout a model is. Behind every release there is now an eval suite with a measured ceiling per dataset, so a flat result reads as a miss or as an exhausted problem instead of a guess.
 
 **Agent-first:** the autonomous loop landed at v0.1, not as a late-stage add-on. Two dials turn release to release: the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular, then prompts, then DL/vision).
 
@@ -53,7 +58,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 | v0.2 | **Sandboxed code-gen + the multi-agent cell-by-cell system** (Supervisor, coding agent, Summarizer) + notebook deliverable + the deterministic guard stack | shipped |
 | v0.3 | **Interactive runs**: terminal UI (live transcript + input box), plain-English chat with queued delivery, pause / resume / stop, notebook Q&A, standing rules | shipped |
 | v0.4 | **Researcher + Critic specialists**: literature-grounded proposals with real citations, leak review before a score banks; agent picks the metric + starting model; probability metrics | shipped |
-| v0.5 | **`PromptTarget`: agentic prompt iteration** — you give a labelled eval set and a one-line task, the agent writes a prompt, reads what it got wrong, and rewrites it. Classification **and** regression, scored on a sealed holdout | in progress |
+| v0.5 | **`PromptTarget`: agentic prompt iteration** — you give a labelled eval set and a one-line task, the agent writes a prompt, reads what it got wrong, and rewrites it. Classification **and** regression, scored on a sealed holdout | shipped |
 | v0.6 | `DLModelTarget`: vision transfer learning, validated on a local RTX 4050 | planned |
 | v0.7 | **Cost-constrained recommendation** + serving profile + `iterate cost` | planned |
 | v0.9 | Infer features/target from the data + a description; **MCP discovery** of the data/code itself (absorbs the v0.8 milestone) | planned |
@@ -110,6 +115,27 @@ Messages queue while a cell or an LLM call is in flight; you get an instant ack 
 
 ---
 
+## What v0.5 adds: prompts, same loop
+
+A prompt eval set is a CSV like any other: input columns plus one column holding the right answer. Pass `--task` and the run switches to prompt iteration. Nothing about the loop changes. The Supervisor still briefs one change per experiment, the coding agent still measures like for like, the Critic still reviews, the Summarizer still hands on what was learned. What changes is what a cell does: one model call per record instead of one fit.
+
+- **The harness owns the model call.** Inside a session the agent writes the prompt and calls `ask(prompt, rows)`; it cannot change the model, the temperature or the endpoint between experiments, so two experiments differ by the prompt and nothing else. The allowed answers are a tool schema built from the label set, so an answer outside it cannot happen. `evaluate(answers, truth)` scores with the run's metric, and `submit(prompt)` runs it over the holdout and writes the predictions and the prompt together.
+- **The holdout is sealed the same way.** Training rows are written with answers, holdout rows without, and holdout rows never enter the session. Few-shot examples can only come from training rows.
+- **Classification and regression.** A closed set of labels is scored with f1, accuracy and the rest; a numeric answer (a rating, a score on a scale) with rmse, pearson, spearman or kendall. Free text is refused rather than scored, unless you pass `--allow-free-text` and accept exact-string matching.
+- **Candidates are ranked on a fixed slice, the winner is re-scored on everything.** `--loop-holdout` (default 100) keeps the search cheap and paired; `best_score_on_full_holdout` in `prompts.yaml` is the number to quote.
+- **`prompts.yaml` is the deliverable.** Every version, what changed, its score, and `best: true` on the one to put in production. Written by the harness, never by the agent.
+
+```bash
+iterate run --data eval.csv --target label --task "decide whether this ticket is urgent"
+iterate run --data eval.csv --target label --task "..." --prompt-file current_prompt.txt   # start from the prompt you ship today
+iterate run --data pairs.csv --target score --task "rate how similar the two sentences are, 0 to 5" --metric pearson
+iterate run --data eval.csv --target label --task "..." --target-model gemma4:12b --target-backend ollama --model llama-3.3-70b-versatile --backend groq
+```
+
+The last form tunes a prompt for one model while a stronger model drives the run. The cost line is honest: a pass is one model call per record, so 100 records on a local 12B is minutes, not seconds. Every answer is cached, so re-measuring a prompt the run has already tried is free.
+
+---
+
 ## Quick start
 
 **Local-first. $0. No API keys required.**
@@ -125,6 +151,11 @@ pip install iterate-ai         # "iterate" was taken on PyPI; the command is sti
 
 # 3. Prepare a tabular CSV (your standard ML data cleaning) and run
 iterate run --data train.clean.csv --target churn --metric f1
+
+# 3b. Or iterate a prompt: a labelled eval set + one line saying what the job is
+python examples/toxicity_jigsaw/prepare.py     # builds examples/toxicity_jigsaw/data.csv, no account needed
+iterate run --data examples/toxicity_jigsaw/data.csv --target label \
+            --task "decide whether this Wikipedia comment is toxic" --metric f1
 ```
 
 The first run offers a one-time setup wizard (backend, model, compute, install consent); after that, flags override saved defaults per run.
@@ -146,17 +177,17 @@ iterate run --data train.clean.csv --target churn --metric f1 \
             --until 30m --notebooks all
 ```
 
-Useful flags: `--max-iterations`, `--patience`, `--until` (wall-clock bound), `--notebooks best|all|none`, `--compute local|e2b`, `--install/--no-install` (package-install consent), `--think` (reasoning mode for the coder, Ollama only), `--fresh` (archive memory, start a new chapter), `--plain` (classic output instead of the interactive UI), `--spec` (the v0.1 allow-list path, kept as the fast lane). Full reference: `iterate run --help`
+Useful flags: `--max-iterations`, `--patience`, `--until` (wall-clock bound), `--notebooks best|all|none`, `--compute local|e2b`, `--install/--no-install` (package-install consent), `--think` (reasoning mode for the coder, Ollama only), `--fresh` (archive memory, start a new chapter), `--plain` (classic output instead of the interactive UI), `--spec` (the v0.1 allow-list path, kept as the fast lane). Prompt runs: `--task` (switches to prompt iteration), `--prompt-file` (your current prompt as the baseline), `--target-model` / `--target-backend` (the model whose prompt is tuned, separate from the one driving the run), `--loop-holdout` (records per candidate during the search). Full reference: `iterate run --help`
 
-**Where things land:** `.iterate/runs/<run_id>/best.ipynb` (the runnable winner), `notebooks/` (with `--notebooks all`), `best.json` (config + score sidecar). Code-path winners ship as notebooks by design; `--spec` winners also save `best_model.joblib`.
+**Where things land:** `.iterate/runs/<run_id>/best.ipynb` (the runnable winner), `notebooks/` (with `--notebooks all`), `best.json` (config + score sidecar), `prompts.yaml` on a prompt run (every version with its score, the best marked). Code-path winners ship as notebooks by design; `--spec` winners also save `best_model.joblib`.
 
 **Safety boundaries:** your `--source` file is read as text, never executed. The generated code runs locally only with your consent (the setup wizard asks), or fully isolated with `--compute e2b`. The holdout labels never enter the kernel; scoring happens host-side.
 
 > **Note on the one-line form.** The `iterate "improve our churn baseline"` experience,
 > where the agent discovers the data, baseline, and metric itself, is the **v1.0 vision**,
-> not v0.2. Today you pass `--data`/`--target`/`--metric` explicitly; the inputs shrink
-> release by release (see the roadmap). Auto-discovery, prompt + vision targets, and
-> cost-constrained serving are on the roadmap, not shipped yet.
+> not v0.5. Today you pass `--data`/`--target` explicitly (and `--task` for a prompt run);
+> the inputs shrink release by release (see the roadmap). Auto-discovery, vision targets,
+> and cost-constrained serving are on the roadmap, not shipped yet.
 
 ---
 
@@ -166,7 +197,7 @@ Useful flags: `--max-iterations`, `--patience`, `--until` (wall-clock bound), `-
 |---|---|---|
 | `ModelTarget` | Trains a tabular model, scores it on a sealed holdout | **shipped (v0.1, code-gen in v0.2)** |
 | `DLModelTarget` | Transfer-learns a vision model, scores it | planned (v0.6) |
-| `PromptTarget` | Runs an LLM prompt against a labelled eval set, one model call per record, scored on a sealed holdout | v0.5 |
+| `PromptTarget` | Runs an LLM prompt against a labelled eval set, one model call per record, scored on a sealed holdout | **shipped (v0.5)** |
 
 All inherit from `BenchmarkTarget`. Same iteration loop, different execution path. (LLMs are **prompt-iteration only**; we don't fine-tune foundation models.)
 
@@ -219,7 +250,7 @@ src/iterate/
 | Persistent memory across sessions | ✗ | log only | ✗ | ✗ | **✓ shipped** |
 | Bounded autonomy (deadline / patience) | ✗ | ✗ | ✗ | partial | **✓ shipped** |
 | Auditable reasoning trail (runnable notebooks) | ✗ | ✗ | ✗ | basic | **✓ shipped** |
-| Iterates LLM prompts | ✗ | ✗ | eval only | ✗ | v0.5 |
+| Iterates LLM prompts | ✗ | ✗ | eval only | ✗ | **✓ shipped** |
 | Iterates DL / vision models | partial | ✗ | ✗ | partial | planned v0.6 |
 | Literature-aware proposals | ✗ | ✗ | ✗ | partial | ✓ |
 | Cost-to-serve-aware optimization | ✗ | ✗ | ✗ | ✗ | planned v0.7 |
