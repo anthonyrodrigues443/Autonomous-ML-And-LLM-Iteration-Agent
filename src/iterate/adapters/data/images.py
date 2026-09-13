@@ -29,7 +29,6 @@ from iterate.adapters.data.tabular import (
     DEFAULT_TEST_SIZE,
     TabularDataset,
     dataset_from_frames,
-    looks_like_classification,
     split_frame,
 )
 
@@ -331,7 +330,7 @@ def profile_images(
     test_digests = {
         hashes[str(p)] for p in dataset.test_features[column.column] if hashes.get(str(p))
     }
-    classification = looks_like_classification(dataset.train_target)
+    classification = dataset.task == "classification"
     counts = (
         dataset.train_target.astype(str).value_counts(normalize=True)
         if classification

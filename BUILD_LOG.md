@@ -558,6 +558,18 @@ Overlap shows up as a number: Imagewoof leaves under two points to fine-tuning, 
 - `pyproject.toml`: `pillow` in core, a `[vision]` extra for torch and torchvision.
 - Tests: 37 new, 844 in the suite. Synthetic PNGs cover portrait, grayscale, corrupt, missing and cross-split duplicate images; the materialise test asserts that a class-sorted source does not become a class-sorted slot range.
 
+**How the task is decided, settled during the review.** Tony proposed replacing the hard-coded twenty-distinct-values rule with "regression when distinct values exceed 10% of the rows". Measured before deciding, across the nine corpus datasets and six synthetic targets:
+
+| target | rows | distinct | ratio | rule: 20 | rule: 10% | truth |
+|---|---|---|---|---|---|---|
+| sts_benchmark | 800 | 48 | 6.0% | regression | classification | regression |
+| age, integer | 10,000 | 72 | 0.7% | regression | classification | regression |
+| score on a 0.2 grid | 1,000 | 26 | 2.6% | regression | classification | regression |
+| 40 integer class ids | 300 | 40 | 13.3% | regression | regression | classification |
+| 15-row float regression | 15 | 15 | 100% | classification | regression | regression |
+
+The ratio rule breaks STS-B in our own corpus and every score on a fixed scale, because real regression targets repeat values far more than 10% of the rows. The count rule breaks tiny regression sets. The column's kind carries most of the signal, so the shipped rule reads kind before count: text and booleans are classes; a number with a fractional part is regression, always; an integer-valued column is the one ambiguous case and reads as classes while it stays under twenty distinct values; an explicit `--metric` names the task and overrides the guess, where before a regression metric on a low-cardinality integer target was rejected as a contradiction. The run prints what it decided and why when nothing was named. Tony kept this rule over his own on the evidence. The rule now lives in one place, `looks_like_classification`, with the decision carried on the dataset as `task`; the three private copies in codegen, the proposer's profile and the image profile are gone.
+
 **Not here, by design:** the target, the preamble, the folder form of `--data`, and the prompts. Days 2 and 3.
 
 **Two things found in passing, both filed on the sprint table.** `evals/runner.command_for` never passes `--task` for a prompt dataset, so a version sweep would measure the prompt corpus as tabular runs; fixed on Day 2 with the vision runner change. And `examples/tweet_irony/`, `examples/tweet_emotion/` and their `dataset.toml` files are not tracked by git at all, only excluded locally, so carry-in 8 means adding them to the repo, not writing a README.

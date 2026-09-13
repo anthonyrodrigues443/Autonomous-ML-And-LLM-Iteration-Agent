@@ -109,7 +109,7 @@ def summarize_dataset(dataset: TabularDataset) -> str:
         skewed = skews[skews > 1.0]
         if not skewed.empty:
             lines.append(f"Skewed numeric (|skew|>1): {', '.join(skewed.head(8).index)}.")
-    if target.nunique() <= 20:  # classification: balance + a numeric code for signal
+    if dataset.task == "classification":  # balance + a numeric code for signal
         counts = target.value_counts(normalize=True)
         lines.append(
             "Class balance: " + ", ".join(f"{v!r}: {p:.0%}" for v, p in counts.head(6).items()) + "."

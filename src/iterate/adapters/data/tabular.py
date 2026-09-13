@@ -48,6 +48,7 @@ class TabularDataset:
     test_size: float
     data_hash: str  # content fingerprint of the full dataset (a data version)
     user_split: bool = False  # the caller supplied train and holdout; nothing was shuffled
+    task: str = "classification"  # the one place the task is decided; explicit metric wins
 
     @property
     def n_train(self) -> int:
@@ -65,18 +66,40 @@ def _content_hash(frame: pd.DataFrame) -> str:
 
 
 def looks_like_classification(target: pd.Series) -> bool:
-    """Discrete target → classification; a continuous target → regression.
+    """Discrete target: classification. Continuous target: regression.
 
-    The distinct-value cap applies to INTEGER targets as well as float ones. An
-    integer column was previously always read as a class label, so a price, a count
-    or a year became thousands of "classes" and the stratified split raised before
-    the run could start: the diamonds dataset, with 11,602 distinct integer prices,
-    could not be loaded at all. Every target with few enough distinct values is
-    unaffected, so nothing that worked before changes behaviour.
+    Text and booleans are classes. A number with a fractional part is a measurement,
+    never a class. An integer-valued column is the only ambiguous case, and it reads
+    as classes while it stays small; an explicit metric overrides all of this.
     """
-    if pd.api.types.is_bool_dtype(target) or not pd.api.types.is_numeric_dtype(target):
+    values = target.dropna()
+    if pd.api.types.is_bool_dtype(values) or not pd.api.types.is_numeric_dtype(values):
         return True
-    return bool(target.nunique(dropna=True) <= _MAX_CLASSES_FOR_STRATIFY)
+    numbers = values.astype(float)
+    if bool((numbers % 1 != 0).any()):
+        return False
+    return bool(numbers.nunique() <= _MAX_CLASSES_FOR_STRATIFY)
+
+
+def describe_target(target: pd.Series) -> str:
+    """Why the task was read the way it was, for the line printed before a run."""
+    values = target.dropna()
+    n = int(values.nunique())
+    if pd.api.types.is_bool_dtype(values):
+        return "a boolean column"
+    if not pd.api.types.is_numeric_dtype(values):
+        return f"{n} text labels"
+    if bool((values.astype(float) % 1 != 0).any()):
+        return f"{n} distinct numbers with fractional values"
+    return f"{n} distinct integer values"
+
+
+def _resolve_task(target: pd.Series, task: str | None) -> str:
+    if task is not None:
+        if task not in ("classification", "regression"):
+            raise ValueError(f"task must be classification or regression, got {task!r}")
+        return task
+    return "classification" if looks_like_classification(target) else "regression"
 
 
 log = logging.getLogger(__name__)
@@ -105,11 +128,13 @@ def split_frame(
     test_size: float = DEFAULT_TEST_SIZE,
     seed: int = DEFAULT_SEED,
     stratify: bool = True,
+    task: str | None = None,
 ) -> TabularDataset:
     """A deterministic train/holdout split of one frame.
 
     ``stratify`` keeps the class balance identical in train and holdout for a
-    classification target; it is ignored for a continuous (regression) target.
+    classification target; it is ignored for a regression target. ``task`` is the
+    caller's word (an explicit metric) and overrides the heuristic.
     """
     if target not in frame.columns:
         raise ValueError(f"target column {target!r} not in columns {list(frame.columns)}")
@@ -117,8 +142,9 @@ def split_frame(
     features = [col for col in frame.columns if col != target]
     feature_frame = frame[features]
     target_col = frame[target]
+    resolved = _resolve_task(target_col, task)
 
-    stratify_on = target_col if (stratify and looks_like_classification(target_col)) else None
+    stratify_on = target_col if (stratify and resolved == "classification") else None
     train_feat, test_feat, train_tgt, test_tgt = train_test_split(
         feature_frame,
         target_col,
@@ -137,11 +163,17 @@ def split_frame(
         seed=seed,
         test_size=test_size,
         data_hash=_content_hash(frame),
+        task=resolved,
     )
 
 
 def dataset_from_frames(
-    train: pd.DataFrame, holdout: pd.DataFrame, target: str, *, seed: int = DEFAULT_SEED
+    train: pd.DataFrame,
+    holdout: pd.DataFrame,
+    target: str,
+    *,
+    seed: int = DEFAULT_SEED,
+    task: str | None = None,
 ) -> TabularDataset:
     """A dataset from a split the CALLER made. Membership and labels are untouched.
 
@@ -174,7 +206,8 @@ def dataset_from_frames(
     train = train.sample(frac=1, random_state=seed)
     holdout = holdout.sample(frac=1, random_state=seed)
 
-    if looks_like_classification(train[target]):
+    resolved = _resolve_task(train[target], task)
+    if resolved == "classification":
         unseen = set(holdout[target].dropna().unique()) - set(train[target].dropna().unique())
         if unseen:
             log.warning(
@@ -197,6 +230,7 @@ def dataset_from_frames(
             pd.concat([train.sort_index(), holdout.sort_index()], ignore_index=True)
         ),
         user_split=True,
+        task=resolved,
     )
 
 
@@ -207,19 +241,34 @@ def load_csv(
     test_size: float = DEFAULT_TEST_SIZE,
     seed: int = DEFAULT_SEED,
     stratify: bool = True,
+    task: str | None = None,
 ) -> TabularDataset:
     """Load a CSV and return a deterministic train/holdout split."""
     return split_frame(
-        _read_csv_any_encoding(path), target, test_size=test_size, seed=seed, stratify=stratify
+        _read_csv_any_encoding(path),
+        target,
+        test_size=test_size,
+        seed=seed,
+        stratify=stratify,
+        task=task,
     )
 
 
 def load_split(
-    train_path: str | Path, holdout_path: str | Path, target: str, *, seed: int = DEFAULT_SEED
+    train_path: str | Path,
+    holdout_path: str | Path,
+    target: str,
+    *,
+    seed: int = DEFAULT_SEED,
+    task: str | None = None,
 ) -> TabularDataset:
     """Two CSVs the user split themselves; the holdout is sealed as it stands."""
     return dataset_from_frames(
-        _read_csv_any_encoding(train_path), _read_csv_any_encoding(holdout_path), target, seed=seed
+        _read_csv_any_encoding(train_path),
+        _read_csv_any_encoding(holdout_path),
+        target,
+        seed=seed,
+        task=task,
     )
 
 
@@ -244,6 +293,7 @@ __all__ = [
     "DEFAULT_TEST_SIZE",
     "TabularDataset",
     "dataset_from_frames",
+    "describe_target",
     "load_csv",
     "load_split",
     "split_frame",

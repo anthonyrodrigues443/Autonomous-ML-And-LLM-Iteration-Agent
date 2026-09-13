@@ -412,15 +412,25 @@ def run(
         _configure_logging()
 
     # ─── Load data ─────────────────────────────────────────────────────────
+    # An explicit metric names the task; only without one does the loader guess.
+    from iterate.adapters.data.tabular import describe_target
+    from iterate.core.scoring import task_for_metric as _task_for_metric
+
+    named_task = _task_for_metric(metric) if metric is not None else None
     if data is not None:
-        dataset = load_csv(data, target=target)
+        dataset = load_csv(data, target=target, task=named_task)
     else:
         assert train is not None  # validated above
         assert holdout is not None
-        dataset = load_split(train, holdout, target=target)
+        dataset = load_split(train, holdout, target=target, task=named_task)
         console.print(
             f"[dim]your split: {dataset.n_train} train rows, {dataset.n_test} holdout rows, "
             "sealed as given[/dim]"
+        )
+    if named_task is None:
+        console.print(
+            f"[dim]target {target!r} read as {dataset.task} "
+            f"({describe_target(dataset.train_target)}); pass --metric to override[/dim]"
         )
     data_summary = summarize_dataset(dataset)
 

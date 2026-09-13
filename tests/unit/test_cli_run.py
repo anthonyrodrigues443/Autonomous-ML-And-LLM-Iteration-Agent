@@ -472,9 +472,17 @@ def _stub_run_supervised(
         return _FakeClient(think=kw.get("think", False))
 
     def _fake_run_supervised(
-        *, target: Any, dataset: Any, supervisor: Any, make_coder: Any,
-        terminator: Any, memory: Any, data_summary: str, summarizer: Any = None,
-        on_experiment: Any = None, controller: Any = None,
+        *,
+        target: Any,
+        dataset: Any,
+        supervisor: Any,
+        make_coder: Any,
+        terminator: Any,
+        memory: Any,
+        data_summary: str,
+        summarizer: Any = None,
+        on_experiment: Any = None,
+        controller: Any = None,
         # **kwargs so adding a loop parameter does not break every CLI test; the
         # ones these tests assert on are named explicitly above.
         **kwargs: Any,
@@ -496,11 +504,24 @@ def _stub_run_supervised(
             exp = Experiment(
                 candidate=Candidate(
                     description="probe attempt",
-                    changes={"cells": [{"code": "x=1", "stdout": "ok", "error": None,
-                                        "source": "agent", "outputs": [], "thinking": None}]},
+                    changes={
+                        "cells": [
+                            {
+                                "code": "x=1",
+                                "stdout": "ok",
+                                "error": None,
+                                "source": "agent",
+                                "outputs": [],
+                                "thinking": None,
+                            }
+                        ]
+                    },
                     rationale="r",
                 ),
-                target="tabular-model", hypothesis="h", status="completed", iteration=1,
+                target="tabular-model",
+                hypothesis="h",
+                status="completed",
+                iteration=1,
                 result=ExperimentResult(
                     experiment_id="e",
                     metrics=Metrics(
@@ -510,8 +531,11 @@ def _stub_run_supervised(
             )
             on_experiment(experiment=exp, baseline=baseline, is_best=True, run_id="t")
         return RunResult(
-            baseline=baseline, history=[], best=None,
-            stopped_because="max_iterations", run_id="t",
+            baseline=baseline,
+            history=[],
+            best=None,
+            stopped_because="max_iterations",
+            run_id="t",
         )
 
     # run() imports these lazily — patch at the source modules.
@@ -530,8 +554,19 @@ def test_think_applies_to_the_coder_only(tmp_path: Path, monkeypatch: pytest.Mon
 
     result = runner.invoke(
         app,
-        ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
-         "--code", "--think", "--memory", str(tmp_path / "m.db")],
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--code",
+            "--think",
+            "--memory",
+            str(tmp_path / "m.db"),
+        ],
     )
     assert result.exit_code == 0, result.stdout
     # the supervisor must NEVER think (single-tool-call role); only the coder does
@@ -551,8 +586,18 @@ def test_without_think_both_agents_share_one_no_think_client(
 
     result = runner.invoke(
         app,
-        ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
-         "--code", "--memory", str(tmp_path / "m.db")],
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--code",
+            "--memory",
+            str(tmp_path / "m.db"),
+        ],
     )
     assert result.exit_code == 0, result.stdout
     assert captured["coder_client"] is captured["supervisor_client"]  # same instance
@@ -572,8 +617,20 @@ def test_each_iteration_notebook_is_saved_the_moment_it_finishes(
     try:
         result = runner.invoke(
             app,
-            ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
-             "--code", "--notebooks", "all", "--memory", str(tmp_path / "m.db")],
+            [
+                "run",
+                "--data",
+                str(data),
+                "--target",
+                "churn",
+                "--metric",
+                "f1",
+                "--code",
+                "--notebooks",
+                "all",
+                "--memory",
+                str(tmp_path / "m.db"),
+            ],
         )
     finally:
         get_settings.cache_clear()
@@ -695,3 +752,31 @@ def test_a_users_split_reaches_the_loop_unsplit(
     assert (dataset.n_train, dataset.n_test) == (40, 12)
     assert sorted(dataset.test_features["f1"]) == list(range(100, 112))
     assert "your split: 40 train rows, 12 holdout rows" in _plain(result.output)
+
+
+def test_an_explicit_metric_names_the_task_for_the_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "ratings.csv"
+    pd.DataFrame({"f1": range(60), "rating": [1 + i % 5 for i in range(60)]}).to_csv(
+        data, index=False
+    )
+    captured = _stub_run_supervised(monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "rating",
+            "--metric",
+            "rmse",
+            "--code",
+            "--memory",
+            str(tmp_path / "m.db"),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["dataset"].task == "regression"
+    assert "read as" not in _plain(result.output)  # nothing guessed, nothing announced

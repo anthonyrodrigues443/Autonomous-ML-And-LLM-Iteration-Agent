@@ -447,20 +447,8 @@ def build_inputs(dataset: TabularDataset) -> dict[str, bytes]:
 
 
 def task_for_metric_safe(dataset: TabularDataset) -> str:
-    # The dataset doesn't carry the metric; the task is conveyed for the LLM's
-    # benefit. We infer it from the target dtype the same way the data adapter does.
-    return "classification" if _looks_classification(dataset) else "regression"
-
-
-def _looks_classification(dataset: TabularDataset) -> bool:
-    target = dataset.train_target
-    # Few distinct values or non-float dtype -> treat as classification.
-    return target.nunique() <= 20 or not _is_float(target)
-
-
-def _is_float(series: object) -> bool:
-    dtype = getattr(series, "dtype", None)
-    return bool(getattr(dtype, "kind", "") == "f")
+    """The task as the loader decided it, conveyed to the session through meta.json."""
+    return dataset.task
 
 
 def parse_probabilities(probabilities_csv: bytes | None, *, expected: int) -> list[list[float]]:

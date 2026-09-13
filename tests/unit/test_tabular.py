@@ -98,9 +98,9 @@ def test_a_non_utf8_csv_loads_instead_of_raising(tmp_path: Path) -> None:
     accented name is latin-1, so the user's first contact with the tool would be a
     decoding traceback on a file that opens fine in every spreadsheet."""
     path = tmp_path / "latin1.csv"
-    path.write_bytes(("a,b,label\n" + "".join(
-        f"{i},caf\xe9{i},{i % 2}\n" for i in range(40)
-    )).encode("latin-1"))
+    path.write_bytes(
+        ("a,b,label\n" + "".join(f"{i},caf\xe9{i},{i % 2}\n" for i in range(40))).encode("latin-1")
+    )
     with pytest.raises(UnicodeDecodeError):
         path.read_text(encoding="utf-8")  # the file really is not UTF-8
     ds = load_csv(path, target="label")
@@ -114,10 +114,11 @@ def test_an_integer_regression_target_loads_instead_of_stratifying(tmp_path: Pat
     split raised before the run could start. Prices, counts and years are all
     integers, so this is the common case, not an edge one."""
     path = tmp_path / "prices.csv"
-    frame = pd.DataFrame({"carat": range(200), "depth": range(200),
-                          "price": [300 + i * 7 for i in range(200)]})
+    frame = pd.DataFrame(
+        {"carat": range(200), "depth": range(200), "price": [300 + i * 7 for i in range(200)]}
+    )
     frame.to_csv(path, index=False)
-    ds = load_csv(path, target="price")           # would raise before the fix
+    ds = load_csv(path, target="price")  # would raise before the fix
     assert ds.n_train + ds.n_test == 200
 
 
@@ -315,3 +316,51 @@ def test_load_split_hash_covers_both_files(tmp_path: Path) -> None:
     frame.loc[3, "f2"] = 99.0
     frame.to_csv(train, index=False)
     assert load_split(train, holdout, target="churn").data_hash not in (before, after_holdout)
+
+
+# ─── how the task is decided ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (["a", "b", "a"], True),
+        ([True, False, True], True),
+        ([1.0, 2.0, 1.0, 2.0], True),  # integers stored as floats are still classes
+        ([1.5, 2.0, 3.25], False),  # a fractional value is a measurement
+        ([round(0.2 * i, 1) for i in range(26)] * 30, False),  # a score on a 0.2 grid
+        (list(range(18, 90)) * 100, False),  # ages: 72 distinct integers
+        (list(range(5)) * 200, True),  # a 1 to 5 style integer scale reads as classes
+    ],
+)
+def test_the_task_rule_reads_kind_before_count(values: list[object], expected: bool) -> None:
+    from iterate.adapters.data.tabular import looks_like_classification
+
+    assert looks_like_classification(pd.Series(values)) is expected
+
+
+def test_a_tiny_float_target_is_regression(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import describe_target
+
+    frame = pd.DataFrame({"f1": range(15), "y": [0.1 * i + 0.05 for i in range(15)]})
+    path = tmp_path / "tiny.csv"
+    frame.to_csv(path, index=False)
+    ds = load_csv(path, target="y")
+    assert ds.task == "regression"
+    assert "fractional" in describe_target(ds.train_target)
+
+
+def test_an_explicit_task_overrides_the_guess_and_the_stratify(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    frame = pd.DataFrame({"f1": range(60), "rating": [1 + i % 5 for i in range(60)]})
+    path = tmp_path / "ratings.csv"
+    frame.to_csv(path, index=False)
+    assert load_csv(path, target="rating").task == "classification"
+    ds = load_csv(path, target="rating", task="regression")
+    assert ds.task == "regression"
+    holdout = tmp_path / "h.csv"
+    frame.head(10).to_csv(holdout, index=False)
+    assert load_split(path, holdout, target="rating", task="regression").task == "regression"
+    with pytest.raises(ValueError, match="task must be"):
+        load_csv(path, target="rating", task="ordinal")
