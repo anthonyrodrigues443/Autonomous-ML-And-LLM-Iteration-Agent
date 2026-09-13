@@ -353,7 +353,9 @@ def test_unreadable_and_shared_images_are_counted(tmp_path: Path) -> None:
 
 
 def test_a_numeric_score_profiles_as_regression_not_classes(tmp_path: Path) -> None:
-    path = _make_csv_dataset(tmp_path)
+    # Enough rows that the training split carries more than twenty distinct values,
+    # the same rule that reads a numeric tabular target as regression.
+    path = _make_csv_dataset(tmp_path, per_class=12)
     frame = pd.read_csv(path)
     frame[LABEL_COLUMN] = [1.0 + (i * 0.137) % 4.0 for i in range(len(frame))]
     frame.to_csv(path, index=False)
