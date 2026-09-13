@@ -29,6 +29,7 @@ from iterate.adapters.data.tabular import (
     DEFAULT_TEST_SIZE,
     TabularDataset,
     dataset_from_frames,
+    looks_like_classification,
     split_frame,
 )
 
@@ -257,6 +258,7 @@ class ImageProfile:
     column: str
     classes: int
     class_balance: tuple[tuple[str, float], ...]
+    target_spread: tuple[float, float, float, float] | None
     widths: tuple[int, int, int]
     heights: tuple[int, int, int]
     portrait_share: float
@@ -267,13 +269,22 @@ class ImageProfile:
 
     def render(self) -> str:
         w, h = self.widths, self.heights
+        if self.target_spread is not None:
+            mean, std, low, high = self.target_spread
+            target = (
+                "Target: a number, so this is regression. "
+                f"Spread: mean={mean:.4g}, std={std:.4g}, min={low:.4g}, max={high:.4g}."
+            )
+        else:
+            target = (
+                f"Classes: {self.classes}. Class balance: "
+                + ", ".join(f"{c!r}: {p:.0%}" for c, p in self.class_balance[:6])
+                + "."
+            )
         lines = [
             f"Rows: {self.n_train} train / {self.n_test} test (sealed holdout). "
             "Every row is one image.",
-            f"Image column: {self.column!r} (absolute paths). Classes: {self.classes}.",
-            "Class balance: "
-            + ", ".join(f"{c!r}: {p:.0%}" for c, p in self.class_balance[:6])
-            + ".",
+            f"Image column: {self.column!r} (absolute paths). {target}",
             f"Width min/median/max: {w[0]}/{w[1]}/{w[2]}; height {h[0]}/{h[1]}/{h[2]}; "
             f"{self.portrait_share:.0%} portrait.",
             "Modes: "
@@ -320,9 +331,23 @@ def profile_images(
     test_digests = {
         hashes[str(p)] for p in dataset.test_features[column.column] if hashes.get(str(p))
     }
-    counts = dataset.train_target.astype(str).value_counts(normalize=True)
+    classification = looks_like_classification(dataset.train_target)
+    counts = (
+        dataset.train_target.astype(str).value_counts(normalize=True)
+        if classification
+        else dataset.train_target.iloc[0:0]
+    )
+    spread = None
+    if not classification:
+        target = dataset.train_target.astype(float)
+        spread = (
+            float(target.mean()),
+            float(target.std()),
+            float(target.min()),
+            float(target.max()),
+        )
 
-    def spread(values: list[int]) -> tuple[int, int, int]:
+    def extent(values: list[int]) -> tuple[int, int, int]:
         return (min(values), int(median(values)), max(values)) if values else (0, 0, 0)
 
     def shares(counter: Counter[str]) -> tuple[tuple[str, float], ...]:
@@ -333,10 +358,11 @@ def profile_images(
         n_train=dataset.n_train,
         n_test=dataset.n_test,
         column=column.column,
-        classes=int(dataset.train_target.nunique()),
+        classes=int(dataset.train_target.nunique()) if classification else 0,
         class_balance=tuple((str(k), float(v)) for k, v in counts.items()),
-        widths=spread(widths),
-        heights=spread(heights),
+        target_spread=spread,
+        widths=extent(widths),
+        heights=extent(heights),
         portrait_share=(portrait / seen) if seen else 0.0,
         modes=shares(modes),
         formats=shares(formats),

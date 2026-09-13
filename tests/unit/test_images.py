@@ -350,3 +350,26 @@ def test_unreadable_and_shared_images_are_counted(tmp_path: Path) -> None:
     profile = profile_images(dataset, column, file_hashes(paths))
     assert profile.shared_across_split == 1
     assert profile.unreadable == 2
+
+
+def test_a_numeric_score_profiles_as_regression_not_classes(tmp_path: Path) -> None:
+    path = _make_csv_dataset(tmp_path)
+    frame = pd.read_csv(path)
+    frame[LABEL_COLUMN] = [1.0 + (i * 0.137) % 4.0 for i in range(len(frame))]
+    frame.to_csv(path, index=False)
+    dataset = load_csv(path, target=LABEL_COLUMN)
+    column = detect_image_column(pd.read_csv(path), [IMAGE_COLUMN], path)
+    assert column is not None
+    dataset = resolve_paths(dataset, column)
+    paths = [*dataset.train_features[IMAGE_COLUMN], *dataset.test_features[IMAGE_COLUMN]]
+    profile = profile_images(dataset, column, file_hashes(paths))
+    assert profile.classes == 0
+    assert profile.class_balance == ()
+    assert profile.target_spread is not None
+    mean, std, low, high = profile.target_spread
+    assert 1.0 <= low <= mean <= high < 5.0
+    assert std > 0
+    text = profile.render()
+    assert "regression" in text
+    assert "Spread: mean=" in text
+    assert "Class balance" not in text
