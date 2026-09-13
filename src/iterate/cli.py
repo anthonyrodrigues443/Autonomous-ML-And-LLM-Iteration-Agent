@@ -125,8 +125,30 @@ def setup() -> None:
 
 @app.command()
 def run(
-    data: Path = typer.Option(
-        ..., "--data", help="Path to the CSV dataset.", exists=True, dir_okay=False
+    data: Path | None = typer.Option(
+        None,
+        "--data",
+        help="Path to the CSV dataset. It is split here, 80/20, stratified on a "
+        "classification target, and the holdout is sealed. To bring your own split, "
+        "pass --train and --holdout instead.",
+        exists=True,
+        dir_okay=False,
+    ),
+    train: Path | None = typer.Option(
+        None,
+        "--train",
+        help="Your training CSV, when you split the data yourself. Needs --holdout; "
+        "cannot be combined with --data.",
+        exists=True,
+        dir_okay=False,
+    ),
+    holdout: Path | None = typer.Option(
+        None,
+        "--holdout",
+        help="Your holdout CSV, sealed exactly as given: its labels never enter the "
+        "kernel and nothing is reshuffled. Needs --train.",
+        exists=True,
+        dir_okay=False,
     ),
     target: str = typer.Option(..., "--target", help="Name of the target column."),
     metric: str | None = typer.Option(
@@ -276,7 +298,7 @@ def run(
     # don't pay the pandas + scikit-learn import cost.
     from iterate.adapters.compute.kernel import E2BKernel, LocalKernel, StatefulKernel
     from iterate.adapters.compute.local import LocalExecutor
-    from iterate.adapters.data.tabular import load_csv
+    from iterate.adapters.data.tabular import load_csv, load_split
     from iterate.core import codegen
     from iterate.core.agent_loop import run_supervised
     from iterate.core.coder import CodingAgent
@@ -293,6 +315,24 @@ def run(
     from iterate.core.terminator import default_terminator
     from iterate.llm.factory import build_client
     from iterate.targets.model import ModelTarget
+
+    # ─── One input split here, or two inputs the user split ────────────────
+    if data is None and (train is None or holdout is None):
+        raise typer.BadParameter(
+            "pass --data for a dataset split here, or both --train and --holdout for a "
+            "split you made yourself"
+        )
+    if data is not None and (train is not None or holdout is not None):
+        raise typer.BadParameter(
+            "--data is split here; --train and --holdout are your own split. Pass one "
+            "form, not both"
+        )
+    if data is None and not code:
+        raise typer.BadParameter(
+            "--train and --holdout are not supported on the --spec fast lane; pass --data"
+        )
+    if train is not None and holdout is not None and train.resolve() == holdout.resolve():
+        raise typer.BadParameter("--train and --holdout are the same file")
 
     # ─── First run with no saved config? Offer the setup wizard. ───────────
     if not userconfig.exists() and sys.stdin.isatty():
@@ -372,7 +412,16 @@ def run(
         _configure_logging()
 
     # ─── Load data ─────────────────────────────────────────────────────────
-    dataset = load_csv(data, target=target)
+    if data is not None:
+        dataset = load_csv(data, target=target)
+    else:
+        assert train is not None  # validated above
+        assert holdout is not None
+        dataset = load_split(train, holdout, target=target)
+        console.print(
+            f"[dim]your split: {dataset.n_train} train rows, {dataset.n_test} holdout rows, "
+            "sealed as given[/dim]"
+        )
     data_summary = summarize_dataset(dataset)
 
     # ─── LLM clients + memory ──────────────────────────────────────────────
@@ -615,7 +664,8 @@ def run(
                 is_best=is_best,
                 run_dir=Path(settings.iterate_runs_dir) / run_id,
                 mode=notebooks,
-                data_path=str(data),
+                data_path=str(data or train),
+                holdout_path=str(holdout) if holdout is not None else None,
                 target=target,
                 metric=metric,
             )
@@ -743,7 +793,8 @@ def run(
             result,
             mode=notebooks,
             run_dir=run_dir,
-            data_path=str(data),
+            data_path=str(data or train),
+            holdout_path=str(holdout) if holdout is not None else None,
             target=target,
             metric=metric,
         )
@@ -1140,6 +1191,7 @@ def _render_experiment(
     baseline_score: float | None,
     metric: str,
     data_path: str,
+    holdout_path: str | None = None,
     target: str,
     leaderboard: list[Experiment] | None = None,
 ) -> Any:
@@ -1178,6 +1230,7 @@ def _render_experiment(
     return build_notebook(
         exp,
         data_path=data_path,
+        holdout_path=holdout_path,
         target=target,
         metric=metric,
         baseline_score=baseline_score,
@@ -1194,6 +1247,7 @@ def _write_experiment_notebook(
     run_dir: Path,
     mode: str,
     data_path: str,
+    holdout_path: str | None = None,
     target: str,
     metric: str,
 ) -> None:
@@ -1213,6 +1267,7 @@ def _write_experiment_notebook(
                 baseline_score=baseline_score,
                 metric=metric,
                 data_path=data_path,
+                holdout_path=holdout_path,
                 target=target,
             ),
             run_dir / "notebooks" / name,
@@ -1225,6 +1280,7 @@ def _write_experiment_notebook(
                 baseline_score=baseline_score,
                 metric=metric,
                 data_path=data_path,
+                holdout_path=holdout_path,
                 target=target,
             ),
             run_dir / "best.ipynb",
@@ -1237,6 +1293,7 @@ def _write_notebooks(
     mode: str,
     run_dir: Path,
     data_path: str,
+    holdout_path: str | None = None,
     target: str,
     metric: str,
 ) -> None:
@@ -1261,6 +1318,7 @@ def _write_notebooks(
                         baseline_score=baseline_score,
                         metric=metric,
                         data_path=data_path,
+                        holdout_path=holdout_path,
                         target=target,
                     ),
                     run_dir / "notebooks" / name,
@@ -1276,6 +1334,7 @@ def _write_notebooks(
                     baseline_score=baseline_score,
                     metric=metric,
                     data_path=data_path,
+                    holdout_path=holdout_path,
                     target=target,
                     leaderboard=result.history,
                 ),

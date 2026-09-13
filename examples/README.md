@@ -9,6 +9,8 @@ Public-dataset demos that ship with `iterate`.
 | `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | **working** — but measured at f1_macro 0.989 for a minimal prompt, so it has almost no headroom |
 | `hate_speech_davidson/` | `PromptTarget` | Davidson hate / offensive / neither (public) | **working, the prompt example worth running** |
 | `sts_benchmark/` | `PromptTarget` | STS-B sentence similarity, scored 0-5 (public) | **working** — the REGRESSION example |
+| `flowers102/` | `DLModelTarget` | Oxford Flowers102, 102 species (public) | data ready (v0.6 Day 1); the target lands on Day 2, the run switch on Day 3 |
+| `eurosat/` | `DLModelTarget` | EuroSAT satellite land use, 10 classes (public, MIT) | data ready (v0.6 Day 1); the vision certification dataset |
 
 ### Which prompt example to run
 

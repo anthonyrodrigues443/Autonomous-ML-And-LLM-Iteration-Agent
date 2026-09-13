@@ -70,12 +70,17 @@ dependencies = [
     # is the only command a user types — `--compute e2b` then needs just an API key.
     # It's a light HTTP SDK, so the cost of always-installing it is small.
     "e2b-code-interpreter>=1.0.0",
+    # Image headers and hashes for a vision dataset; torchvision requires it anyway.
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]
 # Anthropic Claude is the only major backend that's NOT OpenAI-compatible —
 # install only if you want to use Claude as a backend.
 anthropic = ["anthropic>=0.40.0"]
+# Vision transfer learning (v0.6). Kept out of core: torch is too large to install for
+# a tabular run.
+vision = ["torch>=2.9", "torchvision>=0.24"]
 # Dataset adapters (Kaggle / HuggingFace) — future data-source integrations.
 datasets = ["kaggle>=1.6.0", "datasets>=3.0.0"]
 # MCP (Model Context Protocol) integration — pluggable tools + data sources
