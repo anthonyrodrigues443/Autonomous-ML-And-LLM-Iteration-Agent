@@ -39,6 +39,8 @@
 - The cadence is ~1 build day per calendar day, so each sprint day carries roughly two of the earlier plan-days. What makes Sundays real is the cut lists: every week names what ships and what moves to the post-v1.0 backlog. Anything unfinished on Saturday rolls forward; the Sunday release ships whatever passed the gate, and release notes state exactly what made it.
 - The week sections below are rewritten to sprint calendar dates; the earlier scope-unit week numbering (6-16) is retired. v0.3 builds TODAY (Sat 2026-07-25) and releases tomorrow.
 
+**Updated 2026-09-12: sprint 4 re-dated.** v0.5 shipped 2026-09-09, a month after its code was complete, because the release waited on the certification run. Sprint 4 (v0.6) now runs Sun 2026-09-13 to Sat 2026-09-19 with the release on Sun 2026-09-20; sprints 5 to 7 keep their scope and re-anchor their dates at the v0.6 release, per the standing rule that windows re-anchor at every release.
+
 - **Targets:** `ModelTarget` (tabular ML) · `PromptTarget` (production LLM prompts, prompt-iteration only) · `DLModelTarget` (vision, transfer learning — validated on local RTX 4050).
 - **Moat — the specialized combination, not one feature:** a domain specialist for ML/DL/prompt iteration that does *together* what no single tool does — agentic iteration across **ML + DL models AND LLM prompts** · **persistent memory** (revisits past failures when conditions change) · **literature-grounded** proposals · **bounded autonomy** + human-approval gates · **auditable reasoning trail** · **cost-constrained optimization** (best score you can *afford to serve* — cheapest cloud, $/mo, req/hr) · **rich auto-discovered context** (DB / MCP / Drive). Cost-aware serving is the flagship for cost-sensitive startups; the moat is the *combination* + the specialization. (Full matrix: README comparison table.)
 - **Compute:** pluggable backend — local MPS · RTX 4050 (GPU validation) · e2b · cloud-GPU adapter.
@@ -52,7 +54,7 @@
 | Jul 25 | **Interactive CLI**: pause, mid-run chat, resume (streaming stretch) → **v0.3 · Sun 2026-07-26** |
 | Jul 27 to Aug 1 | **Specialists + eval hardening**: Researcher + Critic, dossier + lean ledger, probability metrics, agent picks the metric + starting model → **v0.4 · Sun 2026-08-02** |
 | Aug 3-8 | Dial B: `PromptTarget`, agentic prompt iteration (toxicity + intent examples) → **v0.5 · Sun 2026-08-09** |
-| Aug 10-15 | Dial B: `DLModelTarget`, vision transfer learning (4050) → **v0.6 · Sun 2026-08-16** |
+| Sep 13-19 | Dial B: `DLModelTarget`, vision transfer learning (4050) → **v0.6 · Sun 2026-09-20** *(re-dated 2026-09-12)* |
 | Aug 17-22 | Cost-constrained recommendation + serving profile + `iterate cost` → **v0.7 · Sun 2026-08-23** |
 | Aug 24-29 | Dial A, both steps: infer inputs from data + a description AND MCP discovery (filesystem/Postgres, gap-fill pause) → **v0.9 · Sun 2026-08-30** *(absorbs v0.8)* |
 | Aug 31 to Sep 5 | One-sentence input + benchmark + dashboard + Reporter + docs + launch → **v1.0 · Sun 2026-09-06** *(absorbs v0.10)* |
@@ -68,7 +70,7 @@ Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. **The
 | v0.3.0 | sprint 1 | **Sun 2026-07-26** | tabular | *(same inputs)*: **full interactive CLI** (pause the loop, chat with the agent, resume); token streaming is the stretch item |
 | v0.4.0 | sprint 2 | **Sun 2026-08-02** | tabular | data + features + target + baseline + deadline  *(Researcher + Critic specialists at the tool boundary; agent picks metric + starting model from research; probability metrics)* |
 | v0.5.0 | sprint 3 | **RELEASED 2026-09-09** (planned Aug 9; slipped to Aug 11 for the regression half, then waited on the certification run) | + prompts | data + target + a task line (+ your current prompt, optional) + deadline: **the same loop on LLM prompts**, classification and regression, sealed holdout, `prompts.yaml` deliverable, eval suite with a measured ceiling per dataset |
-| v0.6.0 | sprint 4 | **Sun 2026-08-16** | + DL / vision | data + target + deadline  *(validated on the RTX 4050)* |
+| v0.6.0 | sprint 4 | **Sun 2026-09-20** (re-dated 2026-09-12) | + DL / vision | data + target + deadline  *(validated on the RTX 4050)* |
 | v0.7.0 | sprint 5 | **Sun 2026-08-23** | all three | + serving budget / cloud  *(cost-constrained recommendation + serving profile + `iterate cost`)* |
 | v0.9.0 | sprint 6 | **Sun 2026-08-30** | all | data + a one-line description OR one sentence + a data source  *(absorbs v0.8: infers features/target/metric with a confirm pause; MCP discovery over filesystem + Postgres with the gap-fill pause)* |
 | v1.0.0 | sprint 7 | **Sun 2026-09-06** | all | one sentence  *(absorbs v0.10: multi-backend benchmark + read-only dashboard + prose report; full discovery + docs + launch)* |
@@ -322,19 +324,51 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 ---
 
-## Sprint 4: v0.6, DLModelTarget vision. Mon 2026-08-10 to Sat 2026-08-15, release Sun 2026-08-16
+## Sprint 4: v0.6, DLModelTarget vision. Sun 2026-09-13 to Sat 2026-09-19, release Sun 2026-09-20
 
-**Goal:** the third problem type. Vision transfer learning validated on the RTX 4050 (the public claim), with GPU-aware execution. Line up 4050 access for Wed-Fri NOW; MPS is the smoke path, not the claim.
+*(Re-planned 2026-09-12. The Aug 10-15 dates never ran: sprint 3's code was complete Aug 11 and its release waited on the certification run until Sep 9.)*
+
+**Carry-ins from the v0.5 certification and the sprint 3 evidence (recorded 2026-09-12, ordered by what a user feels first):**
+1. **A prompt iteration scores about eight full 100-record variants, and most of them lose.** Ranking on 25 paired records is nearly as reliable as on 100 for choosing which of eight to keep, so exploratory variants should be ranked on a small slice and only the survivor promoted to the full slice before `submit`. Roughly four times fewer calls per iteration, on any backend. Tony's framing on 2026-09-08: "API calls taking time is no reason to argue time"; latency is the user's hardware, the multiplier is ours.
+2. **The prompt floor scores exactly 0.0 under f1 when the positive class is not the majority.** The contended irony run banked "not ironic" for every row and scored 0.0. The baseline prompt's answers for the loop holdout are already in the answer cache from `baseline()`, so the floor can re-submit them at zero model calls and score the baseline number instead of zero.
+3. **`prompts.yaml` does not label a fallback-banked or a duplicate version.** Both stamps exist on the experiment (`floor_banked`, `duplicate_submission`); the record does not read them. `kind: fallback` and `duplicate_of: vN`.
+4. **The prompt path has no dead-lever guard.** The STS-B run spent iterations 2 to 4 refining one scale-definition lever, all three below iteration 1, and nothing stopped the repeat. The prompt family needs its own lever classes (the `_PROMPT_MOVES` ladder is the vocabulary) and a guard that fires when the same class has lost twice running. Replayed on the recorded STS-B run before it ships: it must fire at iteration 3.
+5. **The free-text token cap is a bound, not a size.** 512 tokens for every free-text target; it should be sized from the training answers so a slow record costs seconds, not minutes.
+6. **The eval runner never passes `--task`, so a version sweep would measure every prompt dataset as a tabular run** (`evals/runner.command_for`, found 2026-09-13). Fixed on Day 2 alongside the vision runner change.
+7. **Both tabular sweeps are lower bounds on churn, measurably.** A live run reached 0.6651 against the v2 ceiling of 0.6467 with bagging over tuned boosting, which neither sweep does. A third axis, hyperparameter search plus ensembling over boosting, is `v3`.
+8. **Output-format discipline is a lever no sweep technique contains.** The STS-B winner was "answer with a decimal". Both prompt sweeps gain a seventh technique and STS-B and irony are re-measured; the cache makes the first six free.
+9. **`tweet_irony` is the v0.5 certification dataset and has a demo video, but it is not in the repo.** Its folder, `tweet_emotion/`, and both `dataset.toml` files sit under a local git exclude (found 2026-09-13). Track them, with a README.
+10. **The Summarizer-authors-dossier change was measured at n=1 per arm and reverted.** Three repeats per arm decide it. Compute, not build time: a nohup queue on an idle night.
+11. **The version-over-version table is nearly empty.** Ceilings exist for all nine datasets; the 0.4.0 and 0.5.0 cells do not. Compute on an idle night.
+12. **The harness deciding to inspect from the data profile** (since the floor model never sets `want_inspect`). Cut candidate: it needs its own before/after and the week already carries three measured items.
+
+**Goal:** the third problem type. Image classification by transfer learning on a pretrained backbone, on the same loop, validated on the RTX 4050 (the public claim). MPS on the Mac is the smoke path, not the claim.
+
+**Design calls, proposed 2026-09-12 (Tony cuts before Day 1):**
+- **A vision dataset is a CSV of image paths plus a label column, or a folder with one subfolder per class.** `load_csv`, the sealed stratified split, scoring, memory, the notebook and the eval suite work unchanged; the adapter adds an image profile for the supervisor, a content hash over the image bytes, and opaque hard links so no path or slot order can carry the class.
+- **The split can be the user's, for every family (Tony's call, 2026-09-13).** `--data` alone means the harness splits; `--train` plus `--holdout` means the holdout is sealed exactly as given. A class-folder tree with `train/` and `test/` inside is the same thing for images.
+- **Images live in a flat folder with opaque filenames, labels only in the CSV**, so a holdout path can never encode its class. The Critic is told to look for path-parsing anyway.
+- **The deterministic floor is a linear probe:** frozen pretrained backbone, embeddings cached once, logistic regression on top. Seconds on any device, and it doubles as the floor cell when a session dies, the same shape as the prompt path's majority answer.
+- **The harness owns image loading, tensor caching, a `fit` helper with per-epoch prints and OOM capture, and `submit`.** The agent owns the levers: backbone, unfreeze depth, learning rate and schedule, augmentation, image size, epochs, label smoothing. Harness bounded, solutions open.
+- **torch and torchvision live behind a `[vision]` extra.** e2b bundled into core because it is light; torch is not. A vision run without the extra gets one install line.
+- **e2b is refused for vision runs** and recorded in LIMITATIONS: the sandbox is CPU and the images would need uploading file by file.
+- **Two datasets, chosen by the Day 1 research against seven criteria.** Oxford Flowers102 is the headline example (8,189 photographs, 102 classes, one 329 MiB download; 1 of its images is in the ImageNet-1k training set and none of its test images is a near-duplicate of one) and EuroSAT is the certification dataset (27,000 satellite tiles, 10 classes, MIT licence, zero ImageNet overlap by construction: Sentinel-2 launched in 2015). Imagenette and Imagewoof, named in the 2026-09-12 planning note, are disqualified: every one of their images is an ILSVRC-2012 image, so a transfer result there measures a backbone remembering its own training set.
+- **The 4050 laptop runs WSL2 with the CUDA torch wheel, reached over SSH on Tailscale.** The harness has POSIX-only tty checks, so native Windows is not the path.
 
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
-| Mon Aug 10 | Recipe research (torchvision/timm backbone, freeze + head; dataset that trains on a 6 GB card; MPS vs CUDA) + vision data adapter (image folders behind the existing data seam); RESEARCH_LOG entry | adapter + RESEARCH_LOG | |
-| Tue Aug 11 | `DLModelTarget` baseline (frozen backbone + linear head, deterministic) | `targets/dl.py` + tests | |
-| Wed Aug 12 | Candidate space via the code path: agent writes training cells (unfreeze depth, lr schedule, augmentation); GPU-aware kernel (device pick; OOM captured as a failure, never a crash) | wiring + tests | |
-| Thu Aug 13 | RTX 4050 validation (the public claim) + MPS smoke test; kernel-time budget semantics under GPU training re-checked | validation notes | |
-| Fri Aug 14 | Vision example + notebook deliverable (training curves in cells); if local floor-model latency is impractical for DL, document the honest cloud-backend recommendation | example + validation | |
-| Sat Aug 15 | Buffer; if green, the cloud-GPU `ComputeBackend` interface (interface only, implementation stays trigger-based) | fixes | |
-| Sun Aug 16 | **Release v0.6.0** per the standing checklist | v0.6.0 out | |
+| Sun Sep 13 | Recipe research (datasets, backbone, MPS versus CUDA, the lever ladder) and the one measurement that sets the budgets: seconds per epoch on MPS at the chosen resolution with cached tensors. Image adapter: path-column detection, class-folder trees, path resolution, image content hash, opaque hard links, an image profile for the supervisor. The user's own split for every family (`--train` + `--holdout`, Tony's call). Two prepare scripts. The `[vision]` extra | RESEARCH_LOG entry, `adapters/data/images.py`, `load_split`, two examples, tests on tiny synthetic PNGs | done |
+| Mon Sep 14 | `DLModelTarget`: probe baseline, a typed recipe runner for `run()`, code job and scoring, meta.json with family vision. Vision ceiling sweep through the recipe runner, no LLM, run overnight on MPS | `targets/dl.py`, `evals/vision_ceilings.py`, two `dataset.toml`, headroom numbers | |
+| Tue Sep 15 | The code path: vision preamble (device pick, torch seeding, cached tensors, helpers, worked example), floor cell, GPU memory freed between cells, CLI dispatch with auto-detect and e2b refusal, prompts.yaml vision keys for all four roles, the vision lever ladder and code markers in the supervisor, first live MPS run on gemma4:12b | wiring, prompts, tests, first smoke run | |
+| Wed Sep 16 | Live runs and what only running finds: guards for the failure modes a 12B produces writing torch. Notebook check that training curves render. LIMITATIONS rows: MPS nondeterminism, e2b, floor-model torch reliability | fixes, tests, docs | |
+| Thu Sep 17 | RTX 4050 validation, the public claim: install over WSL2, same example, CUDA versus MPS epoch time, VRAM peak, an OOM run to prove capture. Example READMEs, examples index, RESULTS regenerated | validation notes, docs | |
+| Fri Sep 18 | Carry-ins 1 to 5 and 9, one PR: cached-baseline floor, `prompts.yaml` labels, prompt dead-lever guard (replayed on STS-B first), small-slice-then-promote measured as calls per iteration before and after, sized free-text cap, tweet_irony README | wiring, tests, measurements | |
+| Sat Sep 19 | Carry-ins 6 to 8: the eval runner fix, the v3 tuned-ensemble axis, the seventh technique in both prompt sweeps with STS-B and irony re-measured. Then the release gate per the standing checklist: README and LIMITATIONS sync, version bump, launch drafts | `evals/tuning.py`, sweep v2, release PR | |
+| Sun Sep 20 | Tony's certification run on the vision example with measured headroom (sequential, Ollama restarted first), then **release v0.6.0** | v0.6.0 out | |
+
+**Background compute on idle nights, not build days:** carry-in 10 (the Summarizer A/B at three repeats per arm, about 4.5 hours) and carry-in 11 (the 0.4.0 and 0.5.0 cells). Both are nohup queues, run only when no live run is on Ollama.
+
+**Cut list if the week runs long, in cut order:** carry-in 12, carry-in 11, the cloud-GPU `ComputeBackend` interface, the second corpus dataset beyond its ceiling row.
 
 ---
 
@@ -492,6 +526,41 @@ The discovery agent is what makes the demo wow. It does:
 ---
 
 ## Done
+
+### 2026-09-13 | Sprint 4 Day 1 | The image seam, and the two datasets that can carry the claim
+
+**Task:** the first day of the third target family. Not the target, and not the wiring: the seam a vision dataset enters through, the datasets that can honestly carry a transfer-learning claim, the research entry behind every choice, and one measurement that sets the budgets. Plus one call from Tony that reshaped the input contract for every family.
+
+**The research, and what it overturned.** Six research angles ran in parallel (datasets, backbones, MPS, CUDA on a 6 GB card, transfer-learning levers, codebase fit), a synthesis merged them, and the eight claims the design rests on were each handed to a skeptic told to refute them. All eight held. The one that mattered most disqualified the dataset the sprint plan had named: Imagewoof and Imagenette carry 1,350 images per class, which is exactly ILSVRC-2012's 1,300 training images plus its 50 validation images per class. Every image is an ImageNet image, so a probe on ImageNet features there is a backbone remembering its own training set. Flowers102 has one overlapping image in 8,189; EuroSAT is satellite imagery no ImageNet backbone has seen. The full entry is in RESEARCH_LOG.
+
+**The measurement (M5, MPS, resnet18, batch 64, images pre-decoded to one uint8 tensor, 3 epochs, no DataLoader):**
+
+| dataset | px | train / holdout | probe | fine-tune, 3 epochs | s per epoch | peak MPS memory |
+|---|---|---|---|---|---|---|
+| imagewoof | 160 | 9,025 / 3,929 | 0.853 | 0.870 | 28 | 3.5 GB |
+| flowers102 | 160 | 6,551 / 1,638 | 0.892 | 0.958 | 21 | 2.4 GB |
+| flowers102 | 224 | 6,551 / 1,638 | 0.932 | 0.972 | 39 | 4.4 GB |
+| eurosat | 64 | 21,600 / 5,400 | 0.897 | 0.974 | 14 | 1.2 GB |
+| eurosat | 128 | 21,600 / 5,400 | 0.919 | 0.981 | 53 | 2.4 GB |
+
+Overlap shows up as a number: Imagewoof leaves under two points to fine-tuning, the other two leave six to eight. Every fine-tune fits the existing 600 s cell and the 1,800 s session holds eight or more, so the tabular budgets carry over unchanged. Decoding 27,000 JPEGs into the cached tensor costs 4 to 6 s; hashing every image's bytes costs under 2 s.
+
+**Tony's call, recorded in DECISIONS: the split can be the user's, for every family.** `--data` alone means the harness splits, 80/20 and stratified as before. `--train` plus `--holdout` means the split is theirs and the holdout is sealed exactly as given, nothing reshuffled. For images a folder with `train/` and `test/` inside is the same thing. His reason was trust: a team that does not want a tool reshuffling its data keeps control of the one thing every score depends on. The three wrong combinations fail before the setup wizard and before any file is read.
+
+**The leak the folder form exposed, and what the review found in the first fix.** A user's class-folder tree names the class in every path, and a class-sorted tree names it in the ORDER too. The first version hard-linked every image under a seeded shuffle of slot numbers. The adversarial review run before the PR refuted it three ways: the rows the kernel receives were still in class order, because only the file NAMES had been shuffled; the seed is public, so the slot permutation was invertible; and a hard link shares the source's inode, so the file's timestamp still sorted by class on a tree written class by class. The shipped rule is structural on every channel: every image is COPIED under a run-scoped image cache with its own sha256 as its name, no suffix (a format could be a label), one fixed mtime, written to a temporary name and renamed so an interrupted copy never sits in a slot; a missing file maps to an opaque path that does not exist; and both loaders shuffle row order once with the fixed seed, membership and labels untouched, which also applies to a user's CSV split. Copying 27,000 tiles costs a few seconds and the disk of the dataset once. The prepare scripts keep a flat layout too, since the examples are public.
+
+**What shipped.**
+- `adapters/data/tabular.py`: `split_frame` and `dataset_from_frames` behind `load_csv` and the new `load_split`; a `user_split` flag on the dataset; rows shuffled once with the fixed seed (the review showed a label-sorted holdout would otherwise have handed `--loop-holdout` a single-class slice); empty labels refused; the holdout index kept disjoint from train; a warning when the holdout carries a class train never saw.
+- `cli.py` and `deliver/notebook.py`: the delivered notebook of a `--train`/`--holdout` run loads the user's split with `load_split`, where the first version re-split the training file (review finding); `--train` and `--holdout` naming the same file is refused.
+- `adapters/data/images.py`, new: image-column detection (strict: one feature column, every value an image suffix, a sample on disk), class-folder trees with or without a split inside, absolute paths, per-file sha256, a data version covering the bytes, byte-named copies, and a header-only profile (sizes, modes, formats, unreadable files, byte-identical images across the split). On its first run the profile found byte-identical images in both Flowers102 and Imagewoof.
+- `cli.py`: `--train` and `--holdout`, the exclusivity rule, the same-file refusal, and a refusal on the `--spec` lane.
+- `examples/flowers102/` and `examples/eurosat/`: prepare scripts that download, verify checksums, flatten into `images/NNNNN.jpg` with the label only in the CSV, and assert no filename carries a class token. Both ran on the real archives.
+- `pyproject.toml`: `pillow` in core, a `[vision]` extra for torch and torchvision.
+- Tests: 37 new, 844 in the suite. Synthetic PNGs cover portrait, grayscale, corrupt, missing and cross-split duplicate images; the materialise test asserts that a class-sorted source does not become a class-sorted slot range.
+
+**Not here, by design:** the target, the preamble, the folder form of `--data`, and the prompts. Days 2 and 3.
+
+**Two things found in passing, both filed on the sprint table.** `evals/runner.command_for` never passes `--task` for a prompt dataset, so a version sweep would measure the prompt corpus as tabular runs; fixed on Day 2 with the vision runner change. And `examples/tweet_irony/`, `examples/tweet_emotion/` and their `dataset.toml` files are not tracked by git at all, only excluded locally, so carry-in 8 means adding them to the repo, not writing a README.
 
 ### 2026-09-09 | Sprint 3 release | v0.5.0 released
 
