@@ -321,3 +321,14 @@ def test_delivered_notebook_scoring_cell_handles_the_proba_contract() -> None:
     cell = _score_code_cell("roc_auc")
     assert "isinstance(_out, tuple)" in cell
     assert "y_proba=probabilities" in cell
+
+
+def test_the_load_cell_of_a_users_split_names_both_files() -> None:
+    from iterate.deliver.notebook import _load_cell
+
+    cell = _load_cell("train.csv", "y", "holdout.csv")
+    assert "load_split('train.csv', 'holdout.csv', target='y')" in cell
+    assert "load_csv" not in cell
+    plain = _load_cell("data.csv", "y")
+    assert "load_csv('data.csv', target='y')" in plain
+    assert "load_split" not in plain

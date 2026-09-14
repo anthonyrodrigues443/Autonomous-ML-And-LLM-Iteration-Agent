@@ -98,9 +98,9 @@ def test_a_non_utf8_csv_loads_instead_of_raising(tmp_path: Path) -> None:
     accented name is latin-1, so the user's first contact with the tool would be a
     decoding traceback on a file that opens fine in every spreadsheet."""
     path = tmp_path / "latin1.csv"
-    path.write_bytes(("a,b,label\n" + "".join(
-        f"{i},caf\xe9{i},{i % 2}\n" for i in range(40)
-    )).encode("latin-1"))
+    path.write_bytes(
+        ("a,b,label\n" + "".join(f"{i},caf\xe9{i},{i % 2}\n" for i in range(40))).encode("latin-1")
+    )
     with pytest.raises(UnicodeDecodeError):
         path.read_text(encoding="utf-8")  # the file really is not UTF-8
     ds = load_csv(path, target="label")
@@ -114,10 +114,11 @@ def test_an_integer_regression_target_loads_instead_of_stratifying(tmp_path: Pat
     split raised before the run could start. Prices, counts and years are all
     integers, so this is the common case, not an edge one."""
     path = tmp_path / "prices.csv"
-    frame = pd.DataFrame({"carat": range(200), "depth": range(200),
-                          "price": [300 + i * 7 for i in range(200)]})
+    frame = pd.DataFrame(
+        {"carat": range(200), "depth": range(200), "price": [300 + i * 7 for i in range(200)]}
+    )
     frame.to_csv(path, index=False)
-    ds = load_csv(path, target="price")           # would raise before the fix
+    ds = load_csv(path, target="price")  # would raise before the fix
     assert ds.n_train + ds.n_test == 200
 
 
@@ -161,3 +162,205 @@ def test_asking_for_more_holdout_than_exists_is_a_no_op(tmp_path: Path) -> None:
 
     assert with_smaller_holdout(dataset, 10_000).n_test == dataset.n_test
     assert with_smaller_holdout(dataset, 0).n_test == dataset.n_test
+
+
+# ─── the user's own split ────────────────────────────────────────────────
+
+
+def _make_split(tmp_path: Path, *, n_train: int = 80, n_test: int = 20) -> tuple[Path, Path]:
+    """Two CSVs the user split themselves, same columns, target in the middle."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    def frame(n: int, offset: int) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "f1": range(offset, offset + n),
+                "churn": [i % 2 for i in range(n)],
+                "f2": [i * 0.5 for i in range(n)],
+            }
+        )
+
+    train, holdout = tmp_path / "train.csv", tmp_path / "holdout.csv"
+    frame(n_train, 0).to_csv(train, index=False)
+    frame(n_test, 1000).to_csv(holdout, index=False)
+    return train, holdout
+
+
+def test_load_split_keeps_the_users_rows_exactly(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    train, holdout = _make_split(tmp_path)
+    ds = load_split(train, holdout, target="churn")
+    assert ds.user_split is True
+    assert (ds.n_train, ds.n_test) == (80, 20)
+    assert ds.features == ["f1", "f2"]
+    # Membership is exactly the user's; only the row order moves (fixed seed).
+    assert sorted(ds.train_features["f1"]) == list(range(80))
+    assert sorted(ds.test_features["f1"]) == list(range(1000, 1020))
+    assert list(ds.test_features["f1"]) != list(range(1000, 1020))
+    # Pairing survives the shuffle: the label was built as (f1 - offset) % 2.
+    for f, y in zip(ds.test_features["f1"], ds.test_target, strict=True):
+        assert int(y) == (int(f) - 1000) % 2
+    for f, y in zip(ds.train_features["f1"], ds.train_target, strict=True):
+        assert int(y) == int(f) % 2
+    assert ds.test_size == pytest.approx(0.2)
+
+
+def test_load_split_holdout_index_is_disjoint_from_train(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    ds = load_split(*_make_split(tmp_path), target="churn")
+    assert set(ds.train_features.index).isdisjoint(set(ds.test_features.index))
+
+
+def test_load_split_reorders_holdout_columns_to_the_training_layout(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    train, holdout = _make_split(tmp_path)
+    shuffled = pd.read_csv(holdout)[["f2", "churn", "f1"]]
+    shuffled.to_csv(holdout, index=False)
+    ds = load_split(train, holdout, target="churn")
+    assert list(ds.test_features.columns) == ["f1", "f2"]
+
+
+def test_load_split_rejects_a_column_mismatch(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    train, holdout = _make_split(tmp_path)
+    frame = pd.read_csv(holdout).drop(columns=["f2"])
+    frame["f3"] = 1
+    frame.to_csv(holdout, index=False)
+    with pytest.raises(ValueError, match=r"missing \['f2'\] and has extra \['f3'\]"):
+        load_split(train, holdout, target="churn")
+
+
+def test_load_split_rejects_a_missing_target_in_either_file(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    train, holdout = _make_split(tmp_path)
+    pd.read_csv(holdout).drop(columns=["churn"]).to_csv(holdout, index=False)
+    with pytest.raises(ValueError, match="not in the holdout columns"):
+        load_split(train, holdout, target="churn")
+    train, holdout = _make_split(tmp_path / "again")
+    pd.read_csv(train).drop(columns=["churn"]).to_csv(train, index=False)
+    with pytest.raises(ValueError, match="not in the train columns"):
+        load_split(train, holdout, target="churn")
+
+
+def test_load_split_rejects_an_empty_label(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    train, holdout = _make_split(tmp_path)
+    frame = pd.read_csv(holdout)
+    frame.loc[2, "churn"] = None
+    frame.to_csv(holdout, index=False)
+    with pytest.raises(ValueError, match="1 empty 'churn' value"):
+        load_split(train, holdout, target="churn")
+
+
+def test_load_split_takes_a_regression_target_without_a_class_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    train, holdout = _make_split(tmp_path)
+    for path in (train, holdout):
+        frame = pd.read_csv(path)
+        frame["churn"] = frame["f1"] * 1.37 + 0.5
+        frame.to_csv(path, index=False)
+    with caplog.at_level("WARNING"):
+        ds = load_split(train, holdout, target="churn")
+    assert ds.user_split is True
+    assert "absent from train" not in caplog.text
+
+
+def test_a_label_sorted_user_holdout_still_gives_a_mixed_loop_slice(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split, with_smaller_holdout
+
+    train, holdout = _make_split(tmp_path)
+    frame = pd.read_csv(holdout)
+    frame["churn"] = [0] * 10 + [1] * 10
+    frame.to_csv(holdout, index=False)
+    ds = load_split(train, holdout, target="churn")
+    sliced = with_smaller_holdout(ds, 8)
+    assert set(sliced.test_target) == {0, 1}
+    assert list(sliced.test_features.index) == list(ds.test_features.index[:8])
+
+
+def test_load_split_warns_when_the_holdout_has_an_unseen_class(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    train, holdout = _make_split(tmp_path)
+    frame = pd.read_csv(holdout)
+    frame.loc[0, "churn"] = 7
+    frame.to_csv(holdout, index=False)
+    with caplog.at_level("WARNING"):
+        ds = load_split(train, holdout, target="churn")
+    assert ds.n_test == 20
+    assert "absent from train" in caplog.text
+
+
+def test_load_split_hash_covers_both_files(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    train, holdout = _make_split(tmp_path)
+    before = load_split(train, holdout, target="churn").data_hash
+    frame = pd.read_csv(holdout)
+    frame.loc[3, "f2"] = 99.0
+    frame.to_csv(holdout, index=False)
+    after_holdout = load_split(train, holdout, target="churn").data_hash
+    assert after_holdout != before
+    frame = pd.read_csv(train)
+    frame.loc[3, "f2"] = 99.0
+    frame.to_csv(train, index=False)
+    assert load_split(train, holdout, target="churn").data_hash not in (before, after_holdout)
+
+
+# ─── how the task is decided ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (["a", "b", "a"], True),
+        ([True, False, True], True),
+        ([1.0, 2.0, 1.0, 2.0], True),  # integers stored as floats are still classes
+        ([1.5, 2.0, 3.25], False),  # a fractional value is a measurement
+        ([round(0.2 * i, 1) for i in range(26)] * 30, False),  # a score on a 0.2 grid
+        (list(range(18, 90)) * 100, False),  # ages: 72 distinct integers
+        (list(range(5)) * 200, True),  # a 1 to 5 style integer scale reads as classes
+    ],
+)
+def test_the_task_rule_reads_kind_before_count(values: list[object], expected: bool) -> None:
+    from iterate.adapters.data.tabular import looks_like_classification
+
+    assert looks_like_classification(pd.Series(values)) is expected
+
+
+def test_a_tiny_float_target_is_regression(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import describe_target
+
+    frame = pd.DataFrame({"f1": range(15), "y": [0.1 * i + 0.05 for i in range(15)]})
+    path = tmp_path / "tiny.csv"
+    frame.to_csv(path, index=False)
+    ds = load_csv(path, target="y")
+    assert ds.task == "regression"
+    assert "fractional" in describe_target(ds.train_target)
+
+
+def test_an_explicit_task_overrides_the_guess_and_the_stratify(tmp_path: Path) -> None:
+    from iterate.adapters.data.tabular import load_split
+
+    frame = pd.DataFrame({"f1": range(60), "rating": [1 + i % 5 for i in range(60)]})
+    path = tmp_path / "ratings.csv"
+    frame.to_csv(path, index=False)
+    assert load_csv(path, target="rating").task == "classification"
+    ds = load_csv(path, target="rating", task="regression")
+    assert ds.task == "regression"
+    holdout = tmp_path / "h.csv"
+    frame.head(10).to_csv(holdout, index=False)
+    assert load_split(path, holdout, target="rating", task="regression").task == "regression"
+    with pytest.raises(ValueError, match="task must be"):
+        load_csv(path, target="rating", task="ordinal")

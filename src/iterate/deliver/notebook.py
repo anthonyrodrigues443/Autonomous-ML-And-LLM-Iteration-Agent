@@ -37,6 +37,7 @@ def build_notebook(
     baseline_score: float | None = None,
     is_best: bool = False,
     leaderboard: list[Experiment] | None = None,
+    holdout_path: str | None = None,
 ) -> NotebookNode:
     """Render one experiment into a self-reproducing notebook.
 
@@ -50,7 +51,7 @@ def build_notebook(
     ]
     if leaderboard:
         nb.cells.append(new_markdown_cell(_leaderboard_md(leaderboard, metric, baseline_score)))
-    nb.cells.append(new_code_cell(_load_cell(data_path, target)))
+    nb.cells.append(new_code_cell(_load_cell(data_path, target, holdout_path)))
     if is_code_candidate(candidate.changes):
         nb.cells.append(new_code_cell(str(candidate.changes["code"]).strip()))
         nb.cells.append(new_code_cell(_score_code_cell(metric)))
@@ -257,7 +258,15 @@ def _leaderboard_md(
     return "\n".join(rows)
 
 
-def _load_cell(data_path: str, target: str) -> str:
+def _load_cell(data_path: str, target: str, holdout_path: str | None = None) -> str:
+    if holdout_path is not None:
+        return (
+            "# Load the split you supplied, the holdout sealed exactly as iterate measured it.\n"
+            "from iterate.adapters.data.tabular import load_split\n\n"
+            f"ds = load_split({data_path!r}, {holdout_path!r}, target={target!r})\n"
+            "X_train, y_train = ds.train_features, ds.train_target\n"
+            "X_holdout, y_holdout = ds.test_features, ds.test_target"
+        )
     return (
         "# Load the data with the exact split iterate measured on (same seed/stratify).\n"
         "from iterate.adapters.data.tabular import load_csv\n\n"

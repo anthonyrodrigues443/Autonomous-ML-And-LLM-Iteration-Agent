@@ -47,6 +47,8 @@ class TabularDataset:
     seed: int
     test_size: float
     data_hash: str  # content fingerprint of the full dataset (a data version)
+    user_split: bool = False  # the caller supplied train and holdout; nothing was shuffled
+    task: str = "classification"  # the one place the task is decided; explicit metric wins
 
     @property
     def n_train(self) -> int:
@@ -64,18 +66,40 @@ def _content_hash(frame: pd.DataFrame) -> str:
 
 
 def looks_like_classification(target: pd.Series) -> bool:
-    """Discrete target → classification; a continuous target → regression.
+    """Discrete target: classification. Continuous target: regression.
 
-    The distinct-value cap applies to INTEGER targets as well as float ones. An
-    integer column was previously always read as a class label, so a price, a count
-    or a year became thousands of "classes" and the stratified split raised before
-    the run could start: the diamonds dataset, with 11,602 distinct integer prices,
-    could not be loaded at all. Every target with few enough distinct values is
-    unaffected, so nothing that worked before changes behaviour.
+    Text and booleans are classes. A number with a fractional part is a measurement,
+    never a class. An integer-valued column is the only ambiguous case, and it reads
+    as classes while it stays small; an explicit metric overrides all of this.
     """
-    if pd.api.types.is_bool_dtype(target) or not pd.api.types.is_numeric_dtype(target):
+    values = target.dropna()
+    if pd.api.types.is_bool_dtype(values) or not pd.api.types.is_numeric_dtype(values):
         return True
-    return bool(target.nunique(dropna=True) <= _MAX_CLASSES_FOR_STRATIFY)
+    numbers = values.astype(float)
+    if bool((numbers % 1 != 0).any()):
+        return False
+    return bool(numbers.nunique() <= _MAX_CLASSES_FOR_STRATIFY)
+
+
+def describe_target(target: pd.Series) -> str:
+    """Why the task was read the way it was, for the line printed before a run."""
+    values = target.dropna()
+    n = int(values.nunique())
+    if pd.api.types.is_bool_dtype(values):
+        return "a boolean column"
+    if not pd.api.types.is_numeric_dtype(values):
+        return f"{n} text labels"
+    if bool((values.astype(float) % 1 != 0).any()):
+        return f"{n} distinct numbers with fractional values"
+    return f"{n} distinct integer values"
+
+
+def _resolve_task(target: pd.Series, task: str | None) -> str:
+    if task is not None:
+        if task not in ("classification", "regression"):
+            raise ValueError(f"task must be classification or regression, got {task!r}")
+        return task
+    return "classification" if looks_like_classification(target) else "regression"
 
 
 log = logging.getLogger(__name__)
@@ -97,28 +121,30 @@ def _read_csv_any_encoding(path: str | Path) -> pd.DataFrame:
         return pd.read_csv(path, encoding="latin-1")
 
 
-def load_csv(
-    path: str | Path,
+def split_frame(
+    frame: pd.DataFrame,
     target: str,
     *,
     test_size: float = DEFAULT_TEST_SIZE,
     seed: int = DEFAULT_SEED,
     stratify: bool = True,
+    task: str | None = None,
 ) -> TabularDataset:
-    """Load a CSV and return a deterministic train/holdout split.
+    """A deterministic train/holdout split of one frame.
 
     ``stratify`` keeps the class balance identical in train and holdout for a
-    classification target; it is ignored for a continuous (regression) target.
+    classification target; it is ignored for a regression target. ``task`` is the
+    caller's word (an explicit metric) and overrides the heuristic.
     """
-    frame = _read_csv_any_encoding(path)
     if target not in frame.columns:
-        raise ValueError(f"target column {target!r} not in CSV columns {list(frame.columns)}")
+        raise ValueError(f"target column {target!r} not in columns {list(frame.columns)}")
 
     features = [col for col in frame.columns if col != target]
     feature_frame = frame[features]
     target_col = frame[target]
+    resolved = _resolve_task(target_col, task)
 
-    stratify_on = target_col if (stratify and looks_like_classification(target_col)) else None
+    stratify_on = target_col if (stratify and resolved == "classification") else None
     train_feat, test_feat, train_tgt, test_tgt = train_test_split(
         feature_frame,
         target_col,
@@ -137,23 +163,121 @@ def load_csv(
         seed=seed,
         test_size=test_size,
         data_hash=_content_hash(frame),
+        task=resolved,
+    )
+
+
+def dataset_from_frames(
+    train: pd.DataFrame,
+    holdout: pd.DataFrame,
+    target: str,
+    *,
+    seed: int = DEFAULT_SEED,
+    task: str | None = None,
+) -> TabularDataset:
+    """A dataset from a split the CALLER made. Membership and labels are untouched.
+
+    Rows are shuffled with the fixed seed, pairing kept, because a file sorted by
+    label would otherwise reach the kernel with its order encoding the answer. The
+    holdout is reordered to the training frame's columns so the kernel sees one
+    layout, and its index is kept disjoint from train.
+    """
+    for name, frame in (("train", train), ("holdout", holdout)):
+        if target not in frame.columns:
+            raise ValueError(
+                f"target column {target!r} not in the {name} columns {list(frame.columns)}"
+            )
+        if frame.empty:
+            raise ValueError(f"the {name} file has no rows")
+        if frame[target].isna().any():
+            raise ValueError(
+                f"the {name} file has {int(frame[target].isna().sum())} empty {target!r} value(s)"
+            )
+    features = [col for col in train.columns if col != target]
+    missing = sorted(set(features) - set(holdout.columns))
+    extra = sorted(set(holdout.columns) - set(train.columns))
+    if missing or extra:
+        raise ValueError(
+            f"train and holdout columns differ: the holdout is missing {missing} "
+            f"and has extra {extra}"
+        )
+    holdout = holdout[[*features, target]]
+    holdout.index = pd.RangeIndex(len(train), len(train) + len(holdout))
+    train = train.sample(frac=1, random_state=seed)
+    holdout = holdout.sample(frac=1, random_state=seed)
+
+    resolved = _resolve_task(train[target], task)
+    if resolved == "classification":
+        unseen = set(holdout[target].dropna().unique()) - set(train[target].dropna().unique())
+        if unseen:
+            log.warning(
+                "holdout has %d class(es) absent from train: %s",
+                len(unseen),
+                sorted(str(v) for v in unseen)[:5],
+            )
+
+    n_train, n_test = len(train), len(holdout)
+    return TabularDataset(
+        train_features=train[features],
+        train_target=train[target],
+        test_features=holdout[features],
+        test_target=holdout[target],
+        target=target,
+        features=features,
+        seed=seed,
+        test_size=n_test / (n_train + n_test),
+        data_hash=_content_hash(
+            pd.concat([train.sort_index(), holdout.sort_index()], ignore_index=True)
+        ),
+        user_split=True,
+        task=resolved,
+    )
+
+
+def load_csv(
+    path: str | Path,
+    target: str,
+    *,
+    test_size: float = DEFAULT_TEST_SIZE,
+    seed: int = DEFAULT_SEED,
+    stratify: bool = True,
+    task: str | None = None,
+) -> TabularDataset:
+    """Load a CSV and return a deterministic train/holdout split."""
+    return split_frame(
+        _read_csv_any_encoding(path),
+        target,
+        test_size=test_size,
+        seed=seed,
+        stratify=stratify,
+        task=task,
+    )
+
+
+def load_split(
+    train_path: str | Path,
+    holdout_path: str | Path,
+    target: str,
+    *,
+    seed: int = DEFAULT_SEED,
+    task: str | None = None,
+) -> TabularDataset:
+    """Two CSVs the user split themselves; the holdout is sealed as it stands."""
+    return dataset_from_frames(
+        _read_csv_any_encoding(train_path),
+        _read_csv_any_encoding(holdout_path),
+        target,
+        seed=seed,
+        task=task,
     )
 
 
 def with_smaller_holdout(dataset: TabularDataset, n: int) -> TabularDataset:
     """The same dataset with its holdout cut to the first ``n`` rows.
 
-    For a target where scoring costs one model call per record, the full holdout is
-    too expensive to spend on every candidate — measured on a local 12B, 300 records
-    is sixteen minutes, and a three-iteration run spends half its wall clock there.
-
-    Taking the FIRST n is a random subset, not a biased one: `train_test_split` has
-    already shuffled, so the holdout is in no meaningful order. Taking the same
-    first n every time is the point — every candidate is then scored on identical
-    records, which makes the comparison paired and keeps ranking reliable even
-    though each individual score carries more sampling error than the full set
-    would. The winner is re-scored on the whole holdout at the end, and THAT is the
-    number worth quoting.
+    Both loaders shuffle rows with the fixed seed, so the first ``n`` is a random
+    subset and the SAME subset for every candidate, which keeps the comparison
+    paired. The winner is re-scored on the whole holdout at the end.
     """
     if n >= len(dataset.test_features) or n <= 0:
         return dataset
@@ -168,6 +292,10 @@ __all__ = [
     "DEFAULT_SEED",
     "DEFAULT_TEST_SIZE",
     "TabularDataset",
+    "dataset_from_frames",
+    "describe_target",
     "load_csv",
+    "load_split",
+    "split_frame",
     "with_smaller_holdout",
 ]

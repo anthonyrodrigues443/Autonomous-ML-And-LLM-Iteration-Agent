@@ -68,7 +68,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 
 ## What it does
 
-You give it a prepared CSV, the target column, and a metric. The agent does the rest: builds its own baseline, then runs one briefed experiment per iteration, cell by cell, against a sealed holdout it never sees.
+You give it a prepared CSV, the target column, and a metric. The agent does the rest: builds its own baseline, then runs one briefed experiment per iteration, cell by cell, against a sealed holdout it never sees. The split is yours if you want it to be: pass `--train` and `--holdout` instead of `--data` and the holdout is sealed exactly as you gave it, its rows shuffled once so their order cannot carry a label.
 
 What a live run looks like:
 
@@ -177,7 +177,7 @@ iterate run --data train.clean.csv --target churn --metric f1 \
             --until 30m --notebooks all
 ```
 
-Useful flags: `--max-iterations`, `--patience`, `--until` (wall-clock bound), `--notebooks best|all|none`, `--compute local|e2b`, `--install/--no-install` (package-install consent), `--think` (reasoning mode for the coder, Ollama only), `--fresh` (archive memory, start a new chapter), `--plain` (classic output instead of the interactive UI), `--spec` (the v0.1 allow-list path, kept as the fast lane). Prompt runs: `--task` (switches to prompt iteration), `--prompt-file` (your current prompt as the baseline), `--target-model` / `--target-backend` (the model whose prompt is tuned, separate from the one driving the run), `--loop-holdout` (records per candidate during the search). Full reference: `iterate run --help`
+Useful flags: `--train` + `--holdout` instead of `--data` (bring your own split: the holdout is sealed exactly as given; code path only, the `--spec` lane keeps `--data`), `--max-iterations`, `--patience`, `--until` (wall-clock bound), `--notebooks best|all|none`, `--compute local|e2b`, `--install/--no-install` (package-install consent), `--think` (reasoning mode for the coder, Ollama only), `--fresh` (archive memory, start a new chapter), `--plain` (classic output instead of the interactive UI), `--spec` (the v0.1 allow-list path, kept as the fast lane). Prompt runs: `--task` (switches to prompt iteration), `--prompt-file` (your current prompt as the baseline), `--target-model` / `--target-backend` (the model whose prompt is tuned, separate from the one driving the run), `--loop-holdout` (records per candidate during the search). Full reference: `iterate run --help`
 
 **Where things land:** `.iterate/runs/<run_id>/best.ipynb` (the runnable winner), `notebooks/` (with `--notebooks all`), `best.json` (config + score sidecar), `prompts.yaml` on a prompt run (every version with its score, the best marked). Code-path winners ship as notebooks by design; `--spec` winners also save `best_model.joblib`.
 

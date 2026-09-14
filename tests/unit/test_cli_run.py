@@ -472,9 +472,17 @@ def _stub_run_supervised(
         return _FakeClient(think=kw.get("think", False))
 
     def _fake_run_supervised(
-        *, target: Any, dataset: Any, supervisor: Any, make_coder: Any,
-        terminator: Any, memory: Any, data_summary: str, summarizer: Any = None,
-        on_experiment: Any = None, controller: Any = None,
+        *,
+        target: Any,
+        dataset: Any,
+        supervisor: Any,
+        make_coder: Any,
+        terminator: Any,
+        memory: Any,
+        data_summary: str,
+        summarizer: Any = None,
+        on_experiment: Any = None,
+        controller: Any = None,
         # **kwargs so adding a loop parameter does not break every CLI test; the
         # ones these tests assert on are named explicitly above.
         **kwargs: Any,
@@ -483,6 +491,7 @@ def _stub_run_supervised(
         from iterate.schemas.experiment import Candidate, Experiment
 
         coder = make_coder()
+        captured["dataset"] = dataset
         captured["supervisor_client"] = supervisor._client
         captured["coder_client"] = coder._client
         captured["controller"] = controller
@@ -495,11 +504,24 @@ def _stub_run_supervised(
             exp = Experiment(
                 candidate=Candidate(
                     description="probe attempt",
-                    changes={"cells": [{"code": "x=1", "stdout": "ok", "error": None,
-                                        "source": "agent", "outputs": [], "thinking": None}]},
+                    changes={
+                        "cells": [
+                            {
+                                "code": "x=1",
+                                "stdout": "ok",
+                                "error": None,
+                                "source": "agent",
+                                "outputs": [],
+                                "thinking": None,
+                            }
+                        ]
+                    },
                     rationale="r",
                 ),
-                target="tabular-model", hypothesis="h", status="completed", iteration=1,
+                target="tabular-model",
+                hypothesis="h",
+                status="completed",
+                iteration=1,
                 result=ExperimentResult(
                     experiment_id="e",
                     metrics=Metrics(
@@ -509,8 +531,11 @@ def _stub_run_supervised(
             )
             on_experiment(experiment=exp, baseline=baseline, is_best=True, run_id="t")
         return RunResult(
-            baseline=baseline, history=[], best=None,
-            stopped_because="max_iterations", run_id="t",
+            baseline=baseline,
+            history=[],
+            best=None,
+            stopped_because="max_iterations",
+            run_id="t",
         )
 
     # run() imports these lazily — patch at the source modules.
@@ -529,8 +554,19 @@ def test_think_applies_to_the_coder_only(tmp_path: Path, monkeypatch: pytest.Mon
 
     result = runner.invoke(
         app,
-        ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
-         "--code", "--think", "--memory", str(tmp_path / "m.db")],
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--code",
+            "--think",
+            "--memory",
+            str(tmp_path / "m.db"),
+        ],
     )
     assert result.exit_code == 0, result.stdout
     # the supervisor must NEVER think (single-tool-call role); only the coder does
@@ -550,8 +586,18 @@ def test_without_think_both_agents_share_one_no_think_client(
 
     result = runner.invoke(
         app,
-        ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
-         "--code", "--memory", str(tmp_path / "m.db")],
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--code",
+            "--memory",
+            str(tmp_path / "m.db"),
+        ],
     )
     assert result.exit_code == 0, result.stdout
     assert captured["coder_client"] is captured["supervisor_client"]  # same instance
@@ -571,8 +617,20 @@ def test_each_iteration_notebook_is_saved_the_moment_it_finishes(
     try:
         result = runner.invoke(
             app,
-            ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
-             "--code", "--notebooks", "all", "--memory", str(tmp_path / "m.db")],
+            [
+                "run",
+                "--data",
+                str(data),
+                "--target",
+                "churn",
+                "--metric",
+                "f1",
+                "--code",
+                "--notebooks",
+                "all",
+                "--memory",
+                str(tmp_path / "m.db"),
+            ],
         )
     finally:
         get_settings.cache_clear()
@@ -606,3 +664,119 @@ def test_research_is_on_by_default_and_can_be_turned_off(
     )
     assert result.exit_code == 0, result.stdout
     assert captured["researcher"] is None
+
+
+# ─── one input we split, or two the user split ────────────────────────────
+
+
+def _two_csvs(tmp_path: Path) -> tuple[Path, Path]:
+    frame = pd.DataFrame({"f1": range(40), "y": [i % 2 for i in range(40)]})
+    train, holdout = tmp_path / "train.csv", tmp_path / "holdout.csv"
+    frame.to_csv(train, index=False)
+    frame.to_csv(holdout, index=False)
+    return train, holdout
+
+
+def _plain(output: str) -> str:
+    """Typer draws the error inside a wrapped box; read it back as one line."""
+    stripped = "".join(ch for ch in output if ch not in "│╭╰─╮╯")
+    return " ".join(stripped.split())
+
+
+def test_run_needs_data_or_both_of_train_and_holdout(tmp_path: Path) -> None:
+    train, _ = _two_csvs(tmp_path)
+    result = runner.invoke(app, ["run", "--target", "y"])
+    assert result.exit_code != 0
+    assert "both --train and --holdout" in _plain(result.output)
+    result = runner.invoke(app, ["run", "--train", str(train), "--target", "y"])
+    assert result.exit_code != 0
+    assert "both --train and --holdout" in _plain(result.output)
+
+
+def test_run_refuses_data_together_with_a_users_split(tmp_path: Path) -> None:
+    train, holdout = _two_csvs(tmp_path)
+    result = runner.invoke(
+        app, ["run", "--data", str(train), "--holdout", str(holdout), "--target", "y"]
+    )
+    assert result.exit_code != 0
+    assert "one form, not both" in _plain(result.output)
+
+
+def test_the_same_file_for_train_and_holdout_is_refused(tmp_path: Path) -> None:
+    train, _ = _two_csvs(tmp_path)
+    result = runner.invoke(
+        app, ["run", "--train", str(train), "--holdout", str(train), "--target", "y"]
+    )
+    assert result.exit_code != 0
+    assert "the same file" in _plain(result.output)
+
+
+def test_a_users_split_is_refused_on_the_spec_lane(tmp_path: Path) -> None:
+    train, holdout = _two_csvs(tmp_path)
+    result = runner.invoke(
+        app,
+        ["run", "--train", str(train), "--holdout", str(holdout), "--target", "y", "--spec"],
+    )
+    assert result.exit_code != 0
+    assert "fast lane" in _plain(result.output)
+
+
+def test_a_users_split_reaches_the_loop_unsplit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    train, holdout = _two_csvs(tmp_path)
+    frame = pd.DataFrame({"f1": range(100, 112), "y": [i % 2 for i in range(12)]})
+    frame.to_csv(holdout, index=False)
+    captured = _stub_run_supervised(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--train",
+            str(train),
+            "--holdout",
+            str(holdout),
+            "--target",
+            "y",
+            "--metric",
+            "f1",
+            "--code",
+            "--memory",
+            str(tmp_path / "m.db"),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    dataset = captured["dataset"]
+    assert dataset.user_split is True
+    assert (dataset.n_train, dataset.n_test) == (40, 12)
+    assert sorted(dataset.test_features["f1"]) == list(range(100, 112))
+    assert "your split: 40 train rows, 12 holdout rows" in _plain(result.output)
+
+
+def test_an_explicit_metric_names_the_task_for_the_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "ratings.csv"
+    pd.DataFrame({"f1": range(60), "rating": [1 + i % 5 for i in range(60)]}).to_csv(
+        data, index=False
+    )
+    captured = _stub_run_supervised(monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "rating",
+            "--metric",
+            "rmse",
+            "--code",
+            "--memory",
+            str(tmp_path / "m.db"),
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert captured["dataset"].task == "regression"
+    assert "read as" not in _plain(result.output)  # nothing guessed, nothing announced

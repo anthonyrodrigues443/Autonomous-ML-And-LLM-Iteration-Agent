@@ -47,16 +47,8 @@ class RunSetup:
 
 
 def target_task(dataset: TabularDataset) -> str:
-    """classification or regression, from the target column alone. No LLM.
-
-    DELEGATES to the loader's own heuristic rather than reimplementing one. The
-    loader already decides this to choose whether to stratify the split, and two
-    definitions of "is this classification" would eventually disagree — which is
-    exactly how a metric gets picked for a task the data was never split for.
-    """
-    from iterate.adapters.data.tabular import looks_like_classification
-
-    return "classification" if looks_like_classification(dataset.train_target) else "regression"
+    """classification or regression, as the loader decided it. One definition only."""
+    return dataset.task
 
 
 def _n_classes(target: Any) -> int:
