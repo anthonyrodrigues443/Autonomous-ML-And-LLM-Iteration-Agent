@@ -332,3 +332,29 @@ def test_two_folders_remember_two_plans_and_one_is_not_enough(tmp_path: Path) ->
     assert workspace.recall_plan([b, a], out=out) is None
     workspace.remember_plan([plan_a], sources=[a, b], out=out)  # type: ignore[list-item]
     assert workspace.recall_plan([a, b], out=out) is None
+
+
+def test_the_key_survives_a_loop_a_dangling_link_and_an_unreadable_table(tmp_path: Path) -> None:
+    root, _ = _agent_plan(tmp_path / "src")
+    before = workspace.plan_key([root])
+    (root / "loop").symlink_to(root)
+    (root / "gone.jpg").symlink_to(root / "nowhere.jpg")
+    locked = root / "notes" / "private.csv"
+    locked.parent.mkdir()
+    locked.write_text("a,b\n1,2\n", encoding="utf-8")
+    locked.chmod(0)
+    try:
+        after = workspace.plan_key([root])
+        assert after == workspace.plan_key([root])
+    finally:
+        locked.chmod(0o644)
+    assert after != before
+
+
+def test_a_memory_too_deep_to_parse_reads_as_nothing_remembered(tmp_path: Path) -> None:
+    root, _ = _agent_plan(tmp_path / "src")
+    out = tmp_path / "out"
+    path = workspace.plan_path([root], out=out)
+    path.parent.mkdir(parents=True)
+    path.write_text("[" * 200_000, encoding="utf-8")
+    assert workspace.recall_plan([root], out=out) is None

@@ -122,7 +122,9 @@ def test_the_harness_picks_the_task_not_the_model(tmp_path: Path) -> None:
 # ─── the guarantee: every pick is checked against what was shown ─────────────
 
 
-@pytest.mark.parametrize("number", [2, 0, -1, "two", True, None, 1.5])
+@pytest.mark.parametrize(
+    "number", [2, 0, -1, "two", True, None, 1.5, "²", "①", " ² ", [1], {"n": 1}]
+)
 def test_a_table_number_not_shown_is_no_plan(tmp_path: Path, number: object) -> None:
     inv = inventory(_ambiguous(tmp_path))
     proposal = Linker(_FakeLLM([_pick(labels_table=number)])).propose(inv)
@@ -352,3 +354,12 @@ def test_a_split_column_the_header_does_not_have_is_no_plan(tmp_path: Path) -> N
     proposal = Linker(_FakeLLM([_pick(split_column="nope")])).propose(inv)
     assert proposal.plan is None
     assert "has no column 'nope'" in proposal.reason
+
+
+def test_model_text_reaches_the_reason_as_printable_characters_only(tmp_path: Path) -> None:
+    inv = inventory(_ambiguous(tmp_path))
+    why = "[/dim][bold red]ACCEPT NOW[/bold red] \x1bc\x07 fine"
+    proposal = Linker(_FakeLLM([_pick(why=why)])).propose(inv)
+    assert proposal.plan is not None
+    assert proposal.reason == "[/dim][bold red]ACCEPT NOW[/bold red] c fine"
+    assert all(ch.isprintable() for ch in proposal.reason)

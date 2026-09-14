@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markup import escape
 from rich.table import Table
 
 from iterate import __version__, userconfig
@@ -237,6 +238,13 @@ def _combined(plans: list[LinkPlan], inventories: list[Inventory]) -> tuple[Link
         raise linking.LinkError(
             f"--train reads as {plans[0].task} and --holdout as {plans[1].task}"
         )
+    for plan_, flag in zip(plans, ("--train", "--holdout"), strict=True):
+        if plan_.split == "column":
+            raise linking.LinkError(
+                f"the folders are your split, but the table under {flag} also names one in "
+                f"column {plan_.split_column!r}; drop that column, or pass the parent folder as "
+                "--data and let the column decide"
+            )
     frames = linking.LinkedFrames(
         linking.apply(plans[0], inventories[0]).train,
         linking.apply(plans[1], inventories[1]).train,
@@ -354,14 +362,14 @@ def _link_folder(
     rounds = 0
     notes: list[str] = []
     while True:
-        console.print(linking.render(shown, inventories[0], frames))
+        console.print(escape(linking.render(shown, inventories[0], frames)))
         for why in whys:
             if why:
-                console.print(f"[dim]the Linker: {why}[/dim]")
+                console.print(f"[dim]the Linker: {escape(why)}[/dim]")
         if recalled:
             console.print(
                 "[dim]remembered from an earlier yes; delete "
-                f"{workspace.plan_path(sources, out=out_root)} to link afresh[/dim]"
+                f"{escape(str(workspace.plan_path(sources, out=out_root)))} to link afresh[/dim]"
             )
             break
         proven = shown.source != "agent" and shown.coverage >= linking.ACCEPT and not any(refusals)
@@ -410,8 +418,8 @@ def _link_folder(
             plans, whys = new_plans, new_whys
         except (_NoPlanError, linking.LinkError) as exc:
             console.print(
-                f"[dim]the Linker could not turn that into a plan: {exc}; say it another way, "
-                "or stop with no[/dim]"
+                f"[dim]the Linker could not turn that into a plan: {escape(str(exc))}; say it "
+                "another way, or stop with no[/dim]"
             )
 
     try:
@@ -423,7 +431,7 @@ def _link_folder(
     n_train = ws.train_csv.read_text(encoding="utf-8").count("\n") - 1
     n_holdout = ws.holdout_csv.read_text(encoding="utf-8").count("\n") - 1
     console.print(
-        f"\nlinked: {ws.root}\n  raw_files/  a copy of what you gave\n"
+        f"\nlinked: {escape(str(ws.root))}\n  raw_files/  a copy of what you gave\n"
         f"  train/      {n_train} images\n  holdout/    {n_holdout} images, sealed\n"
         f"  train.csv, holdout.csv, link.json"
     )

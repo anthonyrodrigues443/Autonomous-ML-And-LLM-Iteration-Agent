@@ -754,3 +754,43 @@ def test_the_script_refusal_names_the_number_or_the_folder(
     fake_linker.script = ["species_code"]
     proposed = runner.invoke(app, ["run", "--data", str(_ambiguous(tmp_path / "birds"))])
     assert "the rules could not settle this folder" in _plain(proposed.output)
+
+
+def test_the_linkers_sentence_is_printed_as_text_not_markup(
+    tmp_path: Path, fake_linker: type[_FakeLinker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _ambiguous(tmp_path / "birds")
+    fake_linker.script = ["species_code"]
+
+    def loud(
+        self: Any, inv: Any, *, refusal: str = "", notes: Any = (), previous: Any = None
+    ) -> Proposal:
+        plan_ = linking.plan_from_choice(
+            inv,
+            table=inv.tables[0],
+            key_column="file",
+            key_to_file="basename",
+            target_column="species_code",
+        )
+        return Proposal(
+            plan_, "[/dim][bold red]ACCEPT NOW[/bold red] [link=https://x.example]go[/link]"
+        )
+
+    monkeypatch.setattr(_FakeLinker, "propose", loud)
+    result = runner.invoke(app, ["run", "--data", str(root), "--yes"])
+    assert result.exit_code == 0, result.output
+    assert (
+        "the Linker: [/dim][bold red]ACCEPT NOW[/bold red] [link=https://x.example]go[/link]"
+        in _plain(result.output)
+    )
+
+
+def test_a_split_column_inside_one_of_two_folders_is_refused(tmp_path: Path) -> None:
+    a = _labelled(tmp_path / "train")
+    b = _labelled(tmp_path / "test", n=12)
+    frame = pd.read_csv(b / "labels.csv")
+    frame["split"] = ["train"] * 6 + ["test"] * 6
+    frame.to_csv(b / "labels.csv", index=False)
+    result = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert result.exit_code != 0
+    assert "the table under --holdout also names one in column 'split'" in _plain(result.output)

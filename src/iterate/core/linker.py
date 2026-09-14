@@ -59,8 +59,11 @@ class Listing:
         a number that is not a position in the list it was shown names nothing."""
         if isinstance(index, bool):
             return None
-        if isinstance(index, str) and index.strip().isdigit():
-            index = int(index.strip())
+        if isinstance(index, str) and index.strip().isdecimal():
+            try:
+                index = int(index.strip())
+            except ValueError:
+                return None
         if not isinstance(index, int):
             return None
         return self.tables[index - 1] if 1 <= index <= len(self.tables) else None
@@ -240,7 +243,11 @@ PROPOSE_LINK = _tool()
 
 
 def _text(value: object) -> str:
-    return "" if value is None else str(value).strip()
+    """Model text as plain printable characters: no control bytes reach a message
+    or the terminal."""
+    if value is None:
+        return ""
+    return "".join(ch for ch in str(value) if ch.isprintable()).strip()
 
 
 class Linker:

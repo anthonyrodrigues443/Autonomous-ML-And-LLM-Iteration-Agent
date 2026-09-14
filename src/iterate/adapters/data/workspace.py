@@ -30,7 +30,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from iterate.adapters.data.linking import SKIP_DIRS, TABLE_SUFFIXES, LinkedFrames, LinkError
+from iterate.adapters.data.linking import (
+    LINK_VERSION,
+    MAX_DEPTH,
+    SKIP_DIRS,
+    TABLE_SUFFIXES,
+    LinkedFrames,
+    LinkError,
+)
 from iterate.adapters.data.tabular import DEFAULT_SEED, DEFAULT_TEST_SIZE, split_frame
 from iterate.schemas.link import LinkPlan
 
@@ -57,11 +64,23 @@ def _ignore(directory: str, names: list[str]) -> set[str]:
 
 
 def _files_under(source: Path) -> list[Path]:
-    """Every visible file, following symlinked folders the way the inventory does."""
+    """Every visible file to the inventory's depth, following symlinked folders once
+    each, so a link back up the tree ends the walk instead of looping."""
     out: list[Path] = []
+    seen = {os.path.realpath(source)}
     for directory, dirs, files in os.walk(source, followlinks=True):
-        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS)
         base = Path(directory)
+        depth = len(base.relative_to(source).parts)
+        kept = []
+        for d in sorted(dirs):
+            if d.startswith(".") or d in SKIP_DIRS or depth >= MAX_DEPTH:
+                continue
+            real = os.path.realpath(base / d)
+            if real in seen:
+                continue
+            seen.add(real)
+            kept.append(d)
+        dirs[:] = kept
         out.extend(base / f for f in sorted(files) if not f.startswith("."))
     return out
 
@@ -212,16 +231,28 @@ def write(
 # ─── the plans a person said yes to ───────────────────────────────────────
 
 
+def _feed(digest: hashlib._Hash, part: bytes) -> None:
+    digest.update(f"{len(part)}:".encode())
+    digest.update(part)
+
+
 def plan_key(sources: list[Path]) -> str:
     """Stable per source folders as the link sees them: every file's path and size,
-    and every table's bytes, so an edited label file is a different key."""
+    every table's bytes, and the ladder's version, so an edited label file or a
+    new rule is a different key. A file that cannot be read is part of the key,
+    not a reason to stop."""
     digest = hashlib.sha256()
+    _feed(digest, LINK_VERSION.encode())
     for source in (s.resolve() for s in sources):
-        digest.update(str(source).encode())
+        _feed(digest, str(source).encode())
         for p in _files_under(source):
-            digest.update(f"{p.relative_to(source).as_posix()}:{p.stat().st_size}".encode())
-            if p.suffix.lower() in TABLE_SUFFIXES:
-                digest.update(p.read_bytes())
+            rel = p.relative_to(source).as_posix()
+            try:
+                _feed(digest, f"{rel}:{p.stat().st_size}".encode())
+                if p.suffix.lower() in TABLE_SUFFIXES:
+                    _feed(digest, p.read_bytes())
+            except OSError:
+                _feed(digest, f"{rel}:unreadable".encode())
     return f"{sources[0].name}-{digest.hexdigest()[:12]}"
 
 
@@ -256,7 +287,7 @@ def recall_plan(sources: list[Path], *, out: Path) -> list[LinkPlan] | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         plans = [LinkPlan.model_validate(p) for p in data["plans"]]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
         return None
     return plans if len(plans) == len(sources) else None
 

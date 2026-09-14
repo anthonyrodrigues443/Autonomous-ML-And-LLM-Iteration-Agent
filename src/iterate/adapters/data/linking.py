@@ -93,6 +93,7 @@ HOW: dict[KeyMethod, str] = {
 ACCEPT = 0.98
 PAUSE = 0.90
 MAX_DEPTH = 6
+LINK_VERSION = "1"  # bump when a rung or a check changes, so remembered plans are looked at again
 
 
 class LinkError(ValueError):
@@ -799,6 +800,8 @@ __all__ = [
     "HOW",
     "IMAGE_SUFFIXES",
     "KEY_METHODS",
+    "LINK_VERSION",
+    "MAX_DEPTH",
     "PAUSE",
     "SKIP_DIRS",
     "TABLE_SUFFIXES",
