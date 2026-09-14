@@ -266,3 +266,95 @@ def test_a_stale_file_in_a_slot_is_refused_not_reused(tmp_path: Path) -> None:
     _png(slot / "cat_0.png", 12345)  # a different image already sits where cat_0 goes
     with pytest.raises(LinkError, match="already holds a different file"):
         workspace.write(p, frames, sources=[root], out=tmp_path / "out")
+
+
+# ─── the plans a person said yes to ───────────────────────────────────────
+
+
+def _agent_plan(root: Path) -> tuple[Path, object]:
+    for i in range(12):
+        _png(root / "img" / f"{i}.jpg", i)
+    pd.DataFrame(
+        {"file": [f"{i}.jpg" for i in range(12)], "region": ["n", "s"] * 6, "code": ["x", "y"] * 6}
+    ).to_csv(root / "meta.csv", index=False)
+    from iterate.adapters.data.linking import plan_from_choice
+
+    plan_ = plan_from_choice(
+        inventory(root),
+        table=root / "meta.csv",
+        key_column="file",
+        key_to_file="basename",
+        target_column="code",
+        source="agent",
+    )
+    return root, plan_
+
+
+def test_an_accepted_plan_is_remembered_by_the_folders_contents(tmp_path: Path) -> None:
+    root, plan_ = _agent_plan(tmp_path / "src")
+    out = tmp_path / "out"
+    assert workspace.recall_plan([root], out=out) is None
+    path = workspace.remember_plan([plan_], sources=[root], out=out)  # type: ignore[list-item]
+    assert path.parent == out / "plans"
+    assert path.name.startswith("src-")
+    assert workspace.recall_plan([root], out=out) == [plan_]
+
+    frame = pd.read_csv(root / "meta.csv")
+    frame["code"] = ["y", "x"] * 6  # same length, different labels
+    frame.to_csv(root / "meta.csv", index=False)
+    assert workspace.recall_plan([root], out=out) is None
+
+    frame["code"] = ["x", "y"] * 6
+    frame.to_csv(root / "meta.csv", index=False)
+    assert workspace.recall_plan([root], out=out) == [plan_]
+    workspace.forget_plan([root], out=out)
+    assert workspace.recall_plan([root], out=out) is None
+    workspace.forget_plan([root], out=out)  # nothing there is fine
+
+
+def test_a_broken_memory_reads_as_nothing_remembered(tmp_path: Path) -> None:
+    root, _ = _agent_plan(tmp_path / "src")
+    out = tmp_path / "out"
+    path = workspace.plan_path([root], out=out)
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert workspace.recall_plan([root], out=out) is None
+    path.write_text(json.dumps({"plans": [{"shape": "table_join"}]}), encoding="utf-8")
+    assert workspace.recall_plan([root], out=out) is None
+
+
+def test_two_folders_remember_two_plans_and_one_is_not_enough(tmp_path: Path) -> None:
+    a, plan_a = _agent_plan(tmp_path / "train")
+    b, plan_b = _agent_plan(tmp_path / "test")
+    out = tmp_path / "out"
+    workspace.remember_plan([plan_a, plan_b], sources=[a, b], out=out)  # type: ignore[list-item]
+    assert workspace.recall_plan([a, b], out=out) == [plan_a, plan_b]
+    assert workspace.recall_plan([b, a], out=out) is None
+    workspace.remember_plan([plan_a], sources=[a, b], out=out)  # type: ignore[list-item]
+    assert workspace.recall_plan([a, b], out=out) is None
+
+
+def test_the_key_survives_a_loop_a_dangling_link_and_an_unreadable_table(tmp_path: Path) -> None:
+    root, _ = _agent_plan(tmp_path / "src")
+    before = workspace.plan_key([root])
+    (root / "loop").symlink_to(root)
+    (root / "gone.jpg").symlink_to(root / "nowhere.jpg")
+    locked = root / "notes" / "private.csv"
+    locked.parent.mkdir()
+    locked.write_text("a,b\n1,2\n", encoding="utf-8")
+    locked.chmod(0)
+    try:
+        after = workspace.plan_key([root])
+        assert after == workspace.plan_key([root])
+    finally:
+        locked.chmod(0o644)
+    assert after != before
+
+
+def test_a_memory_too_deep_to_parse_reads_as_nothing_remembered(tmp_path: Path) -> None:
+    root, _ = _agent_plan(tmp_path / "src")
+    out = tmp_path / "out"
+    path = workspace.plan_path([root], out=out)
+    path.parent.mkdir(parents=True)
+    path.write_text("[" * 200_000, encoding="utf-8")
+    assert workspace.recall_plan([root], out=out) is None

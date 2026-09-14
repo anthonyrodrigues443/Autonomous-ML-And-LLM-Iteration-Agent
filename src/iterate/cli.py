@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markup import escape
 from rich.table import Table
 
 from iterate import __version__, userconfig
@@ -34,10 +35,15 @@ from iterate.config import get_settings
 # sklearn+pandas import cost on every invocation.
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from iterate.adapters.data.linking import Inventory, LinkedFrames
     from iterate.core.interactive import RunController
+    from iterate.core.linker import Linker
     from iterate.core.memory import Memory
     from iterate.core.orchestrator import RunResult
     from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult
+    from iterate.schemas.link import LinkPlan
     from iterate.targets.model import ModelTarget
 
 app = typer.Typer(
@@ -123,6 +129,170 @@ def setup() -> None:
     console.print(f"\n[green]saved[/green] → {path}")
 
 
+class _NoPlanError(Exception):
+    """A correction the Linker could not turn into a plan; the message says why."""
+
+
+def _transfer(hint: LinkPlan, inv: Inventory) -> LinkPlan | None:
+    """The other folder's choice tried on this one: the table with the same name, or
+    the only table, read with the same columns. Measured like any plan; None if it
+    does not hold here."""
+    from iterate.adapters.data import linking
+
+    if hint.shape == "class_folders" or not (hint.labels_file and hint.target_column):
+        return None
+    name = Path(hint.labels_file).name
+    table = next((t for t in inv.tables if t.name == name), None)
+    if table is None and len(inv.tables) == 1:
+        table = inv.tables[0]
+    if table is None:
+        return None
+    try:
+        moved = linking.plan_from_choice(
+            inv,
+            table=table,
+            key_column=str(hint.key_column),
+            key_to_file=str(hint.key_to_file),
+            target_column=hint.target_column,
+            split_column=hint.split_column,
+            source=hint.source,
+        )
+    except linking.LinkError:
+        return None
+    note = f"columns taken from the other folder's {name}"
+    return moved.model_copy(update={"notes": [*moved.notes, note]})
+
+
+def _side(
+    inv: Inventory,
+    *,
+    labels: Path | None,
+    key: str | None,
+    target: str | None,
+    linker: Callable[[], Linker],
+    hint: LinkPlan | None,
+) -> tuple[LinkPlan, str | None, str]:
+    """One folder's first plan: rules, then the other folder's choice, then the
+    Linker, and only on a refusal a choice would settle. Returns the plan, the
+    Linker's sentence when it spoke, and the rules' refusal when they did."""
+    from iterate.adapters.data import linking
+
+    try:
+        return linking.plan(inv, labels=labels, key=key, target=target), None, ""
+    except linking.LinkError as exc:
+        if not exc.ambiguous or labels is not None:
+            raise typer.BadParameter(str(exc)) from exc
+        refusal = str(exc)
+    if hint is not None:
+        moved = _transfer(hint, inv)
+        if moved is not None:
+            return moved, None, refusal
+    proposal = linker().propose(inv, refusal=refusal, previous=hint)
+    if proposal.plan is None:
+        raise typer.BadParameter(
+            f"{refusal}\nthe Linker could not settle it either: {proposal.reason}"
+        )
+    return proposal.plan, proposal.reason, refusal
+
+
+def _corrected(
+    inventories: list[Inventory],
+    plans: list[LinkPlan],
+    refusals: list[str],
+    *,
+    notes: list[str],
+    linker: Callable[[], Linker],
+) -> tuple[list[LinkPlan], list[str | None]]:
+    """The plans after a correction. Only a folder the rules refused is the model's to
+    change: the first such folder gets the note; a second one takes that choice when
+    it holds there, or gets its own proposal with the same note."""
+    out = list(plans)
+    whys: list[str | None] = [None] * len(plans)
+    changed_first = False
+    for i, (inv, refusal) in enumerate(zip(inventories, refusals, strict=True)):
+        if not refusal:
+            continue
+        follows_first = i == 1 and changed_first
+        if follows_first:
+            moved = _transfer(out[0], inv)
+            if moved is not None:
+                out[i] = moved
+                continue
+        hint = out[0] if follows_first else plans[i]
+        proposal = linker().propose(inv, refusal=refusal, notes=notes, previous=hint)
+        if proposal.plan is None:
+            raise _NoPlanError(proposal.reason)
+        out[i], whys[i] = proposal.plan, proposal.reason
+        changed_first = changed_first or i == 0
+    return out, whys
+
+
+def _combined(plans: list[LinkPlan], inventories: list[Inventory]) -> tuple[LinkedFrames, LinkPlan]:
+    """The frames the plans build, and the one plan shown for them: for two folders
+    the first plan carrying the user's split and the lower coverage."""
+    from iterate.adapters.data import linking
+
+    if len(plans) == 1:
+        return linking.apply(plans[0], inventories[0]), plans[0]
+    if plans[0].task != plans[1].task:
+        raise linking.LinkError(
+            f"--train reads as {plans[0].task} and --holdout as {plans[1].task}"
+        )
+    for plan_, flag in zip(plans, ("--train", "--holdout"), strict=True):
+        if plan_.split == "column":
+            raise linking.LinkError(
+                f"the folders are your split, but the table under {flag} also names one in "
+                f"column {plan_.split_column!r}; drop that column, or pass the parent folder as "
+                "--data and let the column decide"
+            )
+    frames = linking.LinkedFrames(
+        linking.apply(plans[0], inventories[0]).train,
+        linking.apply(plans[1], inventories[1]).train,
+    )
+    notes = [*plans[0].notes, *(n for n in plans[1].notes if n not in plans[0].notes)]
+    shown = plans[0].model_copy(
+        update={
+            "split": "folders",
+            "coverage": min(p.coverage for p in plans),
+            "source": "agent" if any(p.source == "agent" for p in plans) else plans[0].source,
+            "notes": notes,
+        }
+    )
+    return frames, shown
+
+
+def _revalidated(remembered: list[LinkPlan], inventories: list[Inventory]) -> list[LinkPlan] | None:
+    """Remembered plans measured again on the folder as it is now; None if any no
+    longer holds, so a stale memory can never skip the rules."""
+    from iterate.adapters.data import linking
+
+    out: list[LinkPlan] = []
+    for plan_, inv in zip(remembered, inventories, strict=True):
+        try:
+            if plan_.source != "agent":
+                fresh = linking.plan(inv)
+                if fresh != plan_:
+                    return None
+                out.append(fresh)
+                continue
+            if not (plan_.labels_file and plan_.target_column):
+                return None
+            out.append(
+                linking.plan_from_choice(
+                    inv,
+                    table=Path(plan_.labels_file),
+                    key_column=str(plan_.key_column),
+                    key_to_file=str(plan_.key_to_file),
+                    target_column=plan_.target_column,
+                    split_column=plan_.split_column,
+                    source=plan_.source,
+                )
+            )
+        except linking.LinkError:
+            return None
+    return out
+
+
 def _link_folder(
     *,
     data: Path | None,
@@ -132,10 +302,15 @@ def _link_folder(
     key: str | None,
     target: str | None,
     yes: bool,
+    make_linker: Callable[[], Linker],
 ) -> Any:
-    """Link a folder of images to its labels by rules, show what was found, pause when
-    the coverage is not full, and write the canonical folder. Returns the workspace."""
+    """Link a folder of images to its labels before the run: rules first, a plan
+    remembered from an earlier yes, the Linker where the rules could only say "one
+    of these", then the block a person reads. The pause is a conversation: yes, no,
+    or what to change in plain English, `MAX_ROUNDS` corrections at most. Nothing
+    the Linker says is shown before it was measured. Returns the workspace."""
     from iterate.adapters.data import linking, workspace
+    from iterate.core.linker import MAX_ROUNDS
 
     if (key or target) and labels is None:
         raise typer.BadParameter("--key and --target describe --labels; pass --labels too")
@@ -144,52 +319,119 @@ def _link_folder(
             "--labels goes with --data: put both folders under one folder as train/ and "
             "test/ with the table beside them, or give each folder its own table"
         )
-    try:
-        if data is not None:
-            inv = linking.inventory(data)
-            plan = linking.plan(inv, labels=labels, key=key, target=target)
-            frames = linking.apply(plan, inv)
-            sources = [data]
-        else:
-            assert train is not None  # validated by the caller
-            assert holdout is not None
-            inv = linking.inventory(train)
-            inv_holdout = linking.inventory(holdout)
-            plan = linking.plan(inv, labels=labels, key=key, target=target)
-            plan_holdout = linking.plan(inv_holdout, labels=labels, key=key, target=target)
-            if plan_holdout.task != plan.task:
-                raise linking.LinkError(
-                    f"--train reads as {plan.task} and --holdout as {plan_holdout.task}"
-                )
-            frames = linking.LinkedFrames(
-                linking.apply(plan, inv).train, linking.apply(plan_holdout, inv_holdout).train
-            )
-            plan = plan.model_copy(
-                update={"split": "folders", "coverage": min(plan.coverage, plan_holdout.coverage)}
-            )
-            sources = [train, holdout]
-    except linking.LinkError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-
-    console.print(linking.render(plan, inv, frames))
-    if plan.coverage < linking.ACCEPT and not yes:
-        if not _stdin_owns_tty():
-            raise typer.BadParameter(
-                f"coverage is {plan.coverage:.1%}, under {linking.ACCEPT:.0%}; re-run with --yes "
-                "to accept it, or fix the link with --labels, --key and --target"
-            )
-        if not typer.confirm("Continue with this plan?", default=False):
-            raise typer.Exit(code=1)
-
+    sources = [data] if data is not None else [cast("Path", train), cast("Path", holdout)]
     out_root = Path(get_settings().iterate_runs_dir).parent / "data"
+    built: list[Linker] = []
+
+    def linker() -> Linker:
+        if not built:
+            built.append(make_linker())
+        return built[0]
+
     try:
-        ws = workspace.write(plan, frames, sources=sources, out=out_root)
+        inventories = [linking.inventory(s) for s in sources]
     except linking.LinkError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+    remembered = None if labels is not None else workspace.recall_plan(sources, out=out_root)
+    plans = _revalidated(remembered, inventories) if remembered else None
+    recalled = plans is not None
+    whys: list[str | None] = []
+    refusals: list[str] = []
+    if plans is None:
+        if remembered:
+            workspace.forget_plan(sources, out=out_root)
+        plans = []
+        for inv in inventories:
+            plan_, why, refusal = _side(
+                inv,
+                labels=labels,
+                key=key,
+                target=target,
+                linker=linker,
+                hint=plans[0] if plans else None,
+            )
+            plans.append(plan_)
+            whys.append(why)
+            refusals.append(refusal)
+    try:
+        frames, shown = _combined(plans, inventories)
+    except linking.LinkError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    rounds = 0
+    notes: list[str] = []
+    while True:
+        console.print(escape(linking.render(shown, inventories[0], frames)))
+        for why in whys:
+            if why:
+                console.print(f"[dim]the Linker: {escape(why)}[/dim]")
+        if recalled:
+            console.print(
+                "[dim]remembered from an earlier yes; delete "
+                f"{escape(str(workspace.plan_path(sources, out=out_root)))} to link afresh[/dim]"
+            )
+            break
+        proven = shown.source != "agent" and shown.coverage >= linking.ACCEPT and not any(refusals)
+        if yes or proven:
+            break
+        if not _stdin_owns_tty():
+            why_ask = (
+                "the rules could not settle this folder, so the plan shown was proposed for it"
+                if any(refusals)
+                else f"coverage is {shown.coverage:.1%}, under {linking.ACCEPT:.0%}"
+            )
+            raise typer.BadParameter(
+                f"{why_ask}; re-run with --yes to accept it, or settle it with --labels, --key "
+                "and --target"
+            )
+        answer = ""
+        while not answer:
+            answer = typer.prompt(
+                "yes to continue, no to stop, or say what to change", default="", show_default=False
+            ).strip()
+        word = answer.lower().rstrip(" .!")
+        if word in ("y", "yes"):
+            break
+        if word in ("n", "no"):
+            raise typer.Exit(code=1)
+        if not any(refusals):
+            # The rules proved every folder here; a change of mind is a job for the flags,
+            # not for the model.
+            console.print(
+                "[dim]this plan came from the rules; answer yes or no, or settle it with "
+                "--labels, --key and --target[/dim]"
+            )
+            continue
+        if rounds >= MAX_ROUNDS:
+            raise typer.BadParameter(
+                f"{MAX_ROUNDS} corrections and no plan you accepted; settle it with --labels, "
+                "--key and --target"
+            )
+        rounds += 1
+        notes.append(answer)
+        try:
+            new_plans, new_whys = _corrected(
+                inventories, plans, refusals, notes=notes, linker=linker
+            )
+            frames, shown = _combined(new_plans, inventories)
+            plans, whys = new_plans, new_whys
+        except (_NoPlanError, linking.LinkError) as exc:
+            console.print(
+                f"[dim]the Linker could not turn that into a plan: {escape(str(exc))}; say it "
+                "another way, or stop with no[/dim]"
+            )
+
+    try:
+        ws = workspace.write(shown, frames, sources=sources, out=out_root)
+    except linking.LinkError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if any(p.source == "agent" for p in plans) and not recalled:
+        workspace.remember_plan(plans, sources=sources, out=out_root)
     n_train = ws.train_csv.read_text(encoding="utf-8").count("\n") - 1
     n_holdout = ws.holdout_csv.read_text(encoding="utf-8").count("\n") - 1
     console.print(
-        f"\nlinked: {ws.root}\n  raw_files/  a copy of what you gave\n"
+        f"\nlinked: {escape(str(ws.root))}\n  raw_files/  a copy of what you gave\n"
         f"  train/      {n_train} images\n  holdout/    {n_holdout} images, sealed\n"
         f"  train.csv, holdout.csv, link.json"
     )
@@ -239,7 +481,8 @@ def run(
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Folders only: accept a link between 90% and 98% coverage without asking.",
+        help="Folders only: accept a link the rules could not fully prove, or one the "
+        "Linker proposed, without asking. Every such plan was measured first.",
     ),
     metric: str | None = typer.Option(
         None,
@@ -424,24 +667,15 @@ def run(
     if train is not None and holdout is not None and train.resolve() == holdout.resolve():
         raise typer.BadParameter("--train and --holdout are the same file")
 
-    # ─── A folder of images is linked first, by rules, and shown before anything runs ──
     given = [p for p in (data, train, holdout) if p is not None]
     folders = [p for p in given if p.is_dir()]
     if folders and len(folders) != len(given):
         raise typer.BadParameter("give folders for every input, or files for every input")
-    if folders:
-        ws = _link_folder(
-            data=data, train=train, holdout=holdout, labels=labels, key=key, target=target, yes=yes
-        )
-        console.print(
-            "[dim]the folder is ready; the vision target that runs on it lands later in "
-            f"v0.6, so this run stops here. Its CSVs: {ws.train_csv} and {ws.holdout_csv}[/dim]"
-        )
-        raise typer.Exit(code=0)
-    if target is None:
-        raise typer.BadParameter("--target is required for a CSV")
-    if labels is not None or key is not None or yes:
-        raise typer.BadParameter("--labels, --key and --yes describe a folder of images")
+    if not folders:
+        if target is None:
+            raise typer.BadParameter("--target is required for a CSV")
+        if labels is not None or key is not None or yes:
+            raise typer.BadParameter("--labels, --key and --yes describe a folder of images")
 
     # ─── First run with no saved config? Offer the setup wizard. ───────────
     if not userconfig.exists() and sys.stdin.isatty():
@@ -461,6 +695,46 @@ def run(
     if notebooks not in ("best", "all", "none"):
         raise typer.BadParameter(f"--notebooks must be best | all | none, got {notebooks!r}")
 
+    # ─── Cloud backend? API key required wherever a client is built. ───────
+    settings = get_settings()
+    if backend != "ollama":
+        api_key = api_key or cfg.get("api_key") or _resolved_api_key_from_env(settings, backend)
+
+    def _need_key() -> None:
+        if backend != "ollama" and not api_key:
+            raise typer.BadParameter(
+                f"backend {backend!r} requires --api-key or a corresponding env var "
+                f"(ITERATE_BACKEND_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / …)"
+            )
+
+    # ─── A folder of images is linked first and shown before anything runs ──
+    # Rules alone where they can prove it; the Linker only where they could not,
+    # so a rules-only folder never builds a client and needs no key.
+    if folders:
+        from iterate.core.linker import Linker
+
+        def _make_linker() -> Linker:
+            _need_key()
+            return Linker(build_client(backend, model=model, base_url=base_url, api_key=api_key))
+
+        ws = _link_folder(
+            data=data,
+            train=train,
+            holdout=holdout,
+            labels=labels,
+            key=key,
+            target=target,
+            yes=yes,
+            make_linker=_make_linker,
+        )
+        console.print(
+            "[dim]the folder is ready; the vision target that runs on it lands later in "
+            f"v0.6, so this run stops here. Its CSVs: {ws.train_csv} and {ws.holdout_csv}[/dim]"
+        )
+        raise typer.Exit(code=0)
+    assert target is not None  # a CSV run was checked above
+    _need_key()
+
     # ─── Validate ──────────────────────────────────────────────────────────
     if baseline is not None and source is None:
         raise typer.BadParameter("--baseline requires --source")
@@ -478,7 +752,6 @@ def run(
                 f"unknown average {average!r}; expected one of {list(AVERAGES)}"
             )
 
-    settings = get_settings()
     resolved_memory_path = memory_path or Path(settings.iterate_memory_db)
 
     # ─── New chapter? Archive the existing db. ─────────────────────────────
@@ -491,18 +764,6 @@ def run(
                 f"[dim]memory: archived [/dim]{resolved_memory_path}[dim] → "
                 f"[/dim]{archived.name}[dim]; starting fresh[/dim]"
             )
-
-    # ─── Cloud backend? API key required. ──────────────────────────────────
-    if backend != "ollama":
-        resolved_key = (
-            api_key or cfg.get("api_key") or _resolved_api_key_from_env(settings, backend)
-        )
-        if not resolved_key:
-            raise typer.BadParameter(
-                f"backend {backend!r} requires --api-key or a corresponding env var "
-                f"(ITERATE_BACKEND_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / …)"
-            )
-        api_key = resolved_key
 
     # ─── e2b compute? API key required. ────────────────────────────────────
     e2b_api_key = cfg.get("e2b_api_key") or settings.e2b_api_key

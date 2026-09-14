@@ -7,6 +7,9 @@
         train.csv         image (relative to this folder), label
         holdout.csv
         link.json         the plan that produced it
+    <out>/plans/<name>-<hash>.json
+                          a plan a person said yes to, keyed by the folder's contents,
+                          so the same data never goes through the Linker twice
 
 The train and holdout folders name the class in their paths on purpose: they are
 for people. The kernel never reads them; it gets the byte-named copies the image
@@ -15,22 +18,28 @@ adapter makes from the CSVs.
 
 from __future__ import annotations
 
+import contextlib
 import filecmp
 import hashlib
 import json
 import os
 import shutil
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pandas as pd
 
-from iterate.adapters.data.linking import SKIP_DIRS, LinkedFrames, LinkError
+from iterate.adapters.data.linking import (
+    LINK_VERSION,
+    MAX_DEPTH,
+    SKIP_DIRS,
+    TABLE_SUFFIXES,
+    LinkedFrames,
+    LinkError,
+)
 from iterate.adapters.data.tabular import DEFAULT_SEED, DEFAULT_TEST_SIZE, split_frame
-
-if TYPE_CHECKING:
-    from iterate.schemas.link import LinkPlan
+from iterate.schemas.link import LinkPlan
 
 RAW = "raw_files"
 TRAIN = "train"
@@ -38,6 +47,7 @@ HOLDOUT = "holdout"
 TRAIN_CSV = "train.csv"
 HOLDOUT_CSV = "holdout.csv"
 PLAN_JSON = "link.json"
+PLANS = "plans"
 ROLES = ("train", "holdout")
 
 
@@ -54,11 +64,23 @@ def _ignore(directory: str, names: list[str]) -> set[str]:
 
 
 def _files_under(source: Path) -> list[Path]:
-    """Every visible file, following symlinked folders the way the inventory does."""
+    """Every visible file to the inventory's depth, following symlinked folders once
+    each, so a link back up the tree ends the walk instead of looping."""
     out: list[Path] = []
+    seen = {os.path.realpath(source)}
     for directory, dirs, files in os.walk(source, followlinks=True):
-        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS)
         base = Path(directory)
+        depth = len(base.relative_to(source).parts)
+        kept = []
+        for d in sorted(dirs):
+            if d.startswith(".") or d in SKIP_DIRS or depth >= MAX_DEPTH:
+                continue
+            real = os.path.realpath(base / d)
+            if real in seen:
+                continue
+            seen.add(real)
+            kept.append(d)
+        dirs[:] = kept
         out.extend(base / f for f in sorted(files) if not f.startswith("."))
     return out
 
@@ -206,4 +228,85 @@ def write(
     return ws
 
 
-__all__ = ["HOLDOUT_CSV", "PLAN_JSON", "TRAIN_CSV", "Workspace", "workspace_name", "write"]
+# ─── the plans a person said yes to ───────────────────────────────────────
+
+
+def _feed(digest: hashlib._Hash, part: bytes) -> None:
+    digest.update(f"{len(part)}:".encode())
+    digest.update(part)
+
+
+def plan_key(sources: list[Path]) -> str:
+    """Stable per source folders as the link sees them: every file's path and size,
+    every table's bytes, and the ladder's version, so an edited label file or a
+    new rule is a different key. A file that cannot be read is part of the key,
+    not a reason to stop."""
+    digest = hashlib.sha256()
+    _feed(digest, LINK_VERSION.encode())
+    for source in (s.resolve() for s in sources):
+        _feed(digest, str(source).encode())
+        for p in _files_under(source):
+            rel = p.relative_to(source).as_posix()
+            try:
+                _feed(digest, f"{rel}:{p.stat().st_size}".encode())
+                if p.suffix.lower() in TABLE_SUFFIXES:
+                    _feed(digest, p.read_bytes())
+            except OSError:
+                _feed(digest, f"{rel}:unreadable".encode())
+    return f"{sources[0].name}-{digest.hexdigest()[:12]}"
+
+
+def plan_path(sources: list[Path], *, out: Path) -> Path:
+    return out.resolve() / PLANS / f"{plan_key(sources)}.json"
+
+
+def remember_plan(plans: list[LinkPlan], *, sources: list[Path], out: Path) -> Path:
+    """Keep the plans a person accepted, one per source folder."""
+    path = plan_path(sources, out=out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "sources": [str(s.resolve()) for s in sources],
+                "plans": [p.model_dump() for p in plans],
+                "accepted": datetime.now(UTC).isoformat(timespec="seconds"),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def recall_plan(sources: list[Path], *, out: Path) -> list[LinkPlan] | None:
+    """The plans accepted for these folders as they are now, or None. Anything that
+    does not read back as one plan per folder is treated as nothing remembered."""
+    path = plan_path(sources, out=out)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        plans = [LinkPlan.model_validate(p) for p in data["plans"]]
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        return None
+    return plans if len(plans) == len(sources) else None
+
+
+def forget_plan(sources: list[Path], *, out: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        plan_path(sources, out=out).unlink()
+
+
+__all__ = [
+    "HOLDOUT_CSV",
+    "PLAN_JSON",
+    "TRAIN_CSV",
+    "Workspace",
+    "forget_plan",
+    "plan_key",
+    "plan_path",
+    "recall_plan",
+    "remember_plan",
+    "workspace_name",
+    "write",
+]

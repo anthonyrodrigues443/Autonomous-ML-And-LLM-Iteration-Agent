@@ -1004,3 +1004,59 @@ reconstructor:
       rationale: >-
         Briefly state which parts of the source you drew from and why this is a
         faithful reconstruction (and what you approximated, if anything).
+
+linker:
+  # The Linker, the sixth specialist. It runs only where the rules ladder refused a
+  # folder for want of a choice (no rule fits, two tables tie, two key columns
+  # disagree, a label table no key resolves), never on a fault in the data. It is
+  # shown a capped listing with the join share the harness measured for every
+  # column, and answers ONE tool call that picks a table by NUMBER and columns by
+  # NAME. The harness rebuilds the frame from the picks and measures the coverage
+  # before anyone sees the plan; the task comes from the label values, never from
+  # the model. A person's correction in plain English comes back as a note.
+  system: |-
+    You link a folder of images to their labels. The rules that read folders could not settle this one, and the reason is given. You are shown the folder's layout, its tables numbered, and every column of every table with the share of rows the host could match to an image file when the column is read as a path, a file name, a file name without its extension, or a bare number. Those shares are measured; trust them over the column names.
+
+    Answer with ONE propose_link call that picks: the table holding the labels, by its NUMBER; the column that names each image, by its exact name; how that column names the file; the column holding the label, by its exact name; and, only when the table has one, the column whose values say train or test for each row.
+
+    The key column is one whose measured share is high; a column that matches few rows is not the key however it is named. The label column holds what a model should predict for each image: a class name, a code, or a number. It is never the key, never a file path, never a free-text description, and never a split marker. Do not choose the task, do not invent a column, and keep `why` to one sentence.
+
+    If the person running this left a correction, it wins over everything else in this message, including your own previous answer.
+
+  # Placeholders: {listing}, {refusal}, {previous}, {notes}
+  user_template: |-
+    Folder listing (computed by the host; the shares are measured):
+    {listing}
+
+    Why the rules stopped: {refusal}
+
+    Your previous answer: {previous}
+    Corrections from the person running this:
+    {notes}
+
+    Call propose_link now.
+
+  retry_nudge: "Respond ONLY with the propose_link tool call. No prose."
+
+  tool:
+    name: propose_link
+    description: "Say how the images in this folder link to their labels, by picking from the listing. Call it exactly once."
+    fields:
+      labels_table: >-
+        The NUMBER of the table that holds the labels, from the listing. Never a
+        file name.
+      key_column: >-
+        The exact name of the column that names each image.
+      key_to_file: >-
+        How the key names the file: path (a relative path with its extension),
+        basename (the file name with its extension), stem (the file name without
+        its extension), or stem_int (a bare number equal to the file name without
+        its extension and leading zeros).
+      target_column: >-
+        The exact name of the column holding the label to predict.
+      split_column: >-
+        Only when the table has a column whose values say train or test for each
+        row: its exact name. Leave it out otherwise.
+      why: >-
+        ONE sentence naming the measured share or the column meaning that drove
+        the choice. Shown to the person.
