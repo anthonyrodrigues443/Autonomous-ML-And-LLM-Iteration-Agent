@@ -632,8 +632,6 @@ def plan_from_choice(
             raise LinkError(f"{table.name} has no column {name!r}; columns are {columns}")
     if key_column == target_column:
         raise LinkError(f"{table.name}: {key_column!r} cannot be both the key and the target")
-    if split_column in (key_column, target_column):
-        raise LinkError(f"{table.name}: {split_column!r} cannot be the split and the key or target")
     if key_to_file not in KEY_METHODS:
         raise LinkError(
             f"{key_to_file!r} is not a way to read a key; one of {', '.join(KEY_METHODS)}"
@@ -644,6 +642,9 @@ def plan_from_choice(
         raise LinkError(
             f"{table.name}: column {key_column!r} holds decimals, so it cannot name a file"
         )
+    split_col = split_column or _split_column(frame)
+    if split_col in (key_column, target_column):
+        raise LinkError(f"{table.name}: {split_col!r} cannot be the split and the key or target")
     if split_column is not None and not _names_the_split(frame, split_column):
         raise LinkError(
             f"{table.name}: column {split_column!r} does not hold train and test values"
@@ -664,7 +665,7 @@ def plan_from_choice(
         method=method,
         chosen=target_column,
         block=[],
-        split_col=split_column or _split_column(frame),
+        split_col=split_col,
         linked=linked,
         unlabelled=unlabelled,
         coverage=coverage,

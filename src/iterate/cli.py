@@ -202,23 +202,27 @@ def _corrected(
     notes: list[str],
     linker: Callable[[], Linker],
 ) -> tuple[list[LinkPlan], list[str | None]]:
-    """The plans after a correction: the Linker on the first folder with the note,
-    then the second folder takes that choice or gets its own proposal."""
-    first = linker().propose(inventories[0], refusal=refusals[0], notes=notes, previous=plans[0])
-    if first.plan is None:
-        raise _NoPlanError(first.reason)
-    out: list[LinkPlan] = [first.plan]
-    whys: list[str | None] = [first.reason]
-    if len(inventories) == 2:
-        moved = _transfer(first.plan, inventories[1])
-        if moved is None:
-            second = linker().propose(
-                inventories[1], refusal=refusals[1], notes=notes, previous=first.plan
-            )
-            if second.plan is None:
-                raise _NoPlanError(second.reason)
-            moved, whys = second.plan, [*whys, second.reason]
-        out.append(moved)
+    """The plans after a correction. Only a folder the rules refused is the model's to
+    change: the first such folder gets the note; a second one takes that choice when
+    it holds there, or gets its own proposal with the same note."""
+    out = list(plans)
+    whys: list[str | None] = [None] * len(plans)
+    changed_first = False
+    for i, (inv, refusal) in enumerate(zip(inventories, refusals, strict=True)):
+        if not refusal:
+            continue
+        follows_first = i == 1 and changed_first
+        if follows_first:
+            moved = _transfer(out[0], inv)
+            if moved is not None:
+                out[i] = moved
+                continue
+        hint = out[0] if follows_first else plans[i]
+        proposal = linker().propose(inv, refusal=refusal, notes=notes, previous=hint)
+        if proposal.plan is None:
+            raise _NoPlanError(proposal.reason)
+        out[i], whys[i] = proposal.plan, proposal.reason
+        changed_first = changed_first or i == 0
     return out, whys
 
 
@@ -256,9 +260,15 @@ def _revalidated(remembered: list[LinkPlan], inventories: list[Inventory]) -> li
 
     out: list[LinkPlan] = []
     for plan_, inv in zip(remembered, inventories, strict=True):
-        if plan_.shape == "class_folders" or not (plan_.labels_file and plan_.target_column):
-            return None
         try:
+            if plan_.source != "agent":
+                fresh = linking.plan(inv)
+                if fresh != plan_:
+                    return None
+                out.append(fresh)
+                continue
+            if not (plan_.labels_file and plan_.target_column):
+                return None
             out.append(
                 linking.plan_from_choice(
                     inv,
@@ -354,23 +364,37 @@ def _link_folder(
                 f"{workspace.plan_path(sources, out=out_root)} to link afresh[/dim]"
             )
             break
-        proven = shown.source != "agent" and shown.coverage >= linking.ACCEPT
+        proven = shown.source != "agent" and shown.coverage >= linking.ACCEPT and not any(refusals)
         if yes or proven:
             break
         if not _stdin_owns_tty():
+            why_ask = (
+                "the rules could not settle this folder, so the plan shown was proposed for it"
+                if any(refusals)
+                else f"coverage is {shown.coverage:.1%}, under {linking.ACCEPT:.0%}"
+            )
             raise typer.BadParameter(
-                "this link needs a yes; re-run with --yes to accept it, or settle it with "
-                "--labels, --key and --target"
+                f"{why_ask}; re-run with --yes to accept it, or settle it with --labels, --key "
+                "and --target"
             )
         answer = ""
         while not answer:
             answer = typer.prompt(
                 "yes to continue, no to stop, or say what to change", default="", show_default=False
             ).strip()
-        if answer.lower() in ("y", "yes"):
+        word = answer.lower().rstrip(" .!")
+        if word in ("y", "yes"):
             break
-        if answer.lower() in ("n", "no"):
+        if word in ("n", "no"):
             raise typer.Exit(code=1)
+        if not any(refusals):
+            # The rules proved every folder here; a change of mind is a job for the flags,
+            # not for the model.
+            console.print(
+                "[dim]this plan came from the rules; answer yes or no, or settle it with "
+                "--labels, --key and --target[/dim]"
+            )
+            continue
         if rounds >= MAX_ROUNDS:
             raise typer.BadParameter(
                 f"{MAX_ROUNDS} corrections and no plan you accepted; settle it with --labels, "
@@ -379,20 +403,23 @@ def _link_folder(
         rounds += 1
         notes.append(answer)
         try:
-            plans, whys = _corrected(inventories, plans, refusals, notes=notes, linker=linker)
-            frames, shown = _combined(plans, inventories)
+            new_plans, new_whys = _corrected(
+                inventories, plans, refusals, notes=notes, linker=linker
+            )
+            frames, shown = _combined(new_plans, inventories)
+            plans, whys = new_plans, new_whys
         except (_NoPlanError, linking.LinkError) as exc:
             console.print(
                 f"[dim]the Linker could not turn that into a plan: {exc}; say it another way, "
                 "or stop with no[/dim]"
             )
 
-    if any(p.source == "agent" for p in plans) and not recalled:
-        workspace.remember_plan(plans, sources=sources, out=out_root)
     try:
         ws = workspace.write(shown, frames, sources=sources, out=out_root)
     except linking.LinkError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if any(p.source == "agent" for p in plans) and not recalled:
+        workspace.remember_plan(plans, sources=sources, out=out_root)
     n_train = ws.train_csv.read_text(encoding="utf-8").count("\n") - 1
     n_holdout = ws.holdout_csv.read_text(encoding="utf-8").count("\n") - 1
     console.print(
@@ -660,24 +687,27 @@ def run(
     if notebooks not in ("best", "all", "none"):
         raise typer.BadParameter(f"--notebooks must be best | all | none, got {notebooks!r}")
 
-    # ─── Cloud backend? API key required. ──────────────────────────────────
+    # ─── Cloud backend? API key required wherever a client is built. ───────
     settings = get_settings()
     if backend != "ollama":
-        resolved_key = (
-            api_key or cfg.get("api_key") or _resolved_api_key_from_env(settings, backend)
-        )
-        if not resolved_key:
+        api_key = api_key or cfg.get("api_key") or _resolved_api_key_from_env(settings, backend)
+
+    def _need_key() -> None:
+        if backend != "ollama" and not api_key:
             raise typer.BadParameter(
                 f"backend {backend!r} requires --api-key or a corresponding env var "
                 f"(ITERATE_BACKEND_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / …)"
             )
-        api_key = resolved_key
 
     # ─── A folder of images is linked first and shown before anything runs ──
     # Rules alone where they can prove it; the Linker only where they could not,
-    # so a rules-only folder never builds a client.
+    # so a rules-only folder never builds a client and needs no key.
     if folders:
         from iterate.core.linker import Linker
+
+        def _make_linker() -> Linker:
+            _need_key()
+            return Linker(build_client(backend, model=model, base_url=base_url, api_key=api_key))
 
         ws = _link_folder(
             data=data,
@@ -687,9 +717,7 @@ def run(
             key=key,
             target=target,
             yes=yes,
-            make_linker=lambda: Linker(
-                build_client(backend, model=model, base_url=base_url, api_key=api_key)
-            ),
+            make_linker=_make_linker,
         )
         console.print(
             "[dim]the folder is ready; the vision target that runs on it lands later in "
@@ -697,6 +725,7 @@ def run(
         )
         raise typer.Exit(code=0)
     assert target is not None  # a CSV run was checked above
+    _need_key()
 
     # ─── Validate ──────────────────────────────────────────────────────────
     if baseline is not None and source is None:

@@ -345,3 +345,10 @@ def test_the_tool_has_no_task_and_no_free_text_choice() -> None:
         "target_column",
         "why",
     }
+
+
+def test_a_split_column_the_header_does_not_have_is_no_plan(tmp_path: Path) -> None:
+    inv = inventory(_ambiguous(tmp_path))
+    proposal = Linker(_FakeLLM([_pick(split_column="nope")])).propose(inv)
+    assert proposal.plan is None
+    assert "has no column 'nope'" in proposal.reason

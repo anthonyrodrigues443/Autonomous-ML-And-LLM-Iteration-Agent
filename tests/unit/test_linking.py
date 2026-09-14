@@ -609,3 +609,86 @@ def test_join_rates_name_the_best_reading_per_column(tmp_path: Path) -> None:
     inv = inventory(_unnamed_target(tmp_path))
     rates = linking.join_rates(inv, tmp_path / "meta.csv")
     assert rates == {"file": ("basename", 1.0)}
+
+
+def test_the_split_column_found_by_name_may_not_be_the_target(tmp_path: Path) -> None:
+    root = tmp_path / "d"
+    for i in range(24):
+        _png(root / "img" / f"{i:03d}.jpg", i)
+    pd.DataFrame(
+        {
+            "file": [f"{i:03d}.jpg" for i in range(24)],
+            "split": ["train"] * 18 + ["test"] * 6,
+            "region": ["n", "s"] * 12,
+        }
+    ).to_csv(root / "meta.csv", index=False)
+    inv = inventory(root)
+    with pytest.raises(LinkError, match="'split' cannot be the split and the key or target"):
+        linking.plan_from_choice(
+            inv,
+            table=root / "meta.csv",
+            key_column="file",
+            key_to_file="basename",
+            target_column="split",
+        )
+    ok = linking.plan_from_choice(
+        inv,
+        table=root / "meta.csv",
+        key_column="file",
+        key_to_file="basename",
+        target_column="region",
+    )
+    assert (ok.target_column, ok.split_column) == ("region", "split")
+
+
+def test_the_floor_is_measured_not_assumed(tmp_path: Path) -> None:
+    root = _unnamed_target(tmp_path)
+    inv = inventory(root)
+    for i in range(4):
+        (root / "img" / f"{i}.jpg").unlink()
+    inv = inventory(root)
+    with pytest.raises(LinkError, match=r"66\.7% of rows.*under the 90% floor"):
+        linking.plan_from_choice(
+            inv,
+            table=root / "meta.csv",
+            key_column="file",
+            key_to_file="basename",
+            target_column="code",
+        )
+    for i in range(3):
+        _png(root / "img" / f"{i}.jpg", i)
+    inv = inventory(root)
+    p = linking.plan_from_choice(
+        inv,
+        table=root / "meta.csv",
+        key_column="file",
+        key_to_file="basename",
+        target_column="code",
+    )
+    assert p.coverage == pytest.approx(11 / 12)
+    assert p.notes == ["91.7% of rows resolved to an image; the rest are dropped"]
+
+
+def test_named_picks_refuse_a_one_row_table_and_a_decimal_key(tmp_path: Path) -> None:
+    root = _unnamed_target(tmp_path)
+    inv = inventory(root)
+    frame = pd.read_csv(root / "meta.csv")
+    frame["weight"] = [0.5 + i * 0.25 for i in range(12)]
+    frame.to_csv(root / "meta.csv", index=False)
+    with pytest.raises(LinkError, match="holds decimals"):
+        linking.plan_from_choice(
+            inv,
+            table=root / "meta.csv",
+            key_column="weight",
+            key_to_file="stem",
+            target_column="code",
+        )
+    frame.head(1).to_csv(root / "meta.csv", index=False)
+    with pytest.raises(LinkError, match="fewer than two rows"):
+        linking.plan_from_choice(
+            inv,
+            table=root / "meta.csv",
+            key_column="file",
+            key_to_file="basename",
+            target_column="code",
+        )

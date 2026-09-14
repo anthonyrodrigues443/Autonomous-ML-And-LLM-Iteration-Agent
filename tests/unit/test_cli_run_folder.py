@@ -481,3 +481,276 @@ def test_a_csv_of_image_paths_stops_before_the_loop(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "this CSV holds image paths" in _plain(result.output)
+
+
+# ─── what the review forced ──────────────────────────────────────────────────
+
+
+def _labelled(root: Path, *, n: int = 24) -> Path:
+    for i in range(n):
+        _png(root / "img" / f"{i:03d}.jpg", i)
+    pd.DataFrame(
+        {"file": [f"{i:03d}.jpg" for i in range(n)], "label": ["a", "b"] * (n // 2)}
+    ).to_csv(root / "labels.csv", index=False)
+    return root
+
+
+def _cached_plans(tmp_path: Path) -> list[dict[str, Any]]:
+    import json
+
+    files = list((_data_dir(tmp_path) / "plans").iterdir())
+    assert len(files) == 1
+    return list(json.loads(files[0].read_text(encoding="utf-8"))["plans"])
+
+
+def test_a_correction_the_frames_refuse_keeps_the_plan_you_saw(
+    tmp_path: Path, fake_linker: type[_FakeLinker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plan that measures fine but leaves no holdout rows is refused at the frames;
+    the block and the plan on offer must stay the previous one, and a yes must write
+    and remember that one, never the refused one."""
+    import json
+
+    root = tmp_path / "birds"
+    n = 100
+    for i in range(n):
+        _png(root / "img" / f"{i:03d}.jpg", i)
+    species: list[str | None] = ["x", "y"] * 50
+    for i in range(95, 100):
+        species[i] = None
+    pd.DataFrame(
+        {
+            "file": [f"{i:03d}.jpg" for i in range(n)],
+            "region": ["north", "south", "east", "west"] * 25,
+            "species_code": species,
+            "subset": ["train"] * 95 + ["test"] * 5,
+        }
+    ).to_csv(root / "meta.csv", index=False)
+    fake_linker.script = ["region", "species_code"]
+    _answers(monkeypatch, ["use species_code", "yes"])
+    result = runner.invoke(app, ["run", "--data", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "the split leaves no holdout rows" in _plain(result.output)
+    ws = next(p for p in _data_dir(tmp_path).iterdir() if p.name != "plans")
+    written = json.loads((ws / "link.json").read_text(encoding="utf-8"))["plan"]
+    assert written["target_column"] == "region"
+    assert _cached_plans(tmp_path)[0]["target_column"] == "region"
+    again = runner.invoke(app, ["run", "--data", str(root), "--yes"])
+    assert again.exit_code == 0, again.output
+    assert "remembered from an earlier yes" in _plain(again.output)
+    assert fake_linker.built == 1
+
+
+def test_a_plan_the_rules_proved_takes_only_yes_or_no_at_the_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("iterate.core.linker.Linker", _NeverBuilt)
+    root = _partial(tmp_path)
+    _answers(monkeypatch, ["hmm, are you sure", "Yes."])
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(root),
+            "--labels",
+            str(root / "labels.csv"),
+            "--key",
+            "id",
+            "--target",
+            "label",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "this plan came from the rules; answer yes or no" in _plain(result.output)
+    _answers(monkeypatch, ["NO."])
+    result = runner.invoke(app, ["run", "--data", str(root)])
+    assert result.exit_code == 1
+
+
+def test_a_correction_reaches_only_the_folder_the_rules_refused(
+    tmp_path: Path, fake_linker: type[_FakeLinker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a = _labelled(tmp_path / "train")
+    b = _ambiguous(tmp_path / "test", n=12)
+    fake_linker.script = ["species_code", "region"]
+    _answers(monkeypatch, ["for the holdout use region", "yes"])
+    result = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert result.exit_code == 0, result.output
+    assert [c["root"].name for c in fake_linker.calls] == ["test", "test"]
+    assert all(c["refusal"] for c in fake_linker.calls)
+    cached = _cached_plans(tmp_path)
+    assert [p["source"] for p in cached] == ["rules", "agent"]
+    assert cached[1]["target_column"] == "region"
+
+    a2 = _ambiguous(tmp_path / "train2")
+    b2 = _labelled(tmp_path / "test2", n=12)
+    fake_linker.calls = []
+    fake_linker.script = ["species_code", "region"]
+    _answers(monkeypatch, ["use region", "yes"])
+    result = runner.invoke(app, ["run", "--train", str(a2), "--holdout", str(b2)])
+    assert result.exit_code == 0, result.output
+    assert [c["root"].name for c in fake_linker.calls] == ["train2", "train2"]
+
+
+def test_a_failed_write_leaves_nothing_remembered(
+    tmp_path: Path, fake_linker: type[_FakeLinker]
+) -> None:
+    root = tmp_path / "birds"
+    for i in range(24):
+        _png(root / "img" / f"{i:03d}.jpg", i)
+    pd.DataFrame(
+        {
+            "file": [f"{i:03d}.jpg" for i in range(24)],
+            "region": ["north", "south", "east"] * 8,
+            "species_code": ["x", "y"] * 11 + ["z", "x"],
+        }
+    ).to_csv(root / "meta.csv", index=False)
+    fake_linker.script = ["species_code"]
+    first = runner.invoke(app, ["run", "--data", str(root), "--yes"])
+    assert first.exit_code != 0
+    assert "classes with a single image cannot be split" in _plain(first.output)
+    assert not (_data_dir(tmp_path) / "plans").exists()
+    fake_linker.script = ["region"]
+    again = runner.invoke(app, ["run", "--data", str(root), "--yes"])
+    assert again.exit_code == 0, again.output
+    assert fake_linker.built == 2
+    assert "target 'region'" in _plain(again.output)
+
+
+def test_a_transferred_plan_on_a_refused_folder_still_needs_a_yes(
+    tmp_path: Path, fake_linker: type[_FakeLinker]
+) -> None:
+    a = _labelled(tmp_path / "train")
+    b = tmp_path / "test"
+    for i in range(12):
+        _png(b / "img" / f"{i:03d}.jpg", i)
+    pd.DataFrame({"file": [f"{i:03d}.jpg" for i in range(12)], "label": ["a", "b"] * 6}).to_csv(
+        b / "labels.csv", index=False
+    )
+    pd.DataFrame({"file": [f"{i:03d}.jpg" for i in range(12)], "label": ["a"] * 12}).to_csv(
+        b / "sample_submission.csv", index=False
+    )
+    refused = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert refused.exit_code != 0
+    assert "re-run with --yes" in _plain(refused.output)
+    accepted = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b), "--yes"])
+    assert accepted.exit_code == 0, accepted.output
+    assert "columns taken from the other folder's labels.csv" in _plain(accepted.output)
+    assert fake_linker.built == 0
+
+
+def test_a_class_folder_train_and_an_agent_holdout_are_remembered_together(
+    tmp_path: Path, fake_linker: type[_FakeLinker]
+) -> None:
+    a = tmp_path / "train"
+    for c in ("cat", "dog"):
+        for i in range(6):
+            _png(a / c / f"{c}_{i}.png", i)
+    b = _ambiguous(tmp_path / "test", n=12)
+    fake_linker.script = ["species_code", "species_code"]
+    assert (
+        runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b), "--yes"]).exit_code == 0
+    )
+    again = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b), "--yes"])
+    assert again.exit_code == 0, again.output
+    assert fake_linker.built == 1
+    assert "remembered from an earlier yes" in _plain(again.output)
+
+
+def test_a_rules_only_folder_needs_no_api_key_on_a_cloud_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("iterate.core.linker.Linker", _NeverBuilt)
+    monkeypatch.setattr(cli_module, "_resolved_api_key_from_env", lambda settings, backend: None)
+    source = _class_tree(tmp_path / "pets")
+    result = runner.invoke(app, ["run", "--data", str(source), "--backend", "groq"])
+    assert result.exit_code == 0, result.output
+
+
+def test_the_linker_on_a_cloud_backend_needs_the_key(
+    tmp_path: Path, fake_linker: type[_FakeLinker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli_module, "_resolved_api_key_from_env", lambda settings, backend: None)
+    root = _ambiguous(tmp_path / "birds")
+    result = runner.invoke(app, ["run", "--data", str(root), "--backend", "groq", "--yes"])
+    assert result.exit_code != 0
+    assert "requires --api-key" in _plain(result.output)
+    assert fake_linker.built == 0
+
+
+def test_a_remembered_plan_that_no_longer_holds_is_forgotten(
+    tmp_path: Path, fake_linker: type[_FakeLinker]
+) -> None:
+    import json
+
+    root = _ambiguous(tmp_path / "birds")
+    fake_linker.script = ["species_code", "region"]
+    assert runner.invoke(app, ["run", "--data", str(root), "--yes"]).exit_code == 0
+    path = next((_data_dir(tmp_path) / "plans").iterdir())
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["plans"][0]["target_column"] = "gone"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    again = runner.invoke(app, ["run", "--data", str(root), "--yes"])
+    assert again.exit_code == 0, again.output
+    assert fake_linker.built == 2
+    text = _plain(again.output)
+    assert "remembered from an earlier yes" not in text
+    assert "target 'region'" in text
+    assert _cached_plans(tmp_path)[0]["target_column"] == "region"
+
+
+def test_a_choice_that_does_not_hold_on_the_second_folder_gets_its_own_look(
+    tmp_path: Path, fake_linker: type[_FakeLinker]
+) -> None:
+    a = _ambiguous(tmp_path / "train")
+    b = tmp_path / "test"
+    for i in range(12):
+        _png(b / "img" / f"{i:03d}.jpg", i)
+    pd.DataFrame(
+        {
+            "file": [f"{i:03d}.jpg" for i in range(12)],
+            "kind": ["x", "y"] * 6,
+            "zone": ["n", "s", "e"] * 4,
+            "who": [f"p{i}" for i in range(12)],
+        }
+    ).to_csv(b / "meta.csv", index=False)
+    fake_linker.script = ["species_code", "kind"]
+    result = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b), "--yes"])
+    assert result.exit_code == 0, result.output
+    assert [c["root"].name for c in fake_linker.calls] == ["train", "test"]
+    assert fake_linker.calls[1]["refusal"].endswith("one folder per class")
+    assert fake_linker.calls[1]["previous"].target_column == "species_code"
+    root = next(p for p in _data_dir(tmp_path).iterdir() if p.name != "plans")
+    assert set(pd.read_csv(root / "holdout.csv")["label"]) == {"x", "y"}
+
+
+def test_labels_without_key_on_disagreeing_columns_is_refused_not_linked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("iterate.core.linker.Linker", _NeverBuilt)
+    root = tmp_path / "two_keys"
+    for i in range(10):
+        _png(root / "images" / f"{i}.jpg", i)
+    pd.DataFrame(
+        {
+            "id": [str(i) for i in range(10)],
+            "image": [f"images/{9 - i}.jpg" for i in range(10)],
+            "label": ["a", "b"] * 5,
+        }
+    ).to_csv(root / "labels.csv", index=False)
+    result = runner.invoke(
+        app, ["run", "--data", str(root), "--labels", str(root / "labels.csv"), "--target", "label"]
+    )
+    assert result.exit_code != 0
+    assert "pass --key to say which" in _plain(result.output)
+
+
+def test_the_script_refusal_names_the_number_or_the_folder(
+    tmp_path: Path, fake_linker: type[_FakeLinker]
+) -> None:
+    partial = runner.invoke(app, ["run", "--data", str(_partial(tmp_path))])
+    assert "coverage is 95.0%, under 98%; re-run with --yes" in _plain(partial.output)
+    fake_linker.script = ["species_code"]
+    proposed = runner.invoke(app, ["run", "--data", str(_ambiguous(tmp_path / "birds"))])
+    assert "the rules could not settle this folder" in _plain(proposed.output)
