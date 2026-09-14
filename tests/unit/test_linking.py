@@ -486,3 +486,126 @@ def test_the_schema_refuses_a_plan_whose_parts_disagree() -> None:
             task="classification",
             coverage=1.0,
         )
+
+
+# ─── refusal kinds, and a plan from named picks ────────────────────────────
+
+
+def _unnamed_target(root: Path) -> Path:
+    for i in range(12):
+        _png(root / "img" / f"{i}.jpg", i)
+    pd.DataFrame(
+        {
+            "file": [f"{i}.jpg" for i in range(12)],
+            "region": ["n", "s"] * 6,
+            "code": ["x", "y", "z"] * 4,
+        }
+    ).to_csv(root / "meta.csv", index=False)
+    return root
+
+
+def test_a_refusal_says_whether_a_choice_would_settle_it(tmp_path: Path) -> None:
+    with pytest.raises(LinkError) as no_rule_with_table:
+        plan(inventory(_unnamed_target(tmp_path / "a")))
+    assert no_rule_with_table.value.ambiguous is True
+
+    for i in range(6):
+        _png(tmp_path / "b" / f"img{i}.png", i)
+    with pytest.raises(LinkError) as no_rule_no_table:
+        plan(inventory(tmp_path / "b"))
+    assert no_rule_no_table.value.ambiguous is False
+
+    (tmp_path / "c" / "data.parquet").parent.mkdir()
+    (tmp_path / "c" / "data.parquet").write_bytes(b"PAR1")
+    with pytest.raises(LinkError) as containers:
+        plan(inventory(tmp_path / "c"))
+    assert containers.value.ambiguous is False
+
+    _class_tree(tmp_path / "d")
+    _png(tmp_path / "d" / "cat" / "closeups" / "extra.png", 7)
+    with pytest.raises(LinkError) as nested_no_table:
+        plan(inventory(tmp_path / "d"))
+    assert nested_no_table.value.ambiguous is False
+    pd.DataFrame({"a": [1, 2], "b": [3, 4]}).to_csv(tmp_path / "d" / "notes.csv", index=False)
+    with pytest.raises(LinkError) as nested_with_table:
+        plan(inventory(tmp_path / "d"))
+    assert nested_with_table.value.ambiguous is True
+
+
+def test_a_stray_split_value_is_a_fault_in_the_data_not_a_choice(tmp_path: Path) -> None:
+    root = _table_and_images(
+        tmp_path,
+        key="id",
+        values=[str(i) for i in range(10)],
+        labels=["a", "b"] * 5,
+        files=[f"{i}.jpg" for i in range(10)],
+    )
+    frame = pd.read_csv(root / "labels.csv")
+    frame["split"] = ["train"] * 6 + ["test"] * 3 + ["maybe"]
+    frame.to_csv(root / "labels.csv", index=False)
+    with pytest.raises(LinkError, match="also holds") as caught:
+        plan(inventory(root))
+    assert caught.value.ambiguous is False
+
+
+def test_a_plan_from_named_picks_is_measured_like_a_rules_plan(tmp_path: Path) -> None:
+    root = _table_and_images(
+        tmp_path,
+        key="id",
+        values=[str(i) for i in range(20)],
+        labels=["a", "b"] * 10,
+        files=[f"{i}.jpg" for i in range(20)],
+    )
+    inv = inventory(root)
+    by_rules = plan(inv)
+    by_choice = linking.plan_from_choice(
+        inv,
+        table=root / "labels.csv",
+        key_column="id",
+        key_to_file="stem",
+        target_column="label",
+        source="agent",
+    )
+    assert by_choice.model_dump(exclude={"source"}) == by_rules.model_dump(exclude={"source"})
+    assert by_choice.source == "agent"
+    assert apply(by_choice, inv).train.equals(apply(by_rules, inv).train)
+
+
+def test_named_picks_are_checked_against_the_folder(tmp_path: Path) -> None:
+    inv = inventory(_unnamed_target(tmp_path))
+    table = tmp_path / "meta.csv"
+    with pytest.raises(LinkError, match="is not a table under"):
+        linking.plan_from_choice(
+            inv,
+            table=tmp_path / "other.csv",
+            key_column="file",
+            key_to_file="basename",
+            target_column="code",
+        )
+    with pytest.raises(LinkError, match="has no column 'label'"):
+        linking.plan_from_choice(
+            inv, table=table, key_column="file", key_to_file="basename", target_column="label"
+        )
+    with pytest.raises(LinkError, match="not a way to read a key"):
+        linking.plan_from_choice(
+            inv, table=table, key_column="file", key_to_file="magic", target_column="code"
+        )
+    with pytest.raises(LinkError, match="cannot be the split and the key"):
+        linking.plan_from_choice(
+            inv,
+            table=table,
+            key_column="file",
+            key_to_file="basename",
+            target_column="code",
+            split_column="file",
+        )
+    with pytest.raises(LinkError, match=r"resolves 0.0% of rows.*under the 90% floor"):
+        linking.plan_from_choice(
+            inv, table=table, key_column="file", key_to_file="stem_int", target_column="code"
+        )
+
+
+def test_join_rates_name_the_best_reading_per_column(tmp_path: Path) -> None:
+    inv = inventory(_unnamed_target(tmp_path))
+    rates = linking.join_rates(inv, tmp_path / "meta.csv")
+    assert rates == {"file": ("basename", 1.0)}

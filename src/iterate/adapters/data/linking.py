@@ -5,9 +5,10 @@ An inventory walks the folder, then the ladder tries shapes in a fixed order and
 the first plan that builds a frame with enough coverage wins: explicit flags, a
 table joined to the images on an exact key, class folders. Anything the rules
 cannot prove is refused with the reason: a plan that resolves too few rows, two
-tables or two key columns that both fit, a split value nobody named. The Linker (a
-later piece) can only add a plan where this ladder found none, and its plan goes
-through the same `apply`.
+tables or two key columns that both fit, a split value nobody named. A refusal that
+a choice would settle is marked ambiguous; the Linker may try those and nothing
+else, and its picks come back through `plan_from_choice`, which measures them
+exactly as a rules plan before anything is built.
 """
 
 from __future__ import annotations
@@ -83,13 +84,27 @@ TARGET_NAMES = (
     "count",
 )
 KEY_METHODS: tuple[KeyMethod, ...] = ("path", "basename", "stem", "stem_int")
+HOW: dict[KeyMethod, str] = {
+    "path": "a path",
+    "basename": "the file name",
+    "stem": "the file name without its extension",
+    "stem_int": "the file number",
+}
 ACCEPT = 0.98
 PAUSE = 0.90
 MAX_DEPTH = 6
 
 
 class LinkError(ValueError):
-    """The folder cannot be read as a labelled image dataset; the message says why."""
+    """The folder cannot be read as a labelled image dataset; the message says why.
+
+    ``ambiguous`` marks a refusal a choice would settle, as against a fault in the
+    data: only those may go to the Linker.
+    """
+
+    def __init__(self, message: str, *, ambiguous: bool = False) -> None:
+        super().__init__(message)
+        self.ambiguous = ambiguous
 
 
 @dataclass
@@ -247,7 +262,7 @@ def _resolve(
 # ─── the ladder ───────────────────────────────────────────────────────────
 
 
-def _read_table(path: Path) -> pd.DataFrame:
+def read_table(path: Path) -> pd.DataFrame:
     sep = "\t" if path.suffix.lower() == ".tsv" else ","
     return pd.read_csv(path, sep=sep, encoding_errors="replace")
 
@@ -282,34 +297,38 @@ def _pick_target(frame: pd.DataFrame, exclude: set[str]) -> tuple[str | None, li
     return (rest[0], []) if len(rest) == 1 else (None, [])
 
 
+def _names_the_split(frame: pd.DataFrame, column: str) -> bool:
+    """True when the column holds train and holdout names. A value that is neither is
+    refused rather than guessed, and so are two holdout names."""
+    values = {str(v).lower() for v in frame[column].dropna().unique()}
+    if not (values & set(TRAIN_NAMES) and values & set(HOLDOUT_NAMES)):
+        return False
+    stray = sorted(values - set(TRAIN_NAMES) - set(HOLDOUT_NAMES))
+    if stray:
+        raise LinkError(
+            f"column {column!r} names the split but also holds {stray}; rename those rows "
+            "to a train or a test value, or drop the column"
+        )
+    if len(values & set(HOLDOUT_NAMES)) > 1:
+        raise LinkError(
+            f"column {column!r} holds more than one holdout name "
+            f"({sorted(values & set(HOLDOUT_NAMES))}); merge them into one first"
+        )
+    return True
+
+
 def _split_column(frame: pd.DataFrame) -> str | None:
-    """A column that names the split, or None. A value that is neither a train name
-    nor a holdout name is refused rather than guessed."""
+    """A column named like a split that holds one, or None."""
     for c in frame.columns:
-        if str(c).lower() not in SPLIT_COLUMNS:
-            continue
-        values = {str(v).lower() for v in frame[c].dropna().unique()}
-        if not (values & set(TRAIN_NAMES) and values & set(HOLDOUT_NAMES)):
-            continue
-        stray = sorted(values - set(TRAIN_NAMES) - set(HOLDOUT_NAMES))
-        if stray:
-            raise LinkError(
-                f"column {c!r} names the split but also holds {stray}; rename those rows "
-                "to a train or a test value, or drop the column"
-            )
-        if len(values & set(HOLDOUT_NAMES)) > 1:
-            raise LinkError(
-                f"column {c!r} holds more than one holdout name "
-                f"({sorted(values & set(HOLDOUT_NAMES))}); merge them into one first"
-            )
-        return str(c)
+        if str(c).lower() in SPLIT_COLUMNS and _names_the_split(frame, str(c)):
+            return str(c)
     return None
 
 
 def _looks_like_a_label_table(table: Path) -> bool:
     """A table with a label-looking column claims the labels, even when no key resolves."""
     try:
-        frame = _read_table(table)
+        frame = read_table(table)
     except (OSError, ValueError):
         return False
     lowered = {str(c).lower() for c in frame.columns}
@@ -328,6 +347,71 @@ class _Candidate:
     resolved: tuple[Path | None, ...]
 
 
+def _link_rows(
+    frame: pd.DataFrame,
+    column: str,
+    index: dict[str, list[Path]],
+    method: KeyMethod,
+    chosen: str | None,
+    block: list[str],
+) -> tuple[list[Path | None], int, float]:
+    """One key column read one way, against one target: the image per row or None,
+    how many resolved rows have no label, and the coverage. Every plan, whoever
+    picked its parts, is measured here."""
+    resolved, _ = _resolve(frame[column], index, method)
+    labelled = frame[block].notna().all(axis=1) if block else frame[str(chosen)].notna()
+    pairs = list(zip(resolved, labelled, strict=True))
+    linked = [p if ok else None for p, ok in pairs]
+    unlabelled = sum(1 for p, ok in pairs if p is not None and not ok)
+    coverage = sum(1 for p in linked if p is not None) / max(1, len(linked))
+    return linked, unlabelled, coverage
+
+
+def _candidate(
+    inv: Inventory,
+    table: Path,
+    frame: pd.DataFrame,
+    *,
+    column: str,
+    method: KeyMethod,
+    chosen: str | None,
+    block: list[str],
+    split_col: str | None,
+    linked: list[Path | None],
+    unlabelled: int,
+    coverage: float,
+    source: Source,
+) -> _Candidate:
+    first = str(frame[column].iloc[0]).lower()
+    shape: Shape = (
+        "csv_of_paths"
+        if method == "path" and first.endswith(tuple(IMAGE_SUFFIXES))
+        else "table_join"
+    )
+    notes: list[str] = []
+    if coverage < ACCEPT:
+        notes.append(f"{coverage:.1%} of rows resolved to an image; the rest are dropped")
+    if unlabelled:
+        notes.append(f"{unlabelled} row(s) have no label and are dropped")
+    return _Candidate(
+        LinkPlan(
+            shape=shape,
+            source=source,
+            labels_file=str(table),
+            key_column=column,
+            key_to_file=method,
+            target_column=chosen,
+            onehot_columns=block,
+            task=_task_of(frame[chosen]) if chosen else "classification",
+            split="column" if split_col else ("folders" if inv.split_pair else "ours"),
+            split_column=split_col,
+            coverage=coverage,
+            notes=notes,
+        ),
+        tuple(linked),
+    )
+
+
 def _plan_from_table(
     inv: Inventory,
     table: Path,
@@ -336,7 +420,7 @@ def _plan_from_table(
     target: str | None,
     source: Source,
 ) -> LinkPlan | None:
-    frame = _read_table(table)
+    frame = read_table(table)
     if len(frame) < 2:
         return None
     if key is not None and key not in frame.columns:
@@ -352,49 +436,29 @@ def _plan_from_table(
     for column in columns:
         if not _key_dtype_ok(frame[column]):
             continue
+        chosen, block = (target, []) if target else _pick_target(frame, {column})
+        if chosen is None and not block:
+            continue
         for method in KEY_METHODS:
-            resolved, coverage = _resolve(frame[column], index[method], method)
-            if coverage < PAUSE:
-                continue
-            chosen, block = (target, []) if target else _pick_target(frame, {column})
-            if chosen is None and not block:
-                continue
-            labelled = frame[block].notna().all(axis=1) if block else frame[chosen].notna()
-            pairs = list(zip(resolved, labelled, strict=True))
-            linked = [p if ok else None for p, ok in pairs]
-            unlabelled = sum(1 for p, ok in pairs if p is not None and not ok)
-            coverage = sum(1 for p in linked if p is not None) / len(linked)
-            if coverage < PAUSE:
-                continue
-            split_col = _split_column(frame)
-            first = str(frame[column].iloc[0]).lower()
-            shape: Shape = (
-                "csv_of_paths"
-                if method == "path" and first.endswith(tuple(IMAGE_SUFFIXES))
-                else "table_join"
+            linked, unlabelled, coverage = _link_rows(
+                frame, str(column), index[method], method, chosen, block
             )
-            notes: list[str] = []
-            if coverage < ACCEPT:
-                notes.append(f"{coverage:.1%} of rows resolved to an image; the rest are dropped")
-            if unlabelled:
-                notes.append(f"{unlabelled} row(s) have no label and are dropped")
+            if coverage < PAUSE:
+                continue
             candidates.append(
-                _Candidate(
-                    LinkPlan(
-                        shape=shape,
-                        source=source,
-                        labels_file=str(table),
-                        key_column=str(column),
-                        key_to_file=method,
-                        target_column=chosen,
-                        onehot_columns=block,
-                        task=_task_of(frame[chosen]) if chosen else "classification",
-                        split="column" if split_col else ("folders" if inv.split_pair else "ours"),
-                        split_column=split_col,
-                        coverage=coverage,
-                        notes=notes,
-                    ),
-                    tuple(linked),
+                _candidate(
+                    inv,
+                    table,
+                    frame,
+                    column=str(column),
+                    method=method,
+                    chosen=chosen,
+                    block=block,
+                    split_col=_split_column(frame),
+                    linked=linked,
+                    unlabelled=unlabelled,
+                    coverage=coverage,
+                    source=source,
                 )
             )
             break
@@ -410,7 +474,8 @@ def _plan_from_table(
         ):
             raise LinkError(
                 f"{table.name}: columns {best.plan.key_column!r} and {other.plan.key_column!r} "
-                "both name the images but point at different files; pass --key to say which"
+                "both name the images but point at different files; pass --key to say which",
+                ambiguous=True,
             )
     return best.plan
 
@@ -442,7 +507,8 @@ def _plan_class_folders(inv: Inventory) -> LinkPlan | None:
                 return None
             if any(p.parent != d for p in members):
                 raise LinkError(
-                    f"{d}: a class folder with folders inside; flatten it, or pass --labels"
+                    f"{d}: a class folder with folders inside; flatten it, or pass --labels",
+                    ambiguous=bool(inv.tables),
                 )
     notes = (
         [f"ignoring folder(s) {inv.ignored}; only the train and holdout pair is read"]
@@ -500,7 +566,8 @@ def plan(
         if len(tied) > 1:
             raise LinkError(
                 f"{inv.root}: {' and '.join(tied)} both link the images equally well; pass "
-                "--labels to say which one holds the labels"
+                "--labels to say which one holds the labels",
+                ambiguous=True,
             )
         return next(p for _, p in fits if p.coverage == top)
     claimants = [t.name for t in inv.tables if _looks_like_a_label_table(t)]
@@ -508,7 +575,8 @@ def plan(
         raise LinkError(
             f"{inv.root}: {', '.join(claimants)} looks like the label table but no column "
             f"resolves at least {PAUSE:.0%} of its rows to an image. Pass --labels <csv> "
-            "with --key <column> and --target <column> to say how"
+            "with --key <column> and --target <column> to say how",
+            ambiguous=True,
         )
     folders = _plan_class_folders(inv)
     if folders is not None:
@@ -516,8 +584,92 @@ def plan(
     seen = f"{len(inv.images)} images and {len(inv.tables)} table(s)"
     raise LinkError(
         f"{inv.root}: {seen}, and no rule links them. Pass --labels <csv> with --key <column> "
-        "and --target <column> to say how, or lay the images out as one folder per class"
+        "and --target <column> to say how, or lay the images out as one folder per class",
+        ambiguous=bool(inv.tables),
     )
+
+
+# ─── a plan from named picks ──────────────────────────────────────────────
+
+
+def join_rates(inv: Inventory, table: Path) -> dict[str, tuple[KeyMethod, float]]:
+    """For each column that could name a file, the reading that resolves the most rows
+    to an image and that share. Shown to the Linker so it picks from measured joins."""
+    frame = read_table(table)
+    index = _index(inv.images, inv.root, table.parent)
+    out: dict[str, tuple[KeyMethod, float]] = {}
+    for column in frame.columns:
+        if not _key_dtype_ok(frame[column]):
+            continue
+        best = max(
+            ((m, _resolve(frame[column], index[m], m)[1]) for m in KEY_METHODS),
+            key=lambda pair: pair[1],
+        )
+        if best[1] > 0:
+            out[str(column)] = best
+    return out
+
+
+def plan_from_choice(
+    inv: Inventory,
+    *,
+    table: Path,
+    key_column: str,
+    key_to_file: str,
+    target_column: str,
+    split_column: str | None = None,
+    source: Source = "agent",
+) -> LinkPlan:
+    """A plan from named picks, measured exactly as a rules plan. Every pick must name
+    something the table holds; the task comes from the label values; below the floor
+    is a refusal, not a plan."""
+    if table not in inv.tables:
+        raise LinkError(f"{table} is not a table under {inv.root}")
+    frame = read_table(table)
+    columns = [str(c) for c in frame.columns]
+    for name in (key_column, target_column, *([split_column] if split_column else [])):
+        if name not in columns:
+            raise LinkError(f"{table.name} has no column {name!r}; columns are {columns}")
+    if key_column == target_column:
+        raise LinkError(f"{table.name}: {key_column!r} cannot be both the key and the target")
+    if split_column in (key_column, target_column):
+        raise LinkError(f"{table.name}: {split_column!r} cannot be the split and the key or target")
+    if key_to_file not in KEY_METHODS:
+        raise LinkError(
+            f"{key_to_file!r} is not a way to read a key; one of {', '.join(KEY_METHODS)}"
+        )
+    if len(frame) < 2:
+        raise LinkError(f"{table.name} has fewer than two rows")
+    if not _key_dtype_ok(frame[key_column]):
+        raise LinkError(
+            f"{table.name}: column {key_column!r} holds decimals, so it cannot name a file"
+        )
+    if split_column is not None and not _names_the_split(frame, split_column):
+        raise LinkError(
+            f"{table.name}: column {split_column!r} does not hold train and test values"
+        )
+    method = key_to_file
+    index = _index(inv.images, inv.root, table.parent)[method]
+    linked, unlabelled, coverage = _link_rows(frame, key_column, index, method, target_column, [])
+    if coverage < PAUSE:
+        raise LinkError(
+            f"{table.name}: column {key_column!r} read as {HOW[method]} resolves {coverage:.1%} "
+            f"of rows to a labelled image, under the {PAUSE:.0%} floor"
+        )
+    return _candidate(
+        inv,
+        table,
+        frame,
+        column=key_column,
+        method=method,
+        chosen=target_column,
+        block=[],
+        split_col=split_column or _split_column(frame),
+        linked=linked,
+        unlabelled=unlabelled,
+        coverage=coverage,
+        source=source,
+    ).plan
 
 
 # ─── apply ────────────────────────────────────────────────────────────────
@@ -553,7 +705,7 @@ def apply(plan_: LinkPlan, inv: Inventory) -> LinkedFrames:
     assert plan_.key_column
     assert plan_.key_to_file
     table = Path(plan_.labels_file)
-    frame = _read_table(table)
+    frame = read_table(table)
     index = _index(inv.images, inv.root, table.parent)[plan_.key_to_file]
     resolved, _ = _resolve(frame[plan_.key_column], index, plan_.key_to_file)
     if plan_.onehot_columns:
@@ -610,12 +762,7 @@ def render(plan_: LinkPlan, inv: Inventory, frames: LinkedFrames) -> str:
     if plan_.shape == "class_folders":
         labels = f"labels: the folder names ({frames.train['label'].nunique()} classes)"
     else:
-        how = {
-            "path": "a path",
-            "basename": "the file name",
-            "stem": "the file name without its extension",
-            "stem_int": "the file number",
-        }[plan_.key_to_file or "path"]
+        how = HOW[plan_.key_to_file or "path"]
         target = (
             ", ".join(plan_.onehot_columns) + " (one-hot)"
             if plan_.onehot_columns
@@ -648,6 +795,7 @@ def render(plan_: LinkPlan, inv: Inventory, frames: LinkedFrames) -> str:
 __all__ = [
     "ACCEPT",
     "CONTAINER_SUFFIXES",
+    "HOW",
     "IMAGE_SUFFIXES",
     "KEY_METHODS",
     "PAUSE",
@@ -658,6 +806,9 @@ __all__ = [
     "LinkedFrames",
     "apply",
     "inventory",
+    "join_rates",
     "plan",
+    "plan_from_choice",
+    "read_table",
     "render",
 ]
