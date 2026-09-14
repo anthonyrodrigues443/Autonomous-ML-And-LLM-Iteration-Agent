@@ -123,34 +123,124 @@ def setup() -> None:
     console.print(f"\n[green]saved[/green] → {path}")
 
 
+def _link_folder(
+    *,
+    data: Path | None,
+    train: Path | None,
+    holdout: Path | None,
+    labels: Path | None,
+    key: str | None,
+    target: str | None,
+    yes: bool,
+) -> Any:
+    """Link a folder of images to its labels by rules, show what was found, pause when
+    the coverage is not full, and write the canonical folder. Returns the workspace."""
+    from iterate.adapters.data import linking, workspace
+
+    if (key or target) and labels is None:
+        raise typer.BadParameter("--key and --target describe --labels; pass --labels too")
+    if labels is not None and data is None:
+        raise typer.BadParameter(
+            "--labels goes with --data: put both folders under one folder as train/ and "
+            "test/ with the table beside them, or give each folder its own table"
+        )
+    try:
+        if data is not None:
+            inv = linking.inventory(data)
+            plan = linking.plan(inv, labels=labels, key=key, target=target)
+            frames = linking.apply(plan, inv)
+            sources = [data]
+        else:
+            assert train is not None  # validated by the caller
+            assert holdout is not None
+            inv = linking.inventory(train)
+            inv_holdout = linking.inventory(holdout)
+            plan = linking.plan(inv, labels=labels, key=key, target=target)
+            plan_holdout = linking.plan(inv_holdout, labels=labels, key=key, target=target)
+            if plan_holdout.task != plan.task:
+                raise linking.LinkError(
+                    f"--train reads as {plan.task} and --holdout as {plan_holdout.task}"
+                )
+            frames = linking.LinkedFrames(
+                linking.apply(plan, inv).train, linking.apply(plan_holdout, inv_holdout).train
+            )
+            plan = plan.model_copy(
+                update={"split": "folders", "coverage": min(plan.coverage, plan_holdout.coverage)}
+            )
+            sources = [train, holdout]
+    except linking.LinkError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    console.print(linking.render(plan, inv, frames))
+    if plan.coverage < linking.ACCEPT and not yes:
+        if not _stdin_owns_tty():
+            raise typer.BadParameter(
+                f"coverage is {plan.coverage:.1%}, under {linking.ACCEPT:.0%}; re-run with --yes "
+                "to accept it, or fix the link with --labels, --key and --target"
+            )
+        if not typer.confirm("Continue with this plan?", default=False):
+            raise typer.Exit(code=1)
+
+    out_root = Path(get_settings().iterate_runs_dir).parent / "data"
+    try:
+        ws = workspace.write(plan, frames, sources=sources, out=out_root)
+    except linking.LinkError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    n_train = ws.train_csv.read_text(encoding="utf-8").count("\n") - 1
+    n_holdout = ws.holdout_csv.read_text(encoding="utf-8").count("\n") - 1
+    console.print(
+        f"\nlinked: {ws.root}\n  raw_files/  a copy of what you gave\n"
+        f"  train/      {n_train} images\n  holdout/    {n_holdout} images, sealed\n"
+        f"  train.csv, holdout.csv, link.json"
+    )
+    return ws
+
+
 @app.command()
 def run(
     data: Path | None = typer.Option(
         None,
         "--data",
-        help="Path to the CSV dataset. It is split here, 80/20, stratified on a "
-        "classification target, and the holdout is sealed. To bring your own split, "
-        "pass --train and --holdout instead.",
+        help="Your CSV, or a folder of images with their labels inside laid out however "
+        "they came. Split here, 80/20, stratified on a classification target, and the "
+        "holdout is sealed. To bring your own split, pass --train and --holdout instead.",
         exists=True,
-        dir_okay=False,
     ),
     train: Path | None = typer.Option(
         None,
         "--train",
-        help="Your training CSV, when you split the data yourself. Needs --holdout; "
-        "cannot be combined with --data.",
+        help="Your training CSV or folder, when you split the data yourself. Needs "
+        "--holdout; cannot be combined with --data.",
         exists=True,
-        dir_okay=False,
     ),
     holdout: Path | None = typer.Option(
         None,
         "--holdout",
-        help="Your holdout CSV, sealed exactly as given: its labels never enter the "
-        "kernel and nothing is reshuffled. Needs --train.",
+        help="Your holdout CSV or folder, sealed exactly as given: its labels never enter "
+        "the kernel and nothing is reshuffled. Needs --train.",
+        exists=True,
+    ),
+    target: str | None = typer.Option(
+        None,
+        "--target",
+        help="Name of the target column. Not needed for a folder of images, where the "
+        "label is found for you; with --labels it names that table's label column.",
+    ),
+    labels: Path | None = typer.Option(
+        None,
+        "--labels",
+        help="Folders only: the table that holds the labels, when the rules should not pick one.",
         exists=True,
         dir_okay=False,
     ),
-    target: str = typer.Option(..., "--target", help="Name of the target column."),
+    key: str | None = typer.Option(
+        None, "--key", help="Folders only: the column in --labels that names each image."
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Folders only: accept a link between 90% and 98% coverage without asking.",
+    ),
     metric: str | None = typer.Option(
         None,
         "--metric",
@@ -334,6 +424,25 @@ def run(
     if train is not None and holdout is not None and train.resolve() == holdout.resolve():
         raise typer.BadParameter("--train and --holdout are the same file")
 
+    # ─── A folder of images is linked first, by rules, and shown before anything runs ──
+    given = [p for p in (data, train, holdout) if p is not None]
+    folders = [p for p in given if p.is_dir()]
+    if folders and len(folders) != len(given):
+        raise typer.BadParameter("give folders for every input, or files for every input")
+    if folders:
+        ws = _link_folder(
+            data=data, train=train, holdout=holdout, labels=labels, key=key, target=target, yes=yes
+        )
+        console.print(
+            "[dim]the folder is ready; the vision target that runs on it lands later in "
+            f"v0.6, so this run stops here. Its CSVs: {ws.train_csv} and {ws.holdout_csv}[/dim]"
+        )
+        raise typer.Exit(code=0)
+    if target is None:
+        raise typer.BadParameter("--target is required for a CSV")
+    if labels is not None or key is not None or yes:
+        raise typer.BadParameter("--labels, --key and --yes describe a folder of images")
+
     # ─── First run with no saved config? Offer the setup wizard. ───────────
     if not userconfig.exists() and sys.stdin.isatty():
         console.print("[dim]No saved config found — let's set your defaults once.[/dim]\n")
@@ -432,6 +541,16 @@ def run(
             f"[dim]target {target!r} read as {dataset.task} "
             f"({describe_target(dataset.train_target)}); pass --metric to override[/dim]"
         )
+    from iterate.adapters.data.images import detect_image_column
+
+    first_file = data if data is not None else train
+    assert first_file is not None
+    if detect_image_column(dataset.train_features, dataset.features, first_file) is not None:
+        console.print(
+            "[dim]this CSV holds image paths; the vision target that runs on it lands "
+            "later in v0.6, so this run stops here[/dim]"
+        )
+        raise typer.Exit(code=0)
     data_summary = summarize_dataset(dataset)
 
     # ─── LLM clients + memory ──────────────────────────────────────────────
@@ -534,12 +653,16 @@ def run(
         # Same no-think client as the other strict roles: the Researcher must emit
         # a single structured tool call, and a thinking trace crowds that out.
         # Cached beside the runs so a re-run on the same data pays nothing.
-        critic_agent = Critic(
-            client,
-            metric=metric,
-            direction=direction,
-            family="prompt" if is_prompt_run else "tabular",
-        ) if critique else None
+        critic_agent = (
+            Critic(
+                client,
+                metric=metric,
+                direction=direction,
+                family="prompt" if is_prompt_run else "tabular",
+            )
+            if critique
+            else None
+        )
         researcher = (
             Researcher(
                 client,
@@ -863,7 +986,9 @@ def _rescore_winner_on_full_holdout(
     try:
         final = full_target.baseline()
     except Exception as exc:
-        console.print(f"[dim]final re-score failed ({type(exc).__name__}); keeping the loop score[/dim]")
+        console.print(
+            f"[dim]final re-score failed ({type(exc).__name__}); keeping the loop score[/dim]"
+        )
         return None
     if final.metrics is None:
         return None
