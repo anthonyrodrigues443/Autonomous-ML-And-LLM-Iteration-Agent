@@ -87,13 +87,29 @@ def supports(version: str, flag: str) -> bool:
 # with the input text read as a high-cardinality categorical, and records a
 # meaningless number under a real dataset name. Worse than an error.
 FIRST_PROMPT_VERSION = (0, 5, 0)
+# The same failure one family later: before v0.6 a CSV of image paths runs as a
+# tabular problem on file names.
+FIRST_VISION_VERSION = (0, 6, 0)
+# The working tree links a folder and then stops until the vision run is wired, so a
+# dev cell would record a run that never trained. Lifted with the CLI's guard; a test
+# runs the real command so the two cannot drift apart.
+DEV_RUNS_VISION = False
+
+
+def skip_reason(version: str, dataset: Dataset) -> str | None:
+    """Why this version cannot honestly run this dataset, or None when it can."""
+    if dataset.is_vision:
+        if version == DEV_VERSION:
+            return None if DEV_RUNS_VISION else "the vision run is not wired yet"
+        return None if parse_version(version) >= FIRST_VISION_VERSION else "predates DLModelTarget"
+    if dataset.is_prompt_task and parse_version(version) < FIRST_PROMPT_VERSION:
+        return "predates PromptTarget"
+    return None
 
 
 def supports_dataset(version: str, dataset: Dataset) -> bool:
     """False when this version cannot honestly run this dataset."""
-    if not dataset.is_prompt_task:
-        return True
-    return parse_version(version) >= FIRST_PROMPT_VERSION
+    return skip_reason(version, dataset) is None
 
 
 def cell_dir(version: str, dataset_name: str, repeat: int, work_dir: Path | None = None) -> Path:

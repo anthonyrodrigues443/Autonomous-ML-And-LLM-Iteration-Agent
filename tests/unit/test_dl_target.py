@@ -1,0 +1,379 @@
+"""Tests for the vision target with no torch: a fake runner stands in for the
+backbone, so CI covers the recipe, the budget, the ruler, the seal and the code job
+without a download or a GPU."""
+
+from __future__ import annotations
+
+import io
+import json
+import subprocess
+import sys
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import pandas as pd
+import pytest
+from PIL import Image
+
+from evals.config import REPO_ROOT
+from iterate.adapters.compute.base import SupportsCodeGen
+from iterate.adapters.compute.runner import LocalCodeRunner, RunResult
+from iterate.adapters.data.images import Prepared, prepare_images
+from iterate.adapters.data.tabular import load_csv, load_split
+from iterate.schemas.experiment import Candidate
+from iterate.targets import dl
+from iterate.targets.base import BenchmarkTarget
+from iterate.targets.dl import DLModelTarget, FitJob, FitReport, RecipeError
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+pytestmark = pytest.mark.unit
+
+
+def _write(root: Path, classes: int, per_class: int, *, offset: int = 0) -> list[dict[str, Any]]:
+    """One colour per class, one shade per image, so every file's bytes differ."""
+    rows = []
+    for k in range(classes):
+        for i in range(per_class):
+            path = root / "images" / f"{k:02d}_{offset + i:03d}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            colour = (20 * k % 256, (37 * k + 60) % 256, (7 * (offset + i) + 90) % 256)
+            Image.new("RGB", (16, 16), colour).save(path)
+            rows.append({"image": f"images/{path.name}", "label": k})
+    return rows
+
+
+def _prepared(tmp_path: Path, *, classes: int = 3, per_class: int = 10) -> Prepared:
+    root = tmp_path / "data"
+    pd.DataFrame(_write(root, classes, per_class)).to_csv(root / "data.csv", index=False)
+    loaded = load_csv(root / "data.csv", target="label", task="classification")
+    return prepare_images(loaded, root / "data.csv", into=tmp_path / "cache")
+
+
+class FakeRunner:
+    """Channel means stand in for a backbone; a fine-tune is a nearest-centroid fit on
+    the same features, so every class colour is told apart."""
+
+    device = "cpu"
+
+    def __init__(self, *, fail: Exception | None = None) -> None:
+        self.jobs: list[FitJob] = []
+        self._fail = fail
+
+    def embed(self, pixels: np.ndarray, *, backbone: str) -> np.ndarray:
+        return pixels.reshape(len(pixels), 3, -1).mean(axis=2).astype(np.float32)
+
+    def fit(self, job: FitJob) -> FitReport:
+        self.jobs.append(job)
+        if self._fail is not None:
+            raise self._fail
+        train = self.embed(job.train, backbone="")
+        held = self.embed(job.holdout, backbone="")
+        centres = np.stack([train[job.labels == c].mean(axis=0) for c in range(job.n_classes)])
+        logits = -((held[:, None, :] - centres[None]) ** 2).sum(-1)
+        p = np.exp(logits - logits.max(axis=1, keepdims=True))
+        return FitReport(p / p.sum(axis=1, keepdims=True), job.recipe.epochs, job.recipe.epochs)
+
+
+def _target(prepared: Prepared, *, metric: str = "accuracy", runner: Any = None) -> DLModelTarget:
+    return DLModelTarget(
+        prepared.dataset,
+        column=prepared.column.column,
+        metric=metric,
+        runner=runner or FakeRunner(),
+        image_size=prepared.image_size,
+        profile=prepared.profile,
+    )
+
+
+def _cand(changes: dict[str, Any]) -> Candidate:
+    return Candidate(description="d", changes=changes, rationale="r")
+
+
+# ─── the contract ────────────────────────────────────────────────────────────
+
+
+def test_the_target_meets_both_contracts(tmp_path: Path) -> None:
+    target = _target(_prepared(tmp_path))
+    assert isinstance(target, BenchmarkTarget)
+    assert isinstance(target, SupportsCodeGen)
+
+
+def test_the_probe_is_the_baseline_and_counts_the_holdout(tmp_path: Path) -> None:
+    prepared = _prepared(tmp_path)
+    result = _target(prepared).baseline()
+    assert result.error is None
+    assert result.metrics is not None
+    assert result.metrics.primary_value == 1.0
+    assert result.metrics.n_samples == prepared.dataset.n_test
+    recorded = json.loads(result.artifacts[dl.RECIPE_JSON])
+    assert (recorded["unfreeze"], recorded["epochs_run"]) == ("none", 0)
+
+
+def test_a_fine_tune_runs_through_the_runner_and_records_its_epochs(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    result = _target(_prepared(tmp_path), runner=runner).run(
+        _cand({"unfreeze": "all", "epochs": 2})
+    )
+    assert result.error is None
+    assert result.metrics is not None
+    assert result.metrics.primary_value == 1.0
+    assert json.loads(result.artifacts[dl.RECIPE_JSON])["epochs_planned"] == 2
+    assert len(runner.jobs) == 1
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"unfreeze": "all", "epochs": "3"}, "epochs must be int, got '3'"),
+        ({"unfreeze": "all", "epochs": 3, "lr": True}, "lr must be float, got True"),
+        ({"unfreeze": "all", "epochs": 3, "seed": -1}, "seed=-1 is outside"),
+        ({"unfreeze": "all", "epochs": 3, "seed": 2**64}, "is outside 0 to"),
+        ({"backbone": "efficientnet_b0"}, "backbone must be one of"),
+        ({"unfreeze": "all", "epochs": 0}, "the probe takes 0 epochs"),
+        ({"unfreeze": "all", "epochs": 3, "image_size": 16}, "image_size=16 is outside"),
+        ({"code": "def train_and_predict(): ..."}, "unknown recipe keys ['code']"),
+    ],
+)
+def test_a_recipe_is_refused_by_name_as_a_failed_result(
+    tmp_path: Path, changes: dict[str, Any], reason: str
+) -> None:
+    runner = FakeRunner()
+    result = _target(_prepared(tmp_path), runner=runner).run(_cand(changes))
+    assert result.metrics is None
+    assert result.error is not None
+    assert result.error.startswith("recipe refused: ")
+    assert reason in result.error
+    assert runner.jobs == []
+
+
+def test_a_path_that_is_not_a_byte_named_copy_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    pd.DataFrame(_write(root, 3, 6)).to_csv(root / "data.csv", index=False)
+    raw = load_csv(root / "data.csv", target="label", task="classification")
+    with pytest.raises(ValueError, match="must hold the byte-named copies"):
+        DLModelTarget(raw, column="image", metric="accuracy", runner=FakeRunner())
+
+
+def test_a_numeric_label_or_a_regression_metric_is_refused(tmp_path: Path) -> None:
+    prepared = _prepared(tmp_path)
+    with pytest.raises(ValueError, match="scores classes"):
+        _target(prepared, metric="rmse")
+
+
+# ─── one ruler ───────────────────────────────────────────────────────────────
+
+
+def test_integer_classes_score_the_same_through_run_and_the_code_job(tmp_path: Path) -> None:
+    """Twelve integer classes: sorted as text, 10 and 11 would sit between 1 and 2,
+    and the same probabilities scored 1.0 one way and 0.60 the other."""
+    prepared = _prepared(tmp_path, classes=12, per_class=8)
+    target = _target(prepared, metric="roc_auc")
+    by_run = target.baseline()
+    assert by_run.metrics is not None
+    classes = json.loads(target.meta_json())["classes"]
+    assert classes == list(range(12))
+    proba = target._probes[("resnet18", prepared.image_size)][2]
+    predictions = "\n".join(str(classes[i]) for i in proba.argmax(1)).encode()
+    probabilities = "\n".join(",".join(f"{v:.10f}" for v in row) for row in proba).encode()
+    outputs = {"predictions.csv": predictions, "probabilities.csv": probabilities}
+    by_code = target.score_code_job(
+        RunResult(stdout="", stderr="", exit_code=0, outputs=outputs), "code"
+    )
+    assert by_code.metrics is not None
+    for name in ("roc_auc", "accuracy", "log_loss"):
+        assert by_code.metrics.values[name] == pytest.approx(by_run.metrics.values[name], abs=1e-6)
+
+
+# ─── the seal ────────────────────────────────────────────────────────────────
+
+
+def _user_split_with_a_holdout_only_class(tmp_path: Path) -> Prepared:
+    root = tmp_path / "data"
+    pd.DataFrame(_write(root, 3, 8)).to_csv(root / "train.csv", index=False)
+    pd.DataFrame(_write(root, 4, 3, offset=100)).to_csv(root / "holdout.csv", index=False)
+    loaded = load_split(
+        root / "train.csv", root / "holdout.csv", target="label", task="classification"
+    )
+    return prepare_images(loaded, root / "train.csv", into=tmp_path / "cache")
+
+
+def test_the_runner_sees_training_labels_and_holdout_pixels_only(tmp_path: Path) -> None:
+    prepared = _user_split_with_a_holdout_only_class(tmp_path)
+    runner = FakeRunner()
+    target = _target(prepared, runner=runner)
+    assert json.loads(target.meta_json())["classes"] == [0, 1, 2]
+    assert json.loads(target.meta_json())["family"] == "vision"
+    result = target.run(_cand({"unfreeze": "all", "epochs": 1}))
+    assert result.error is None
+    (job,) = runner.jobs
+    assert len(job.labels) == prepared.dataset.n_train
+    assert set(job.labels.tolist()) == {0, 1, 2}
+    assert len(job.holdout) == prepared.dataset.n_test
+    assert job.n_classes == 3
+
+
+def test_a_probability_metric_with_a_holdout_only_class_fails_with_the_reason(
+    tmp_path: Path,
+) -> None:
+    prepared = _user_split_with_a_holdout_only_class(tmp_path)
+    result = _target(prepared, metric="roc_auc").baseline()
+    assert result.metrics is None
+    assert result.error == "roc_auc needs one probability column per holdout class"
+
+
+# ─── out of memory ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("MPS backend out of memory (MPS allocated: 1.75 GiB, max allowed: 1.78 GiB)", "oom"),
+        ("CUDA out of memory. Tried to allocate 2.00 GiB", "oom"),
+        ("Invalid buffer size: 372.53 GiB", "buffer"),
+        ("mat1 and mat2 shapes cannot be multiplied", None),
+    ],
+)
+def test_out_of_memory_is_read_from_the_text(text: str, kind: str | None) -> None:
+    assert dl.oom_kind(RuntimeError(text)) == kind
+    assert dl.oom_kind(ValueError(text)) is None
+
+
+def test_an_out_of_memory_error_is_raised_without_its_chain() -> None:
+    def boom() -> None:
+        raise RuntimeError("MPS backend out of memory (MPS allocated: 1 GiB)")
+
+    with pytest.raises(dl.DeviceOutOfMemoryError) as caught:
+        dl._guarded("cpu", boom, "batch_size=64, image_size=224")
+    assert "halve one of them" in str(caught.value)
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+def test_a_buffer_too_large_is_not_retryable_and_other_errors_propagate() -> None:
+    def buffer() -> None:
+        raise RuntimeError("Invalid buffer size: 372.53 GiB")
+
+    def other() -> None:
+        raise RuntimeError("mat1 and mat2 shapes cannot be multiplied")
+
+    with pytest.raises(dl.DeviceOutOfMemoryError, match="not retryable"):
+        dl._guarded("cpu", buffer, "image_size=384")
+    with pytest.raises(RuntimeError, match="shapes"):
+        dl._guarded("cpu", other, "x")
+
+
+def test_a_device_failure_in_a_fit_is_a_failed_result(tmp_path: Path) -> None:
+    failure = dl.DeviceOutOfMemoryError("out of memory on mps at batch_size=64: halve one of them")
+    result = _target(_prepared(tmp_path), runner=FakeRunner(fail=failure)).run(
+        _cand({"unfreeze": "all", "epochs": 1})
+    )
+    assert result.metrics is None
+    assert result.error == "out of memory on mps at batch_size=64: halve one of them"
+
+
+# ─── the budget ──────────────────────────────────────────────────────────────
+
+
+def test_epoch_one_alone_over_the_budget_is_refused_with_advice() -> None:
+    with pytest.raises(RecipeError, match="halve image_size or use resnet18"):
+        dl.plan_epochs(3, 600.0, 540.0)
+
+
+def test_the_plan_is_the_whole_epochs_that_fit() -> None:
+    assert dl.plan_epochs(5, 120.0, 500.0) == 4
+    assert dl.plan_epochs(3, 21.0, 500.0) == 3
+
+
+def test_an_epoch_the_deadline_cuts_is_not_counted_and_the_log_says_so() -> None:
+    logs: list[str] = []
+    summaries = iter(["loss=1.0000 train_acc=0.5000", None])
+    assert dl.run_epochs(lambda _epoch: next(summaries), 3, logs.append) == 1
+    assert logs[0].startswith("epoch 1/3 loss=1.0000")
+    assert logs[1] == "stopped in epoch 2/3: the fit budget ran out"
+
+
+def test_pixels_over_a_quarter_of_ram_are_refused_with_their_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dl, "_ram_bytes", lambda: 100_000)
+    result = _target(_prepared(tmp_path)).baseline()
+    assert result.error is not None
+    assert "GiB decoded, over a quarter of this machine's RAM; lower image_size" in result.error
+
+
+def test_only_one_decoded_size_is_kept(tmp_path: Path) -> None:
+    target = _target(_prepared(tmp_path))
+    target.baseline()
+    target.run(_cand({"image_size": 64}))
+    assert list(target._pixels) == [64]
+
+
+@pytest.mark.parametrize("classes", [2, 4])
+def test_the_probe_head_predicts_what_the_probe_predicts(tmp_path: Path, classes: int) -> None:
+    prepared = _prepared(tmp_path, classes=classes, per_class=10)
+    target = _target(prepared)
+    target.baseline()
+    weight, bias = target._probe_head("resnet18", prepared.image_size)
+    _, held = target._decoded(prepared.image_size)
+    logits = FakeRunner().embed(held, backbone="resnet18") @ weight.T + bias
+    probe = target._probes[("resnet18", prepared.image_size)][2]
+    assert (logits.argmax(1) == probe.argmax(1)).all()
+
+
+# ─── the code job ────────────────────────────────────────────────────────────
+
+_MAJORITY = (
+    "def train_and_predict(X_train, y_train, X_holdout):\n"
+    "    top = y_train.mode()[0]\n"
+    "    return [top] * len(X_holdout)\n"
+)
+
+
+def test_the_code_job_hands_over_paths_without_labels_and_the_vision_meta(tmp_path: Path) -> None:
+    prepared = _prepared(tmp_path)
+    job = _target(prepared).build_code_job(_cand({"code": _MAJORITY}))
+    holdout = pd.read_csv(io.BytesIO(job.inputs["holdout.csv"]))
+    assert list(holdout.columns) == ["image"]
+    assert len(holdout) == prepared.dataset.n_test
+    meta = json.loads(job.inputs["meta.json"])
+    assert meta["family"] == "vision"
+    assert meta["classes"] == [0, 1, 2]
+    assert job.outputs == ["predictions.csv", "probabilities.csv"]
+
+
+def test_a_majority_answer_scores_through_the_local_runner(tmp_path: Path) -> None:
+    prepared = _prepared(tmp_path)
+    target = _target(prepared)
+    job = target.build_code_job(_cand({"code": _MAJORITY}))
+    run = LocalCodeRunner().run(job.script, inputs=job.inputs, outputs=job.outputs, timeout=60)
+    assert run.succeeded, run.stderr
+    result = target.score_code_job(run, "majority")
+    assert result.metrics is not None
+    assert result.metrics.n_samples == prepared.dataset.n_test
+    assert 0.0 < result.metrics.primary_value < 1.0
+
+
+def test_a_failed_script_is_a_failed_result(tmp_path: Path) -> None:
+    result = _target(_prepared(tmp_path)).score_code_job(
+        RunResult(stdout="", stderr="Traceback: boom", exit_code=1, outputs={}), "x"
+    )
+    assert result.metrics is None
+    assert result.error is not None
+    assert result.error.startswith("code script failed")
+
+
+# ─── imports ─────────────────────────────────────────────────────────────────
+
+
+def test_the_target_and_the_sweep_import_without_torch() -> None:
+    code = (
+        "import sys\n"
+        "import iterate.targets.dl, evals.vision_ceilings\n"
+        "print('torch' in sys.modules)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=REPO_ROOT
+    )
+    assert out.stdout.strip() == "False"

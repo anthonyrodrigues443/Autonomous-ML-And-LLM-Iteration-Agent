@@ -104,3 +104,27 @@ def test_the_shipped_registry_is_loadable_and_names_real_metrics() -> None:
     assert datasets, "no dataset specs found under evals/datasets/"
     for dataset in datasets:
         assert dataset.metric in REGISTRY, f"{dataset.name}: unknown metric {dataset.metric}"
+
+
+def test_a_vision_dataset_says_its_family(tmp_path: Path) -> None:
+    _spec(tmp_path, "flowers", 'target = "label"\nmetric = "accuracy"\nfamily = "vision"\n')
+
+    (dataset,) = corpus.load(tmp_path)
+
+    assert dataset.is_vision
+    assert not dataset.is_prompt_task
+
+
+def test_an_unknown_family_is_refused(tmp_path: Path) -> None:
+    _spec(tmp_path, "sounds", 'target = "y"\nmetric = "f1"\nfamily = "audio"\n')
+
+    with pytest.raises(corpus.BadDatasetSpecError, match="family 'audio'"):
+        corpus.load(tmp_path)
+
+
+def test_the_two_vision_datasets_are_registered() -> None:
+    by_name = {dataset.name: dataset for dataset in corpus.load()}
+    for name in ("flowers102", "eurosat"):
+        assert by_name[name].is_vision
+        assert (by_name[name].target, by_name[name].metric) == ("label", "accuracy")
+        assert by_name[name].path == REPO_ROOT / "examples" / name / "data.csv"

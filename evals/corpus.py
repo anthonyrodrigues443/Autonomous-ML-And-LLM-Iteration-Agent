@@ -34,6 +34,9 @@ _DEFAULT_DATA_FILE = "data.csv"
 # Enough of a sha256 to make a collision a non-issue while staying readable in a
 # table cell. Same length the package uses for its own data fingerprints.
 _HASH_CHARS = 16
+# Only a vision dataset needs saying: a prompt dataset is known by its task line and
+# everything else is tabular.
+FAMILIES = ("", "tabular", "prompt", "vision")
 
 
 @dataclass(frozen=True)
@@ -50,10 +53,16 @@ class Dataset:
     # Its presence is what tells the harness to sweep prompt techniques for this
     # dataset's ceiling rather than model families.
     task: str = ""
+    # "vision" for a CSV of image paths; the ceiling is then a sweep of recipes.
+    family: str = ""
 
     @property
     def is_prompt_task(self) -> bool:
         return bool(self.task.strip())
+
+    @property
+    def is_vision(self) -> bool:
+        return self.family.strip() == "vision"
 
     @property
     def available(self) -> bool:
@@ -91,6 +100,12 @@ def _load_one(spec_path: Path) -> Dataset:
     if missing:
         raise BadDatasetSpecError(f"{spec_path}: missing {', '.join(missing)}")
 
+    family = str(raw.get("family", "")).strip()
+    if family not in FAMILIES:
+        raise BadDatasetSpecError(
+            f"{spec_path}: family {family!r} is not one of {', '.join(f for f in FAMILIES if f)}"
+        )
+
     declared = str(raw.get("data", "")).strip()
     path = (REPO_ROOT / declared) if declared else (spec_path.parent / _DEFAULT_DATA_FILE)
 
@@ -102,6 +117,7 @@ def _load_one(spec_path: Path) -> Dataset:
         source=str(raw.get("source", "")),
         notes=str(raw.get("notes", "")),
         task=str(raw.get("task", "")),
+        family=family,
     )
 
 

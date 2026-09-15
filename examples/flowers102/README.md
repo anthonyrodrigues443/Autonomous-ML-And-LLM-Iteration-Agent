@@ -32,9 +32,10 @@ The layout is flat on purpose: every image is `images/NNNNN.jpg` in shuffled ord
 and the label lives only in the CSV, so a holdout path can never tell a model its
 class. The script asserts that before writing anything.
 
-**Status:** data ready (v0.6 Day 1). The `DLModelTarget` lands on Day 2 of the
-v0.6 sprint and the `iterate run` switch for images on Day 3; until then this
-folder is data only.
+**Status:** data ready, and `DLModelTarget` measures its ceiling here in the eval
+sweep (`python -m evals.run ceilings --datasets flowers102`). The `iterate run`
+switch for images lands next; until then a run on this folder stops once it is
+linked.
 
 **License:** Oxford states no license for the images. The script downloads them for
 local use and this repo redistributes nothing. Cite: Nilsback, M-E. and Zisserman,

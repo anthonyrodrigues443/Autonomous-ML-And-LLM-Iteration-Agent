@@ -264,3 +264,5 @@ Decisions: Shipped the ladder skeleton: five numbered rungs (BASELINE, METRIC LE
 **Out of scope today:** the target and the code path (Days 2 and 3); a 4050 memory table (measured on Day 5, never cited from a 3060); a deliverable beyond the notebook, since `ExperimentResult.artifacts` holds strings and a fine-tuned head is not one; species names for Flowers102 unless a verified index turns up; timm.
 
 ---
+
+**Corrections, 2026-09-16, measured building the target.** On MPS an out-of-memory error is a plain `RuntimeError` ("MPS backend out of memory"), not `torch.OutOfMemoryError`, which only CUDA raises; the runner reads the message. And by default the MPS pool never raises: its high watermark ratio defaults to 1.7 of the recommended working set, past this Mac's 24 GB, so the machine pages instead. The runner starts torch with the high ratio at 1.0 and the low at 0.8; setting the high ratio alone fails at startup, because the low default of 1.4 then sits above it.

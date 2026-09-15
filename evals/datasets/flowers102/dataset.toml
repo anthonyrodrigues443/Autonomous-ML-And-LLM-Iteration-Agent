@@ -1,0 +1,6 @@
+data = "examples/flowers102/data.csv"
+target = "label"
+metric = "accuracy"
+family = "vision"
+source = "Oxford Flowers102 (Nilsback and Zisserman 2008), prepared by examples/flowers102/prepare.py"
+notes = "The vision headline. 102 species, 40 to 258 images each; one of its 8,189 images is in the ImageNet-1k training set, so a transfer result here is not a backbone remembering its own training data."

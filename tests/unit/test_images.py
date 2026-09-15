@@ -4,7 +4,7 @@ family rides on."""
 from __future__ import annotations
 
 from itertools import pairwise
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -25,10 +25,7 @@ from iterate.adapters.data.images import (
     resolve_paths,
     split_folders,
 )
-from iterate.adapters.data.tabular import load_csv
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from iterate.adapters.data.tabular import load_csv, load_split
 
 pytestmark = pytest.mark.unit
 
@@ -399,3 +396,150 @@ def test_the_image_profile_renders_facts_only_when_given() -> None:
     assert "Data checks" not in plain
     told = ImageProfile(**base, facts=("2 holdout images left out as byte copies.",)).render()  # type: ignore[arg-type]
     assert told == plain + "\nData checks: 2 holdout images left out as byte copies."
+
+
+# ─── prepare ──────────────────────────────────────────────────────────────
+
+
+def _tiny_csv(root: Path, *, per_class: int = 8) -> Path:
+    rows = []
+    for k, c in enumerate(CLASSES):
+        for i in range(per_class):
+            path = root / "images" / f"{c}_{i}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _png(path, seed=k * 30 + i)
+            rows.append({"image": f"images/{path.name}", "label": c})
+    csv = root / "data.csv"
+    pd.DataFrame(rows).to_csv(csv, index=False)
+    return csv
+
+
+def test_prepare_copies_under_byte_names_outside_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.adapters.data.images import image_cache_dir, prepare_images
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert image_cache_dir() == tmp_path / "xdg" / "iterate" / "images"
+    csv = _tiny_csv(tmp_path / "data")
+    prepared = prepare_images(load_csv(csv, target="label"), csv)
+    assert prepared.cache_dir.parent == tmp_path / "xdg" / "iterate" / "images"
+    paths = [
+        Path(str(p))
+        for f in (prepared.dataset.train_features, prepared.dataset.test_features)
+        for p in f["image"]
+    ]
+    assert {p.parent for p in paths} == {prepared.cache_dir}
+    assert all(len(p.name) == 16 and "." not in p.name for p in paths)
+    assert prepared.dataset.data_hash == prepared.cache_dir.name
+
+
+def test_prepare_leaves_twins_out_of_a_split_it_made_and_not_out_of_a_users(
+    tmp_path: Path,
+) -> None:
+    from iterate.adapters.data.images import prepare_images
+
+    csv = _tiny_csv(tmp_path / "data")
+    frame = pd.read_csv(csv)
+    source = csv.parent / "images" / "cat_0.png"
+    for i in range(6):
+        copy = csv.parent / "images" / f"cat_copy_{i}.png"
+        copy.write_bytes(source.read_bytes())
+        frame.loc[len(frame)] = {"image": f"images/{copy.name}", "label": "cat"}
+    frame.to_csv(csv, index=False)
+
+    loaded = load_csv(csv, target="label")
+    column = detect_image_column(loaded.train_features, loaded.features, csv)
+    assert column is not None
+    absolute = resolve_paths(loaded, column)
+    hashes = file_hashes(
+        [str(p) for f in (absolute.train_features, absolute.test_features) for p in f["image"]]
+    )
+    in_train = {hashes[str(p)] for p in absolute.train_features["image"]}
+    expected = [str(p) for p in absolute.test_features["image"] if hashes[str(p)] in in_train]
+    assert expected, "the fixture put no copy across the split"
+
+    prepared = prepare_images(loaded, csv, into=tmp_path / "cache")
+    assert list(prepared.dropped) == expected
+    assert prepared.dataset.n_test == loaded.n_test - len(expected)
+    assert f"{len(expected)} holdout images left out as byte copies of training images." in (
+        prepared.dataset.facts
+    )
+
+    train = tmp_path / "user" / "train.csv"
+    holdout = tmp_path / "user" / "holdout.csv"
+    train.parent.mkdir()
+    rows = pd.read_csv(csv)
+    rows["image"] = rows["image"].map(lambda v: str(csv.parent / v))
+    rows.iloc[:20].to_csv(train, index=False)
+    rows.iloc[20:].to_csv(holdout, index=False)
+    theirs = prepare_images(load_split(train, holdout, target="label"), train, into=tmp_path / "c2")
+    assert theirs.dropped == ()
+    assert theirs.dataset.n_test == len(rows) - 20
+
+
+def test_prepare_refuses_a_holdout_made_only_of_copies(tmp_path: Path) -> None:
+    from iterate.adapters.data.images import prepare_images
+
+    root = tmp_path / "data"
+    rows = []
+    for k, c in enumerate(CLASSES):
+        first = root / "images" / f"{c}_0.png"
+        first.parent.mkdir(parents=True, exist_ok=True)
+        _png(first, seed=k * 30)
+        for i in range(8):
+            path = root / "images" / f"{c}_{i}.png"
+            if i:
+                path.write_bytes(first.read_bytes())
+            rows.append({"image": f"images/{path.name}", "label": c})
+    pd.DataFrame(rows).to_csv(root / "data.csv", index=False)
+    with pytest.raises(ValueError, match="leaves no holdout rows"):
+        prepare_images(load_csv(root / "data.csv", target="label"), root / "data.csv", into=root)
+
+
+def test_prepare_adds_the_monitor_brief_and_facts_after_the_ones_there(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from iterate.adapters.data import monitor
+    from iterate.adapters.data.images import prepare_images
+    from iterate.schemas.monitor import DataReport
+
+    csv = _tiny_csv(tmp_path / "data")
+    report = DataReport(
+        version="1",
+        images=24,
+        train_rows=19,
+        holdout_rows=5,
+        split="ours",
+        seconds=0.0,
+        findings=[],
+    )
+    monitor.save(report, csv.parent)
+    loaded = replace(load_csv(csv, target="label"), facts=("first.",))
+    prepared = prepare_images(loaded, csv, into=tmp_path / "cache", facts=("last.",))
+    assert prepared.dataset.facts == ("first.", report.brief(), "last.")
+    assert prepared.profile.render().splitlines()[-1].startswith("Data checks: first. Data checks")
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "size"), [(64, 64, 64), (100, 120, 96), (500, 375, 160), (20, 20, 32)]
+)
+def test_the_default_size_follows_the_median_short_side(width: int, height: int, size: int) -> None:
+    from iterate.adapters.data.images import ImageProfile, default_image_size
+
+    profile = ImageProfile(
+        n_train=10,
+        n_test=3,
+        column="image",
+        classes=2,
+        class_balance=(("a", 0.5), ("b", 0.5)),
+        target_spread=None,
+        widths=(width, width, width),
+        heights=(height, height, height),
+        portrait_share=0.0,
+        modes=(("RGB", 1.0),),
+        formats=(("PNG", 1.0),),
+        unreadable=0,
+        shared_across_split=0,
+    )
+    assert default_image_size(profile) == size

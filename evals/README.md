@@ -131,11 +131,12 @@ does hyperparameter search or ensembling-over-boosting, so neither can see that
 margin. That is `v3`, and until it exists a churn capture fraction should be read as
 "of what a fixed sweep could find", not "of what is there".
 
-## Two kinds of ceiling
+## Three kinds of ceiling
 
-A `task` line in a dataset's `dataset.toml` marks it as a PROMPT dataset and selects
-a different sweep. Both answer the same question — what is achievable here, with no
-LLM deciding — and both are lower bounds.
+A `task` line in a dataset's `dataset.toml` marks it as a PROMPT dataset, and
+`family = "vision"` marks a CSV of image paths; each selects its own sweep. All three
+answer the same question, what is achievable here with no LLM deciding, and all three
+are lower bounds.
 
 **Tabular: model families, then feature treatments.** Nine estimators through the
 real `ModelTarget` (v1), and eight feature treatments through the code path (v2,
@@ -188,6 +189,28 @@ examples alone (0.9510 vs 0.9478). Davidson is the counter-case where adding the
 definition to few-shot costs 0.09. So the best technique still differs by dataset,
 which is the argument for an agent iterating per dataset rather than a prompt shape
 someone hardcodes.
+
+**Vision: recipes.** Twelve typed recipes through the real `DLModelTarget.run()`,
+the same call an agent candidate takes, after the same `prepare_images` step:
+
+```
+probe resnet18 · probe convnext_tiny · fine-tune 3 epochs · 5 epochs · head only
+  · probe head with SGD · label smoothing · flip and crop · resnet50 · convnext_tiny
+  · probe at the larger size · fine-tune at the larger size
+```
+
+The larger size is twice the base, up to 224. Each evaluation has 540 seconds
+counted from the top of the call; the runner plans the whole epochs that fit and
+builds its schedule over them, and every row records its epochs planned and run, so a
+trimmed recipe shows. Runs on MPS are not bitwise repeatable and each recipe runs
+once, so the stored detail carries the holdout's standard error: rows within it are a
+tie. Each vision sweep runs in a child process of its own, because torch and lightgbm
+cannot share a process on macOS and a ceilings run over the whole corpus fits lightgbm
+for its tabular rows. It runs overnight on one machine, one dataset after the other:
+
+```bash
+nohup uv run python -m evals.run ceilings --datasets flowers102,eurosat > sweep.log 2>&1 &
+```
 
 ## Two corpora, one word
 
