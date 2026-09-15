@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -238,11 +239,10 @@ def _key_strings(values: pd.Series) -> list[str]:
     return ["" if pd.isna(v) else str(v).strip() for v in values]
 
 
-def _resolve(
+def _claimed(
     values: pd.Series, index: dict[str, list[Path]], method: KeyMethod
-) -> tuple[list[Path | None], float]:
-    """One image per row or None; coverage is the share of rows that resolved to an
-    image no other row resolved to."""
+) -> list[Path | None]:
+    """The image each row names, or None when the key names nothing or several."""
     out: list[Path | None] = []
     for v in _key_strings(values):
         candidates = (index.get(v) or index.get(v.lower()) or []) if v else []
@@ -251,13 +251,60 @@ def _resolve(
         if method == "path" and v and not candidates:
             candidates = index.get(v.replace("\\", "/").lstrip("./")) or []
         out.append(candidates[0] if len(candidates) == 1 else None)
-    counts: dict[Path, int] = {}
-    for p in out:
-        if p is not None:
-            counts[p] = counts.get(p, 0) + 1
-    out = [p if p is not None and counts[p] == 1 else None for p in out]
-    hits = sum(1 for p in out if p is not None)
-    return out, hits / max(1, len(out))
+    return out
+
+
+def _unshared(claimed: list[Path | None]) -> list[Path | None]:
+    """Only an image exactly one row names is kept; two rows naming one image are
+    both set aside, and the monitor reports them."""
+    counts = Counter(p for p in claimed if p is not None)
+    return [p if p is not None and counts[p] == 1 else None for p in claimed]
+
+
+def _resolve(
+    values: pd.Series, index: dict[str, list[Path]], method: KeyMethod
+) -> tuple[list[Path | None], float]:
+    """One image per row or None; coverage is the share of rows that resolved to an
+    image no other row resolved to."""
+    out = _unshared(_claimed(values, index, method))
+    return out, sum(1 for p in out if p is not None) / max(1, len(out))
+
+
+@dataclass(frozen=True)
+class TableRows:
+    """A table read the way ``apply`` reads it. ``keys`` is each row's key as text,
+    ``claimed`` the image each row names, ``resolved`` only an image exactly one row
+    names, which is what ``apply`` keeps, and ``label`` the row's label when the
+    plan names one."""
+
+    frame: pd.DataFrame
+    keys: list[str]
+    claimed: list[Path | None]
+    resolved: list[Path | None]
+    label: pd.Series | None
+
+
+def table_rows(
+    inv: Inventory,
+    table: Path,
+    key_column: str,
+    key_to_file: KeyMethod,
+    *,
+    target_column: str | None = None,
+    onehot_columns: Sequence[str] = (),
+) -> TableRows:
+    """The one way a table becomes rows: ``apply`` reads through here, and so do the
+    monitor's table checks, so both see the same images and the same labels."""
+    frame = read_table(table)
+    index = _index(inv.images, inv.root, table.parent)[key_to_file]
+    claimed = _claimed(frame[key_column], index, key_to_file)
+    label: pd.Series | None = None
+    if onehot_columns:
+        block = list(onehot_columns)
+        label = frame[block].idxmax(axis=1).where(frame[block].notna().all(axis=1))
+    elif target_column is not None:
+        label = frame[target_column]
+    return TableRows(frame, _key_strings(frame[key_column]), claimed, _unshared(claimed), label)
 
 
 # ─── the ladder ───────────────────────────────────────────────────────────
@@ -485,7 +532,7 @@ def _class_dirs(root: Path) -> list[Path]:
     return [p for p in sorted(root.iterdir()) if p.is_dir() and _visible(p)]
 
 
-def _class_of(image: Path, root: Path) -> str | None:
+def class_of(image: Path, root: Path) -> str | None:
     """The top-level folder under ``root`` an inventoried image sits in, or None."""
     try:
         parts = image.relative_to(root).parts
@@ -503,7 +550,7 @@ def _plan_class_folders(inv: Inventory) -> LinkPlan | None:
         if len(dirs) < 2:
             return None
         for d in dirs:
-            members = [p for p in inv.images if _class_of(p, r) == d.name]
+            members = [p for p in inv.images if class_of(p, r) == d.name]
             if not members:
                 return None
             if any(p.parent != d for p in members):
@@ -681,7 +728,7 @@ def _frame_from_class_dirs(inv: Inventory, root: Path) -> pd.DataFrame:
     rows = [
         {"image": str(p), "label": label}
         for p in inv.images
-        if (label := _class_of(p, root)) is not None
+        if (label := class_of(p, root)) is not None
     ]
     return pd.DataFrame(rows, columns=["image", "label"])
 
@@ -706,21 +753,18 @@ def apply(plan_: LinkPlan, inv: Inventory) -> LinkedFrames:
     assert plan_.labels_file  # the schema
     assert plan_.key_column
     assert plan_.key_to_file
-    table = Path(plan_.labels_file)
-    frame = read_table(table)
-    index = _index(inv.images, inv.root, table.parent)[plan_.key_to_file]
-    resolved, _ = _resolve(frame[plan_.key_column], index, plan_.key_to_file)
-    if plan_.onehot_columns:
-        label = (
-            frame[plan_.onehot_columns]
-            .idxmax(axis=1)
-            .where(frame[plan_.onehot_columns].notna().all(axis=1))
-        )
-    else:
-        assert plan_.target_column  # the schema
-        label = frame[plan_.target_column]
+    rows = table_rows(
+        inv,
+        Path(plan_.labels_file),
+        plan_.key_column,
+        plan_.key_to_file,
+        target_column=plan_.target_column,
+        onehot_columns=plan_.onehot_columns,
+    )
+    assert rows.label is not None  # the schema: a target column or a one-hot block
+    frame = rows.frame
     out = pd.DataFrame(
-        {"image": [str(p) if p else None for p in resolved], "label": label.to_numpy()}
+        {"image": [str(p) if p else None for p in rows.resolved], "label": rows.label.to_numpy()}
     )
     if plan_.split_column:
         marks = frame[plan_.split_column].astype(str).str.lower()
@@ -756,8 +800,9 @@ def _checked(frames: LinkedFrames, plan_: LinkPlan, inv: Inventory) -> LinkedFra
     return frames
 
 
-def render(plan_: LinkPlan, inv: Inventory, frames: LinkedFrames) -> str:
-    """The block a person reads before saying yes."""
+def render(plan_: LinkPlan, inv: Inventory, frames: LinkedFrames, *, dropped: int = 0) -> str:
+    """The block a person reads before saying yes. ``dropped`` is how many holdout
+    images our split left out as byte copies of a training image."""
     where = f"data: {inv.root}"
     if inv.collapsed:
         where += f" (inside {'/'.join(inv.collapsed)})"
@@ -775,8 +820,13 @@ def render(plan_: LinkPlan, inv: Inventory, frames: LinkedFrames) -> str:
             f"{how}, target {target}"
         )
     n_hold = 0 if frames.holdout is None else len(frames.holdout)
+    ours = f"split: none given, {len(frames.train) + n_hold + dropped} images split here 80/20"
+    if frames.holdout is not None:
+        ours += f", {len(frames.train)} train / {n_hold} holdout"
+        if dropped:
+            ours += f" ({dropped} left out as byte copies of a training image)"
     split = {
-        "ours": f"split: none given, {len(frames.train)} images split here 80/20",
+        "ours": ours,
         "folders": f"split: yours, from the folders, {len(frames.train)} train / {n_hold} holdout",
         "column": (
             f"split: yours, from column {plan_.split_column!r}, "
@@ -808,11 +858,14 @@ __all__ = [
     "Inventory",
     "LinkError",
     "LinkedFrames",
+    "TableRows",
     "apply",
+    "class_of",
     "inventory",
     "join_rates",
     "plan",
     "plan_from_choice",
     "read_table",
     "render",
+    "table_rows",
 ]

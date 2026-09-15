@@ -265,6 +265,7 @@ class ImageProfile:
     formats: tuple[tuple[str, float], ...]
     unreadable: int
     shared_across_split: int
+    facts: tuple[str, ...] = ()
 
     def render(self) -> str:
         w, h = self.widths, self.heights
@@ -294,6 +295,8 @@ class ImageProfile:
             f"Unreadable files: {self.unreadable}. Byte-identical images in both splits: "
             f"{self.shared_across_split}.",
         ]
+        if self.facts:
+            lines.append("Data checks: " + " ".join(self.facts))
         return "\n".join(lines)
 
 
@@ -367,6 +370,7 @@ def profile_images(
         formats=shares(formats),
         unreadable=unreadable,
         shared_across_split=len(train_digests & test_digests),
+        facts=dataset.facts,
     )
 
 

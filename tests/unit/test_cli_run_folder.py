@@ -8,13 +8,13 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pandas as pd
 import pytest
-from PIL import Image
 from typer.testing import CliRunner
 
 from iterate import cli as cli_module
 from iterate.adapters.data import linking
 from iterate.cli import app
 from iterate.core.linker import Proposal
+from tests.unit.image_fixtures import class_tree, png
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -29,16 +29,11 @@ def _plain(output: str) -> str:
     return " ".join(stripped.split())
 
 
-def _png(path: Path, seed: int = 0) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (12, 8), (seed * 9 % 255, 60, 120)).save(path)
+_png = png
 
 
 def _class_tree(root: Path, *, per_class: int = 6, seed: int = 0) -> Path:
-    for c in ("cat", "dog", "emu"):
-        for i in range(per_class):
-            _png(root / c / f"{c}_{seed + i}.png", seed + i)
-    return root
+    return class_tree(root, per_class=per_class, seed=seed)
 
 
 @pytest.fixture(autouse=True)
@@ -794,3 +789,270 @@ def test_a_split_column_inside_one_of_two_folders_is_refused(tmp_path: Path) -> 
     result = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
     assert result.exit_code != 0
     assert "the table under --holdout also names one in column 'split'" in _plain(result.output)
+
+
+# ─── the monitor at the pause ────────────────────────────────────────────────
+
+
+def test_the_checks_print_under_the_block_and_land_beside_the_plan(tmp_path: Path) -> None:
+    import json
+
+    source = _class_tree(tmp_path / "pets", per_class=8)
+    result = runner.invoke(app, ["run", "--data", str(source)])
+    assert result.exit_code == 0, result.output
+    text = _plain(result.output)
+    assert "checks: 7 passed (24 images read in" in text
+    assert "monitor.json 0 finding(s)" in text
+    root = next(p for p in _data_dir(tmp_path).iterdir() if p.name != "plans")
+    report = json.loads((root / "monitor.json").read_text(encoding="utf-8"))
+    assert [f["check"] for f in report["findings"]] == [
+        "coverage",
+        "labels",
+        "twins",
+        "lookalikes",
+        "sources",
+        "floors",
+        "groups",
+    ]
+    assert report["dropped"] == []
+
+
+def _twin_pair(tmp_path: Path) -> tuple[Path, Path]:
+    a = _class_tree(tmp_path / "train", per_class=5)
+    b = _class_tree(tmp_path / "test", per_class=2, seed=100)
+    (b / "cat" / "cat_twin.png").write_bytes((a / "cat" / "cat_0.png").read_bytes())
+    return a, b
+
+
+def test_a_twin_in_the_users_holdout_asks_and_drop_takes_it_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    a, b = _twin_pair(tmp_path)
+    asked = _answers(monkeypatch, ["remove them", "yes"])
+    result = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert result.exit_code == 0, result.output
+    assert asked[0].startswith(
+        "yes to continue, no to stop, drop to take the twins out of your holdout"
+    )
+    text = _plain(result.output)
+    assert (
+        "warn: 1 holdout images (14.3%) are byte-identical to a training image, 1 under the same label"
+        in text
+    )
+    assert "dropped: 1 holdout images dropped from your holdout at your request" in text
+    assert "monitor.json 0 finding(s), 1 holdout images dropped" in text
+    root = next(p for p in _data_dir(tmp_path).iterdir() if p.name != "plans")
+    assert len(pd.read_csv(root / "holdout.csv")) == 6
+    assert json.loads((root / "monitor.json").read_text(encoding="utf-8"))["dropped"] == [
+        "cat/cat_twin.png"
+    ]
+    assert (root / "raw_files" / "holdout" / "cat" / "cat_twin.png").exists()
+
+
+def test_a_warn_makes_a_proven_plan_wait_and_yes_keeps_the_twins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, b = _twin_pair(tmp_path)
+    refused = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert refused.exit_code != 0
+    assert "the checks found something worth a look; re-run with --yes" in _plain(refused.output)
+    assert not _data_dir(tmp_path).exists()
+    _answers(monkeypatch, ["yes"])
+    kept = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert kept.exit_code == 0, kept.output
+    assert "monitor.json 1 finding(s)" in _plain(kept.output)
+    root = next(p for p in _data_dir(tmp_path).iterdir() if p.name != "plans")
+    assert len(pd.read_csv(root / "holdout.csv")) == 7
+
+
+def test_drop_with_nothing_to_drop_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _partial(tmp_path)
+    _answers(monkeypatch, ["drop", "yes"])
+    result = runner.invoke(app, ["run", "--data", str(root)])
+    assert result.exit_code == 0, result.output
+    assert "nothing to drop: no holdout image is a byte copy" in _plain(result.output)
+
+
+def test_a_first_pick_whose_split_refuses_can_be_corrected(
+    tmp_path: Path, fake_linker: type[_FakeLinker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "birds"
+    for i in range(24):
+        _png(root / "img" / f"{i:03d}.jpg", i)
+    pd.DataFrame(
+        {
+            "file": [f"{i:03d}.jpg" for i in range(24)],
+            "region": ["north", "south", "east"] * 8,
+            "species_code": ["x", "y"] * 11 + ["z", "x"],
+            "photographer": [f"person {i}" for i in range(24)],
+        }
+    ).to_csv(root / "meta.csv", index=False)
+    fake_linker.script = ["species_code", "region"]
+    _answers(monkeypatch, ["use region", "yes"])
+    result = runner.invoke(app, ["run", "--data", str(root)])
+    assert result.exit_code == 0, result.output
+    text = _plain(result.output)
+    assert "target 'species_code'" in text
+    assert "classes with a single image cannot be split: ['z']" in text
+    assert "target 'region'" in text
+    assert "checks:" in text
+    fake_linker.script = ["species_code"]
+    for i in range(24):
+        _png(tmp_path / "birds2" / "img" / f"{i:03d}.jpg", i)
+    pd.read_csv(root / "meta.csv").to_csv(tmp_path / "birds2" / "meta.csv", index=False)
+    scripted = runner.invoke(app, ["run", "--data", str(tmp_path / "birds2"), "--yes"])
+    assert scripted.exit_code != 0
+    assert "classes with a single image cannot be split" in _plain(scripted.output)
+    assert not (_data_dir(tmp_path) / "plans").exists() or not any(
+        "birds2" in p.name for p in (_data_dir(tmp_path) / "plans").iterdir()
+    )
+
+
+def test_nine_images_in_three_classes_are_refused_before_any_copy(tmp_path: Path) -> None:
+    source = _class_tree(tmp_path / "pets", per_class=3)
+    result = runner.invoke(app, ["run", "--data", str(source)])
+    assert result.exit_code != 0
+    assert "3 classes need at least 3 images on each side of the split" in _plain(result.output)
+    assert not _data_dir(tmp_path).exists()
+
+
+def test_a_remembered_plan_still_shows_the_checks(
+    tmp_path: Path, fake_linker: type[_FakeLinker]
+) -> None:
+    root = _ambiguous(tmp_path / "birds")
+    fake_linker.script = ["species_code"]
+    assert runner.invoke(app, ["run", "--data", str(root), "--yes"]).exit_code == 0
+    again = runner.invoke(app, ["run", "--data", str(root)])
+    assert again.exit_code == 0, again.output
+    text = _plain(again.output)
+    assert "remembered from an earlier yes" in text
+    assert "checks: 7 passed" in text
+
+
+def test_our_split_leaves_byte_copies_out_and_says_so(tmp_path: Path) -> None:
+    import json
+
+    source = _class_tree(tmp_path / "pets", per_class=8)
+    for i in range(6):
+        (source / "cat" / f"cat_copy_{i}.png").write_bytes(
+            (source / "cat" / "cat_0.png").read_bytes()
+        )
+    result = runner.invoke(app, ["run", "--data", str(source)])
+    assert result.exit_code == 0, result.output
+    text = _plain(result.output)
+    root = next(p for p in _data_dir(tmp_path).iterdir() if p.name != "plans")
+    report = json.loads((root / "monitor.json").read_text(encoding="utf-8"))
+    assert report["dropped"], "the fixture put no copy across the split"
+    assert f"dropped: {len(report['dropped'])} holdout images left out of the holdout" in text
+    assert "no image sits on both sides of the split" in text
+
+
+# ─── what the review forced, round two ───────────────────────────────────────
+
+
+def test_a_punctuation_only_answer_is_asked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _partial(tmp_path)
+    asked = _answers(monkeypatch, [".", "!!!", "yes"])
+    result = runner.invoke(app, ["run", "--data", str(root)])
+    assert result.exit_code == 0, result.output
+    assert len(asked) == 3
+
+
+def test_a_correction_that_starts_with_drop_reaches_the_linker(
+    tmp_path: Path, fake_linker: type[_FakeLinker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _ambiguous(tmp_path / "birds")
+    fake_linker.script = ["species_code", "region"]
+    _answers(monkeypatch, ["drop species_code, use region", "yes"])
+    result = runner.invoke(app, ["run", "--data", str(root)])
+    assert result.exit_code == 0, result.output
+    assert fake_linker.calls[1]["notes"] == ["drop species_code, use region"]
+    assert "target 'region'" in _plain(result.output)
+    assert "nothing to drop" not in _plain(result.output)
+
+
+def test_remove_the_copies_drops_and_a_drop_that_would_empty_the_holdout_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, b = _twin_pair(tmp_path)
+    _answers(monkeypatch, ["remove the copies", "yes"])
+    result = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert result.exit_code == 0, result.output
+    assert "1 holdout images dropped" in _plain(result.output)
+
+    c = _class_tree(tmp_path / "train2", per_class=5)
+    d = tmp_path / "test2"
+    for k, klass in enumerate(("cat", "dog", "emu")):
+        (d / klass / f"{klass}_copy.png").parent.mkdir(parents=True)
+        (d / klass / f"{klass}_copy.png").write_bytes((c / klass / f"{klass}_{k}.png").read_bytes())
+    asked = _answers(monkeypatch, ["drop", "yes"])
+    result = runner.invoke(app, ["run", "--train", str(c), "--holdout", str(d)])
+    assert result.exit_code == 0, result.output
+    text = _plain(result.output)
+    assert "dropping them would leave no holdout rows" in text
+    assert len(asked) == 2
+    root = next(
+        p for p in _data_dir(tmp_path).iterdir() if p.name != "plans" and "train2" in p.name
+    )
+    assert len(pd.read_csv(root / "holdout.csv")) == 3
+
+
+def _twin_pair_the_linker_links(tmp_path: Path) -> tuple[Path, Path]:
+    a = _ambiguous(tmp_path / "train")
+    b = _ambiguous(tmp_path / "test", n=12)
+    for i in range(12):
+        png(b / "img" / f"{i:03d}.jpg", 100 + i, klass=1)  # colours no training image has
+    (b / "img" / "000.jpg").write_bytes((a / "img" / "000.jpg").read_bytes())
+    return a, b
+
+
+def test_a_remembered_plan_with_a_warn_still_waits_and_a_remembered_drop_is_re_applied(
+    tmp_path: Path, fake_linker: type[_FakeLinker], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, b = _twin_pair_the_linker_links(tmp_path)
+    fake_linker.script = ["species_code"]
+    first = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b), "--yes"])
+    assert first.exit_code == 0, first.output
+    assert "1 finding(s)" in _plain(first.output)  # the twin stayed under --yes
+
+    refused = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert refused.exit_code != 0
+    text = _plain(refused.output)
+    assert "remembered from an earlier yes" in text
+    assert "the checks found something worth a look; re-run with --yes" in text
+
+    asked = _answers(monkeypatch, ["drop", "yes"])
+    second = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
+    assert second.exit_code == 0, second.output
+    assert len(asked) == 1  # after the drop nothing warns, so the plan is settled
+    assert "1 holdout images dropped" in _plain(second.output)
+    assert fake_linker.built == 1
+
+    a2, b2 = _twin_pair_the_linker_links(tmp_path / "again")
+    fake_linker.script = ["species_code"]
+    _answers(monkeypatch, ["drop", "yes"])
+    assert runner.invoke(app, ["run", "--train", str(a2), "--holdout", str(b2)]).exit_code == 0
+    roots_before = {p.name for p in _data_dir(tmp_path).iterdir()}
+    asked = _answers(monkeypatch, [])
+    third = runner.invoke(app, ["run", "--train", str(a2), "--holdout", str(b2)])
+    assert third.exit_code == 0, third.output
+    assert asked == []
+    assert "dropped 1 holdout images that are byte copies of a training image, as before" in _plain(
+        third.output
+    )
+    assert {p.name for p in _data_dir(tmp_path).iterdir()} == roots_before
+
+
+def test_a_proven_plan_whose_split_is_refused_stops_without_asking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _class_tree(tmp_path / "pets", per_class=3)
+    asked = _answers(monkeypatch, ["yes"])
+    result = runner.invoke(app, ["run", "--data", str(source)])
+    assert result.exit_code != 0
+    assert asked == []
+    assert "3 classes need at least 3 images on each side" in _plain(result.output)

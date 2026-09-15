@@ -49,6 +49,7 @@ class TabularDataset:
     data_hash: str  # content fingerprint of the full dataset (a data version)
     user_split: bool = False  # the caller supplied train and holdout; nothing was shuffled
     task: str = "classification"  # the one place the task is decided; explicit metric wins
+    facts: tuple[str, ...] = ()  # host-run check lines, aggregate only, never a holdout row
 
     @property
     def n_train(self) -> int:

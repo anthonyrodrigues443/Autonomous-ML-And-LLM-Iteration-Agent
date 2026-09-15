@@ -129,6 +129,8 @@ def summarize_dataset(dataset: TabularDataset) -> str:
                 + ", ".join(f"{c}={v:.2f}" for c, v in corr.items())
                 + "."
             )
+    if dataset.facts:
+        lines.append("Data checks: " + " ".join(dataset.facts))
     return "\n".join(lines)
 
 

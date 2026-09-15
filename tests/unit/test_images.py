@@ -375,3 +375,27 @@ def test_a_numeric_score_profiles_as_regression_not_classes(tmp_path: Path) -> N
     assert "regression" in text
     assert "Spread: mean=" in text
     assert "Class balance" not in text
+
+
+def test_the_image_profile_renders_facts_only_when_given() -> None:
+    from iterate.adapters.data.images import ImageProfile
+
+    base = {
+        "n_train": 10,
+        "n_test": 3,
+        "column": "image",
+        "classes": 2,
+        "class_balance": (("a", 0.5), ("b", 0.5)),
+        "target_spread": None,
+        "widths": (12, 12, 12),
+        "heights": (8, 8, 8),
+        "portrait_share": 0.0,
+        "modes": (("RGB", 1.0),),
+        "formats": (("PNG", 1.0),),
+        "unreadable": 0,
+        "shared_across_split": 0,
+    }
+    plain = ImageProfile(**base).render()  # type: ignore[arg-type]
+    assert "Data checks" not in plain
+    told = ImageProfile(**base, facts=("2 holdout images left out as byte copies.",)).render()  # type: ignore[arg-type]
+    assert told == plain + "\nData checks: 2 holdout images left out as byte copies."

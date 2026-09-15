@@ -22,14 +22,17 @@ import contextlib
 import filecmp
 import hashlib
 import json
+import math
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from iterate.adapters.data.images import file_hashes
 from iterate.adapters.data.linking import (
     LINK_VERSION,
     MAX_DEPTH,
@@ -40,6 +43,9 @@ from iterate.adapters.data.linking import (
 )
 from iterate.adapters.data.tabular import DEFAULT_SEED, DEFAULT_TEST_SIZE, split_frame
 from iterate.schemas.link import LinkPlan
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 RAW = "raw_files"
 TRAIN = "train"
@@ -57,6 +63,16 @@ class Workspace:
     train_csv: Path
     holdout_csv: Path
     plan_file: Path
+
+
+@dataclass(frozen=True)
+class Sides:
+    """Both sides of the split as ``write`` lays them out, and the holdout images
+    left out because their bytes sit in the training side."""
+
+    frames: LinkedFrames
+    dropped: list[str] = field(default_factory=list)
+    dropped_labels: list[str] = field(default_factory=list)
 
 
 def _ignore(directory: str, names: list[str]) -> set[str]:
@@ -92,7 +108,7 @@ def workspace_name(sources: list[Path], plan_: LinkPlan, frames: LinkedFrames) -
     for source in sources:
         for p in _files_under(source):
             digest.update(f"{p.relative_to(source).as_posix()}:{p.stat().st_size}".encode())
-    digest.update(plan_.model_dump_json().encode())
+    digest.update(plan_.model_dump_json(exclude={"notes"}).encode())  # notes are commentary
     digest.update(frames.train.to_csv(index=False).encode())
     if frames.holdout is not None:
         digest.update(frames.holdout.to_csv(index=False).encode())
@@ -166,7 +182,9 @@ def _check_relations(sources: list[Path], out: Path) -> None:
             )
 
 
-def _check_class_floor(frame: pd.DataFrame) -> None:
+def _check_class_floor(frame: pd.DataFrame, test_size: float) -> None:
+    """The stratified split's own rules, said before any copy: two images per class,
+    and enough images that each side of the split holds one per class."""
     counts = frame["label"].value_counts()
     thin = sorted(str(c) for c, n in counts.items() if n < 2)
     if thin:
@@ -174,6 +192,58 @@ def _check_class_floor(frame: pd.DataFrame) -> None:
             f"classes with a single image cannot be split: {thin}; drop them, add images, or "
             "pass --train and --holdout"
         )
+    n_holdout = math.ceil(test_size * len(frame))
+    if min(n_holdout, len(frame) - n_holdout) < len(counts):
+        raise LinkError(
+            f"{len(counts)} classes need at least {len(counts)} images on each side of the "
+            f"split and {len(frame)} images give {n_holdout} holdout; add images, about five "
+            "per class, or pass --train and --holdout"
+        )
+
+
+def _paths(frames: LinkedFrames) -> list[str]:
+    parts = [frames.train] + ([frames.holdout] if frames.holdout is not None else [])
+    return list(dict.fromkeys(str(p) for part in parts for p in part["image"]))
+
+
+def sides(
+    plan_: LinkPlan,
+    frames: LinkedFrames,
+    *,
+    hashes: Mapping[str, str | None] | None = None,
+    seed: int = DEFAULT_SEED,
+    test_size: float = DEFAULT_TEST_SIZE,
+) -> Sides:
+    """Both sides as ``write`` lays them out: the user's as given, ours made here.
+    What is checked before the pause is what is written after it. With ``hashes``
+    a holdout image whose bytes sit in training is left out of our split, since a
+    model would score it from memory."""
+    if frames.holdout is not None:
+        return Sides(frames)
+    if plan_.task == "classification":
+        _check_class_floor(frames.train, test_size)
+    try:
+        split = split_frame(frames.train, "label", test_size=test_size, seed=seed, task=plan_.task)
+    except ValueError as exc:
+        raise LinkError(
+            f"the 80/20 split cannot be made: {exc}; pass --train and --holdout"
+        ) from exc
+    train = split.train_features.assign(label=split.train_target.to_numpy())
+    holdout = split.test_features.assign(label=split.test_target.to_numpy())
+    if hashes is None:
+        return Sides(LinkedFrames(train, holdout))
+    seen = {d for p in train["image"] if (d := hashes.get(str(p))) is not None}
+    twin = holdout["image"].map(lambda p: hashes.get(str(p)) in seen).to_numpy(dtype=bool)
+    if twin.all():
+        raise LinkError(
+            "every holdout image is a byte copy of a training image, so the split leaves no "
+            "holdout rows; add images that are not copies, or pass --train and --holdout"
+        )
+    return Sides(
+        LinkedFrames(train, holdout.loc[~twin].reset_index(drop=True)),
+        [str(p) for p in holdout.loc[twin, "image"]],
+        [str(v) for v in holdout.loc[twin, "label"]],
+    )
 
 
 def write(
@@ -184,15 +254,20 @@ def write(
     out: Path,
     seed: int = DEFAULT_SEED,
     test_size: float = DEFAULT_TEST_SIZE,
+    both: Sides | None = None,
 ) -> Workspace:
-    """Write the canonical folder. Idempotent: an existing workspace is reused as is."""
+    """Write the canonical folder. Idempotent: an existing workspace is reused as is.
+    ``both`` is the split the pause showed; without it the same split is made here."""
     sources = [s.resolve() for s in sources]
     out = out.resolve()
     _check_relations(sources, out)
-    if frames.holdout is None and plan_.task == "classification":
-        _check_class_floor(frames.train)
+    if both is None:
+        hashes = None if frames.holdout is not None else file_hashes(_paths(frames))
+        both = sides(plan_, frames, hashes=hashes, seed=seed, test_size=test_size)
+    train, holdout = both.frames.train, both.frames.holdout
+    assert holdout is not None  # sides
 
-    root = out / workspace_name(sources, plan_, frames)
+    root = out / workspace_name(sources, plan_, both.frames)
     ws = Workspace(
         root=root,
         train_csv=root / TRAIN_CSV,
@@ -204,17 +279,11 @@ def write(
 
     raw = root / RAW
     targets = [raw] if len(sources) == 1 else [raw / role for role in ROLES[: len(sources)]]
-    raw_of = _raw_of(frames, sources, targets)
+    raw_of = _raw_of(both.frames, sources, targets)
     for source, target in zip(sources, targets, strict=True):
         shutil.copytree(
             source, target, ignore=_ignore, copy_function=shutil.copyfile, dirs_exist_ok=True
         )
-
-    train, holdout = frames.train, frames.holdout
-    if holdout is None:
-        split = split_frame(train, "label", test_size=test_size, seed=seed, task=plan_.task)
-        train = split.train_features.assign(label=split.train_target.to_numpy())
-        holdout = split.test_features.assign(label=split.test_target.to_numpy())
 
     by_class = plan_.task == "classification"
     train_rows = _place(train, root / TRAIN, by_class=by_class, raw_of=raw_of, root=root)
@@ -260,8 +329,11 @@ def plan_path(sources: list[Path], *, out: Path) -> Path:
     return out.resolve() / PLANS / f"{plan_key(sources)}.json"
 
 
-def remember_plan(plans: list[LinkPlan], *, sources: list[Path], out: Path) -> Path:
-    """Keep the plans a person accepted, one per source folder."""
+def remember_plan(
+    plans: list[LinkPlan], *, sources: list[Path], out: Path, drop_twins: bool = False
+) -> Path:
+    """Keep the plans a person accepted, one per source folder, and whether they
+    asked for the byte twins to come out of their holdout."""
     path = plan_path(sources, out=out)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -269,6 +341,7 @@ def remember_plan(plans: list[LinkPlan], *, sources: list[Path], out: Path) -> P
             {
                 "sources": [str(s.resolve()) for s in sources],
                 "plans": [p.model_dump() for p in plans],
+                "drop_twins": drop_twins,
                 "accepted": datetime.now(UTC).isoformat(timespec="seconds"),
             },
             indent=2,
@@ -276,6 +349,15 @@ def remember_plan(plans: list[LinkPlan], *, sources: list[Path], out: Path) -> P
         encoding="utf-8",
     )
     return path
+
+
+def recall_drop(sources: list[Path], *, out: Path) -> bool:
+    """Whether the remembered yes for these folders came with a drop of the twins."""
+    path = plan_path(sources, out=out)
+    try:
+        return bool(json.loads(path.read_text(encoding="utf-8")).get("drop_twins"))
+    except (OSError, ValueError, AttributeError, RecursionError):
+        return False
 
 
 def recall_plan(sources: list[Path], *, out: Path) -> list[LinkPlan] | None:
@@ -301,12 +383,15 @@ __all__ = [
     "HOLDOUT_CSV",
     "PLAN_JSON",
     "TRAIN_CSV",
+    "Sides",
     "Workspace",
     "forget_plan",
     "plan_key",
     "plan_path",
+    "recall_drop",
     "recall_plan",
     "remember_plan",
+    "sides",
     "workspace_name",
     "write",
 ]

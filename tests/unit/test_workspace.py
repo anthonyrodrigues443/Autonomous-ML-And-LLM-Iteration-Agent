@@ -7,28 +7,21 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from PIL import Image
 
 from iterate.adapters.data import workspace
 from iterate.adapters.data.images import detect_image_column, resolve_paths
 from iterate.adapters.data.linking import apply, inventory, plan
 from iterate.adapters.data.tabular import load_split
+from tests.unit.image_fixtures import CLASSES, class_tree, png
 
 pytestmark = pytest.mark.unit
 
-CLASSES = ("cat", "dog", "emu")
 
-
-def _png(path: Path, seed: int = 0) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (12, 8), (seed * 9 % 255, 60, 120)).save(path)
+_png = png
 
 
 def _class_tree(root: Path, *, per_class: int = 8, seed: int = 0) -> Path:
-    for c in CLASSES:
-        for i in range(per_class):
-            _png(root / c / f"{c}_{seed + i}.png", seed + i)
-    return root
+    return class_tree(root, per_class=per_class, seed=seed)
 
 
 def test_the_layout_for_classification_split_here(tmp_path: Path) -> None:
@@ -260,7 +253,7 @@ def test_a_stale_file_in_a_slot_is_refused_not_reused(tmp_path: Path) -> None:
     inv = inventory(root)
     p = plan(inv)
     frames = apply(p, inv)
-    name = workspace.workspace_name([root.resolve()], p, frames)
+    name = workspace.workspace_name([root.resolve()], p, workspace.sides(p, frames).frames)
     slot = tmp_path / "out" / name / "train" / "cat"
     slot.mkdir(parents=True)
     _png(slot / "cat_0.png", 12345)  # a different image already sits where cat_0 goes
@@ -358,3 +351,97 @@ def test_a_memory_too_deep_to_parse_reads_as_nothing_remembered(tmp_path: Path) 
     path.parent.mkdir(parents=True)
     path.write_text("[" * 200_000, encoding="utf-8")
     assert workspace.recall_plan([root], out=out) is None
+
+
+# ─── the split before the pause ───────────────────────────────────────────
+
+
+def test_sides_are_the_rows_write_lays_out(tmp_path: Path) -> None:
+    source = _class_tree(tmp_path / "pets")
+    inv = inventory(source)
+    p = plan(inv)
+    frames = apply(p, inv)
+    both = workspace.sides(p, frames)
+    assert both.frames.holdout is not None
+    assert both.dropped == []
+    ws = workspace.write(p, frames, sources=[source], out=tmp_path / "out", both=both)
+    train = pd.read_csv(ws.train_csv)
+    holdout = pd.read_csv(ws.holdout_csv)
+    assert sorted(Path(q).name for q in train["image"]) == sorted(
+        Path(str(q)).name for q in both.frames.train["image"]
+    )
+    assert sorted(Path(q).name for q in holdout["image"]) == sorted(
+        Path(str(q)).name for q in both.frames.holdout["image"]
+    )
+    again = workspace.write(p, frames, sources=[source], out=tmp_path / "out")
+    assert again.root == ws.root  # the same split made inside write lands on the same folder
+
+
+def test_a_tree_too_small_for_both_sides_is_refused_before_any_copy(tmp_path: Path) -> None:
+    from iterate.adapters.data.linking import LinkError
+
+    source = _class_tree(tmp_path / "pets", per_class=3)
+    inv = inventory(source)
+    p = plan(inv)
+    frames = apply(p, inv)
+    with pytest.raises(LinkError, match="3 classes need at least 3 images on each side"):
+        workspace.sides(p, frames)
+    with pytest.raises(LinkError, match="on each side"):
+        workspace.write(p, frames, sources=[source], out=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_write_leaves_byte_copies_out_of_the_holdout_on_its_own(tmp_path: Path) -> None:
+    source = _class_tree(tmp_path / "pets")
+    for i in range(6):
+        (source / "cat" / f"cat_copy_{i}.png").write_bytes(
+            (source / "cat" / "cat_0.png").read_bytes()
+        )
+    inv = inventory(source)
+    p = plan(inv)
+    frames = apply(p, inv)
+    ws = workspace.write(p, frames, sources=[source], out=tmp_path / "out")
+    train = {
+        Path(q).read_bytes() for q in pd.read_csv(ws.train_csv)["image"].map(lambda q: ws.root / q)
+    }
+    holdout = [
+        Path(q).read_bytes()
+        for q in pd.read_csv(ws.holdout_csv)["image"].map(lambda q: ws.root / q)
+    ]
+    assert not any(b in train for b in holdout)
+    plain = workspace.sides(p, frames).frames
+    assert plain.holdout is not None
+    assert len(holdout) < len(plain.holdout)  # the split put a copy across, and it came out
+    assert sorted(q.name for q in (ws.root / "raw_files" / "cat").iterdir())[:2] == [
+        "cat_0.png",
+        "cat_1.png",
+    ]
+
+
+def test_write_never_hashes_a_holdout_the_user_gave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.adapters.data.linking import LinkedFrames
+
+    a = _class_tree(tmp_path / "train", per_class=5)
+    b = _class_tree(tmp_path / "test", per_class=2, seed=100)
+    inv_a, inv_b = inventory(a), inventory(b)
+    frames = LinkedFrames(apply(plan(inv_a), inv_a).train, apply(plan(inv_b), inv_b).train)
+
+    def boom(paths: object) -> dict[str, str | None]:
+        raise AssertionError("hashed a given holdout")
+
+    monkeypatch.setattr(workspace, "file_hashes", boom)
+    ws = workspace.write(plan(inv_a), frames, sources=[a, b], out=tmp_path / "out")
+    assert len(pd.read_csv(ws.holdout_csv)) == 6
+
+
+def test_the_memory_keeps_whether_the_twins_were_dropped(tmp_path: Path) -> None:
+    root, plan_ = _agent_plan(tmp_path / "src")
+    out = tmp_path / "out"
+    assert workspace.recall_drop([root], out=out) is False
+    workspace.remember_plan([plan_], sources=[root], out=out, drop_twins=True)  # type: ignore[list-item]
+    assert workspace.recall_drop([root], out=out) is True
+    assert workspace.recall_plan([root], out=out) == [plan_]
+    workspace.remember_plan([plan_], sources=[root], out=out)  # type: ignore[list-item]
+    assert workspace.recall_drop([root], out=out) is False
