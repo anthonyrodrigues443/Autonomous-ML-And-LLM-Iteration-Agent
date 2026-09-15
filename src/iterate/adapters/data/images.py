@@ -266,6 +266,7 @@ class ImageProfile:
     unreadable: int
     shared_across_split: int
     facts: tuple[str, ...] = ()
+    short_sides: tuple[int, int, int] = (0, 0, 0)
 
     def render(self) -> str:
         w, h = self.widths, self.heights
@@ -356,6 +357,7 @@ def profile_images(
         return tuple((k, n / seen) for k, n in counter.most_common()) if seen else ()
 
     portrait = sum(1 for w, h in zip(widths, heights, strict=True) if h > w)
+    shorts = [min(w, h) for w, h in zip(widths, heights, strict=True)]
     return ImageProfile(
         n_train=dataset.n_train,
         n_test=dataset.n_test,
@@ -371,7 +373,110 @@ def profile_images(
         unreadable=unreadable,
         shared_across_split=len(train_digests & test_digests),
         facts=dataset.facts,
+        short_sides=extent(shorts),
     )
+
+
+# ─── prepare ──────────────────────────────────────────────────────────────
+
+_SIZE_STEP = 32
+_SIZE_FLOOR = 32
+_SIZE_CEILING = 160
+
+
+def image_cache_dir() -> Path:
+    """Where byte-named copies live: outside every project and never under .iterate,
+    where one hop up from a holdout copy would reach the linked workspace's
+    holdout.csv. A relative XDG_CACHE_HOME is ignored, as the XDG spec says."""
+    base = os.environ.get("XDG_CACHE_HOME", "")
+    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
+    return root / "iterate" / "images"
+
+
+def default_image_size(profile: ImageProfile) -> int:
+    """The size the images carry without upscaling: the median short side rounded
+    down to a multiple of 32, from 32 to 160."""
+    short = profile.short_sides[1] or min(profile.widths[1], profile.heights[1])
+    return max(_SIZE_FLOOR, min(_SIZE_CEILING, short // _SIZE_STEP * _SIZE_STEP))
+
+
+@dataclass(frozen=True)
+class Prepared:
+    """A dataset ready for the vision target: byte-named copies, the column that holds
+    them, the header profile, where the copies are, the size to train at, and the
+    holdout images left out as byte copies of a training image."""
+
+    dataset: TabularDataset
+    column: ImageColumn
+    profile: ImageProfile
+    cache_dir: Path
+    image_size: int
+    dropped: tuple[str, ...] = ()
+
+
+def _without_twins(
+    dataset: TabularDataset, column: ImageColumn, hashes: dict[str, str | None]
+) -> tuple[TabularDataset, list[str]]:
+    """A holdout this harness split loses the images whose bytes, or whose path, sit in
+    training, the rule the linker's split uses; a holdout the user gave is theirs as
+    given. The path counts too because a missing file has no bytes to compare."""
+    if dataset.user_split:
+        return dataset, []
+    train = [str(p) for p in dataset.train_features[column.column]]
+    seen = {d for p in train if (d := hashes.get(p)) is not None}
+    named = set(train)
+    holdout = dataset.test_features[column.column]
+    twin = holdout.map(lambda p: str(p) in named or hashes.get(str(p)) in seen).to_numpy(dtype=bool)
+    if not twin.any():
+        return dataset, []
+    if twin.all():
+        raise ValueError(
+            "every holdout image is a byte copy of a training image, so the split leaves no "
+            "holdout rows; add images that are not copies, or pass --train and --holdout"
+        )
+    keep = [i for i, t in enumerate(twin) if not t]
+    return (
+        replace(
+            dataset,
+            test_features=dataset.test_features.iloc[keep],
+            test_target=dataset.test_target.iloc[keep],
+        ),
+        [str(p) for p, t in zip(holdout, twin, strict=True) if t],
+    )
+
+
+def _monitor_brief(csv_path: Path) -> list[str]:
+    from iterate.adapters.data import monitor
+
+    report = monitor.load(csv_path.resolve().parent)
+    return [report.brief()] if report is not None else []
+
+
+def prepare_images(
+    dataset: TabularDataset,
+    csv_path: Path,
+    *,
+    into: Path | None = None,
+    facts: Sequence[str] = (),
+) -> Prepared:
+    """The Day 1 pieces in order, for a dataset about to reach the vision target: find
+    the path column, make paths absolute, hash, leave byte copies of a training image
+    out of a holdout this harness split, profile, then copy under byte names. The
+    monitor's brief beside the CSV, when there is one, and ``facts`` join the
+    dataset's facts after the ones it has; all of them are counts, never a row."""
+    column = detect_image_column(dataset.train_features, dataset.features, csv_path)
+    if column is None:
+        raise ValueError(f"{csv_path}: the feature column does not hold image paths")
+    resolved = resolve_paths(dataset, column)
+    hashes = file_hashes(_all_paths(resolved, column))
+    resolved, dropped = _without_twins(resolved, column, hashes)
+    told = [*resolved.facts, *_monitor_brief(csv_path), *facts]
+    if dropped:
+        told.append(f"{len(dropped)} holdout images left out as byte copies of training images.")
+    resolved = replace(resolved, facts=tuple(told))
+    profile = profile_images(resolved, column, hashes)
+    copied, cache_dir = materialise(resolved, column, hashes, into or image_cache_dir())
+    return Prepared(copied, column, profile, cache_dir, default_image_size(profile), tuple(dropped))
 
 
 __all__ = [
@@ -381,13 +486,17 @@ __all__ = [
     "SPLIT_FOLDERS",
     "ImageColumn",
     "ImageProfile",
+    "Prepared",
     "content_hash",
+    "default_image_size",
     "detect_image_column",
     "file_hashes",
     "frame_from_folder",
+    "image_cache_dir",
     "load_image_folder",
     "load_image_split",
     "materialise",
+    "prepare_images",
     "profile_images",
     "resolve_paths",
     "split_folders",

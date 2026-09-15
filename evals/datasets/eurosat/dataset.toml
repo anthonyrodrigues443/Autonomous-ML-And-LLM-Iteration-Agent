@@ -1,0 +1,6 @@
+data = "examples/eurosat/data.csv"
+target = "label"
+metric = "accuracy"
+family = "vision"
+source = "EuroSAT RGB (Helber et al. 2019, MIT licence), prepared by examples/eurosat/prepare.py"
+notes = "The vision certification dataset. 27,000 Sentinel-2 tiles at 64 px, 10 land-use classes, a domain no ImageNet backbone has seen."

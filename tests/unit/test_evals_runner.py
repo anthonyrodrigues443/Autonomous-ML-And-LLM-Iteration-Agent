@@ -9,7 +9,16 @@ import pytest
 
 from evals.config import Conditions
 from evals.corpus import Dataset
-from evals.runner import cell_dir, command_for, parse_version, supports
+from evals.runner import (
+    DEV_RUNS_VISION,
+    DEV_VERSION,
+    cell_dir,
+    command_for,
+    parse_version,
+    skip_reason,
+    supports,
+    supports_dataset,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -135,3 +144,57 @@ def test_a_run_that_never_created_a_database_is_recorded_not_raised(tmp_path: Pa
 
     assert record.status != "ok"
     assert record.error  # the reason is recorded rather than thrown
+
+
+VISION = replace(DATASET, name="flowers102", target="label", metric="accuracy", family="vision")
+PROMPT = replace(DATASET, name="sst2", task="say whether the review is positive")
+
+
+def test_a_vision_dataset_needs_v0_6_and_a_prompt_dataset_v0_5() -> None:
+    assert skip_reason("0.5.0", VISION) == "predates DLModelTarget"
+    assert supports_dataset("0.6.0", VISION)
+    assert skip_reason("0.4.0", PROMPT) == "predates PromptTarget"
+    assert skip_reason("0.4.0", DATASET) is None
+
+
+def test_dev_runs_vision_cells_only_once_the_run_is_wired() -> None:
+    assert supports_dataset(DEV_VERSION, VISION) is DEV_RUNS_VISION
+    if not DEV_RUNS_VISION:
+        assert skip_reason(DEV_VERSION, VISION) == "the vision run is not wired yet"
+
+
+def test_the_dev_gate_moves_with_the_cli_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real command, in both forms a vision run takes: a folder, and the CSV of
+    image paths a dev cell passes. While `iterate run` stops before training on either,
+    dev must skip vision cells; the day either one runs, this fails until the gate in
+    the eval runner lifts with it."""
+    import pandas as pd
+    from typer.testing import CliRunner
+
+    from iterate import cli as cli_module
+    from iterate.cli import app
+    from tests.unit.image_fixtures import class_tree
+
+    folder = class_tree(tmp_path / "pets", per_class=8)
+    images = sorted(folder.rglob("*.png"))
+    csv = tmp_path / "pets.csv"
+    pd.DataFrame(
+        {"image": [str(p) for p in images], "label": [p.parent.name for p in images]}
+    ).to_csv(csv, index=False)
+    cell = command_for(DEV_VERSION, replace(VISION, path=csv), CONDITIONS)
+    forms = {
+        "folder": ["run", "--data", str(folder)],
+        "dev cell": cell[cell.index("iterate") + 1 :],
+    }
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "dot" / "runs"))
+    cli_module.get_settings.cache_clear()
+    try:
+        for name, argv in forms.items():
+            result = CliRunner().invoke(app, argv)
+            assert result.exit_code == 0, (name, result.output)
+            stops = "this run stops here" in " ".join(result.output.split())
+            assert stops is not DEV_RUNS_VISION, name
+    finally:
+        cli_module.get_settings.cache_clear()
