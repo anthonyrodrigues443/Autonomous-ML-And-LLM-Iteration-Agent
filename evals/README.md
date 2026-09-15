@@ -212,6 +212,17 @@ for its tabular rows. It runs overnight on one machine, one dataset after the ot
 nohup uv run python -m evals.run ceilings --datasets flowers102,eurosat > sweep.log 2>&1 &
 ```
 
+Measured 2026-09-16 on an Apple M5 with MPS, 28 minutes for both:
+
+| dataset | probe | ceiling | best recipe | headroom | one standard error |
+|---|---|---|---|---|---|
+| flowers102 | 0.8918 | 0.9743 | convnext_tiny fine-tune, 3 epochs, 160 px | 0.083 | 0.004 |
+| eurosat | 0.8989 | 0.9857 | convnext_tiny fine-tune, 3 epochs, 64 px | 0.087 | 0.002 |
+
+Both ceilings are ties: resnet18 at 224 px reached 0.9719 on Flowers102, and resnet50
+and resnet18 at 128 px both reached 0.9850 on EuroSAT. The stronger frozen backbone is
+most of the gain by itself; the convnext_tiny probe scored 0.9566 on Flowers102.
+
 ## Two corpora, one word
 
 - **the benchmark corpus** (`datasets/`) — real data, ceilings, LLM runs, hours

@@ -166,23 +166,35 @@ def test_dev_runs_vision_cells_only_once_the_run_is_wired() -> None:
 def test_the_dev_gate_moves_with_the_cli_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The real command on a tiny class-folder tree. While `iterate run` stops after
-    linking, dev must skip vision cells; the day it runs, this fails until the gate
-    in the eval runner lifts with it."""
+    """The real command, in both forms a vision run takes: a folder, and the CSV of
+    image paths a dev cell passes. While `iterate run` stops before training on either,
+    dev must skip vision cells; the day either one runs, this fails until the gate in
+    the eval runner lifts with it."""
+    import pandas as pd
     from typer.testing import CliRunner
 
     from iterate import cli as cli_module
     from iterate.cli import app
     from tests.unit.image_fixtures import class_tree
 
+    folder = class_tree(tmp_path / "pets", per_class=8)
+    images = sorted(folder.rglob("*.png"))
+    csv = tmp_path / "pets.csv"
+    pd.DataFrame(
+        {"image": [str(p) for p in images], "label": [p.parent.name for p in images]}
+    ).to_csv(csv, index=False)
+    cell = command_for(DEV_VERSION, replace(VISION, path=csv), CONDITIONS)
+    forms = {
+        "folder": ["run", "--data", str(folder)],
+        "dev cell": cell[cell.index("iterate") + 1 :],
+    }
     monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "dot" / "runs"))
     cli_module.get_settings.cache_clear()
     try:
-        result = CliRunner().invoke(
-            app, ["run", "--data", str(class_tree(tmp_path / "pets", per_class=8))]
-        )
+        for name, argv in forms.items():
+            result = CliRunner().invoke(app, argv)
+            assert result.exit_code == 0, (name, result.output)
+            stops = "this run stops here" in " ".join(result.output.split())
+            assert stops is not DEV_RUNS_VISION, name
     finally:
         cli_module.get_settings.cache_clear()
-    assert result.exit_code == 0, result.output
-    stops = "this run stops here" in " ".join(result.output.split())
-    assert stops is not DEV_RUNS_VISION

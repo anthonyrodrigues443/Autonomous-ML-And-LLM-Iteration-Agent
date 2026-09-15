@@ -45,6 +45,13 @@ RECIPE_JSON = "recipe.json"
 EMBED_BATCH = 256
 TIMED_STEPS = 10
 PIXEL_RAM_SHARE = 0.25
+# A step in train mode, with its scheduler step, costs a little more than the timed one.
+PLAN_MARGIN = 1.1
+SHORT_SCHEDULE = 10
+# 0.7 of the recommended working set: every recipe measured fits under it, and at 1.0 an
+# overshoot paged 10 GB on a 24 GB Mac before it raised. Low above high fails init.
+MPS_HIGH_RATIO = "0.7"
+MPS_LOW_RATIO = "0.56"
 _OUTPUT_TAIL_CHARS = 2000
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
@@ -165,11 +172,12 @@ class Runner(Protocol):
 
 
 def oom_kind(exc: BaseException) -> str | None:
-    """On MPS both failures are plain RuntimeErrors; torch.OutOfMemoryError is CUDA's."""
+    """On MPS and on the CPU allocator both failures are plain RuntimeErrors;
+    torch.OutOfMemoryError is CUDA's."""
     if not isinstance(exc, RuntimeError):
         return None
     text = str(exc).lower()
-    if "out of memory" in text:
+    if "out of memory" in text or "allocate memory" in text:
         return "oom"
     return "buffer" if "invalid buffer size" in text else None
 
@@ -232,6 +240,41 @@ def run_epochs(
     return planned
 
 
+def _time_train_step(model: Any, opt: Any, step: Callable[[], tuple[Any, Any, Any]]) -> float:
+    """Seconds per full training step, optimiser included. Timed in eval mode at a zero
+    learning rate, so it moves neither the weights nor the batch-norm statistics, and
+    the optimiser's state is cleared after."""
+    rates = [group["lr"] for group in opt.param_groups]
+    for group in opt.param_groups:
+        group["lr"] = 0.0
+    model.eval()
+
+    def once() -> None:
+        opt.zero_grad(set_to_none=True)
+        loss, logits, labels = step()
+        opt.step()
+        loss.item()
+        int((logits.argmax(1) == labels).sum())
+
+    try:
+        return time_steps(once)
+    finally:
+        for group, rate in zip(opt.param_groups, rates, strict=True):
+            group["lr"] = rate
+        opt.state.clear()
+        opt.zero_grad(set_to_none=True)
+
+
+def _train_mode(torch: Any, model: Any, recipe: Recipe) -> None:
+    """Train mode; a head-only fit keeps the frozen backbone's batch-norm statistics,
+    so the backbone stays the one the probe head was fitted on."""
+    model.train()
+    if recipe.unfreeze == "head":
+        for module in model.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module.eval()
+
+
 class TorchRunner:
     """torch loads on first use, so this module imports where it is absent."""
 
@@ -272,11 +315,8 @@ class TorchRunner:
             loss.backward()
             return loss, logits, yb
 
-        # Eval mode and no optimiser step: timing must not move the weights or BN statistics.
-        model.eval()
         first = np.arange(min(n, recipe.batch_size))
-        step_seconds = time_steps(lambda: step(first)[0].item())
-        model.zero_grad(set_to_none=True)
+        step_seconds = _time_train_step(model, opt, lambda: step(first)) * PLAN_MARGIN
         per_epoch = math.ceil(n / recipe.batch_size)
         stop_at = job.deadline - step_seconds * math.ceil(len(job.holdout) / recipe.batch_size)
         left = stop_at - time.perf_counter()
@@ -284,7 +324,7 @@ class TorchRunner:
         sched = _schedule(torch, opt, recipe, planned * per_epoch)
 
         def one_epoch(_: int) -> str | None:
-            model.train()
+            _train_mode(torch, model, recipe)
             order, total, hits = rng.permutation(n), 0.0, 0
             for start in range(0, n, recipe.batch_size):
                 if time.perf_counter() > stop_at:
@@ -327,10 +367,10 @@ def _oom_text(kind: str, device: str, where: str) -> str:
 def _torch() -> Any:
     # Read at torch's static init, so they have to be set before the first import.
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    # The default high ratio, 1.7, pages past RAM instead of raising; low above high fails init.
+    # The default high ratio, 1.7, pages past RAM instead of raising.
     if "PYTORCH_MPS_HIGH_WATERMARK_RATIO" not in os.environ:
-        os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "1.0"
-        os.environ["PYTORCH_MPS_LOW_WATERMARK_RATIO"] = "0.8"
+        os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = MPS_HIGH_RATIO
+        os.environ["PYTORCH_MPS_LOW_WATERMARK_RATIO"] = MPS_LOW_RATIO
     import torch
 
     return torch
@@ -365,6 +405,9 @@ def _optimiser(torch: Any, model: Any, recipe: Recipe) -> Any:
 
 
 def _schedule(torch: Any, opt: Any, recipe: Recipe, steps: int) -> Any:
+    # A one-cycle over a step or two never leaves its warm-up; a short run keeps the rate.
+    if steps < SHORT_SCHEDULE:
+        return None
     if recipe.schedule == "onecycle":
         return torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=recipe.lr, total_steps=steps)
     if recipe.schedule == "cosine":
@@ -407,6 +450,26 @@ def _predict(torch: Any, model: Any, holdout: np.ndarray, dev: Any) -> np.ndarra
     return np.asarray(probs / probs.sum(axis=1, keepdims=True), dtype=np.float64)
 
 
+_WIDE_MODES = frozenset({"I", "I;16", "I;16B", "I;16L", "I;16N", "F"})
+
+
+def _as_rgb(im: Any) -> Any:
+    """8-bit RGB. A 16-bit or float image is scaled to 0..255 first: `convert` clips it,
+    so a 16-bit image reads as white and a 0..1 float one as black."""
+    from PIL import Image
+
+    if im.mode not in _WIDE_MODES:
+        return im.convert("RGB")
+    values = np.asarray(im, dtype=np.float64)
+    if im.mode.startswith("I;16"):
+        scale = 65535.0
+    else:
+        top = float(values.max()) if values.size else 0.0
+        scale = next(s for s in (1.0, 255.0, 65535.0, max(top, 1.0)) if top <= s)
+    grey = np.clip(values / scale * 255.0, 0.0, 255.0).astype(np.uint8)
+    return Image.fromarray(grey).convert("RGB")
+
+
 def decode(paths: Sequence[str], size: int) -> np.ndarray:
     from PIL import Image, UnidentifiedImageError
 
@@ -414,8 +477,8 @@ def decode(paths: Sequence[str], size: int) -> np.ndarray:
     for i, path in enumerate(paths):
         try:
             with Image.open(path) as im:
-                rgb = im.convert("RGB")
-        except (UnidentifiedImageError, OSError):
+                rgb = _as_rgb(im)
+        except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
             continue
         scale = size / min(rgb.size)
         w, h = max(size, round(rgb.width * scale)), max(size, round(rgb.height * scale))
@@ -455,6 +518,12 @@ class DLModelTarget:
             raise ValueError(f"{column!r} must hold the byte-named copies images.prepare writes")
         # TRAINING labels only, in the column's own type: the order the code-path scorer uses.
         self._classes: list[Any] = np.unique(dataset.train_target.to_numpy()).tolist()
+        if len(self._classes) < 2:
+            raise ValueError("the vision target needs at least two training classes")
+        if any(isinstance(c, float) and not c.is_integer() for c in self._classes):
+            raise ValueError(
+                "fractional labels are a number to predict; the vision target scores classes"
+            )
         index = {c: i for i, c in enumerate(self._classes)}
         self._labels = np.array([index[c] for c in dataset.train_target.tolist()])
         self._pixels: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -492,9 +561,12 @@ class DLModelTarget:
             error = f"recipe refused: {exc}" if isinstance(exc, RecipeError) else str(exc)
             return ExperimentResult(experiment_id=experiment_id, error=error, logs=_tail(log))
         y_true = self._dataset.test_target.to_numpy()
-        proba = report.probabilities if np.unique(y_true).tolist() == self._classes else None
+        finite = bool(np.isfinite(report.probabilities).all())
+        same_classes = np.unique(y_true).tolist() == self._classes
+        proba = report.probabilities if finite and same_classes else None
         if proba is None and requires_proba(m):
-            error = f"{m} needs one probability column per holdout class"
+            need = "one probability column per holdout class" if finite else "finite probabilities"
+            error = f"{m} needs {need}"
             return ExperimentResult(experiment_id=experiment_id, error=error, logs=_tail(log))
         predicted = [self._classes[i] for i in report.probabilities.argmax(1)]
         values = score(

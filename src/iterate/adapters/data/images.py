@@ -266,6 +266,7 @@ class ImageProfile:
     unreadable: int
     shared_across_split: int
     facts: tuple[str, ...] = ()
+    short_sides: tuple[int, int, int] = (0, 0, 0)
 
     def render(self) -> str:
         w, h = self.widths, self.heights
@@ -356,6 +357,7 @@ def profile_images(
         return tuple((k, n / seen) for k, n in counter.most_common()) if seen else ()
 
     portrait = sum(1 for w, h in zip(widths, heights, strict=True) if h > w)
+    shorts = [min(w, h) for w, h in zip(widths, heights, strict=True)]
     return ImageProfile(
         n_train=dataset.n_train,
         n_test=dataset.n_test,
@@ -371,6 +373,7 @@ def profile_images(
         unreadable=unreadable,
         shared_across_split=len(train_digests & test_digests),
         facts=dataset.facts,
+        short_sides=extent(shorts),
     )
 
 
@@ -384,15 +387,16 @@ _SIZE_CEILING = 160
 def image_cache_dir() -> Path:
     """Where byte-named copies live: outside every project and never under .iterate,
     where one hop up from a holdout copy would reach the linked workspace's
-    holdout.csv."""
-    base = os.environ.get("XDG_CACHE_HOME")
-    return (Path(base) if base else Path.home() / ".cache") / "iterate" / "images"
+    holdout.csv. A relative XDG_CACHE_HOME is ignored, as the XDG spec says."""
+    base = os.environ.get("XDG_CACHE_HOME", "")
+    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
+    return root / "iterate" / "images"
 
 
 def default_image_size(profile: ImageProfile) -> int:
     """The size the images carry without upscaling: the median short side rounded
     down to a multiple of 32, from 32 to 160."""
-    short = min(profile.widths[1], profile.heights[1])
+    short = profile.short_sides[1] or min(profile.widths[1], profile.heights[1])
     return max(_SIZE_FLOOR, min(_SIZE_CEILING, short // _SIZE_STEP * _SIZE_STEP))
 
 
@@ -413,15 +417,16 @@ class Prepared:
 def _without_twins(
     dataset: TabularDataset, column: ImageColumn, hashes: dict[str, str | None]
 ) -> tuple[TabularDataset, list[str]]:
-    """A holdout this harness split loses the images whose bytes sit in training, the
-    rule the linker's split uses; a holdout the user gave is theirs as given."""
+    """A holdout this harness split loses the images whose bytes, or whose path, sit in
+    training, the rule the linker's split uses; a holdout the user gave is theirs as
+    given. The path counts too because a missing file has no bytes to compare."""
     if dataset.user_split:
         return dataset, []
-    seen = {
-        d for p in dataset.train_features[column.column] if (d := hashes.get(str(p))) is not None
-    }
+    train = [str(p) for p in dataset.train_features[column.column]]
+    seen = {d for p in train if (d := hashes.get(p)) is not None}
+    named = set(train)
     holdout = dataset.test_features[column.column]
-    twin = holdout.map(lambda p: hashes.get(str(p)) in seen).to_numpy(dtype=bool)
+    twin = holdout.map(lambda p: str(p) in named or hashes.get(str(p)) in seen).to_numpy(dtype=bool)
     if not twin.any():
         return dataset, []
     if twin.all():

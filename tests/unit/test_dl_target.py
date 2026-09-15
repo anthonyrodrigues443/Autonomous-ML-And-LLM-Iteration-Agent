@@ -8,7 +8,10 @@ import io
 import json
 import subprocess
 import sys
-from typing import TYPE_CHECKING, Any
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -25,9 +28,6 @@ from iterate.targets import dl
 from iterate.targets.base import BenchmarkTarget
 from iterate.targets.dl import DLModelTarget, FitJob, FitReport, RecipeError
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 pytestmark = pytest.mark.unit
 
 
@@ -35,6 +35,20 @@ def _write(root: Path, classes: int, per_class: int, *, offset: int = 0) -> list
     """One colour per class, one shade per image, so every file's bytes differ."""
     rows = []
     for k in range(classes):
+        for i in range(per_class):
+            path = root / "images" / f"{k:02d}_{offset + i:03d}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            colour = (20 * k % 256, (37 * k + 60) % 256, (7 * (offset + i) + 90) % 256)
+            Image.new("RGB", (16, 16), colour).save(path)
+            rows.append({"image": f"images/{path.name}", "label": k})
+    return rows
+
+
+def _write_labels(
+    root: Path, labels: list[int], per_class: int, *, offset: int = 0
+) -> list[dict[str, Any]]:
+    rows = []
+    for k in labels:
         for i in range(per_class):
             path = root / "images" / f"{k:02d}_{offset + i:03d}.png"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +148,16 @@ def test_a_fine_tune_runs_through_the_runner_and_records_its_epochs(tmp_path: Pa
         ({"unfreeze": "all", "epochs": 0}, "the probe takes 0 epochs"),
         ({"unfreeze": "all", "epochs": 3, "image_size": 16}, "image_size=16 is outside"),
         ({"code": "def train_and_predict(): ..."}, "unknown recipe keys ['code']"),
+        ({"unfreeze": "all", "epochs": 3, "batch_size": 0}, "batch_size=0 is outside"),
+        ({"unfreeze": "all", "epochs": 3, "batch_size": 257}, "batch_size=257 is outside"),
+        ({"unfreeze": "all", "epochs": 3, "lr": 0}, "lr=0 is outside"),
+        ({"unfreeze": "all", "epochs": 3, "lr": 2.0}, "lr=2.0 is outside"),
+        ({"unfreeze": "all", "epochs": 13}, "epochs=13 is outside"),
+        (
+            {"unfreeze": "all", "epochs": 3, "label_smoothing": 0.5},
+            "label_smoothing=0.5 is outside",
+        ),
+        ({"unfreeze": "none", "epochs": 3}, "the probe takes 0 epochs"),
     ],
 )
 def test_a_recipe_is_refused_by_name_as_a_failed_result(
@@ -231,6 +255,11 @@ def test_a_probability_metric_with_a_holdout_only_class_fails_with_the_reason(
     [
         ("MPS backend out of memory (MPS allocated: 1.75 GiB, max allowed: 1.78 GiB)", "oom"),
         ("CUDA out of memory. Tried to allocate 2.00 GiB", "oom"),
+        (
+            "[enforce fail at alloc_cpu.cpp:135] DefaultCPUAllocator: can't allocate memory: "
+            "you tried to allocate 1125899906842624 bytes. Error code 12 (Cannot allocate memory)",
+            "oom",
+        ),
         ("Invalid buffer size: 372.53 GiB", "buffer"),
         ("mat1 and mat2 shapes cannot be multiplied", None),
     ],
@@ -298,6 +327,11 @@ def test_pixels_over_a_quarter_of_ram_are_refused_with_their_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(dl, "_ram_bytes", lambda: 100_000)
+
+    def never(paths: list[str], size: int) -> np.ndarray:
+        raise AssertionError("decoded before the RAM check")
+
+    monkeypatch.setattr(dl, "decode", never)
     result = _target(_prepared(tmp_path)).baseline()
     assert result.error is not None
     assert "GiB decoded, over a quarter of this machine's RAM; lower image_size" in result.error
@@ -377,3 +411,140 @@ def test_the_target_and_the_sweep_import_without_torch() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, cwd=REPO_ROOT
     )
     assert out.stdout.strip() == "False"
+
+
+# ─── what the review forced ──────────────────────────────────────────────────
+
+
+def test_an_int_for_a_float_field_is_accepted(tmp_path: Path) -> None:
+    changes = {"unfreeze": "all", "epochs": 1, "lr": 1, "label_smoothing": 0}
+    assert _target(_prepared(tmp_path)).run(_cand(changes)).error is None
+
+
+def test_either_half_of_the_copy_guard_refuses_on_its_own(tmp_path: Path) -> None:
+    dataset = _prepared(tmp_path).dataset
+    renamed = dataset.test_features.copy()
+    first = Path(str(renamed["image"].iloc[0]))
+    renamed.iloc[0, renamed.columns.get_loc("image")] = str(first.with_name("cat_001.png"))
+    for broken in (replace(dataset, test_features=renamed), replace(dataset, data_hash="0" * 16)):
+        with pytest.raises(ValueError, match="must hold the byte-named copies"):
+            DLModelTarget(broken, column="image", metric="accuracy", runner=FakeRunner())
+
+
+def test_a_regression_task_is_refused_even_with_a_class_metric(tmp_path: Path) -> None:
+    dataset = replace(_prepared(tmp_path).dataset, task="regression")
+    with pytest.raises(ValueError, match="scores classes"):
+        DLModelTarget(dataset, column="image", metric="accuracy", runner=FakeRunner())
+
+
+def test_one_training_class_or_fractional_labels_are_refused(tmp_path: Path) -> None:
+    dataset = _prepared(tmp_path).dataset
+    one = replace(dataset, train_target=dataset.train_target * 0)
+    with pytest.raises(ValueError, match="at least two training classes"):
+        DLModelTarget(one, column="image", metric="accuracy", runner=FakeRunner())
+    halves = replace(dataset, train_target=dataset.train_target.astype(float) + 0.5)
+    with pytest.raises(ValueError, match="fractional labels"):
+        DLModelTarget(halves, column="image", metric="accuracy", runner=FakeRunner())
+
+
+def test_a_holdout_with_as_many_classes_but_another_set_cannot_take_probabilities(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    pd.DataFrame(_write_labels(root, [0, 1, 2], 8)).to_csv(root / "train.csv", index=False)
+    pd.DataFrame(_write_labels(root, [0, 1, 3], 3, offset=100)).to_csv(
+        root / "holdout.csv", index=False
+    )
+    loaded = load_split(
+        root / "train.csv", root / "holdout.csv", target="label", task="classification"
+    )
+    prepared = prepare_images(loaded, root / "train.csv", into=tmp_path / "cache")
+    failed = _target(prepared, metric="roc_auc").baseline()
+    assert failed.error == "roc_auc needs one probability column per holdout class"
+    assert _target(prepared).baseline().error is None
+
+
+class NaNRunner(FakeRunner):
+    def fit(self, job: FitJob) -> FitReport:
+        report = super().fit(job)
+        probabilities = report.probabilities.copy()
+        probabilities[0, :] = np.nan
+        return FitReport(probabilities, report.epochs_planned, report.epochs_run)
+
+
+def test_probabilities_that_are_not_finite_fail_a_probability_metric_and_not_accuracy(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(tmp_path)
+    fine_tune = _cand({"unfreeze": "all", "epochs": 1})
+    failed = _target(prepared, metric="roc_auc", runner=NaNRunner()).run(fine_tune)
+    assert failed.error == "roc_auc needs finite probabilities"
+    scored = _target(prepared, runner=NaNRunner()).run(fine_tune)
+    assert scored.error is None
+    assert scored.metrics is not None
+
+
+def test_the_budget_counts_from_the_top_of_the_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = _prepared(tmp_path)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(dl, "time", SimpleNamespace(perf_counter=lambda: clock["now"]))
+    real_decode = dl.decode
+
+    def slow_decode(paths: list[str], size: int) -> np.ndarray:
+        clock["now"] += 100.0
+        return real_decode(paths, size)
+
+    monkeypatch.setattr(dl, "decode", slow_decode)
+    runner = FakeRunner()
+    target = DLModelTarget(
+        prepared.dataset,
+        column="image",
+        metric="accuracy",
+        runner=runner,
+        image_size=prepared.image_size,
+        budget_seconds=540.0,
+    )
+    target.run(_cand({"unfreeze": "all", "epochs": 1}))
+    (job,) = runner.jobs
+    assert job.deadline == 1000.0 + 540.0
+
+
+def test_release_clears_the_kept_traceback_and_empties_the_device_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emptied: list[str] = []
+    stub = SimpleNamespace(mps=SimpleNamespace(empty_cache=lambda: emptied.append("mps")))
+    monkeypatch.setattr(dl, "_torch", lambda: stub)
+    for name in ("last_value", "last_traceback"):
+        monkeypatch.setattr(sys, name, "kept", raising=False)
+
+    def boom() -> None:
+        raise RuntimeError("MPS backend out of memory")
+
+    with pytest.raises(dl.DeviceOutOfMemoryError):
+        dl._guarded("mps", boom, "batch_size=64")
+    assert sys.last_value is None
+    assert sys.last_traceback is None
+    assert emptied == ["mps"]
+
+
+def test_a_16_bit_and_a_float_image_decode_like_their_8_bit_version(tmp_path: Path) -> None:
+    ramp = np.tile(np.linspace(0.0, 1.0, 64), (64, 1))
+    Image.fromarray((ramp * 255).astype(np.uint8)).save(tmp_path / "eight.png")
+    Image.fromarray((ramp * 65535).astype(np.uint16)).save(tmp_path / "sixteen.png")
+    Image.fromarray(ramp.astype(np.float32)).save(tmp_path / "float.tiff")
+    names = ("eight.png", "sixteen.png", "float.tiff")
+    eight, sixteen, floating = dl.decode([str(tmp_path / n) for n in names], 32)
+    assert abs(float(sixteen.mean()) - float(eight.mean())) < 2.0
+    assert abs(float(floating.mean()) - float(eight.mean())) < 2.0
+
+
+def test_an_image_over_the_pixel_limit_decodes_blank_rather_than_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Image.new("RGB", (64, 64), (200, 10, 10)).save(tmp_path / "big.png")
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)
+    (pixels,) = dl.decode([str(tmp_path / "big.png")], 32)
+    assert int(pixels.max()) == 0

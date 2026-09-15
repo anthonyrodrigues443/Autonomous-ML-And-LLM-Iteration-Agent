@@ -200,21 +200,27 @@ def sweep_in_child(dataset: Dataset, *, on_line: Callable[[str], None] | None = 
     """The sweep in a child process of its own. torch and lightgbm each ship an OpenMP
     runtime, and on macOS a fit in one after the other in a single process crashes or
     hangs; a ceilings run over the whole corpus fits lightgbm for its tabular rows."""
-    child = subprocess.Popen(
+    found: str | None = None
+    with subprocess.Popen(
         [sys.executable, "-m", "evals.vision_ceilings", dataset.name],
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-    )
-    assert child.stdout is not None
-    found: str | None = None
-    for line in child.stdout:
-        if line.startswith(_RESULT):
-            found = line[len(_RESULT) :]
-        elif on_line is not None:
-            on_line(line.rstrip("\n"))
-    code = child.wait()
+        errors="replace",
+    ) as child:
+        assert child.stdout is not None
+        try:
+            for line in child.stdout:
+                if line.startswith(_RESULT):
+                    found = line[len(_RESULT) :]
+                elif on_line is not None:
+                    on_line(line.rstrip("\n"))
+        except BaseException:
+            child.kill()
+            child.wait()
+            raise
+        code = child.wait()
     if code != 0 or found is None:
         raise RuntimeError(f"{dataset.name}: the vision sweep's child exited with {code}")
     return Ceiling(**json.loads(found))

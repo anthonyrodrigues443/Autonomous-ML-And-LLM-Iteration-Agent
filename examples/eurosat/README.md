@@ -33,6 +33,11 @@ The layout is flat on purpose: every image is `images/NNNNN.jpg` in shuffled ord
 and the label lives only in the CSV, so a holdout path can never tell a model its
 class. The archive's own filenames repeat the class name, which is exactly why.
 
+**Ceiling, measured by the eval sweep on 2026-09-16:** the resnet18 probe scores
+0.899 and the best of twelve recipes 0.986, convnext_tiny fine-tuned for 3 epochs at
+64 px: 8.7 points of headroom. One standard error on this holdout is 0.16 points, so
+resnet50 and resnet18 at 128 px, both 0.985, tie it.
+
 **Status:** data ready, and `DLModelTarget` measures its ceiling here in the eval
 sweep (`python -m evals.run ceilings --datasets eurosat`). The `iterate run` switch
 for images lands next.

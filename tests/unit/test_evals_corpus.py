@@ -128,3 +128,33 @@ def test_the_two_vision_datasets_are_registered() -> None:
         assert by_name[name].is_vision
         assert (by_name[name].target, by_name[name].metric) == ("label", "accuracy")
         assert by_name[name].path == REPO_ROOT / "examples" / name / "data.csv"
+
+
+def test_a_vision_key_moves_when_an_image_changes_behind_the_same_csv(tmp_path: Path) -> None:
+    from PIL import Image
+
+    folder = tmp_path / "tiles"
+    (folder / "images").mkdir(parents=True)
+    rows = []
+    for i in range(4):
+        Image.new("RGB", (4, 4), (i * 40, 0, 0)).save(folder / "images" / f"{i}.png")
+        rows.append(f"images/{i}.png,c{i % 2}")
+    (folder / "dataset.toml").write_text(
+        'target = "label"\nmetric = "accuracy"\nfamily = "vision"\n', encoding="utf-8"
+    )
+    (folder / "data.csv").write_text("image,label\n" + "\n".join(rows) + "\n", encoding="utf-8")
+
+    (dataset,) = corpus.load(tmp_path)
+    before = dataset.content_hash()
+    Image.new("RGB", (4, 4), (0, 255, 0)).save(folder / "images" / "2.png")
+
+    assert dataset.content_hash() != before
+
+
+def test_a_family_that_contradicts_the_task_line_is_refused(tmp_path: Path) -> None:
+    _spec(tmp_path / "a", "x", 'target = "y"\nmetric = "f1"\nfamily = "prompt"\n')
+    with pytest.raises(corpus.BadDatasetSpecError, match="needs a task line"):
+        corpus.load(tmp_path / "a")
+    _spec(tmp_path / "b", "x", 'target = "y"\nmetric = "f1"\nfamily = "vision"\ntask = "say"\n')
+    with pytest.raises(corpus.BadDatasetSpecError, match="makes this a prompt dataset"):
+        corpus.load(tmp_path / "b")

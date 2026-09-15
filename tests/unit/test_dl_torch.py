@@ -52,11 +52,14 @@ def test_a_tiny_model_fits_on_cpu_and_prints_its_epochs() -> None:
 
 
 def test_a_trimmed_plan_builds_its_schedule_over_the_epochs_it_runs() -> None:
-    """1 s a step, 3 steps an epoch, 2 steps kept back to predict: 7.5 s leaves room
-    for 2 whole epochs of the 5 asked for, and the schedule spans exactly those."""
+    """1 s a step and a tenth of margin, 3 steps an epoch, 2 steps kept back to
+    predict: 7.5 s left leaves room for 2 whole epochs of the 5 asked for, and the
+    schedule spans exactly those."""
     result = _check("trimmed_plan")
     assert result["epochs"] == [2, 2]
     assert result["steps"] == 2 * 3
+    assert result["epoch_seconds"] == 3.3
+    assert 7.0 < result["left"] <= 7.5
 
 
 def test_an_epoch_the_deadline_cuts_still_predicts() -> None:
@@ -78,8 +81,16 @@ def test_a_head_copied_from_the_probe_predicts_what_the_probe_predicts() -> None
 
 def test_on_mps_the_default_pool_starts_at_the_capped_ratios() -> None:
     result = _check("mps_starts")
-    assert result == {"started": True, "high": "1.0", "low": "0.8"}
+    assert result == {"started": True, "high": "0.7", "low": "0.56"}
 
 
 def test_on_mps_an_allocation_over_a_small_cap_raises_the_text_oom_kind_reads() -> None:
     assert _check("mps_cap")["kind"] == "oom"
+
+
+def test_timing_a_step_moves_neither_the_weights_nor_the_batch_norm_statistics() -> None:
+    assert _check("timing_moves_nothing") == {"same": True, "lr": 0.01, "state": 0, "timed": True}
+
+
+def test_a_head_only_fit_keeps_the_backbones_batch_norm_statistics() -> None:
+    assert _check("head_only_keeps_batch_norm") == {"head": True, "all": False}

@@ -543,3 +543,71 @@ def test_the_default_size_follows_the_median_short_side(width: int, height: int,
         shared_across_split=0,
     )
     assert default_image_size(profile) == size
+
+
+def test_the_profile_keeps_the_median_short_side_and_the_default_size_uses_it(
+    tmp_path: Path,
+) -> None:
+    from iterate.adapters.data.images import ImageProfile, default_image_size, prepare_images
+
+    csv = _tiny_csv(tmp_path / "data")
+    prepared = prepare_images(load_csv(csv, target="label"), csv, into=tmp_path / "cache")
+    assert prepared.profile.short_sides[1] == 8
+    mixed = ImageProfile(
+        n_train=4,
+        n_test=1,
+        column="image",
+        classes=2,
+        class_balance=(("a", 0.5), ("b", 0.5)),
+        target_spread=None,
+        widths=(100, 200, 300),
+        heights=(100, 200, 300),
+        portrait_share=0.5,
+        modes=(("RGB", 1.0),),
+        formats=(("PNG", 1.0),),
+        unreadable=0,
+        shared_across_split=0,
+        short_sides=(100, 100, 100),
+    )
+    assert default_image_size(mixed) == 96
+
+
+def test_a_relative_cache_home_is_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from iterate.adapters.data.images import image_cache_dir
+
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative/cache")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert image_cache_dir() == tmp_path / "home" / ".cache" / "iterate" / "images"
+
+
+def test_prepare_refuses_a_csv_without_an_image_column(tmp_path: Path) -> None:
+    from iterate.adapters.data.images import prepare_images
+
+    csv = tmp_path / "t.csv"
+    pd.DataFrame({"a": range(10), "label": ["x", "y"] * 5}).to_csv(csv, index=False)
+    with pytest.raises(ValueError, match="does not hold image paths"):
+        prepare_images(load_csv(csv, target="label"), csv, into=tmp_path / "cache")
+
+
+def test_a_path_named_on_both_sides_is_a_twin_even_when_the_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from iterate.adapters.data.images import _without_twins
+
+    csv = _tiny_csv(tmp_path / "data")
+    loaded = load_csv(csv, target="label")
+    column = detect_image_column(loaded.train_features, loaded.features, csv)
+    assert column is not None
+    resolved = resolve_paths(loaded, column)
+    gone = str(csv.parent / "images" / "gone.png")
+    train = resolved.train_features.copy()
+    holdout = resolved.test_features.copy()
+    train.iloc[0, 0] = gone
+    holdout.iloc[0, 0] = gone
+    dataset = replace(resolved, train_features=train, test_features=holdout)
+    hashes = file_hashes([str(p) for f in (train, holdout) for p in f["image"]])
+    kept, dropped = _without_twins(dataset, column, hashes)
+    assert dropped == [gone]
+    assert kept.n_test == resolved.n_test - 1

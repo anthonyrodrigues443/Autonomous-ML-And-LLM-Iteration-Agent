@@ -28,6 +28,8 @@ def _tiny_build(torch_: Any, backbone: str, n_classes: int | None, head: Any) ->
             super().__init__()
             self.body = torch_.nn.Sequential(
                 torch_.nn.Conv2d(3, 4, 3, padding=1),
+                torch_.nn.BatchNorm2d(4),
+                torch_.nn.ReLU(),
                 torch_.nn.AdaptiveAvgPool2d(1),
                 torch_.nn.Flatten(),
             )
@@ -76,17 +78,28 @@ def fit_prints_epochs() -> dict[str, Any]:
 
 
 def trimmed_plan() -> dict[str, Any]:
+    dl._torch()
     dl.time_steps = lambda step, k=10: 1.0  # type: ignore[assignment]
-    seen: dict[str, int] = {}
-    real = dl._schedule
+    seen: dict[str, float] = {}
+    real_schedule, real_plan = dl._schedule, dl.plan_epochs
 
-    def spy(torch_: Any, opt: Any, recipe: Recipe, steps: int) -> Any:
+    def spy_schedule(torch_: Any, opt: Any, recipe: Recipe, steps: int) -> Any:
         seen["steps"] = steps
-        return real(torch_, opt, recipe, steps)
+        return real_schedule(torch_, opt, recipe, steps)
 
-    dl._schedule = spy  # type: ignore[assignment]
-    report = TorchRunner("cpu").fit(_job(5, time.perf_counter() + 2 + 7.5, []))
-    return {"epochs": [report.epochs_planned, report.epochs_run], "steps": seen["steps"]}
+    def spy_plan(wanted: int, epoch_seconds: float, seconds_left: float) -> int:
+        seen["epoch_seconds"], seen["left"] = epoch_seconds, seconds_left
+        return real_plan(wanted, epoch_seconds, seconds_left)
+
+    dl._schedule = spy_schedule  # type: ignore[assignment]
+    dl.plan_epochs = spy_plan  # type: ignore[assignment]
+    report = TorchRunner("cpu").fit(_job(5, time.perf_counter() + 2.2 + 7.5, []))
+    return {
+        "epochs": [report.epochs_planned, report.epochs_run],
+        "steps": seen["steps"],
+        "epoch_seconds": round(seen["epoch_seconds"], 3),
+        "left": round(seen["left"], 2),
+    }
 
 
 def cut_epoch() -> dict[str, Any]:
@@ -94,7 +107,7 @@ def cut_epoch() -> dict[str, Any]:
     dl.time = SimpleNamespace(perf_counter=lambda: float(next(ticks)))  # type: ignore[assignment]
     dl.time_steps = lambda step, k=10: 0.5  # type: ignore[assignment]
     log: list[str] = []
-    report = TorchRunner("cpu").fit(_job(5, 20.0, log))
+    report = TorchRunner("cpu").fit(_job(5, 20.1, log))
     return {
         "epochs": [report.epochs_planned, report.epochs_run],
         "last": log[-1],
@@ -149,9 +162,59 @@ def mps_cap() -> dict[str, Any]:
         return {"kind": dl.oom_kind(exc)}
 
 
+def timing_moves_nothing() -> dict[str, Any]:
+    torch = dl._torch()
+    model = _tiny_build(torch, "resnet18", 3, None)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=1e-4)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    train, labels = _data(8)
+    xb = dl._to_device(torch, train[:8], torch.device("cpu"))
+    yb = torch.from_numpy(labels[:8])
+
+    def step() -> tuple[Any, Any, Any]:
+        logits = model(xb)
+        loss = torch.nn.functional.cross_entropy(logits, yb)
+        loss.backward()
+        return loss, logits, yb
+
+    seconds = dl._time_train_step(model, opt, step)
+    after = model.state_dict()
+    return {
+        "same": all(bool(torch.equal(before[k], after[k])) for k in before),
+        "lr": opt.param_groups[0]["lr"],
+        "state": len(opt.state),
+        "timed": seconds > 0,
+    }
+
+
+def head_only_keeps_batch_norm() -> dict[str, Any]:
+    torch = dl._torch()
+    built: list[Any] = []
+
+    def keep(torch_: Any, backbone: str, n_classes: int | None, head: Any) -> Any:
+        model = _tiny_build(torch_, backbone, n_classes, head)
+        built.append(model)
+        return model
+
+    dl._build = keep  # type: ignore[assignment]
+    out: dict[str, bool] = {}
+    for unfreeze in ("head", "all"):
+        built.clear()
+        train, labels = _data(8)
+        holdout, _ = _data(3)
+        fit = Recipe(unfreeze=unfreeze, epochs=2, batch_size=8, image_size=16)
+        job = FitJob(train, holdout, labels, fit, 3, None, time.perf_counter() + 120, print)
+        TorchRunner("cpu").fit(job)
+        fresh = _tiny_build(torch, "resnet18", 3, None)
+        out[unfreeze] = bool(torch.equal(built[0].body[1].running_mean, fresh.body[1].running_mean))
+    return out
+
+
 CHECKS = {
     f.__name__: f
     for f in (
+        timing_moves_nothing,
+        head_only_keeps_batch_norm,
         fit_prints_epochs,
         trimmed_plan,
         cut_epoch,

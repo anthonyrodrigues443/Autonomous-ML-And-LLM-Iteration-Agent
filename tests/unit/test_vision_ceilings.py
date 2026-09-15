@@ -18,26 +18,39 @@ from evals.store import Ceiling
 from iterate.targets.dl import DeviceOutOfMemoryError, FitJob, FitReport, Recipe
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 pytestmark = pytest.mark.unit
 
 
 class Fake:
+    """A probe on noisy features, so it misses some; a fine-tune on clean features that
+    gets one holdout row wrong unless the backbone is convnext_tiny, so the rows differ
+    and the ceiling is a single row."""
+
     device = "cpu"
 
     def embed(self, pixels: np.ndarray, *, backbone: str) -> np.ndarray:
-        return pixels.reshape(len(pixels), 3, -1).mean(axis=2).astype(np.float32)
+        means = pixels.reshape(len(pixels), 3, -1).mean(axis=2).astype(np.float32)
+        if backbone == "clean":
+            return means
+        noise = np.random.default_rng(len(pixels)).normal(0.0, 200.0, means.shape)
+        return (means + noise).astype(np.float32)
 
     def fit(self, job: FitJob) -> FitReport:
         if job.recipe.backbone == "resnet50":
             raise DeviceOutOfMemoryError("out of memory on cpu at batch_size=64: halve one of them")
-        train, held = self.embed(job.train, backbone=""), self.embed(job.holdout, backbone="")
+        train = self.embed(job.train, backbone="clean")
+        held = self.embed(job.holdout, backbone="clean")
         centres = np.stack([train[job.labels == c].mean(axis=0) for c in range(job.n_classes)])
         logits = -((held[:, None, :] - centres[None]) ** 2).sum(-1)
         p = np.exp(logits - logits.max(axis=1, keepdims=True))
+        p = p / p.sum(axis=1, keepdims=True)
+        if job.recipe.backbone != "convnext_tiny":
+            p[:1] = np.roll(p[:1], 1, axis=1)
         ran = 2 if job.recipe.epochs == 5 else job.recipe.epochs
-        return FitReport(p / p.sum(axis=1, keepdims=True), job.recipe.epochs, ran)
+        return FitReport(p, job.recipe.epochs, ran)
 
 
 def _dataset(tmp_path: Path) -> Dataset:
@@ -90,8 +103,12 @@ def test_the_sweep_records_every_rung_and_keeps_the_probe_as_the_baseline(tmp_pa
     assert len(rows) == 12
     assert seen == [r.label for r in rows]
     assert rows[0].label == "probe resnet18 32px"
-    assert ceiling.baseline == rows[0].score == 1.0
-    assert ceiling.ceiling == 1.0
+    scored = [r.score for r in rows if r.score is not None]
+    assert ceiling.ceiling == max(scored) == 1.0
+    assert ceiling.baseline == rows[0].score
+    assert rows[0].score is not None
+    assert rows[0].score < ceiling.ceiling
+    assert ceiling.method.endswith("best: fine-tune convnext_tiny 32px 3ep)")
     failed = next(r for r in rows if "resnet50" in r.label)
     assert failed.score is None
     assert failed.error.startswith("out of memory on cpu")
@@ -123,11 +140,28 @@ class _Child:
     """Stands in for the child process: the lines it would print, then its exit code."""
 
     argv: ClassVar[list[str]] = []
+    killed: ClassVar[list[bool]] = []
 
-    def __init__(self, argv: list[str], lines: list[str], code: int) -> None:
+    def __init__(self, argv: list[str], lines: list[str], code: int, *, boom: bool = False) -> None:
         type(self).argv = argv
-        self.stdout = iter(f"{line}\n" for line in lines)
+        self.stdout = self._read(lines, boom)
         self._code = code
+
+    @staticmethod
+    def _read(lines: list[str], boom: bool) -> Iterator[str]:
+        for line in lines:
+            yield f"{line}\n"
+        if boom:
+            raise RuntimeError("a line that cannot be read")
+
+    def __enter__(self) -> _Child:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def kill(self) -> None:
+        type(self).killed.append(True)
 
     def wait(self) -> int:
         return self._code
@@ -162,3 +196,28 @@ def test_a_child_that_dies_is_an_error_not_a_ceiling(
 
 def test_the_child_entry_point_wants_exactly_one_dataset() -> None:
     assert vision_ceilings.main([]) == 2
+
+
+@pytest.mark.parametrize(("lines", "code"), [(["no result line"], 0), (["ceiling-json: {}"], -11)])
+def test_a_child_needs_both_a_result_line_and_a_clean_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lines: list[str], code: int
+) -> None:
+    monkeypatch.setattr(
+        vision_ceilings.subprocess, "Popen", lambda argv, **_: _Child(argv, lines, code)
+    )
+    with pytest.raises(RuntimeError, match="the vision sweep's child exited with"):
+        vision_ceilings.sweep_in_child(_dataset(tmp_path))
+
+
+def test_a_child_whose_output_cannot_be_read_is_killed_and_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _Child.killed = []
+    monkeypatch.setattr(
+        vision_ceilings.subprocess,
+        "Popen",
+        lambda argv, **_: _Child(argv, ["one line"], 0, boom=True),
+    )
+    with pytest.raises(RuntimeError, match="a line that cannot be read"):
+        vision_ceilings.sweep_in_child(_dataset(tmp_path), on_line=lambda _line: None)
+    assert _Child.killed == [True]
