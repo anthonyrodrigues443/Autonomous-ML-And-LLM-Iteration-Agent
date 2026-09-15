@@ -38,12 +38,14 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from iterate.adapters.data.linking import Inventory, LinkedFrames
+    from iterate.adapters.data.workspace import Sides
     from iterate.core.interactive import RunController
     from iterate.core.linker import Linker
     from iterate.core.memory import Memory
     from iterate.core.orchestrator import RunResult
     from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult
     from iterate.schemas.link import LinkPlan
+    from iterate.schemas.monitor import DataReport
     from iterate.targets.model import ModelTarget
 
 app = typer.Typer(
@@ -306,10 +308,12 @@ def _link_folder(
 ) -> Any:
     """Link a folder of images to its labels before the run: rules first, a plan
     remembered from an earlier yes, the Linker where the rules could only say "one
-    of these", then the block a person reads. The pause is a conversation: yes, no,
-    or what to change in plain English, `MAX_ROUNDS` corrections at most. Nothing
-    the Linker says is shown before it was measured. Returns the workspace."""
-    from iterate.adapters.data import linking, workspace
+    of these", then the block a person reads with the monitor's checks under it,
+    on the rows the folder will be written with. The pause is a conversation: yes,
+    no, drop to take byte twins out of a holdout the person gave, or what to change
+    in plain English, `MAX_ROUNDS` corrections at most. Nothing the Linker says is
+    shown before it was measured. Returns the workspace."""
+    from iterate.adapters.data import linking, monitor, workspace
     from iterate.core.linker import MAX_ROUNDS
 
     if (key or target) and labels is None:
@@ -322,11 +326,24 @@ def _link_folder(
     sources = [data] if data is not None else [cast("Path", train), cast("Path", holdout)]
     out_root = Path(get_settings().iterate_runs_dir).parent / "data"
     built: list[Linker] = []
+    checker = monitor.Monitor()
 
     def linker() -> Linker:
         if not built:
             built.append(make_linker())
         return built[0]
+
+    def split(shown_: LinkPlan, frames_: LinkedFrames) -> tuple[Sides | None, str]:
+        """The split the pause checks and the writer lays out, or why there is none."""
+        try:
+            hashes = (
+                None
+                if frames_.holdout is not None
+                else checker.hashes(map(str, frames_.train["image"]))
+            )
+            return workspace.sides(shown_, frames_, hashes=hashes), ""
+        except linking.LinkError as exc:
+            return None, str(exc)
 
     try:
         inventories = [linking.inventory(s) for s in sources]
@@ -359,42 +376,85 @@ def _link_folder(
     except linking.LinkError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
+    both, refused_split = split(shown, frames)
+    report: DataReport | None = None
     rounds = 0
     notes: list[str] = []
     while True:
-        console.print(escape(linking.render(shown, inventories[0], frames)))
+        console.print(
+            escape(linking.render(shown, inventories[0], frames if both is None else both.frames))
+        )
         for why in whys:
             if why:
                 console.print(f"[dim]the Linker: {escape(why)}[/dim]")
+        if both is None:
+            report = None
+            console.print(f"[dim]{escape(refused_split)}[/dim]")
+        else:
+            report = checker.check(plans, inventories, both)
+            console.print(escape(report.render()))
         if recalled:
             console.print(
                 "[dim]remembered from an earlier yes; delete "
                 f"{escape(str(workspace.plan_path(sources, out=out_root)))} to link afresh[/dim]"
             )
+            if both is None:
+                raise typer.BadParameter(refused_split)
             break
         proven = shown.source != "agent" and shown.coverage >= linking.ACCEPT and not any(refusals)
-        if yes or proven:
+        settled = proven and report is not None and not report.needs_a_look
+        if yes or settled:
+            if both is None:
+                raise typer.BadParameter(refused_split)
             break
         if not _stdin_owns_tty():
-            why_ask = (
-                "the rules could not settle this folder, so the plan shown was proposed for it"
-                if any(refusals)
-                else f"coverage is {shown.coverage:.1%}, under {linking.ACCEPT:.0%}"
-            )
+            if both is None:
+                raise typer.BadParameter(refused_split)
+            if any(refusals):
+                why_ask = (
+                    "the rules could not settle this folder, so the plan shown was proposed for it"
+                )
+            elif shown.coverage < linking.ACCEPT:
+                why_ask = f"coverage is {shown.coverage:.1%}, under {linking.ACCEPT:.0%}"
+            else:
+                why_ask = "the checks found something worth a look"
             raise typer.BadParameter(
                 f"{why_ask}; re-run with --yes to accept it, or settle it with --labels, --key "
                 "and --target"
             )
+        twins = None
+        if report is not None:
+            twins = next(
+                (f for f in report.findings if f.check == "twins" and f.severity == "warn"), None
+            )
+        ask = "yes to continue, no to stop, or say what to change"
+        if twins is not None:
+            ask = (
+                "yes to continue, no to stop, drop to take the twins out of your holdout, or say "
+                "what to change"
+            )
         answer = ""
         while not answer:
-            answer = typer.prompt(
-                "yes to continue, no to stop, or say what to change", default="", show_default=False
-            ).strip()
+            answer = typer.prompt(ask, default="", show_default=False).strip()
         word = answer.lower().rstrip(" .!")
         if word in ("y", "yes"):
+            if both is None:
+                raise typer.BadParameter(refused_split)
             break
         if word in ("n", "no"):
             raise typer.Exit(code=1)
+        if word.split()[0] in ("drop", "remove"):
+            if both is None or twins is None:
+                console.print(
+                    "[dim]nothing to drop: no holdout image is a byte copy of a training image[/dim]"
+                )
+                continue
+            holdout = both.frames.holdout
+            assert holdout is not None  # sides
+            paths = map(str, (*both.frames.train["image"], *holdout["image"]))
+            kept, gone = monitor.drop_twins(both.frames, checker.hashes(paths))
+            both = workspace.Sides(kept, [*both.dropped, *gone])
+            continue
         if not any(refusals):
             # The rules proved every folder here; a change of mind is a job for the flags,
             # not for the model.
@@ -414,26 +474,34 @@ def _link_folder(
             new_plans, new_whys = _corrected(
                 inventories, plans, refusals, notes=notes, linker=linker
             )
-            frames, shown = _combined(new_plans, inventories)
-            plans, whys = new_plans, new_whys
+            new_frames, new_shown = _combined(new_plans, inventories)
         except (_NoPlanError, linking.LinkError) as exc:
             console.print(
                 f"[dim]the Linker could not turn that into a plan: {escape(str(exc))}; say it "
                 "another way, or stop with no[/dim]"
             )
+            continue
+        frames, shown, plans, whys = new_frames, new_shown, new_plans, new_whys
+        both, refused_split = split(shown, frames)
 
+    assert both is not None  # every break above has a split
+    assert report is not None
     try:
-        ws = workspace.write(shown, frames, sources=sources, out=out_root)
+        ws = workspace.write(shown, frames, sources=sources, out=out_root, both=both)
     except linking.LinkError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    monitor.save(report, ws.root)
     if any(p.source == "agent" for p in plans) and not recalled:
         workspace.remember_plan(plans, sources=sources, out=out_root)
     n_train = ws.train_csv.read_text(encoding="utf-8").count("\n") - 1
     n_holdout = ws.holdout_csv.read_text(encoding="utf-8").count("\n") - 1
+    found = sum(f.severity != "pass" for f in report.findings)
+    dropped = f", {len(both.dropped)} holdout images dropped" if both.dropped else ""
     console.print(
         f"\nlinked: {escape(str(ws.root))}\n  raw_files/  a copy of what you gave\n"
         f"  train/      {n_train} images\n  holdout/    {n_holdout} images, sealed\n"
-        f"  train.csv, holdout.csv, link.json"
+        f"  train.csv, holdout.csv, link.json\n"
+        f"  monitor.json  {found} finding(s){dropped}"
     )
     return ws
 

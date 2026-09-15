@@ -6,29 +6,22 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 import pytest
-from PIL import Image
 
 from iterate.adapters.data import linking
 from iterate.adapters.data.linking import LinkError, apply, inventory, plan, render
+from tests.unit.image_fixtures import CLASSES, class_tree, png
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 pytestmark = pytest.mark.unit
 
-CLASSES = ("cat", "dog", "emu")
 
-
-def _png(path: Path, seed: int = 0) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    Image.new("RGB", (12, 8), (seed * 9 % 255, 60, 120)).save(path)
+_png = png
 
 
 def _class_tree(root: Path, *, per_class: int = 4, seed: int = 0) -> Path:
-    for c in CLASSES:
-        for i in range(per_class):
-            _png(root / c / f"{c}_{seed + i}.png", seed + i)
-    return root
+    return class_tree(root, per_class=per_class, seed=seed)
 
 
 def _table_and_images(
@@ -692,3 +685,43 @@ def test_named_picks_refuse_a_one_row_table_and_a_decimal_key(tmp_path: Path) ->
             key_to_file="basename",
             target_column="code",
         )
+
+
+def test_table_rows_keeps_what_apply_keeps_and_names_what_it_sets_aside(tmp_path: Path) -> None:
+    root = _table_and_images(
+        tmp_path,
+        key="id",
+        values=[str(i) for i in range(20)] + ["3"],
+        labels=["a", "b"] * 10 + ["z"],
+        files=[f"{i}.jpg" for i in range(20)],
+    )
+    inv = inventory(root)
+    rows = linking.table_rows(inv, root / "labels.csv", "id", "stem", target_column="label")
+    assert rows.keys == [str(i) for i in range(20)] + ["3"]
+    assert rows.claimed[3] == rows.claimed[20] == root / "images" / "3.jpg"
+    assert rows.resolved[3] is None
+    assert rows.resolved[20] is None
+    assert rows.resolved[4] == root / "images" / "4.jpg"
+    assert rows.label is not None
+    assert list(rows.label) == ["a", "b"] * 10 + ["z"]
+    p = plan(inv)
+    assert len(apply(p, inv).train) == 19  # the shared image is set aside, as before
+    frame = pd.DataFrame(
+        {"id": [str(i) for i in range(20)], "cat": [1, 0] * 10, "dog": [0, 1] * 10}
+    )
+    frame.to_csv(root / "labels.csv", index=False)
+    inv = inventory(root)
+    rows = linking.table_rows(inv, root / "labels.csv", "id", "stem", onehot_columns=["cat", "dog"])
+    assert rows.label is not None
+    assert list(rows.label) == ["cat", "dog"] * 10
+
+
+def test_render_names_both_sides_when_the_frames_carry_them(tmp_path: Path) -> None:
+    inv = inventory(_class_tree(tmp_path))
+    p = plan(inv)
+    frames = apply(p, inv)
+    assert "split: none given, 12 images split here 80/20\n" in render(p, inv, frames) + "\n"
+    both = linking.LinkedFrames(frames.train.iloc[:9], frames.train.iloc[9:])
+    assert "split: none given, 12 images split here 80/20, 9 train / 3 holdout" in render(
+        p, inv, both
+    )

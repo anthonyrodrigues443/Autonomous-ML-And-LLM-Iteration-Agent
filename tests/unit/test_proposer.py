@@ -223,3 +223,25 @@ def test_summarize_dataset_includes_a_profile(tmp_path: Path) -> None:
     assert "city=" in summary  # per-categorical cardinality is reported
     assert "Missing values:" in summary
     assert "Class balance:" in summary
+
+
+def test_the_data_checks_line_is_appended_only_when_there_are_facts() -> None:
+    import tempfile
+    from dataclasses import replace
+    from pathlib import Path
+
+    import pandas as pd
+
+    from iterate.adapters.data.tabular import load_csv
+    from iterate.core.proposer import summarize_dataset
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "t.csv"
+        pd.DataFrame(
+            {"f1": range(40), "f2": [i % 3 for i in range(40)], "y": [i % 2 for i in range(40)]}
+        ).to_csv(path, index=False)
+        dataset = load_csv(path, target="y")
+    plain = summarize_dataset(dataset)
+    assert "Data checks" not in plain
+    told = summarize_dataset(replace(dataset, facts=("nothing found.",)))
+    assert told == plain + "\nData checks: nothing found."
