@@ -14,6 +14,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import signal
 import sys
 from datetime import UTC, datetime
@@ -377,12 +378,29 @@ def _link_folder(
         raise typer.BadParameter(str(exc)) from exc
 
     both, refused_split = split(shown, frames)
+    if recalled and both is not None and workspace.recall_drop(sources, out=out_root):
+        # The earlier yes came with a drop of the twins; the same folders get the same.
+        holdout = both.frames.holdout
+        assert holdout is not None  # sides
+        paths = map(str, (*both.frames.train["image"], *holdout["image"]))
+        with contextlib.suppress(linking.LinkError):
+            kept, gone, gone_labels = monitor.drop_twins(both.frames, checker.hashes(paths))
+            if gone:
+                both = workspace.Sides(kept, gone, gone_labels)
+                console.print(
+                    f"[dim]dropped {len(gone)} holdout images that are byte copies of a "
+                    "training image, as before[/dim]"
+                )
     report: DataReport | None = None
     rounds = 0
     notes: list[str] = []
     while True:
         console.print(
-            escape(linking.render(shown, inventories[0], frames if both is None else both.frames))
+            escape(
+                linking.render(shown, inventories[0], frames)
+                if both is None
+                else linking.render(shown, inventories[0], both.frames, dropped=len(both.dropped))
+            )
         )
         for why in whys:
             if why:
@@ -398,11 +416,11 @@ def _link_folder(
                 "[dim]remembered from an earlier yes; delete "
                 f"{escape(str(workspace.plan_path(sources, out=out_root)))} to link afresh[/dim]"
             )
-            if both is None:
-                raise typer.BadParameter(refused_split)
-            break
+        if both is None and (recalled or not any(refusals)):
+            # Nothing a person could say here would change the split; only the data can.
+            raise typer.BadParameter(refused_split)
         proven = shown.source != "agent" and shown.coverage >= linking.ACCEPT and not any(refusals)
-        settled = proven and report is not None and not report.needs_a_look
+        settled = (proven or recalled) and report is not None and not report.needs_a_look
         if yes or settled:
             if both is None:
                 raise typer.BadParameter(refused_split)
@@ -437,13 +455,15 @@ def _link_folder(
         while not answer:
             answer = typer.prompt(ask, default="", show_default=False).strip()
         word = answer.lower().rstrip(" .!")
+        if not word:
+            continue
         if word in ("y", "yes"):
             if both is None:
                 raise typer.BadParameter(refused_split)
             break
         if word in ("n", "no"):
             raise typer.Exit(code=1)
-        if word.split()[0] in ("drop", "remove"):
+        if re.fullmatch(r"(drop|remove)( (them|it|twins|the twins|copies|the copies))?", word):
             if both is None or twins is None:
                 console.print(
                     "[dim]nothing to drop: no holdout image is a byte copy of a training image[/dim]"
@@ -452,10 +472,16 @@ def _link_folder(
             holdout = both.frames.holdout
             assert holdout is not None  # sides
             paths = map(str, (*both.frames.train["image"], *holdout["image"]))
-            kept, gone = monitor.drop_twins(both.frames, checker.hashes(paths))
-            both = workspace.Sides(kept, [*both.dropped, *gone])
+            try:
+                kept, gone, gone_labels = monitor.drop_twins(both.frames, checker.hashes(paths))
+            except linking.LinkError as exc:
+                console.print(f"[dim]{escape(str(exc))}[/dim]")
+                continue
+            both = workspace.Sides(
+                kept, [*both.dropped, *gone], [*both.dropped_labels, *gone_labels]
+            )
             continue
-        if not any(refusals):
+        if not any(refusals) or recalled:
             # The rules proved every folder here; a change of mind is a job for the flags,
             # not for the model.
             console.print(
@@ -492,7 +518,8 @@ def _link_folder(
         raise typer.BadParameter(str(exc)) from exc
     monitor.save(report, ws.root)
     if any(p.source == "agent" for p in plans) and not recalled:
-        workspace.remember_plan(plans, sources=sources, out=out_root)
+        asked_to_drop = bool(both.dropped) and shown.split != "ours"
+        workspace.remember_plan(plans, sources=sources, out=out_root, drop_twins=asked_to_drop)
     n_train = ws.train_csv.read_text(encoding="utf-8").count("\n") - 1
     n_holdout = ws.holdout_csv.read_text(encoding="utf-8").count("\n") - 1
     found = sum(f.severity != "pass" for f in report.findings)

@@ -19,7 +19,7 @@ from iterate.adapters.data.monitor import Monitor, drop_twins
 from tests.unit.image_fixtures import CLASSES, class_tree, png
 
 if TYPE_CHECKING:
-    from iterate.schemas.monitor import DataReport
+    from iterate.schemas.monitor import DataReport, Finding
 
 pytestmark = pytest.mark.unit
 
@@ -36,7 +36,7 @@ def _report(root: Path, checker: Monitor | None = None) -> tuple[DataReport, wor
     return checker.check([p], [inv], both), both
 
 
-def _by_check(report: DataReport) -> dict[str, object]:
+def _by_check(report: DataReport) -> dict[str, Finding]:
     return {f.check: f for f in report.findings}
 
 
@@ -110,7 +110,7 @@ def test_our_split_leaves_byte_copies_out_of_the_holdout(tmp_path: Path) -> None
     assert expected  # the fixture put at least one copy across the split
     assert not any(hashes[str(q)] in train_sha for q in both.frames.holdout["image"])
     report = checker.check([p], [inv], both)
-    assert _by_check(report)["twins"].severity == "pass"  # type: ignore[attr-defined]
+    assert _by_check(report)["twins"].severity == "pass"
     assert report.dropped == [Path(q).relative_to(root).as_posix() for q in expected]
     assert (
         f"dropped: {len(expected)} holdout images left out of the holdout because their bytes are in training"
@@ -127,24 +127,28 @@ def test_a_users_holdout_twin_is_a_warn_that_drop_takes_out(tmp_path: Path) -> N
     checker = Monitor()
     report, both = _report(root, checker)
     twins = _by_check(report)["twins"]
-    assert twins.severity == "warn"  # type: ignore[attr-defined]
-    assert twins.count == 1  # type: ignore[attr-defined]
-    assert twins.share == pytest.approx(1 / 7)  # type: ignore[attr-defined]
+    assert twins.severity == "warn"
+    assert twins.count == 1
+    assert twins.share == pytest.approx(1 / 7)
     assert (
         "1 holdout images (14.3%) are byte-identical to a training image, 1 under the same label"
         in twins.summary
-    )  # type: ignore[attr-defined]
-    assert twins.examples == ["test/cat/cat_99.png = train/cat/cat_0.png"]  # type: ignore[attr-defined]
-    assert "answer drop at the pause" in twins.way_out  # type: ignore[attr-defined]
+    )
+    assert twins.examples == ["test/cat/cat_99.png = train/cat/cat_0.png"]
+    assert "answer drop at the pause" in twins.way_out
     assert report.needs_a_look is True
 
     paths = map(str, (*both.frames.train["image"], *both.frames.holdout["image"]))  # type: ignore[union-attr]
-    kept, gone = drop_twins(both.frames, checker.hashes(paths))
+    kept, gone, gone_labels = drop_twins(both.frames, checker.hashes(paths))
     assert gone == [str(root / "test" / "cat" / "cat_99.png")]
+    assert gone_labels == ["cat"]
     assert kept.holdout is not None
     assert len(kept.holdout) == 6
-    again = checker.check([plan(inventory(root))], [inventory(root)], workspace.Sides(kept, gone))
-    assert _by_check(again)["twins"].severity == "pass"  # type: ignore[attr-defined]
+    again = checker.check(
+        [plan(inventory(root))], [inventory(root)], workspace.Sides(kept, gone, gone_labels)
+    )
+    assert _by_check(again)["labels"].severity == "pass"  # a same-label twin is not a copy note
+    assert _by_check(again)["twins"].severity == "pass"
     assert "dropped: 1 holdout images dropped from your holdout at your request" in again.render()
 
 
@@ -154,8 +158,8 @@ def test_a_twin_under_another_label_says_so(tmp_path: Path) -> None:
         (root / "train" / "cat" / "cat_0.png").read_bytes()
     )
     report, _ = _report(root)
-    assert "0 under the same label" in _by_check(report)["twins"].summary  # type: ignore[attr-defined]
-    assert _by_check(report)["labels"].severity == "pass"  # type: ignore[attr-defined]
+    assert "0 under the same label" in _by_check(report)["twins"].summary
+    assert _by_check(report)["labels"].severity == "pass"
 
 
 # ─── labels ──────────────────────────────────────────────────────────────────
@@ -168,9 +172,9 @@ def test_a_training_copy_under_two_labels_is_a_conflict(tmp_path: Path) -> None:
     )
     report, _ = _report(root)
     labels = _by_check(report)["labels"]
-    assert labels.severity == "warn"  # type: ignore[attr-defined]
-    assert labels.count == 2  # type: ignore[attr-defined]
-    assert labels.examples == ["train/cat/cat_0.png:cat, train/dog/dog_copy.png:dog"]  # type: ignore[attr-defined]
+    assert labels.severity == "warn"
+    assert labels.count == 2
+    assert labels.examples == ["train/cat/cat_0.png:cat, train/dog/dog_copy.png:dog"]
     assert "2 training images carry more than one label (warn)" in report.brief()
 
 
@@ -181,8 +185,8 @@ def test_a_training_copy_under_one_label_is_a_note(tmp_path: Path) -> None:
     )
     report, _ = _report(root)
     labels = _by_check(report)["labels"]
-    assert labels.severity == "note"  # type: ignore[attr-defined]
-    assert "2 training images are byte copies under one label" in labels.summary  # type: ignore[attr-defined]
+    assert labels.severity == "note"
+    assert "2 training images are byte copies under one label" in labels.summary
 
 
 def test_a_conflict_inside_the_holdout_reaches_the_person_not_the_brief(tmp_path: Path) -> None:
@@ -192,9 +196,9 @@ def test_a_conflict_inside_the_holdout_reaches_the_person_not_the_brief(tmp_path
     )
     report, _ = _report(root)
     labels = _by_check(report)["labels"]
-    assert labels.severity == "warn"  # type: ignore[attr-defined]
-    assert labels.count == 0  # type: ignore[attr-defined]
-    assert "holdout test/cat/cat_100.png:cat" in labels.examples[0]  # type: ignore[attr-defined]
+    assert labels.severity == "warn"
+    assert labels.count == 0
+    assert "holdout test/cat/cat_100.png:cat" in labels.examples[0]
     assert "labels: see the report (warn)" in report.brief()
     assert "cat_100" not in report.brief()
 
@@ -208,10 +212,10 @@ def test_a_table_key_listed_twice_under_two_labels_is_a_conflict(tmp_path: Path)
     frame.to_csv(root / "labels.csv", index=False)
     report, _ = _report(root)
     labels = _by_check(report)["labels"]
-    assert labels.severity == "warn"  # type: ignore[attr-defined]
-    assert labels.examples == ["img/003.png listed as b and z"]  # type: ignore[attr-defined]
+    assert labels.severity == "warn"
+    assert labels.examples == ["img/003.png listed as b and z"]
     coverage = _by_check(report)["coverage"]
-    assert coverage.severity == "pass"  # type: ignore[attr-defined]
+    assert coverage.severity == "pass"
 
 
 def test_a_table_key_listed_twice_under_one_label_is_a_note(tmp_path: Path) -> None:
@@ -221,8 +225,8 @@ def test_a_table_key_listed_twice_under_one_label_is_a_note(tmp_path: Path) -> N
     frame.to_csv(root / "labels.csv", index=False)
     report, _ = _report(root)
     labels = _by_check(report)["labels"]
-    assert labels.severity == "note"  # type: ignore[attr-defined]
-    assert "2 table rows list one image under one label" in labels.summary  # type: ignore[attr-defined]
+    assert labels.severity == "note"
+    assert "2 table rows list one image under one label" in labels.summary
 
 
 # ─── lookalikes ──────────────────────────────────────────────────────────────
@@ -245,13 +249,13 @@ def test_re_encoded_and_resized_copies_are_lookalikes_and_a_mirror_is_not(tmp_pa
     png(root / "test" / "emu" / "flat.png", 0, klass=9)  # a flat 12x8 tile never counts
     report, _ = _report(root)
     look = _by_check(report)["lookalikes"]
-    assert look.severity == "note"  # type: ignore[attr-defined]
-    assert sorted(look.details) == [  # type: ignore[attr-defined]
+    assert look.severity == "note"
+    assert sorted(look.details) == [
         "test/cat/grad_half.png ~ train/cat/grad.png",
         "test/cat/grad_q95.jpg ~ train/cat/grad.png",
     ]
-    assert "2 under the same label" in look.summary  # type: ignore[attr-defined]
-    assert _by_check(report)["twins"].severity == "pass"  # type: ignore[attr-defined]
+    assert "2 under the same label" in look.summary
+    assert _by_check(report)["twins"].severity == "pass"
 
 
 def test_over_the_budget_the_thumbnail_pass_is_skipped_and_says_so(
@@ -262,10 +266,11 @@ def test_over_the_budget_the_thumbnail_pass_is_skipped_and_says_so(
     checker = Monitor()
     report, _ = _report(root, checker)
     look = _by_check(report)["lookalikes"]
-    assert look.severity == "note"  # type: ignore[attr-defined]
-    assert look.summary.startswith("skipped: ")  # type: ignore[attr-defined]
+    assert look.severity == "note"
+    assert look.summary.startswith("skipped: ")
     assert not checker._thumb
-    assert _by_check(report)["twins"].severity == "pass"  # type: ignore[attr-defined]
+    assert _by_check(report)["twins"].severity == "pass"
+    assert _by_check(report)["coverage"].severity == "pass"
 
 
 # ─── coverage ────────────────────────────────────────────────────────────────
@@ -281,13 +286,13 @@ def test_orphans_and_unnamed_rows_are_coverage_findings(tmp_path: Path) -> None:
     frame.to_csv(root / "labels.csv", index=False)
     report, _ = _report(root)
     coverage = _by_check(report)["coverage"]
-    assert coverage.severity == "note"  # type: ignore[attr-defined]
-    assert coverage.summary == "1 images (1.0%) have no row, 1 rows name no image"  # type: ignore[attr-defined]
-    assert coverage.examples == ["img/stray.png has no row", "row 'missing.png' names no image"]  # type: ignore[attr-defined]
+    assert coverage.severity == "note"
+    assert coverage.summary == "1 images (1.0%) have no row, 1 rows name no image"
+    assert coverage.examples == ["img/stray.png has no row", "row 'missing.png' names no image"]
     for i in range(4):
         png(root / "img" / f"stray_{i}.png", 600 + i)
     report, _ = _report(root)
-    assert _by_check(report)["coverage"].severity == "warn"  # type: ignore[attr-defined]
+    assert _by_check(report)["coverage"].severity == "warn"
 
 
 def test_an_image_that_cannot_be_decoded_is_a_coverage_warn(tmp_path: Path) -> None:
@@ -295,9 +300,9 @@ def test_an_image_that_cannot_be_decoded_is_a_coverage_warn(tmp_path: Path) -> N
     (root / "test" / "cat" / "broken.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 4)
     report, _ = _report(root)
     coverage = _by_check(report)["coverage"]
-    assert coverage.severity == "warn"  # type: ignore[attr-defined]
-    assert coverage.examples == ["test/cat/broken.png cannot be read"]  # type: ignore[attr-defined]
-    assert _by_check(report)["lookalikes"].severity == "pass"  # type: ignore[attr-defined]
+    assert coverage.severity == "warn"
+    assert coverage.examples == ["test/cat/broken.png cannot be read"]
+    assert _by_check(report)["lookalikes"].severity == "pass"
 
 
 # ─── a second label source ───────────────────────────────────────────────────
@@ -316,12 +321,12 @@ def test_folder_names_that_disagree_with_the_table_are_a_warn(tmp_path: Path) ->
     )
     report, _ = _report(root)
     sources = _by_check(report)["sources"]
-    assert sources.severity == "warn"  # type: ignore[attr-defined]
-    assert sources.summary == "the folder names disagree with the labels on 2 of 30 images"  # type: ignore[attr-defined]
+    assert sources.severity == "warn"
+    assert sources.summary == "the folder names disagree with the labels on 2 of 30 images"
     assert sources.examples == [
         "cat/cat_0.png: dog here, cat there",
         "dog/dog_1.png: emu here, dog there",
-    ]  # type: ignore[attr-defined]
+    ]
 
 
 def test_a_table_column_beside_class_folders_is_a_second_source(tmp_path: Path) -> None:
@@ -333,15 +338,15 @@ def test_a_table_column_beside_class_folders_is_a_second_source(tmp_path: Path) 
     )
     report, _ = _report(root)
     sources = _by_check(report)["sources"]
-    assert sources.severity == "pass"  # type: ignore[attr-defined]
-    assert sources.summary == "column 'kind' of meta.csv agrees with the labels on all 24 images"  # type: ignore[attr-defined]
+    assert sources.severity == "pass"
+    assert sources.summary == "column 'kind' of meta.csv agrees with the labels on all 24 images"
     kinds[0], kinds[9], kinds[17] = "dog", "emu", "cat"
     pd.DataFrame({"file": names, "kind": kinds, "note": ["x"] * 24}).to_csv(
         root / "meta.csv", index=False
     )
     report, _ = _report(root)
-    assert _by_check(report)["sources"].severity == "warn"  # type: ignore[attr-defined]
-    assert "disagrees with the labels on 3 of 24 images" in _by_check(report)["sources"].summary  # type: ignore[attr-defined]
+    assert _by_check(report)["sources"].severity == "warn"
+    assert "disagrees with the labels on 3 of 24 images" in _by_check(report)["sources"].summary
 
 
 def test_batch_folders_beside_a_table_are_no_second_source(tmp_path: Path) -> None:
@@ -352,7 +357,7 @@ def test_batch_folders_beside_a_table_are_no_second_source(tmp_path: Path) -> No
         {"image": [f"batch{i % 2}/{i:03d}.png" for i in range(40)], "label": ["a", "b"] * 20}
     ).to_csv(root / "labels.csv", index=False)
     report, _ = _report(root)
-    assert _by_check(report)["sources"].summary == "no second label source"  # type: ignore[attr-defined]
+    assert _by_check(report)["sources"].summary == "no second label source"
 
 
 # ─── floors ──────────────────────────────────────────────────────────────────
@@ -364,8 +369,8 @@ def test_a_holdout_class_with_no_training_image_is_a_warn(tmp_path: Path) -> Non
     png(root / "test" / "owl" / "owl_1.png", 8, klass=5)
     report, _ = _report(root)
     floors = _by_check(report)["floors"]
-    assert floors.severity == "warn"  # type: ignore[attr-defined]
-    assert floors.examples == ["owl"]  # type: ignore[attr-defined]
+    assert floors.severity == "warn"
+    assert floors.examples == ["owl"]
 
 
 def test_a_lopsided_class_is_a_note_and_a_number_is_no_class(tmp_path: Path) -> None:
@@ -378,14 +383,14 @@ def test_a_lopsided_class_is_a_note_and_a_number_is_no_class(tmp_path: Path) -> 
     )
     report, _ = _report(root)
     floors = _by_check(report)["floors"]
-    assert floors.severity == "note"  # type: ignore[attr-defined]
-    assert "more than 20 to 1" in floors.summary  # type: ignore[attr-defined]
+    assert floors.severity == "note"
+    assert "more than 20 to 1" in floors.summary
     scores = [1.0 + i * 0.37 for i in range(83)]
     pd.DataFrame({"file": [f"{i:03d}.png" for i in range(83)], "score": scores}).to_csv(
         root / "labels.csv", index=False
     )
     report, _ = _report(root)
-    assert _by_check(report)["floors"].summary == "a number is predicted, no classes"  # type: ignore[attr-defined]
+    assert _by_check(report)["floors"].summary == "a number is predicted, no classes"
 
 
 # ─── groups ──────────────────────────────────────────────────────────────────
@@ -396,9 +401,9 @@ def test_an_id_column_spanning_the_split_is_a_warn_and_a_split_by_it_passes(tmp_
     root = _table_root(tmp_path / "t", n=40, extra={"patient_id": patients})
     report, _ = _report(root)
     groups = _by_check(report)["groups"]
-    assert groups.severity == "warn"  # type: ignore[attr-defined]
-    assert "column 'patient_id' groups the rows" in groups.summary  # type: ignore[attr-defined]
-    assert "--train and --holdout" in groups.way_out  # type: ignore[attr-defined]
+    assert groups.severity == "warn"
+    assert "column 'patient_id' groups the rows" in groups.summary
+    assert "--train and --holdout" in groups.way_out
 
     by_patient = tmp_path / "split"
     for side, ids in (("train", range(0, 8)), ("test", range(8, 10))):
@@ -420,7 +425,7 @@ def test_an_id_column_spanning_the_split_is_a_warn_and_a_split_by_it_passes(tmp_
         )
     )
     report = Monitor().check([plan_a, plan_b], [inv_a, inv_b], frames)
-    assert _by_check(report)["groups"].severity == "pass"  # type: ignore[attr-defined]
+    assert _by_check(report)["groups"].severity == "pass"
 
 
 def test_a_small_category_column_and_a_blank_cell_are_no_group(tmp_path: Path) -> None:
@@ -428,7 +433,7 @@ def test_a_small_category_column_and_a_blank_cell_are_no_group(tmp_path: Path) -
     regions[3] = None
     root = _table_root(tmp_path / "t", n=40, extra={"region": regions})
     report, _ = _report(root)
-    assert _by_check(report)["groups"].summary == "no column groups the rows"  # type: ignore[attr-defined]
+    assert _by_check(report)["groups"].summary == "no column groups the rows"
 
 
 # ─── the brief, the file, the cache ──────────────────────────────────────────
@@ -478,3 +483,122 @@ def test_a_second_check_reads_no_file_again(
     monkeypatch.setattr(Path, "read_bytes", counted)
     _report(root, checker)
     assert not [r for r in reads if r.endswith(".png")]
+
+
+# ─── what the review forced ───────────────────────────────────────────────────
+
+
+def test_a_lookalike_is_found_one_bit_off_and_not_two(tmp_path: Path) -> None:
+    from iterate.adapters.data.linking import LinkedFrames
+    from iterate.adapters.data.monitor import _lookalikes
+
+    inv = inventory(_user_split(tmp_path / "pets"))
+    train = pd.DataFrame({"image": ["/t/a.png", "/t/b.png"], "label": ["x", "y"]})
+    holdout = pd.DataFrame(
+        {"image": ["/h/one.png", "/h/two.png", "/h/flat.png"], "label": ["x", "y", "x"]}
+    )
+    h = 0x5A5A5A5A5A5A5A5A
+    thumb = {
+        "/t/a.png": (h, 40.0),
+        "/t/b.png": (0x0F0F0F0F0F0F0F0F, 40.0),
+        "/h/one.png": (h ^ (1 << 17), 40.0),
+        "/h/two.png": (0x0F0F0F0F0F0F0F0F ^ 0b11, 40.0),
+        "/h/flat.png": (h, 0.5),
+    }
+    sha = {p: p for p in (*train["image"], *holdout["image"])}
+    finding = _lookalikes(LinkedFrames(train, holdout), sha, thumb, [inv], over=None)
+    assert finding.severity == "note"
+    assert finding.details == ["/h/one.png ~ /t/a.png"]
+
+
+def test_a_byte_copy_across_the_users_split_is_a_twin_not_a_lookalike(tmp_path: Path) -> None:
+    root = _user_split(tmp_path / "pets")
+    _gradient(root / "train" / "cat" / "grad.png")
+    (root / "test" / "cat" / "grad_copy.png").write_bytes(
+        (root / "train" / "cat" / "grad.png").read_bytes()
+    )
+    report, _ = _report(root)
+    assert _by_check(report)["twins"].severity == "warn"
+    assert _by_check(report)["lookalikes"].severity == "pass"
+
+
+def test_a_column_that_groups_by_shape_alone_is_found(tmp_path: Path) -> None:
+    codes = [f"s{i // 4}" for i in range(100)]  # 25 values, 4 rows each, no group word
+    root = _table_root(tmp_path / "t", n=100, extra={"s_code": codes})
+    report, _ = _report(root)
+    groups = _by_check(report)["groups"]
+    assert groups.severity == "warn"
+    assert "column 's_code' groups the rows" in groups.summary
+
+
+def test_the_plans_own_columns_and_id_inside_a_word_are_never_a_group(tmp_path: Path) -> None:
+    root = tmp_path / "t"
+    n = 100
+    for i in range(n):
+        png(root / "img" / f"{i:03d}.png", i)
+    pd.DataFrame(
+        {
+            "file": [f"{i:03d}.png" for i in range(n)],
+            "class_id": [f"c{i % 10}" for i in range(n)],
+            "width": [12 + i % 30 for i in range(n)],
+            "valid": [i % 2 for i in range(n)],
+        }
+    ).to_csv(root / "labels.csv", index=False)
+    inv = inventory(root)
+    p = plan(inv)
+    assert p.target_column == "class_id"
+    frames = apply(p, inv)
+    checker = Monitor()
+    both = workspace.sides(p, frames, hashes=checker.hashes(map(str, frames.train["image"])))
+    report = checker.check([p], [inv], both)
+    assert _by_check(report)["groups"].summary == "no column groups the rows"
+
+
+def test_a_copy_under_two_labels_is_a_conflict_whichever_side_our_split_put_it(
+    tmp_path: Path,
+) -> None:
+    root = class_tree(tmp_path / "pets", per_class=8)
+    for i in range(4):
+        (root / "dog" / f"dog_copy_{i}.png").write_bytes((root / "cat" / "cat_0.png").read_bytes())
+    report, both = _report(root)
+    labels = _by_check(report)["labels"]
+    assert labels.severity == "warn"
+    assert "byte-identical training images carry more than one label" in labels.summary
+    assert both.dropped, "the fixture put no copy across the split"
+
+
+def test_a_training_class_with_no_holdout_image_is_a_warn(tmp_path: Path) -> None:
+    root = _user_split(tmp_path / "pets")
+    png(root / "train" / "owl" / "owl_0.png", 7, klass=5)
+    png(root / "train" / "owl" / "owl_1.png", 8, klass=5)
+    report, _ = _report(root)
+    floors = _by_check(report)["floors"]
+    assert floors.severity == "warn"
+    assert floors.summary == "1 training classes have no holdout image"
+    assert floors.examples == ["owl"]
+
+
+def test_our_split_refuses_a_holdout_made_only_of_copies(tmp_path: Path) -> None:
+    from iterate.adapters.data.linking import LinkError
+
+    root = tmp_path / "pets"
+    for k, c in enumerate(CLASSES):
+        png(root / c / f"{c}_0.png", 0, klass=k)
+        for i in range(1, 8):
+            (root / c / f"{c}_{i}.png").write_bytes((root / c / f"{c}_0.png").read_bytes())
+    inv = inventory(root)
+    p = plan(inv)
+    frames = apply(p, inv)
+    checker = Monitor()
+    with pytest.raises(LinkError, match="leaves no holdout rows"):
+        workspace.sides(p, frames, hashes=checker.hashes(map(str, frames.train["image"])))
+
+
+def test_the_time_reported_counts_the_read_once(tmp_path: Path) -> None:
+    import time
+
+    root = _user_split(tmp_path / "pets", per_class=20, holdout=8)
+    started = time.perf_counter()
+    report, _ = _report(root)
+    wall = time.perf_counter() - started
+    assert report.seconds <= wall * 1.05 + 0.01

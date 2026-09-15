@@ -72,6 +72,7 @@ class Sides:
 
     frames: LinkedFrames
     dropped: list[str] = field(default_factory=list)
+    dropped_labels: list[str] = field(default_factory=list)
 
 
 def _ignore(directory: str, names: list[str]) -> set[str]:
@@ -107,7 +108,7 @@ def workspace_name(sources: list[Path], plan_: LinkPlan, frames: LinkedFrames) -
     for source in sources:
         for p in _files_under(source):
             digest.update(f"{p.relative_to(source).as_posix()}:{p.stat().st_size}".encode())
-    digest.update(plan_.model_dump_json().encode())
+    digest.update(plan_.model_dump_json(exclude={"notes"}).encode())  # notes are commentary
     digest.update(frames.train.to_csv(index=False).encode())
     if frames.holdout is not None:
         digest.update(frames.holdout.to_csv(index=False).encode())
@@ -233,8 +234,16 @@ def sides(
         return Sides(LinkedFrames(train, holdout))
     seen = {d for p in train["image"] if (d := hashes.get(str(p))) is not None}
     twin = holdout["image"].map(lambda p: hashes.get(str(p)) in seen).to_numpy(dtype=bool)
-    dropped = [str(p) for p in holdout.loc[twin, "image"]]
-    return Sides(LinkedFrames(train, holdout.loc[~twin].reset_index(drop=True)), dropped)
+    if twin.all():
+        raise LinkError(
+            "every holdout image is a byte copy of a training image, so the split leaves no "
+            "holdout rows; add images that are not copies, or pass --train and --holdout"
+        )
+    return Sides(
+        LinkedFrames(train, holdout.loc[~twin].reset_index(drop=True)),
+        [str(p) for p in holdout.loc[twin, "image"]],
+        [str(v) for v in holdout.loc[twin, "label"]],
+    )
 
 
 def write(
@@ -253,9 +262,8 @@ def write(
     out = out.resolve()
     _check_relations(sources, out)
     if both is None:
-        both = sides(
-            plan_, frames, hashes=file_hashes(_paths(frames)), seed=seed, test_size=test_size
-        )
+        hashes = None if frames.holdout is not None else file_hashes(_paths(frames))
+        both = sides(plan_, frames, hashes=hashes, seed=seed, test_size=test_size)
     train, holdout = both.frames.train, both.frames.holdout
     assert holdout is not None  # sides
 
@@ -321,8 +329,11 @@ def plan_path(sources: list[Path], *, out: Path) -> Path:
     return out.resolve() / PLANS / f"{plan_key(sources)}.json"
 
 
-def remember_plan(plans: list[LinkPlan], *, sources: list[Path], out: Path) -> Path:
-    """Keep the plans a person accepted, one per source folder."""
+def remember_plan(
+    plans: list[LinkPlan], *, sources: list[Path], out: Path, drop_twins: bool = False
+) -> Path:
+    """Keep the plans a person accepted, one per source folder, and whether they
+    asked for the byte twins to come out of their holdout."""
     path = plan_path(sources, out=out)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -330,6 +341,7 @@ def remember_plan(plans: list[LinkPlan], *, sources: list[Path], out: Path) -> P
             {
                 "sources": [str(s.resolve()) for s in sources],
                 "plans": [p.model_dump() for p in plans],
+                "drop_twins": drop_twins,
                 "accepted": datetime.now(UTC).isoformat(timespec="seconds"),
             },
             indent=2,
@@ -337,6 +349,15 @@ def remember_plan(plans: list[LinkPlan], *, sources: list[Path], out: Path) -> P
         encoding="utf-8",
     )
     return path
+
+
+def recall_drop(sources: list[Path], *, out: Path) -> bool:
+    """Whether the remembered yes for these folders came with a drop of the twins."""
+    path = plan_path(sources, out=out)
+    try:
+        return bool(json.loads(path.read_text(encoding="utf-8")).get("drop_twins"))
+    except (OSError, ValueError, AttributeError, RecursionError):
+        return False
 
 
 def recall_plan(sources: list[Path], *, out: Path) -> list[LinkPlan] | None:
@@ -367,6 +388,7 @@ __all__ = [
     "forget_plan",
     "plan_key",
     "plan_path",
+    "recall_drop",
     "recall_plan",
     "remember_plan",
     "sides",

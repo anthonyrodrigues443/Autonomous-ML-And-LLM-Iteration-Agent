@@ -152,21 +152,22 @@ class Monitor:
         split as ``workspace.sides`` made it."""
         frames = both.frames
         assert frames.holdout is not None  # workspace.sides
-        started = time.perf_counter()
         paths = list(dict.fromkeys(map(str, (*frames.train["image"], *frames.holdout["image"]))))
         size = sum(_size(p) for p in paths)
         thumbs = size <= LOOKALIKE_BUDGET
-        self._hash(paths, thumbs=thumbs)
+        self._hash(paths, thumbs=thumbs)  # its own time goes to _spent
+        started = time.perf_counter()
         rows = [_rows_of(p, inv) for p, inv in zip(plans, inventories, strict=True)]
         split: Split = plans[0].split if len(plans) == 1 else "folders"
+        left_out = list(zip(both.dropped, both.dropped_labels, strict=True))
         findings = [
             _coverage(inventories, rows, frames, self._sha, self._thumb if thumbs else None),
-            _labels(frames, self._sha, rows, inventories),
+            _labels(frames, self._sha, rows, inventories, left_out=left_out),
             _twins(frames, self._sha, inventories, split=split),
             _lookalikes(frames, self._sha, self._thumb, inventories, over=None if thumbs else size),
             _sources(plans, inventories, frames),
             _floors(frames, task=plans[0].task),
-            _groups(rows, frames),
+            _groups(rows, frames, plans),
         ]
         return DataReport(
             version=MONITOR_VERSION,
@@ -182,14 +183,23 @@ class Monitor:
 
 def drop_twins(
     frames: LinkedFrames, hashes: Mapping[str, str | None]
-) -> tuple[LinkedFrames, list[str]]:
-    """The holdout without the images whose bytes sit in training, and what came out.
-    For a user's split, at the pause, on request."""
+) -> tuple[LinkedFrames, list[str], list[str]]:
+    """The holdout without the images whose bytes sit in training, what came out, and
+    their labels. For a user's split, at the pause, on request. A holdout that would
+    be left empty is refused."""
     assert frames.holdout is not None
     seen = {d for p in frames.train["image"] if (d := hashes.get(str(p))) is not None}
     twin = frames.holdout["image"].map(lambda p: hashes.get(str(p)) in seen).to_numpy(dtype=bool)
-    dropped = [str(p) for p in frames.holdout.loc[twin, "image"]]
-    return LinkedFrames(frames.train, frames.holdout.loc[~twin].reset_index(drop=True)), dropped
+    if twin.all():
+        raise linking.LinkError(
+            "every holdout image is a byte copy of a training image; dropping them would leave "
+            "no holdout rows"
+        )
+    return (
+        LinkedFrames(frames.train, frames.holdout.loc[~twin].reset_index(drop=True)),
+        [str(p) for p in frames.holdout.loc[twin, "image"]],
+        [str(v) for v in frames.holdout.loc[twin, "label"]],
+    )
 
 
 # ─── the checks ───────────────────────────────────────────────────────────
@@ -255,24 +265,30 @@ def _labels(
     sha: Mapping[str, str | None],
     rows: Sequence[TableRows | None],
     inventories: Sequence[Inventory],
+    *,
+    left_out: Sequence[tuple[str, str]] = (),
 ) -> Finding:
     """Duplicate and conflicting labels. On the training side: the same bytes under
-    more than one label, or under one label twice. In a table: rows that name one
-    image together, which ``apply`` sets aside. Inside the holdout the same groups
-    are told to the person and kept out of ``count``, so the brief says nothing a
+    more than one label, or under one label twice; a holdout twin the split left out
+    counts with the training copy it matched, so a copy filed under two labels is a
+    conflict whichever side it fell on. In a table: rows that name one image
+    together, which ``apply`` sets aside. Inside the holdout the same groups are
+    told to the person and kept out of ``count``, so the brief says nothing a
     holdout row could be read from. Across the split, see twins."""
     assert frames.holdout is not None
 
-    def groups(frame: pd.DataFrame) -> list[list[tuple[str, str]]]:
+    def groups(
+        frame: pd.DataFrame, extra: Sequence[tuple[str, str]] = ()
+    ) -> list[list[tuple[str, str]]]:
         by: dict[str, list[tuple[str, str]]] = {}
-        for p, label in zip(frame["image"], frame["label"], strict=True):
+        pairs = [*zip(frame["image"], frame["label"], strict=True), *extra]
+        for p, label in pairs:
             if (d := sha.get(str(p))) is not None:
                 by.setdefault(d, []).append((str(p), str(label)))
         return [g for g in by.values() if len(g) > 1]
 
-    train_groups = groups(frames.train)
-    conflicts = [g for g in train_groups if len({label for _, label in g}) > 1]
-    copies = [g for g in train_groups if len({label for _, label in g}) == 1]
+    conflicts = [g for g in groups(frames.train, left_out) if len({label for _, label in g}) > 1]
+    copies = [g for g in groups(frames.train) if len({label for _, label in g}) == 1]
     hidden = [g for g in groups(frames.holdout) if len({label for _, label in g}) > 1]
     keyed: list[tuple[str, list[str]]] = []
     dup_rows = 0
@@ -570,6 +586,20 @@ def _floors(frames: LinkedFrames, *, task: str) -> Finding:
             examples=absent[:EXAMPLES],
             details=absent[:DETAILS],
         )
+    unscored = sorted(c for c in train if c not in holdout)
+    if unscored:
+        return Finding(
+            check="floors",
+            severity="warn",
+            count=len(unscored),
+            summary=f"{len(unscored)} training classes have no holdout image",
+            way_out=(
+                "they cannot be scored; add images, or place them yourself with --train and "
+                "--holdout"
+            ),
+            examples=unscored[:EXAMPLES],
+            details=unscored[:DETAILS],
+        )
     largest, smallest = train.most_common()[0], train.most_common()[-1]
     if largest[1] > IMBALANCE * smallest[1]:
         return Finding(
@@ -585,36 +615,60 @@ def _floors(frames: LinkedFrames, *, task: str) -> Finding:
     return Finding(
         check="floors",
         severity="pass",
-        summary=f"{len(train)} classes, every holdout class trained on, within {IMBALANCE} to 1",
+        summary=f"{len(train)} classes, every class on both sides, within {IMBALANCE} to 1",
     )
 
 
-def _groups(rows: Sequence[TableRows | None], frames: LinkedFrames) -> Finding:
+def _tokens(name: str) -> set[str]:
+    out, word = set(), ""
+    for ch in name:
+        if ch.isalnum():
+            word += ch
+        elif word:
+            out.add(word.casefold())
+            word = ""
+    if word:
+        out.add(word.casefold())
+    return out
+
+
+def _groups(
+    rows: Sequence[TableRows | None], frames: LinkedFrames, plans: Sequence[LinkPlan]
+) -> Finding:
     """A column that groups the rows, by name or by shape, whose values sit on both
     sides of the split: the same subject, session or device in train and holdout,
-    which a model can learn instead of the label. A question, not a proof."""
+    which a model can learn instead of the label. A question, not a proof. The
+    plan's own columns, the key, the label, a one-hot block, the split, are never
+    a group."""
     assert frames.holdout is not None
     train_paths = set(map(str, frames.train["image"]))
     holdout_paths = set(map(str, frames.holdout["image"]))
     best: tuple[str, float, int, list[str]] | None = None
-    for table in rows:
+    for table, plan_ in zip(rows, plans, strict=True):
         if table is None:
             continue
+        own = {plan_.key_column, plan_.target_column, plan_.split_column, *plan_.onehot_columns}
         frame = table.frame
         n = len(frame)
         for column in frame.columns:
             name = str(column)
+            if name in own:
+                continue
             series = frame[column]
             if pd.api.types.is_float_dtype(series) and not bool(((series.dropna() % 1) == 0).all()):
                 continue
             values = series.astype(str).where(series.notna(), None)
             distinct = int(series.dropna().nunique())
-            if distinct < 2 or distinct == n:
+            if distinct < 3 or distinct == n:
                 continue
             per_value = n / distinct
-            named = any(token in name.casefold() for token in GROUP_NAMES)
-            shaped = distinct >= GROUP_MIN_VALUES and (
-                GROUP_ROWS_PER_VALUE[0] <= per_value <= GROUP_ROWS_PER_VALUE[1]
+            named = bool(_tokens(name) & set(GROUP_NAMES))
+            # By shape only for text codes: a number with a few dozen values is a
+            # measurement far more often than an identity.
+            shaped = (
+                pd.api.types.is_string_dtype(series)
+                and distinct >= GROUP_MIN_VALUES
+                and GROUP_ROWS_PER_VALUE[0] <= per_value <= GROUP_ROWS_PER_VALUE[1]
             )
             if not (named or shaped):
                 continue

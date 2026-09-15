@@ -800,8 +800,9 @@ def _checked(frames: LinkedFrames, plan_: LinkPlan, inv: Inventory) -> LinkedFra
     return frames
 
 
-def render(plan_: LinkPlan, inv: Inventory, frames: LinkedFrames) -> str:
-    """The block a person reads before saying yes."""
+def render(plan_: LinkPlan, inv: Inventory, frames: LinkedFrames, *, dropped: int = 0) -> str:
+    """The block a person reads before saying yes. ``dropped`` is how many holdout
+    images our split left out as byte copies of a training image."""
     where = f"data: {inv.root}"
     if inv.collapsed:
         where += f" (inside {'/'.join(inv.collapsed)})"
@@ -819,9 +820,11 @@ def render(plan_: LinkPlan, inv: Inventory, frames: LinkedFrames) -> str:
             f"{how}, target {target}"
         )
     n_hold = 0 if frames.holdout is None else len(frames.holdout)
-    ours = f"split: none given, {len(frames.train) + n_hold} images split here 80/20"
+    ours = f"split: none given, {len(frames.train) + n_hold + dropped} images split here 80/20"
     if frames.holdout is not None:
         ours += f", {len(frames.train)} train / {n_hold} holdout"
+        if dropped:
+            ours += f" ({dropped} left out as byte copies of a training image)"
     split = {
         "ours": ours,
         "folders": f"split: yours, from the folders, {len(frames.train)} train / {n_hold} holdout",

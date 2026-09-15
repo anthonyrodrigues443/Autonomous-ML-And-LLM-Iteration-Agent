@@ -725,3 +725,7 @@ def test_render_names_both_sides_when_the_frames_carry_them(tmp_path: Path) -> N
     assert "split: none given, 12 images split here 80/20, 9 train / 3 holdout" in render(
         p, inv, both
     )
+    assert (
+        "split: none given, 14 images split here 80/20, 9 train / 3 holdout "
+        "(2 left out as byte copies of a training image)"
+    ) in render(p, inv, both, dropped=2)

@@ -409,7 +409,39 @@ def test_write_leaves_byte_copies_out_of_the_holdout_on_its_own(tmp_path: Path) 
         for q in pd.read_csv(ws.holdout_csv)["image"].map(lambda q: ws.root / q)
     ]
     assert not any(b in train for b in holdout)
+    plain = workspace.sides(p, frames).frames
+    assert plain.holdout is not None
+    assert len(holdout) < len(plain.holdout)  # the split put a copy across, and it came out
     assert sorted(q.name for q in (ws.root / "raw_files" / "cat").iterdir())[:2] == [
         "cat_0.png",
         "cat_1.png",
     ]
+
+
+def test_write_never_hashes_a_holdout_the_user_gave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.adapters.data.linking import LinkedFrames
+
+    a = _class_tree(tmp_path / "train", per_class=5)
+    b = _class_tree(tmp_path / "test", per_class=2, seed=100)
+    inv_a, inv_b = inventory(a), inventory(b)
+    frames = LinkedFrames(apply(plan(inv_a), inv_a).train, apply(plan(inv_b), inv_b).train)
+
+    def boom(paths: object) -> dict[str, str | None]:
+        raise AssertionError("hashed a given holdout")
+
+    monkeypatch.setattr(workspace, "file_hashes", boom)
+    ws = workspace.write(plan(inv_a), frames, sources=[a, b], out=tmp_path / "out")
+    assert len(pd.read_csv(ws.holdout_csv)) == 6
+
+
+def test_the_memory_keeps_whether_the_twins_were_dropped(tmp_path: Path) -> None:
+    root, plan_ = _agent_plan(tmp_path / "src")
+    out = tmp_path / "out"
+    assert workspace.recall_drop([root], out=out) is False
+    workspace.remember_plan([plan_], sources=[root], out=out, drop_twins=True)  # type: ignore[list-item]
+    assert workspace.recall_drop([root], out=out) is True
+    assert workspace.recall_plan([root], out=out) == [plan_]
+    workspace.remember_plan([plan_], sources=[root], out=out)  # type: ignore[list-item]
+    assert workspace.recall_drop([root], out=out) is False
