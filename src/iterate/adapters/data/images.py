@@ -22,6 +22,7 @@ from pathlib import Path
 from statistics import median
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
 
 from iterate.adapters.data.tabular import (
@@ -342,7 +343,9 @@ def profile_images(
     )
     spread = None
     if not classification:
-        target = dataset.train_target.astype(float)
+        # Over the numbers only: the vision target refuses the rest, with a count.
+        numbers = pd.to_numeric(dataset.train_target, errors="coerce")
+        target = numbers[np.isfinite(numbers)]
         spread = (
             float(target.mean()),
             float(target.std()),

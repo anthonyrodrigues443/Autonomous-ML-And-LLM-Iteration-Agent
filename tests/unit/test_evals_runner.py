@@ -84,6 +84,23 @@ def test_the_data_path_is_absolute() -> None:
     assert Path(argv[argv.index("--data") + 1]).is_absolute()
 
 
+def test_a_dataset_with_its_own_holdout_passes_both_files_instead_of_one() -> None:
+    split = replace(DATASET, holdout=Path("examples/storm/holdout.csv"))
+    argv = command_for("dev", split, CONDITIONS)
+
+    assert "--data" not in argv
+    assert argv[argv.index("--train") + 1] == str(DATASET.path.resolve())
+    assert argv[argv.index("--holdout") + 1] == str(Path("examples/storm/holdout.csv").resolve())
+
+
+def test_a_dataset_without_a_holdout_passes_one_file() -> None:
+    argv = command_for("dev", DATASET, CONDITIONS)
+
+    assert argv[argv.index("--data") + 1] == str(DATASET.path.resolve())
+    assert "--train" not in argv
+    assert "--holdout" not in argv
+
+
 def test_dev_sorts_above_every_release() -> None:
     assert parse_version("dev") > parse_version("0.9.9")
     assert parse_version("0.4.0") > parse_version("0.3.1")
@@ -155,6 +172,17 @@ def test_a_vision_dataset_needs_v0_6_and_a_prompt_dataset_v0_5() -> None:
     assert supports_dataset("0.6.0", VISION)
     assert skip_reason("0.4.0", PROMPT) == "predates PromptTarget"
     assert skip_reason("0.4.0", DATASET) is None
+
+
+def test_a_dataset_with_its_own_holdout_needs_a_version_that_takes_both_files() -> None:
+    held = Path("examples/storm/holdout.csv")
+    split, prompt = replace(DATASET, holdout=held), replace(PROMPT, holdout=held)
+    for released in ("0.1.3", "0.4.0", "0.5.0"):
+        assert skip_reason(released, split) == "predates --train/--holdout"
+        assert skip_reason(released, DATASET) is None
+    assert skip_reason("0.5.0", prompt) == "predates --train/--holdout"
+    assert supports_dataset("0.6.0", split)
+    assert supports_dataset(DEV_VERSION, split)
 
 
 def test_dev_runs_vision_cells_only_once_the_run_is_wired() -> None:

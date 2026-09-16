@@ -266,3 +266,41 @@ Decisions: Shipped the ladder skeleton: five numbered rungs (BASELINE, METRIC LE
 ---
 
 **Corrections, 2026-09-16, measured building the target.** On MPS an out-of-memory error is a plain `RuntimeError` ("MPS backend out of memory"), not `torch.OutOfMemoryError`, which only CUDA raises; the runner reads the message. And by default the MPS pool never raises: its high watermark ratio defaults to 1.7 of the recommended working set, past this Mac's 24 GB, so the machine pages instead. Even at 1.0 a convnext_tiny recipe at 384 px grew swap by 9.7 GB on this Mac before raising, so the runner starts torch with the high ratio at 0.7 and the low at 0.56: every recipe measured fits under it, and the 384 px one raises after 1.8 GB. Setting the high ratio alone fails at startup, because the low default of 1.4 then sits above it.
+
+---
+
+## 2026-09-16 - Research: a number label for images, and a baseline trained from zero
+
+**Question:** Tony's two calls at the Day 6 gate: every mode predicts classes and numbers, and the image baseline is a plain CNN trained from zero with basic prep, not a pretrained model. So v0.6 needs a public image dataset whose label is a number, where a small CNN at 64 px clearly beats guessing the mean and a pretrained fine-tune clearly beats the CNN, with an open licence, a download with no account, and no ImageNet images. And the CNN needs a recipe that is stable enough to be a floor.
+
+**Sources reviewed:**
+1. [NASA Tropical Cyclone Wind Estimation on Source Cooperative](https://source.coop/nasa/tropical-storm-competition) and [the dataset DOI](https://doi.org/10.34911/rdnt.xs53up) - 70,257 training frames from 494 storms, wind speed in knots, CC-BY-4.0, every file served on its own with no login; the official test set continues 227 of its 371 storms from the training set, all of those frames later in time.
+2. [arXiv 2404.08325](https://arxiv.org/html/2404.08325) and [DrivenData's winners write-up](https://www.drivendata.co/blog/wind-dependent-variables-winners/) - a pretrained ResNet-18 at 224 px, given the current frame and the two before it, reported at 10.5 kt on the competition's test set; winners at 6.25 to 6.50 kt with stacks of past frames on that same test set, which continues 227 of its 371 storms from training.
+3. [TCIR, KDD 2018](https://www.csie.ntu.edu.tw/~htlin/paper/doc/kdd18tcir.pdf) - a CNN on 64 by 64 crops reaches 10.59 kt, the closest evidence that storm intensity survives a small input.
+4. [SKIPP'D, arXiv 2207.00913](https://arxiv.org/pdf/2207.00913) and [its Hugging Face mirror](https://huggingface.co/datasets/solarbench/SKIPPD) - sky images at a native 64 px with solar power output, CC-BY, a two-layer CNN at 2.43 kW RMSE; no verified stronger model on the official test days.
+5. [KonIQ-10k](https://database.mmsp-kn.de/koniq-10k-database.html) - 10,073 photographs with a quality score, the design pass's first pick; the quality signal is blur, noise and compression, detail a 64 px resize removes.
+6. [Nutrition5k, arXiv 2103.03375](https://arxiv.org/pdf/2103.03375), [UTKFace](https://susanqq.github.io/UTKFace/), [Galaxy Zoo DECaLS on Zenodo](https://zenodo.org/records/4573248) - 3,490 overhead dish photos, below the size bar; face ages for non-commercial research only; galaxy vote fractions in about 104 GB of images.
+
+**Approaches considered:**
+- **KonIQ-10k:** a real human judgement with an honest random split. Rejected before any download: at the 64 px the baseline trains at, the label's signal is mostly gone, so the baseline would sit near the mean and headroom would be measured against a constant.
+- **SKIPP'D:** the 64 px signal is proven by the paper's small CNN. Kept as the fallback: the download is twice the storm subset's and the headroom above a small CNN is unproven.
+- **Storm wind speed:** a whole-image label on frames nothing like ImageNet's photographs, with a published ladder above a small CNN. The risk was the 64 px resize, so it was measured before any code depended on it.
+- **Nutrition5k, UTKFace, Galaxy Zoo:** too small, a licence that forbids redistribution, and too large.
+- **The baseline recipe:** the plain CNN with a constant learning rate, or with a cosine decay. Measured on EuroSAT at 64 px over 20 epochs, the constant rate swung between 0.823 and 0.937 across the last three epochs; the cosine decay ended at 0.950 and 0.945 on two seeds, with its last five epochs inside half a point.
+
+**Decision:** the storm set, every 6th frame of all 494 storms, 11,908 frames and about 250 MB, split by storm with a fixed seed into 395 training storms and 99 held out. The baseline is three blocks of 3 by 3 convolution, batch norm, ReLU and pooling at 32, 64 and 128 channels, a pooled linear head, 64 px, 20 epochs, AdamW at 1e-3 with cosine decay, batch 64, no augmentation; a number label is trained on its training mean and spread and mapped back before scoring. Measured on an Apple M5 with MPS before the build, error bars resampling whole holdout storms:
+
+| | RMSE, knots | error bar |
+|---|---|---|
+| guess the training mean | 26.6 | 1.7 |
+| the plain CNN, 64 px | 13.1 | 0.7 |
+| the plain CNN, 128 px | 16.5 | 1.2 |
+| resnet18 probe, 160 px | 13.2 | 0.6 |
+| resnet18 fine-tune, 3 epochs, 128 px | 9.3 | 0.4 |
+
+The CNN beats the mean by 13.4 knots, 95% interval 10.9 to 15.8, and the fine-tune beats the CNN by 3.8, 2.8 to 4.8. The CNN got worse at 128 px, which is why the baseline stays at 64. The same CNN on the image classification examples: EuroSAT 0.950 and Flowers102 0.554 at 64 px. With a constant rate, Flowers102 scored 0.567 at 64 px and 0.545 at 128 px, at four times the time.
+
+**Smallest viable implementation:** `simple_cnn` beside the pretrained backbones, the fixed baseline recipe with no time cap, number labels through the target, the probe as a ridge fit, `examples/cyclone_wind/prepare.py` with pinned sha256 values for both label files and for the manifest of every frame, and the `holdout` key in the eval corpus so the storm split is sealed as made.
+**How I'll verify it works:** the prepare script rebuilt the measured subset offline with the manifest pin matching and both CSVs byte-identical; the ceiling sweep's baseline row reproduced the pre-build measurement to the fourth decimal, 13.1203.
+
+**Out of scope today:** SKIPP'D as a second number-label example; stacks of past frames, which is how the competition winners won; a per-group error bar inside the sweep, which cannot see storms: a formula that treats every frame as independent came out two to five times smaller than the storm-level one, depending on the row and the formula, so a number-label sweep stores none and the example's README carries the storm-level error bar instead.

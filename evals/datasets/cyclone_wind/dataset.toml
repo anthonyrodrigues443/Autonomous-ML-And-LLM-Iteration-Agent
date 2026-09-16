@@ -1,0 +1,7 @@
+data = "examples/cyclone_wind/train.csv"
+holdout = "examples/cyclone_wind/holdout.csv"
+target = "label"
+metric = "rmse"
+family = "vision"
+source = "NASA Tropical Cyclone Wind Estimation (Maskey et al. 2020, CC-BY-4.0), prepared by examples/cyclone_wind/prepare.py"
+notes = "The number-label vision dataset. 11,908 GOES infrared frames of 494 storms, wind speed in knots, split by storm so no storm is on both sides."

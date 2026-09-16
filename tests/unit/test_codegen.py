@@ -357,12 +357,39 @@ def test_fallback_floor_writes_probabilities_only_when_asked() -> None:
     assert "predict_proba" in with_proba
     assert codegen.PROBABILITIES_CSV in with_proba
     # Probability metrics are classification-only, so a regression floor never needs it.
-    assert codegen.PROBABILITIES_CSV not in codegen.fallback_baseline(
-        "regression", with_proba=True
-    )
+    assert codegen.PROBABILITIES_CSV not in codegen.fallback_baseline("regression", with_proba=True)
 
 
 def test_postamble_tuple_return_is_the_opt_in_proba_contract() -> None:
     script = codegen.assemble_script(_GOOD_FN)
     assert "isinstance(_out, tuple)" in script
     assert codegen.PROBABILITIES_CSV in script
+
+
+# ─── coercion follows the metric's task ─────────────────────────────────────
+
+
+def test_an_integer_regression_target_keeps_fractional_predictions(tmp_path: Path) -> None:
+    frame = pd.DataFrame({"x": list(range(60)), "price": [100 + 7 * i for i in range(60)]})
+    frame.to_csv(tmp_path / "prices.csv", index=False)
+    ds = load_csv(tmp_path / "prices.csv", target="price", task="regression")
+    assert ds.test_target.dtype.kind == "i"
+    preds = "".join(f"{t + 0.9}\n" for t in ds.test_target.tolist()).encode()
+    result = codegen.score_predictions(ds, preds, metric="rmse", experiment_id="e")
+    assert result.metrics is not None
+    assert result.metrics.primary_value == pytest.approx(0.9)
+    truncated = "".join(f"{int(t + 0.9)}\n" for t in ds.test_target.tolist()).encode()
+    floor = codegen.score_predictions(ds, truncated, metric="rmse", experiment_id="e")
+    assert floor.metrics is not None
+    assert floor.metrics.primary_value == 0.0
+
+
+def test_integer_class_labels_still_coerce_to_the_class(tmp_path: Path) -> None:
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    preds = "".join(f"{float(t)}\n" for t in ds.test_target.tolist()).encode()
+    result = codegen.score_predictions(ds, preds, metric="accuracy", experiment_id="e")
+    assert result.metrics is not None
+    assert result.metrics.primary_value == 1.0
+    ints = pd.Series([1, 0])
+    assert codegen._coerce(["1.7", "0.2"], target=ints, task="classification") == [1, 0]
+    assert codegen._coerce(["1.7", "0.2"], target=ints, task="regression") == [1.7, 0.2]

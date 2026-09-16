@@ -59,6 +59,8 @@ if TYPE_CHECKING:
 _MIN_VERSION: dict[str, tuple[int, int, int]] = {
     "--plain": (0, 3, 0),
     "--backend": (0, 2, 0),
+    "--train": (0, 6, 0),
+    "--holdout": (0, 6, 0),
 }
 
 DISTRIBUTION = "iterate-ai"
@@ -104,6 +106,8 @@ def skip_reason(version: str, dataset: Dataset) -> str | None:
         return None if parse_version(version) >= FIRST_VISION_VERSION else "predates DLModelTarget"
     if dataset.is_prompt_task and parse_version(version) < FIRST_PROMPT_VERSION:
         return "predates PromptTarget"
+    if dataset.holdout is not None and not supports(version, "--holdout"):
+        return "predates --train/--holdout"
     return None
 
 
@@ -135,12 +139,16 @@ def command_for(version: str, dataset: Dataset, conditions: Conditions) -> list[
         else ["uv", "run", "--no-project", "--with", f"{DISTRIBUTION}=={version}"]
     )
 
+    files = (
+        ["--train", str(dataset.path.resolve()), "--holdout", str(dataset.holdout.resolve())]
+        if dataset.holdout is not None
+        else ["--data", str(dataset.path.resolve())]
+    )
     argv = [
         *launcher,
         "iterate",
         "run",
-        "--data",
-        str(dataset.path.resolve()),
+        *files,
         "--target",
         dataset.target,
         # Always explicit, even from v0.4 on where it became optional. Letting the

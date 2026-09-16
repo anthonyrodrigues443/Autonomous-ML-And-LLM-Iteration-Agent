@@ -11,7 +11,8 @@ source. Adding a dataset is dropping a folder, with no shared file to edit.
 
 A spec may point `data` somewhere else in the repo instead, which is how the
 datasets already sitting in `examples/` join the corpus without being duplicated.
-Those paths resolve from the repo root, one rule with no special cases.
+Those paths resolve from the repo root, one rule with no special cases. A `holdout`
+beside it names the user's own sealed holdout, resolved the same way.
 
 Every entry carries a content hash of its bytes, and that hash is stored on every
 result. Swap the file behind a name and the old numbers do not silently keep
@@ -24,8 +25,12 @@ import hashlib
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from evals.config import DATASETS_DIR, REPO_ROOT
+
+if TYPE_CHECKING:
+    from iterate.adapters.data.tabular import TabularDataset
 
 _DEFAULT_DATA_FILE = "data.csv"
 # Enough of a sha256 to make a collision a non-issue while staying readable in a
@@ -52,6 +57,7 @@ class Dataset:
     task: str = ""
     # "vision" for a CSV of image paths; the ceiling is then a sweep of recipes.
     family: str = ""
+    holdout: Path | None = None
 
     @property
     def is_prompt_task(self) -> bool:
@@ -62,13 +68,17 @@ class Dataset:
         return self.family.strip() == "vision"
 
     @property
+    def missing(self) -> list[Path]:
+        return [p for p in (self.path, self.holdout) if p is not None and not p.is_file()]
+
+    @property
     def available(self) -> bool:
-        """False when the CSV is not on this machine.
+        """False when a CSV is not on this machine.
 
         A missing dataset is a skip with a message, never a crash. Most of the
         corpus is gitignored, so a fresh clone legitimately has almost none of it.
         """
-        return self.path.is_file()
+        return not self.missing
 
     def content_hash(self) -> str:
         """Fingerprint of the file's bytes.
@@ -78,24 +88,40 @@ class Dataset:
         paper over exactly the kind of change (an encoding fix, a re-export) that
         makes results incomparable.
         """
+        # Without a holdout the key must stay the one every stored result was keyed by.
         digest = hashlib.sha256()
         with self.path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1 << 20), b""):
                 digest.update(chunk)
+        if self.holdout is not None:
+            digest.update(hashlib.sha256(self.holdout.read_bytes()).digest())
         if self.is_vision:
             # The CSV holds only paths, so an image swapped behind it would keep the key.
             digest.update(_image_digest(self.path, self.target).encode())
+            if self.holdout is not None:
+                digest.update(_image_digest(self.holdout, self.target, self.path).encode())
         return digest.hexdigest()[:_HASH_CHARS]
 
 
-def _image_digest(csv: Path, target: str) -> str:
-    """Every image the CSV names, in row order, by its bytes; a missing one as missing."""
+def load_data(dataset: Dataset, *, task: str | None = None) -> TabularDataset:
+    """The split the CLI makes from the same files: the user's own when a holdout is named."""
+    from iterate.adapters.data.tabular import load_csv, load_split
+
+    if dataset.holdout is not None:
+        return load_split(dataset.path, dataset.holdout, target=dataset.target, task=task)
+    return load_csv(dataset.path, target=dataset.target, task=task)
+
+
+def _image_digest(csv: Path, target: str, paths_from: Path | None = None) -> str:
+    """Every image the CSV names, in row order, by its bytes; a missing one as missing.
+    Relative paths resolve beside `paths_from`, the CSV `prepare_images` is given."""
     import pandas as pd
 
     from iterate.adapters.data.images import detect_image_column
 
     frame = pd.read_csv(csv)
-    column = detect_image_column(frame, [c for c in frame.columns if c != target], csv)
+    features = [c for c in frame.columns if c != target]
+    column = detect_image_column(frame, features, paths_from or csv)
     if column is None:
         raise BadDatasetSpecError(f"{csv}: a vision dataset needs one column of image paths")
     digest = hashlib.sha256()
@@ -136,6 +162,7 @@ def _load_one(spec_path: Path) -> Dataset:
 
     declared = str(raw.get("data", "")).strip()
     path = (REPO_ROOT / declared) if declared else (spec_path.parent / _DEFAULT_DATA_FILE)
+    held = str(raw.get("holdout", "")).strip()
 
     return Dataset(
         name=spec_path.parent.name,
@@ -146,6 +173,7 @@ def _load_one(spec_path: Path) -> Dataset:
         notes=str(raw.get("notes", "")),
         task=str(raw.get("task", "")),
         family=family,
+        holdout=(REPO_ROOT / held) if held else None,
     )
 
 
@@ -176,4 +204,4 @@ def select(names: list[str] | None, datasets_dir: Path | None = None) -> list[Da
     return [by_name[name] for name in names]
 
 
-__all__ = ["BadDatasetSpecError", "Dataset", "load", "select"]
+__all__ = ["BadDatasetSpecError", "Dataset", "load", "load_data", "select"]

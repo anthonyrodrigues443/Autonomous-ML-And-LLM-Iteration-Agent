@@ -1,12 +1,13 @@
-"""`DLModelTarget`: image classification by transfer learning, on the same loop.
+"""`DLModelTarget`: images to classes or to a number, on the same loop.
 
 The dataset is the tabular one, a path column and a label column, with every path a
 byte-named copy `images.prepare_images` wrote, so the split, the sealed holdout and
-the scorer are the ones the other two targets use. `baseline()` is the linear probe:
-a frozen backbone embeds each image once and a logistic regression learns on top.
-`run()` takes one typed `Recipe` and fits it through the runner, the same path the
-eval sweep calls with no LLM. torch loads on first use, so this module imports where
-it is absent and CI tests the target with a fake runner.
+the scorer are the ones the other two targets use. `baseline()` is a small CNN trained
+from zero for a fixed number of epochs with no time cap, so it means the same thing on
+every machine. `run()` takes one typed `Recipe` and fits it through the runner, the
+same path the eval sweep calls with no LLM. A number is learned standardised on the
+training labels and mapped back before it is scored. torch loads on first use, so this
+module imports where it is absent and CI tests the target with a fake runner.
 """
 
 from __future__ import annotations
@@ -18,12 +19,14 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+import pandas as pd
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.preprocessing import StandardScaler
 
 from iterate.adapters.compute.base import CodeJob
@@ -40,6 +43,8 @@ if TYPE_CHECKING:
     from iterate.schemas.experiment import Candidate
 
 DEFAULT_SIZE = 160
+BASELINE_SIZE = 64
+PRETRAINED_EPOCHS = 12
 FIT_BUDGET_SECONDS = 540.0
 RECIPE_JSON = "recipe.json"
 EMBED_BATCH = 256
@@ -64,8 +69,10 @@ BACKBONES: dict[str, tuple[str, str]] = {
     "resnet50": ("ResNet50_Weights.IMAGENET1K_V2", "fc"),
     "convnext_tiny": ("ConvNeXt_Tiny_Weights.IMAGENET1K_V1", "classifier.2"),
 }
+# Trained from zero, so no probe and no head-only fit: name to head module.
+SCRATCH: dict[str, str] = {"simple_cnn": "head"}
 _CHOICES: dict[str, tuple[str, ...]] = {
-    "backbone": tuple(BACKBONES),
+    "backbone": (*BACKBONES, *SCRATCH),
     "unfreeze": ("none", "head", "all"),
     "optimizer": ("adamw", "sgd"),
     "schedule": ("onecycle", "cosine", "constant"),
@@ -74,7 +81,7 @@ _CHOICES: dict[str, tuple[str, ...]] = {
 }
 _RANGES: dict[str, tuple[float, float]] = {
     "image_size": (32, 384),
-    "epochs": (0, 12),
+    "epochs": (0, 30),
     "batch_size": (8, 256),
     "lr": (1e-5, 1.0),
     "label_smoothing": (0.0, 0.3),
@@ -104,7 +111,7 @@ class Recipe:
     seed: int = 42
 
     @classmethod
-    def from_changes(cls, changes: dict[str, Any]) -> Recipe:
+    def from_changes(cls, changes: dict[str, Any], *, task: str = "classification") -> Recipe:
         kinds = {f.name: str(f.type) for f in fields(cls)}
         unknown = sorted(set(changes) - set(kinds) - {"note"})
         if unknown:
@@ -113,18 +120,36 @@ class Recipe:
             if name in kinds and not _is_kind(value, kinds[name]):
                 raise RecipeError(f"{name} must be {kinds[name]}, got {value!r}")
         recipe = cls(**{k: v for k, v in changes.items() if k in kinds})
-        recipe.validate()
+        recipe.validate(task)
         return recipe
 
-    def validate(self) -> None:
+    def validate(self, task: str = "classification") -> None:
         for name, allowed in _CHOICES.items():
             if (value := getattr(self, name)) not in allowed:
                 raise RecipeError(f"{name} must be one of {list(allowed)}, got {value!r}")
         for name, (low, high) in _RANGES.items():
-            if (value := getattr(self, name)) is not None and not low <= value <= high:
-                raise RecipeError(f"{name}={value!r} is outside {low} to {high}")
-        if (self.unfreeze == "none") != (self.epochs == 0):
+            pretrained = name == "epochs" and self.backbone not in SCRATCH
+            top = PRETRAINED_EPOCHS if pretrained else high
+            if (value := getattr(self, name)) is not None and not low <= value <= top:
+                too_long = pretrained and value > top
+                hint = " for a pretrained backbone; lower epochs, or use simple_cnn"
+                raise RecipeError(
+                    f"{name}={value!r} is outside {low} to {top}{hint if too_long else ''}"
+                )
+        if self.backbone in SCRATCH:
+            if self.unfreeze != "all" or self.epochs == 0:
+                raise RecipeError(
+                    f"{self.backbone} trains from zero: set unfreeze to all with 1 to 30 epochs; "
+                    "a probe or a head-only fit needs a pretrained backbone"
+                )
+            if self.head_init != "random":
+                raise RecipeError(
+                    f"{self.backbone} has no probe to start its head from; set head_init to random"
+                )
+        elif (self.unfreeze == "none") != (self.epochs == 0):
             raise RecipeError("the probe takes 0 epochs; unfreeze head or all takes 1 to 12")
+        if task == "regression" and self.label_smoothing > 0:
+            raise RecipeError("label_smoothing is for classes; set it to 0 to predict a number")
 
 
 def _is_kind(value: Any, kind: str) -> bool:
@@ -137,23 +162,34 @@ def _is_kind(value: Any, kind: str) -> bool:
     return type(value).__name__ == kind
 
 
+BASELINE = Recipe(
+    backbone="simple_cnn", unfreeze="all", epochs=20, schedule="cosine", augment="none"
+)
+
+
 @dataclass(frozen=True)
 class FitJob:
-    """One fine-tune. `labels` are TRAINING labels; the holdout goes in as pixels only."""
+    """One fit. `labels` are TRAINING labels, class indices or standardised numbers; the
+    holdout goes in as pixels only. `outputs` is the class count, or 1 for a number. A
+    `fixed` job runs every epoch its recipe asks for."""
 
     train: np.ndarray
     holdout: np.ndarray
     labels: np.ndarray
     recipe: Recipe
-    n_classes: int
+    outputs: int
     head: tuple[np.ndarray, np.ndarray] | None
     deadline: float
     log: Callable[[str], None]
+    task: str = "classification"
+    fixed: bool = False
 
 
 @dataclass(frozen=True)
 class FitReport:
-    probabilities: np.ndarray
+    """`outputs` is (n, classes) probabilities, or (n,) standardised numbers."""
+
+    outputs: np.ndarray
     epochs_planned: int
     epochs_run: int
 
@@ -216,13 +252,16 @@ def time_steps(step: Callable[[], object], k: int = TIMED_STEPS) -> float:
     return (time.perf_counter() - tick) / k
 
 
-def plan_epochs(wanted: int, epoch_seconds: float, seconds_left: float) -> int:
+def plan_epochs(
+    wanted: int, epoch_seconds: float, seconds_left: float, *, backbone: str = "resnet18"
+) -> int:
     """The whole epochs that fit, so the schedule is built over what will run."""
     fits = int(seconds_left // epoch_seconds) if epoch_seconds > 0 else wanted
     if fits < 1:
+        advice = "halve image_size" if backbone in SCRATCH else "halve image_size or use resnet18"
         raise RecipeError(
             f"one epoch needs about {epoch_seconds:.0f}s and {max(seconds_left, 0):.0f}s of "
-            "the fit budget are left; halve image_size or use resnet18"
+            f"the fit budget are left; {advice}"
         )
     return min(wanted, fits)
 
@@ -240,10 +279,15 @@ def run_epochs(
     return planned
 
 
-def _time_train_step(model: Any, opt: Any, step: Callable[[], tuple[Any, Any, Any]]) -> float:
-    """Seconds per full training step, optimiser included. Timed in eval mode at a zero
-    learning rate, so it moves neither the weights nor the batch-norm statistics, and
-    the optimiser's state is cleared after."""
+def _time_train_step(
+    model: Any,
+    opt: Any,
+    step: Callable[[], tuple[Any, Any, Any]],
+    tally: Callable[[Any, Any], float],
+) -> float:
+    """Seconds per full training step, optimiser and tally included. Timed in eval mode
+    at a zero learning rate, so it moves neither the weights nor the batch-norm
+    statistics, and the optimiser's state is cleared after."""
     rates = [group["lr"] for group in opt.param_groups]
     for group in opt.param_groups:
         group["lr"] = 0.0
@@ -251,10 +295,10 @@ def _time_train_step(model: Any, opt: Any, step: Callable[[], tuple[Any, Any, An
 
     def once() -> None:
         opt.zero_grad(set_to_none=True)
-        loss, logits, labels = step()
+        loss, out, labels = step()
         opt.step()
         loss.item()
-        int((logits.argmax(1) == labels).sum())
+        tally(out, labels)
 
     try:
         return time_steps(once)
@@ -295,52 +339,73 @@ class TorchRunner:
 
     def _fit(self, job: FitJob) -> FitReport:
         torch, recipe, n = _torch(), job.recipe, len(job.train)
+        regression = job.task == "regression"
         torch.manual_seed(recipe.seed)
         rng = np.random.default_rng(recipe.seed)
         dev = torch.device(self.device)
         cuda = dev.type == "cuda"
-        model = _build(torch, recipe.backbone, job.n_classes, job.head).to(dev)
+        model = _build(torch, recipe.backbone, job.outputs, job.head).to(dev)
         if cuda:
             torch.backends.cudnn.benchmark = True
             model = model.to(memory_format=torch.channels_last)
         opt = _optimiser(torch, model, recipe)
-        loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=recipe.label_smoothing)
+        if regression:
+            loss_fn = torch.nn.MSELoss()
+        else:
+            loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=recipe.label_smoothing)
 
         def step(idx: np.ndarray) -> tuple[Any, Any, Any]:
             xb = _to_device(torch, _augment(job.train[idx], recipe.augment, rng), dev)
             yb = torch.from_numpy(job.labels[idx]).to(dev)
+            if regression:
+                yb = yb.float()
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
-                logits = model(xb)
-                loss = loss_fn(logits, yb)
+                out = model(xb)
+                if regression:
+                    out = out.squeeze(1)
+                loss = loss_fn(out, yb)
             loss.backward()
-            return loss, logits, yb
+            return loss, out, yb
+
+        def tally(out: Any, yb: Any) -> float:
+            if regression:
+                return float(((out.detach().float() - yb) ** 2).sum())
+            return int((out.argmax(1) == yb).sum())
 
         first = np.arange(min(n, recipe.batch_size))
-        step_seconds = _time_train_step(model, opt, lambda: step(first)) * PLAN_MARGIN
+        step_seconds = _time_train_step(model, opt, lambda: step(first), tally) * PLAN_MARGIN
         per_epoch = math.ceil(n / recipe.batch_size)
         stop_at = job.deadline - step_seconds * math.ceil(len(job.holdout) / recipe.batch_size)
         left = stop_at - time.perf_counter()
-        planned = plan_epochs(recipe.epochs, step_seconds * per_epoch, left)
+        planned = (
+            recipe.epochs
+            if job.fixed
+            else plan_epochs(
+                recipe.epochs, step_seconds * per_epoch, left, backbone=recipe.backbone
+            )
+        )
         sched = _schedule(torch, opt, recipe, planned * per_epoch)
 
         def one_epoch(_: int) -> str | None:
             _train_mode(torch, model, recipe)
-            order, total, hits = rng.permutation(n), 0.0, 0
+            order, total, tallied = rng.permutation(n), 0.0, 0.0
             for start in range(0, n, recipe.batch_size):
                 if time.perf_counter() > stop_at:
                     return None
                 idx = order[start : start + recipe.batch_size]
                 opt.zero_grad(set_to_none=True)
-                loss, logits, yb = step(idx)
+                loss, out, yb = step(idx)
                 opt.step()
                 if sched is not None:
                     sched.step()
                 total += loss.item() * len(idx)
-                hits += int((logits.argmax(1) == yb).sum())
-            return f"loss={total / n:.4f} train_acc={hits / n:.4f}"
+                tallied += tally(out, yb)
+            if regression:
+                return f"loss={total / n:.4f} train_r2={1 - tallied / n:.4f}"
+            return f"loss={total / n:.4f} train_acc={tallied / n:.4f}"
 
         ran = run_epochs(one_epoch, planned, job.log)
-        return FitReport(_predict(torch, model, job.holdout, dev), planned, ran)
+        return FitReport(_predict(torch, model, job.holdout, dev, job.task), planned, ran)
 
     def embed(self, pixels: np.ndarray, *, backbone: str) -> np.ndarray:
         where = f"image_size={pixels.shape[-1]} with {backbone}"
@@ -376,16 +441,32 @@ def _torch() -> Any:
     return torch
 
 
+def _simple_cnn(torch: Any, outputs: int) -> Any:
+    nn = torch.nn
+    layers: list[Any] = []
+    for cin, cout in ((3, 32), (32, 64), (64, 128)):
+        conv = nn.Conv2d(cin, cout, 3, padding=1)
+        layers += [conv, nn.BatchNorm2d(cout), nn.ReLU(), nn.MaxPool2d(2)]
+    body = nn.Sequential(*layers, nn.AdaptiveAvgPool2d(1), nn.Flatten())
+    return nn.Sequential(OrderedDict(body=body, head=nn.Linear(128, outputs)))
+
+
 def _build(
-    torch: Any, backbone: str, n_classes: int | None, head: tuple[np.ndarray, np.ndarray] | None
+    torch: Any, backbone: str, outputs: int | None, head: tuple[np.ndarray, np.ndarray] | None
 ) -> Any:
+    if backbone in SCRATCH:
+        if outputs is None or head is not None:
+            raise RecipeError(
+                f"{backbone} has no pretrained features to embed or probe head to copy"
+            )
+        return _simple_cnn(torch, outputs)
     import torchvision.models as tvm
 
     weights, head_name = BACKBONES[backbone]
     enum, member = weights.split(".")
     model = getattr(tvm, backbone)(weights=getattr(getattr(tvm, enum), member))
     features = model.get_submodule(head_name).in_features
-    new = torch.nn.Identity() if n_classes is None else torch.nn.Linear(features, n_classes)
+    new = torch.nn.Identity() if outputs is None else torch.nn.Linear(features, outputs)
     if head is not None:
         with torch.no_grad():
             new.weight.copy_(torch.from_numpy(head[0]))
@@ -394,8 +475,12 @@ def _build(
     return model
 
 
+def _head_name(backbone: str) -> str:
+    return SCRATCH[backbone] if backbone in SCRATCH else BACKBONES[backbone][1]
+
+
 def _optimiser(torch: Any, model: Any, recipe: Recipe) -> Any:
-    head_name = BACKBONES[recipe.backbone][1]
+    head_name = _head_name(recipe.backbone)
     for name, param in model.named_parameters():
         param.requires_grad_(recipe.unfreeze == "all" or name.startswith(head_name))
     params = [p for p in model.parameters() if p.requires_grad]
@@ -439,15 +524,18 @@ def _to_device(torch: Any, batch: np.ndarray, dev: Any) -> Any:
     return (x - torch.from_numpy(_MEAN).to(dev)) / torch.from_numpy(_STD).to(dev)
 
 
-def _predict(torch: Any, model: Any, holdout: np.ndarray, dev: Any) -> np.ndarray:
+def _predict(torch: Any, model: Any, holdout: np.ndarray, dev: Any, task: str) -> np.ndarray:
+    regression = task == "regression"
     model.eval()
     parts = []
     with torch.no_grad():
         for start in range(0, len(holdout), EMBED_BATCH):
-            logits = model(_to_device(torch, holdout[start : start + EMBED_BATCH], dev))
-            parts.append(torch.softmax(logits.float(), dim=1).cpu())
-    probs = np.asarray(torch.cat(parts).numpy(), dtype=np.float64)
-    return np.asarray(probs / probs.sum(axis=1, keepdims=True), dtype=np.float64)
+            out = model(_to_device(torch, holdout[start : start + EMBED_BATCH], dev)).float()
+            parts.append((out.squeeze(1) if regression else torch.softmax(out, dim=1)).cpu())
+    values = np.asarray(torch.cat(parts).numpy(), dtype=np.float64)
+    if regression:
+        return values
+    return np.asarray(values / values.sum(axis=1, keepdims=True), dtype=np.float64)
 
 
 _WIDE_MODES = frozenset({"I", "I;16", "I;16B", "I;16L", "I;16N", "F"})
@@ -488,8 +576,13 @@ def decode(paths: Sequence[str], size: int) -> np.ndarray:
     return out
 
 
+def _numbers(labels: pd.Series) -> np.ndarray:
+    return np.asarray(pd.to_numeric(labels, errors="coerce").astype("float64").to_numpy())
+
+
 class DLModelTarget:
-    """Image classification by transfer learning, scored on the sealed holdout."""
+    """Images to classes or to a number, scored on the sealed holdout. A number is fitted
+    standardised by the training labels' mean and population std, and mapped back."""
 
     def __init__(
         self,
@@ -504,8 +597,12 @@ class DLModelTarget:
         runner: Runner | None = None,
         budget_seconds: float = FIT_BUDGET_SECONDS,
     ) -> None:
-        if task_for_metric(metric) != "classification" or dataset.task != "classification":
-            raise ValueError("the vision target scores classes; a numeric label is not supported")
+        self._task = dataset.task
+        if (kind := task_for_metric(metric)) != dataset.task:
+            raise ValueError(
+                f"{metric} is a {kind} metric and the labels read as {dataset.task}; "
+                f"pick a {dataset.task} metric"
+            )
         self.name = name
         self._dataset, self._column, self._metric, self._average = dataset, column, metric, average
         self._image_size, self._profile, self._budget = image_size, profile, budget_seconds
@@ -516,16 +613,39 @@ class DLModelTarget:
         folders = {p.parent.name for p in paths}
         if folders != {dataset.data_hash} or not all(_COPY_NAME.fullmatch(p.name) for p in paths):
             raise ValueError(f"{column!r} must hold the byte-named copies images.prepare writes")
-        # TRAINING labels only, in the column's own type: the order the code-path scorer uses.
-        self._classes: list[Any] = np.unique(dataset.train_target.to_numpy()).tolist()
-        if len(self._classes) < 2:
-            raise ValueError("the vision target needs at least two training classes")
-        if any(isinstance(c, float) and not c.is_integer() for c in self._classes):
-            raise ValueError(
-                "fractional labels are a number to predict; the vision target scores classes"
-            )
-        index = {c: i for i, c in enumerate(self._classes)}
-        self._labels = np.array([index[c] for c in dataset.train_target.tolist()])
+        self._classes: list[Any] = []
+        self._centre, self._scale = 0.0, 1.0
+        self._spread: list[float] | None = None
+        if self._task == "regression":
+            train = _numbers(dataset.train_target)
+            bad_train = int((~np.isfinite(train)).sum())
+            bad_held = int((~np.isfinite(_numbers(dataset.test_target))).sum())
+            if bad_train or bad_held:
+                raise ValueError(
+                    f"{bad_train} training and {bad_held} holdout labels are not numbers; give "
+                    "every row a number, or pick a classification metric"
+                )
+            with np.errstate(over="ignore", invalid="ignore"):
+                self._centre, self._scale = float(train.mean()), float(train.std())
+            if not (math.isfinite(self._centre) and math.isfinite(self._scale)):
+                raise ValueError("the training labels are too large to standardise; rescale them")
+            if self._scale == 0.0:
+                raise ValueError("every training label is the same number; there is nothing to fit")
+            self._labels = ((train - self._centre) / self._scale).astype(np.float32)
+            stats = (train.mean(), train.std(ddof=1), train.min(), train.max())
+            self._spread = [float(v) for v in stats]
+        else:
+            # TRAINING labels only, in the column's own type: the order the code-path scorer uses.
+            self._classes = np.unique(dataset.train_target.to_numpy()).tolist()
+            if len(self._classes) < 2:
+                raise ValueError("the vision target needs at least two training classes")
+            if any(isinstance(c, float) and not c.is_integer() for c in self._classes):
+                raise ValueError(
+                    "fractional labels are a number to predict; pick a regression metric"
+                )
+            index = {c: i for i, c in enumerate(self._classes)}
+            self._labels = np.array([index[c] for c in dataset.train_target.tolist()])
+        self._outputs = 1 if self._task == "regression" else len(self._classes)
         self._pixels: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._probes: dict[tuple[str, int], tuple[Any, Any, np.ndarray]] = {}
 
@@ -534,17 +654,22 @@ class DLModelTarget:
         return self._runner.device
 
     def baseline(self) -> ExperimentResult:
-        return self._evaluate(Recipe(), experiment_id="baseline")
+        return self._evaluate(self._baseline_recipe(), experiment_id="baseline", fixed=True)
+
+    def _baseline_recipe(self) -> Recipe:
+        return replace(BASELINE, image_size=min(BASELINE_SIZE, self._image_size))
 
     def run(self, candidate: Candidate) -> ExperimentResult:
         try:
-            recipe = Recipe.from_changes(candidate.changes)
+            recipe = Recipe.from_changes(candidate.changes, task=self._task)
         except RecipeError as exc:
             return ExperimentResult(experiment_id=candidate.id, error=f"recipe refused: {exc}")
         return self._evaluate(recipe, experiment_id=candidate.id)
 
-    def _evaluate(self, recipe: Recipe, *, experiment_id: str) -> ExperimentResult:
-        deadline = time.perf_counter() + self._budget
+    def _evaluate(
+        self, recipe: Recipe, *, experiment_id: str, fixed: bool = False
+    ) -> ExperimentResult:
+        deadline = math.inf if fixed else time.perf_counter() + self._budget
         size = recipe.image_size or self._image_size
         recipe, m = replace(recipe, image_size=size), self._metric
         log: list[str] = []
@@ -554,24 +679,29 @@ class DLModelTarget:
             else:
                 lp_ft = recipe.head_init == "probe"
                 head = self._probe_head(recipe.backbone, size) if lp_ft else None
-                train, held, n = *self._decoded(size), len(self._classes)
-                job = FitJob(train, held, self._labels, recipe, n, head, deadline, log.append)
+                train, held = self._decoded(size)
+                job = FitJob(
+                    train,
+                    held,
+                    self._labels,
+                    recipe,
+                    self._outputs,
+                    head,
+                    deadline,
+                    log.append,
+                    task=self._task,
+                    fixed=fixed,
+                )
                 report = self._runner.fit(job)
         except (RecipeError, DeviceOutOfMemoryError) as exc:
             error = f"recipe refused: {exc}" if isinstance(exc, RecipeError) else str(exc)
             return ExperimentResult(experiment_id=experiment_id, error=error, logs=_tail(log))
-        y_true = self._dataset.test_target.to_numpy()
-        finite = bool(np.isfinite(report.probabilities).all())
-        same_classes = np.unique(y_true).tolist() == self._classes
-        proba = report.probabilities if finite and same_classes else None
-        if proba is None and requires_proba(m):
-            need = "one probability column per holdout class" if finite else "finite probabilities"
-            error = f"{m} needs {need}"
-            return ExperimentResult(experiment_id=experiment_id, error=error, logs=_tail(log))
-        predicted = [self._classes[i] for i in report.probabilities.argmax(1)]
-        values = score(
-            "classification", y_true, predicted, y_proba=proba, average=self._average, include=(m,)
-        )
+        if self._task == "regression":
+            values = self._score_numbers(report.outputs)
+        else:
+            values = self._score_classes(report.outputs)
+        if isinstance(values, str):
+            return ExperimentResult(experiment_id=experiment_id, error=values, logs=_tail(log))
         metrics = Metrics(
             values=values, primary=m, direction=direction(m), n_samples=self._dataset.n_test
         )
@@ -580,6 +710,28 @@ class DLModelTarget:
         return ExperimentResult(
             experiment_id=experiment_id, metrics=metrics, logs=_tail(log), artifacts=artifacts
         )
+
+    def _score_classes(self, outputs: np.ndarray) -> dict[str, float] | str:
+        m = self._metric
+        y_true = self._dataset.test_target.to_numpy()
+        finite = bool(np.isfinite(outputs).all())
+        same_classes = np.unique(y_true).tolist() == self._classes
+        proba = outputs if finite and same_classes else None
+        if proba is None and requires_proba(m):
+            need = "one probability column per holdout class" if finite else "finite probabilities"
+            return f"{m} needs {need}"
+        predicted = [self._classes[i] for i in outputs.argmax(1)]
+        return score(
+            "classification", y_true, predicted, y_proba=proba, average=self._average, include=(m,)
+        )
+
+    def _score_numbers(self, outputs: np.ndarray) -> dict[str, float] | str:
+        m = self._metric
+        predicted = np.asarray(outputs, dtype=np.float64) * self._scale + self._centre
+        if (bad := int((~np.isfinite(predicted)).sum())) > 0:
+            return f"{m} needs finite predictions; {bad} of {len(predicted)} are not"
+        include = tuple(dict.fromkeys((m, "pearson", "spearman")))
+        return score("regression", _numbers(self._dataset.test_target), predicted, include=include)
 
     def build_code_job(self, candidate: Candidate) -> CodeJob:
         code = str(candidate.changes["code"])
@@ -597,16 +749,19 @@ class DLModelTarget:
             train, holdout = self._decoded(size)
             features = self._runner.embed(train, backbone=backbone)
             scaler = StandardScaler().fit(features)
-            clf = LogisticRegression(max_iter=3000).fit(scaler.transform(features), self._labels)
+            regression = self._task == "regression"
+            model: Any = Ridge(alpha=1.0) if regression else LogisticRegression(max_iter=3000)
+            model.fit(scaler.transform(features), self._labels)
             held = scaler.transform(self._runner.embed(holdout, backbone=backbone))
-            self._probes[(backbone, size)] = (scaler, clf, clf.predict_proba(held))
+            out = model.predict(held) if regression else model.predict_proba(held)
+            self._probes[(backbone, size)] = (scaler, model, out)
         return self._probes[(backbone, size)]
 
     def _probe_head(self, backbone: str, size: int) -> tuple[np.ndarray, np.ndarray]:
-        scaler, clf, _ = self._probe(backbone, size)
-        weight = clf.coef_ / scaler.scale_
-        bias = clf.intercept_ - weight @ scaler.mean_
-        if len(weight) == 1:
+        scaler, model, _ = self._probe(backbone, size)
+        weight = np.atleast_2d(model.coef_) / scaler.scale_
+        bias = np.atleast_1d(model.intercept_) - weight @ scaler.mean_
+        if self._task == "classification" and len(weight) == 1:
             weight, bias = np.vstack([np.zeros_like(weight), weight]), np.array([0.0, bias[0]])
         return weight.astype(np.float32), bias.astype(np.float32)
 
@@ -646,16 +801,18 @@ class DLModelTarget:
     def meta_json(self) -> bytes:
         payload = {
             "target": self._dataset.target,
-            "task": "classification",
-            "task_kind": "classification",
+            "task": self._task,
+            "task_kind": self._task,
             "features": list(self._dataset.features),
             "image_column": self._column,
-            "classes": self._classes,
+            "classes": self._classes if self._task == "classification" else None,
+            "target_spread": self._spread,
             "metric": self._metric,
             "average": self._average,
             "family": "vision",
             "image_size": self._image_size,
-            "backbones": list(BACKBONES),
+            "baseline": asdict(self._baseline_recipe()),
+            "backbones": [*BACKBONES, *SCRATCH],
             "budget_seconds": self._budget,
             "seed": self._dataset.seed,
         }
@@ -674,9 +831,12 @@ def _tail(lines: list[str], limit: int = _OUTPUT_TAIL_CHARS) -> str | None:
 
 __all__ = [
     "BACKBONES",
+    "BASELINE",
+    "BASELINE_SIZE",
     "DEFAULT_SIZE",
     "FIT_BUDGET_SECONDS",
     "RECIPE_JSON",
+    "SCRATCH",
     "DLModelTarget",
     "DeviceOutOfMemoryError",
     "FitJob",

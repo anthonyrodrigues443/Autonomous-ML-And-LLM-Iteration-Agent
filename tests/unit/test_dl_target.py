@@ -1,14 +1,15 @@
 """Tests for the vision target with no torch: a fake runner stands in for the
 backbone, so CI covers the recipe, the budget, the ruler, the seal and the code job
-without a download or a GPU."""
+for classes and for numbers without a download or a GPU."""
 
 from __future__ import annotations
 
 import io
 import json
+import math
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +18,8 @@ import numpy as np
 import pandas as pd
 import pytest
 from PIL import Image
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 from evals.config import REPO_ROOT
 from iterate.adapters.compute.base import SupportsCodeGen
@@ -26,7 +29,7 @@ from iterate.adapters.data.tabular import load_csv, load_split
 from iterate.schemas.experiment import Candidate
 from iterate.targets import dl
 from iterate.targets.base import BenchmarkTarget
-from iterate.targets.dl import DLModelTarget, FitJob, FitReport, RecipeError
+from iterate.targets.dl import DLModelTarget, FitJob, FitReport, Recipe, RecipeError
 
 pytestmark = pytest.mark.unit
 
@@ -65,9 +68,28 @@ def _prepared(tmp_path: Path, *, classes: int = 3, per_class: int = 10) -> Prepa
     return prepare_images(loaded, root / "data.csv", into=tmp_path / "cache")
 
 
+def _numbers(tmp_path: Path, rows: int = 30) -> Prepared:
+    """A fractional label that rises with the red and green channels."""
+    root = tmp_path / "data"
+    records = []
+    for i in range(rows):
+        path = root / "images" / f"{i:03d}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (16, 16), (8 * i, (5 * i + 40) % 256, 90)).save(path)
+        records.append({"image": f"images/{path.name}", "label": 1.5 * i + 0.25})
+    pd.DataFrame(records).to_csv(root / "data.csv", index=False)
+    loaded = load_csv(root / "data.csv", target="label", task="regression")
+    return prepare_images(loaded, root / "data.csv", into=tmp_path / "cache")
+
+
+def _ramp(n: int) -> np.ndarray:
+    return np.linspace(-1.0, 1.0, n)
+
+
 class FakeRunner:
     """Channel means stand in for a backbone; a fine-tune is a nearest-centroid fit on
-    the same features, so every class colour is told apart."""
+    the same features, so every class colour is told apart. A number comes back as a
+    fixed ramp of standardised outputs, so its score can be worked out by hand."""
 
     device = "cpu"
 
@@ -82,9 +104,11 @@ class FakeRunner:
         self.jobs.append(job)
         if self._fail is not None:
             raise self._fail
+        if job.task == "regression":
+            return FitReport(_ramp(len(job.holdout)), job.recipe.epochs, job.recipe.epochs)
         train = self.embed(job.train, backbone="")
         held = self.embed(job.holdout, backbone="")
-        centres = np.stack([train[job.labels == c].mean(axis=0) for c in range(job.n_classes)])
+        centres = np.stack([train[job.labels == c].mean(axis=0) for c in range(job.outputs)])
         logits = -((held[:, None, :] - centres[None]) ** 2).sum(-1)
         p = np.exp(logits - logits.max(axis=1, keepdims=True))
         return FitReport(p / p.sum(axis=1, keepdims=True), job.recipe.epochs, job.recipe.epochs)
@@ -114,7 +138,7 @@ def test_the_target_meets_both_contracts(tmp_path: Path) -> None:
     assert isinstance(target, SupportsCodeGen)
 
 
-def test_the_probe_is_the_baseline_and_counts_the_holdout(tmp_path: Path) -> None:
+def test_the_baseline_scores_the_holdout_and_records_its_recipe(tmp_path: Path) -> None:
     prepared = _prepared(tmp_path)
     result = _target(prepared).baseline()
     assert result.error is None
@@ -122,7 +146,66 @@ def test_the_probe_is_the_baseline_and_counts_the_holdout(tmp_path: Path) -> Non
     assert result.metrics.primary_value == 1.0
     assert result.metrics.n_samples == prepared.dataset.n_test
     recorded = json.loads(result.artifacts[dl.RECIPE_JSON])
-    assert (recorded["unfreeze"], recorded["epochs_run"]) == ("none", 0)
+    assert (recorded["backbone"], recorded["unfreeze"], recorded["epochs_run"]) == (
+        "simple_cnn",
+        "all",
+        20,
+    )
+
+
+def test_the_baseline_recipe_is_the_small_cnn_from_zero_with_basic_prep() -> None:
+    expected = Recipe(
+        backbone="simple_cnn",
+        image_size=None,
+        unfreeze="all",
+        epochs=20,
+        batch_size=64,
+        lr=1e-3,
+        optimizer="adamw",
+        schedule="cosine",
+        augment="none",
+        label_smoothing=0.0,
+        head_init="random",
+        seed=42,
+    )
+    assert expected == dl.BASELINE
+    assert dl.BASELINE_SIZE == 64
+
+
+@pytest.mark.parametrize(
+    ("numbers", "metric", "outputs"), [(False, "accuracy", 3), (True, "rmse", 1)]
+)
+def test_the_baseline_is_one_fixed_fit_with_no_deadline(
+    tmp_path: Path, numbers: bool, metric: str, outputs: int
+) -> None:
+    prepared = _numbers(tmp_path) if numbers else _prepared(tmp_path)
+    runner = FakeRunner()
+    assert _target(prepared, metric=metric, runner=runner).baseline().error is None
+    (job,) = runner.jobs
+    assert job.recipe == replace(dl.BASELINE, image_size=prepared.image_size)
+    assert (job.fixed, job.deadline) == (True, math.inf)
+    assert (job.task, job.outputs) == (prepared.dataset.task, outputs)
+
+
+def test_the_baseline_size_is_capped_at_64_and_a_smaller_one_is_never_upscaled(
+    tmp_path: Path,
+) -> None:
+    dataset = _prepared(tmp_path).dataset
+    for size, expected in ((160, 64), (64, 64), (48, 48), (32, 32)):
+        runner = FakeRunner()
+        DLModelTarget(
+            dataset, column="image", metric="accuracy", runner=runner, image_size=size
+        ).baseline()
+        assert runner.jobs[0].recipe.image_size == expected
+
+
+def test_an_agent_try_has_a_deadline_and_is_not_fixed(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    changes = {"backbone": "simple_cnn", "unfreeze": "all", "epochs": 30}
+    assert _target(_prepared(tmp_path), runner=runner).run(_cand(changes)).error is None
+    (job,) = runner.jobs
+    assert not job.fixed
+    assert math.isfinite(job.deadline)
 
 
 def test_a_fine_tune_runs_through_the_runner_and_records_its_epochs(tmp_path: Path) -> None:
@@ -152,7 +235,29 @@ def test_a_fine_tune_runs_through_the_runner_and_records_its_epochs(tmp_path: Pa
         ({"unfreeze": "all", "epochs": 3, "batch_size": 257}, "batch_size=257 is outside"),
         ({"unfreeze": "all", "epochs": 3, "lr": 0}, "lr=0 is outside"),
         ({"unfreeze": "all", "epochs": 3, "lr": 2.0}, "lr=2.0 is outside"),
-        ({"unfreeze": "all", "epochs": 13}, "epochs=13 is outside"),
+        ({"unfreeze": "all", "epochs": 13}, "epochs=13 is outside 0 to 12 for a pretrained"),
+        ({"unfreeze": "head", "epochs": 13}, "epochs=13 is outside 0 to 12 for a pretrained"),
+        (
+            {"unfreeze": "all", "epochs": 31},
+            "epochs=31 is outside 0 to 12 for a pretrained backbone; lower epochs, or use simple_cnn",
+        ),
+        (
+            {"backbone": "simple_cnn", "unfreeze": "all", "epochs": 31},
+            "epochs=31 is outside 0 to 30",
+        ),
+        ({"backbone": "simple_cnn"}, "simple_cnn trains from zero: set unfreeze to all"),
+        (
+            {"backbone": "simple_cnn", "unfreeze": "head", "epochs": 3},
+            "simple_cnn trains from zero: set unfreeze to all",
+        ),
+        (
+            {"backbone": "simple_cnn", "unfreeze": "all", "epochs": 0},
+            "simple_cnn trains from zero: set unfreeze to all with 1 to 30 epochs",
+        ),
+        (
+            {"backbone": "simple_cnn", "unfreeze": "all", "epochs": 3, "head_init": "probe"},
+            "simple_cnn has no probe to start its head from; set head_init to random",
+        ),
         (
             {"unfreeze": "all", "epochs": 3, "label_smoothing": 0.5},
             "label_smoothing=0.5 is outside",
@@ -180,10 +285,181 @@ def test_a_path_that_is_not_a_byte_named_copy_is_refused(tmp_path: Path) -> None
         DLModelTarget(raw, column="image", metric="accuracy", runner=FakeRunner())
 
 
-def test_a_numeric_label_or_a_regression_metric_is_refused(tmp_path: Path) -> None:
-    prepared = _prepared(tmp_path)
-    with pytest.raises(ValueError, match="scores classes"):
+def test_a_metric_for_the_other_kind_of_label_is_refused_both_ways(tmp_path: Path) -> None:
+    classes = _prepared(tmp_path / "classes")
+    with pytest.raises(
+        ValueError, match="rmse is a regression metric and the labels read as classification"
+    ):
+        _target(classes, metric="rmse")
+    numbers = _numbers(tmp_path / "numbers")
+    with pytest.raises(
+        ValueError, match="accuracy is a classification metric and the labels read as regression"
+    ):
+        _target(numbers, metric="accuracy")
+    relabelled = replace(classes.dataset, task="regression")
+    with pytest.raises(ValueError, match="accuracy is a classification metric"):
+        DLModelTarget(relabelled, column="image", metric="accuracy", runner=FakeRunner())
+
+
+# ─── numbers ─────────────────────────────────────────────────────────────────
+
+
+def test_a_number_is_fitted_standardised_and_scored_in_its_own_units(tmp_path: Path) -> None:
+    prepared = _numbers(tmp_path)
+    runner = FakeRunner()
+    changes = {"backbone": "simple_cnn", "unfreeze": "all", "epochs": 2}
+    result = _target(prepared, metric="rmse", runner=runner).run(_cand(changes))
+    assert result.error is None
+    assert result.metrics is not None
+    (job,) = runner.jobs
+    train = prepared.dataset.train_target.to_numpy(dtype=float)
+    truth = prepared.dataset.test_target.to_numpy(dtype=float)
+    assert job.labels.dtype == np.float32
+    np.testing.assert_allclose(job.labels, (train - train.mean()) / train.std(), atol=1e-6)
+    predicted = _ramp(len(truth)) * train.std() + train.mean()
+    rmse = math.sqrt(sum((p - t) ** 2 for p, t in zip(predicted, truth, strict=True)) / len(truth))
+    assert result.metrics.primary == "rmse"
+    assert result.metrics.direction == "minimize"
+    assert result.metrics.primary_value == pytest.approx(rmse)
+    assert {"rmse", "r2", "pearson", "spearman"} <= set(result.metrics.values)
+    assert result.metrics.values["spearman"] == pytest.approx(
+        pd.Series(predicted).corr(pd.Series(truth), method="spearman")
+    )
+    recorded = json.loads(result.artifacts[dl.RECIPE_JSON])
+    assert (recorded["epochs_planned"], recorded["epochs_run"]) == (2, 2)
+
+
+@pytest.mark.parametrize(("bad_train", "bad_held"), [(3, 1), (0, 2)])
+def test_labels_that_are_not_numbers_are_refused_with_both_counts(
+    tmp_path: Path, bad_train: int, bad_held: int
+) -> None:
+    dataset = _numbers(tmp_path).dataset
+    train = dataset.train_target.astype(object)
+    train.iloc[:bad_train] = "n/a"
+    held = dataset.test_target.astype(object)
+    held.iloc[:bad_held] = None
+    broken = replace(dataset, train_target=train, test_target=held)
+    with pytest.raises(
+        ValueError, match=f"{bad_train} training and {bad_held} holdout labels are not numbers"
+    ):
+        DLModelTarget(broken, column="image", metric="rmse", runner=FakeRunner())
+
+
+def test_text_in_the_training_labels_reaches_the_counted_refusal_through_prepare(
+    tmp_path: Path,
+) -> None:
+    _numbers(tmp_path)
+    root = tmp_path / "data"
+    frame = pd.read_csv(root / "data.csv").astype({"label": object})
+    frame.loc[[0, 1], "label"] = "abc"
+    frame.iloc[:24].to_csv(root / "train.csv", index=False)
+    frame.iloc[24:].to_csv(root / "holdout.csv", index=False)
+    split = load_split(root / "train.csv", root / "holdout.csv", target="label", task="regression")
+    prepared = prepare_images(split, root / "train.csv", into=tmp_path / "split-cache")
+    with pytest.raises(ValueError, match="2 training and 0 holdout labels are not numbers"):
         _target(prepared, metric="rmse")
+
+
+@pytest.mark.parametrize("step", [1e306, 1e160])
+def test_labels_too_large_to_standardise_are_refused_before_any_fit(
+    tmp_path: Path, step: float
+) -> None:
+    dataset = _numbers(tmp_path).dataset
+    huge = replace(dataset, train_target=pd.Series(np.arange(len(dataset.train_target)) * step))
+    runner = FakeRunner()
+    with pytest.raises(ValueError, match="too large to standardise"):
+        DLModelTarget(huge, column="image", metric="rmse", runner=runner)
+    assert runner.jobs == []
+
+
+def test_a_label_that_is_the_same_number_everywhere_is_refused(tmp_path: Path) -> None:
+    dataset = _numbers(tmp_path).dataset
+    same = replace(dataset, train_target=dataset.train_target * 0 + 7.5)
+    with pytest.raises(ValueError, match="every training label is the same number"):
+        DLModelTarget(same, column="image", metric="rmse", runner=FakeRunner())
+
+
+def test_label_smoothing_is_refused_for_a_number_and_kept_for_classes(tmp_path: Path) -> None:
+    changes = {"backbone": "simple_cnn", "unfreeze": "all", "epochs": 2, "label_smoothing": 0.1}
+    runner = FakeRunner()
+    refused = _target(_numbers(tmp_path / "numbers"), metric="rmse", runner=runner).run(
+        _cand(changes)
+    )
+    assert refused.error == (
+        "recipe refused: label_smoothing is for classes; set it to 0 to predict a number"
+    )
+    assert runner.jobs == []
+    assert _target(_prepared(tmp_path / "classes")).run(_cand(changes)).error is None
+
+
+class NaNRunner(FakeRunner):
+    def fit(self, job: FitJob) -> FitReport:
+        report = super().fit(job)
+        outputs = report.outputs.copy()
+        outputs[:1] = np.nan
+        outputs[1:2] = np.inf
+        return FitReport(outputs, report.epochs_planned, report.epochs_run)
+
+
+def test_numbers_that_are_not_finite_are_a_failed_result_that_counts_them(tmp_path: Path) -> None:
+    prepared = _numbers(tmp_path)
+    result = _target(prepared, metric="mae", runner=NaNRunner()).baseline()
+    assert result.metrics is None
+    assert result.error == f"mae needs finite predictions; 2 of {prepared.dataset.n_test} are not"
+
+
+def test_the_probe_of_a_number_is_a_ridge_fit_whose_head_predicts_the_same(
+    tmp_path: Path,
+) -> None:
+    prepared = _numbers(tmp_path)
+    target = _target(prepared, metric="rmse")
+    result = target.run(_cand({"unfreeze": "none"}))
+    assert result.error is None
+    assert result.metrics is not None
+    _scaler, model, out = target._probes[("resnet18", prepared.image_size)]
+    assert isinstance(model, Ridge)
+    assert model.alpha == 1.0
+    train_pixels, held_pixels = target._decoded(prepared.image_size)
+    features = FakeRunner().embed(train_pixels, backbone="resnet18")
+    held = FakeRunner().embed(held_pixels, backbone="resnet18")
+    standard = StandardScaler().fit(features)
+    expected = Ridge(alpha=1.0).fit(standard.transform(features), target._labels)
+    np.testing.assert_allclose(out, expected.predict(standard.transform(held)), rtol=1e-5)
+    train = prepared.dataset.train_target.to_numpy(dtype=float)
+    truth = prepared.dataset.test_target.to_numpy(dtype=float)
+    rmse = float(np.sqrt(np.mean((out * train.std() + train.mean() - truth) ** 2)))
+    assert result.metrics.primary_value == pytest.approx(rmse)
+    weight, bias = target._probe_head("resnet18", prepared.image_size)
+    assert (weight.shape, bias.shape) == ((1, 3), (1,))
+    np.testing.assert_allclose((held @ weight.T + bias)[:, 0], out, rtol=1e-4, atol=1e-4)
+
+
+def test_simple_cnn_can_neither_embed_nor_take_a_copied_head() -> None:
+    head = (np.zeros((3, 128), np.float32), np.zeros(3, np.float32))
+    for outputs, given in ((None, None), (3, head)):
+        with pytest.raises(RecipeError, match="simple_cnn has no pretrained features"):
+            dl._build(None, "simple_cnn", outputs, given)
+
+
+def test_the_meta_names_the_task_the_spread_the_baseline_and_every_backbone(
+    tmp_path: Path,
+) -> None:
+    classes = json.loads(_target(_prepared(tmp_path / "classes")).meta_json())
+    prepared = _numbers(tmp_path / "numbers")
+    numbers = json.loads(_target(prepared, metric="rmse").meta_json())
+    assert (classes["task"], classes["task_kind"]) == ("classification", "classification")
+    assert (classes["classes"], classes["target_spread"]) == ([0, 1, 2], None)
+    assert (numbers["task"], numbers["task_kind"]) == ("regression", "regression")
+    assert numbers["classes"] is None
+    assert prepared.profile.target_spread is not None
+    assert numbers["target_spread"] == pytest.approx(list(prepared.profile.target_spread))
+    train = prepared.dataset.train_target
+    assert numbers["target_spread"] == pytest.approx(
+        [train.mean(), train.std(), train.min(), train.max()]
+    )
+    for meta in (classes, numbers):
+        assert meta["baseline"] == asdict(replace(dl.BASELINE, image_size=32))
+        assert meta["backbones"] == ["resnet18", "resnet50", "convnext_tiny", "simple_cnn"]
 
 
 # ─── one ruler ───────────────────────────────────────────────────────────────
@@ -194,7 +470,7 @@ def test_integer_classes_score_the_same_through_run_and_the_code_job(tmp_path: P
     and the same probabilities scored 1.0 one way and 0.60 the other."""
     prepared = _prepared(tmp_path, classes=12, per_class=8)
     target = _target(prepared, metric="roc_auc")
-    by_run = target.baseline()
+    by_run = target.run(_cand({"unfreeze": "none"}))
     assert by_run.metrics is not None
     classes = json.loads(target.meta_json())["classes"]
     assert classes == list(range(12))
@@ -235,7 +511,7 @@ def test_the_runner_sees_training_labels_and_holdout_pixels_only(tmp_path: Path)
     assert len(job.labels) == prepared.dataset.n_train
     assert set(job.labels.tolist()) == {0, 1, 2}
     assert len(job.holdout) == prepared.dataset.n_test
-    assert job.n_classes == 3
+    assert job.outputs == 3
 
 
 def test_a_probability_metric_with_a_holdout_only_class_fails_with_the_reason(
@@ -308,6 +584,8 @@ def test_a_device_failure_in_a_fit_is_a_failed_result(tmp_path: Path) -> None:
 def test_epoch_one_alone_over_the_budget_is_refused_with_advice() -> None:
     with pytest.raises(RecipeError, match="halve image_size or use resnet18"):
         dl.plan_epochs(3, 600.0, 540.0)
+    with pytest.raises(RecipeError, match=r"are left; halve image_size$"):
+        dl.plan_epochs(3, 600.0, 540.0, backbone="simple_cnn")
 
 
 def test_the_plan_is_the_whole_epochs_that_fit() -> None:
@@ -431,12 +709,6 @@ def test_either_half_of_the_copy_guard_refuses_on_its_own(tmp_path: Path) -> Non
             DLModelTarget(broken, column="image", metric="accuracy", runner=FakeRunner())
 
 
-def test_a_regression_task_is_refused_even_with_a_class_metric(tmp_path: Path) -> None:
-    dataset = replace(_prepared(tmp_path).dataset, task="regression")
-    with pytest.raises(ValueError, match="scores classes"):
-        DLModelTarget(dataset, column="image", metric="accuracy", runner=FakeRunner())
-
-
 def test_one_training_class_or_fractional_labels_are_refused(tmp_path: Path) -> None:
     dataset = _prepared(tmp_path).dataset
     one = replace(dataset, train_target=dataset.train_target * 0)
@@ -462,14 +734,6 @@ def test_a_holdout_with_as_many_classes_but_another_set_cannot_take_probabilitie
     failed = _target(prepared, metric="roc_auc").baseline()
     assert failed.error == "roc_auc needs one probability column per holdout class"
     assert _target(prepared).baseline().error is None
-
-
-class NaNRunner(FakeRunner):
-    def fit(self, job: FitJob) -> FitReport:
-        report = super().fit(job)
-        probabilities = report.probabilities.copy()
-        probabilities[0, :] = np.nan
-        return FitReport(probabilities, report.epochs_planned, report.epochs_run)
 
 
 def test_probabilities_that_are_not_finite_fail_a_probability_metric_and_not_accuracy(
@@ -509,6 +773,7 @@ def test_the_budget_counts_from_the_top_of_the_call(
     target.run(_cand({"unfreeze": "all", "epochs": 1}))
     (job,) = runner.jobs
     assert job.deadline == 1000.0 + 540.0
+    assert not job.fixed
 
 
 def test_release_clears_the_kept_traceback_and_empties_the_device_cache(

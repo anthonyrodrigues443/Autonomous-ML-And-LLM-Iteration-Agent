@@ -529,9 +529,10 @@ def score_predictions(
     # agent's code being wrong, not ours — capture it as a failed experiment (and
     # feed the reason back) rather than letting it crash the loop.
     try:
-        y_pred = _coerce(preds, target=dataset.test_target)
+        task = task_for_metric(metric)
+        y_pred = _coerce(preds, target=dataset.test_target, task=task)
         values = score(
-            task_for_metric(metric),
+            task,
             dataset.test_target.to_numpy(),
             y_pred,
             y_proba=y_proba,
@@ -568,9 +569,12 @@ def score_predictions(
     return ExperimentResult(experiment_id=experiment_id, metrics=metrics)
 
 
-def _coerce(preds: list[str], *, target: object) -> list[int | float | str]:
+def _coerce(preds: list[str], *, target: object, task: str) -> list[int | float | str]:
     """Coerce string predictions to the holdout target's own type, so labels line
-    up (e.g. int 0/1 vs string "0"/"1" would otherwise be a 'mixed types' error)."""
+    up (e.g. int 0/1 vs string "0"/"1" would otherwise be a 'mixed types' error).
+    A number to predict stays a float whatever the column's dtype."""
+    if task == "regression":
+        return [float(p) for p in preds]
     kind = getattr(getattr(target, "dtype", None), "kind", "O")
     if kind in "iu":  # integer labels (the common 0/1 classification target)
         return [int(float(p)) for p in preds]

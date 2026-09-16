@@ -62,6 +62,12 @@ evals/datasets/<name>/
 Or point `data` at a path relative to the repo root, which is how the datasets in
 `examples/` join the corpus without being copied.
 
+A dataset whose split is made in advance names its holdout beside it with
+`holdout = "<path>"`, and every sweep loads the pair as the user's own split, sealed as
+given; a version whose CLI predates `--train` and `--holdout` skips it. The storm
+example needs this: its frames are split by storm, and a split by frame would put
+the same storm on both sides.
+
 The toml is tracked and the csv is not, so the repo records what the corpus IS
 without carrying megabytes of it. Every result stores the content hash of the file
 it was measured on: swap the bytes behind a name and the old numbers are correctly
@@ -70,7 +76,7 @@ treated as results for something else.
 ## Ceilings
 
 A ceiling is the best score a brute-force sweep of ordinary models reaches, measured
-with no LLM, through the product's own `load_csv` and `ModelTarget` on the same
+with no LLM, through the product's own loader and `ModelTarget` on the same
 sealed split the agent gets. Without one, "no candidate beat the baseline" cannot be
 read: it means the agent failed, or it means there was nothing to find.
 
@@ -190,38 +196,60 @@ definition to few-shot costs 0.09. So the best technique still differs by datase
 which is the argument for an agent iterating per dataset rather than a prompt shape
 someone hardcodes.
 
-**Vision: recipes.** Twelve typed recipes through the real `DLModelTarget.run()`,
-the same call an agent candidate takes, after the same `prepare_images` step:
+**Vision: recipes.** The baseline first, then twelve typed recipes, all through the
+real `DLModelTarget`, after the same `prepare_images` step a run takes:
 
 ```
-probe resnet18 · probe convnext_tiny · fine-tune 3 epochs · 5 epochs · head only
-  · probe head with SGD · label smoothing · flip and crop · resnet50 · convnext_tiny
-  · probe at the larger size · fine-tune at the larger size
+the plain CNN from zero (the baseline) · probe resnet18 · probe convnext_tiny
+  · fine-tune 3 epochs · 5 epochs · head only · probe head with SGD · label smoothing
+  · flip and crop · resnet50 · convnext_tiny · probe at the larger size
+  · fine-tune at the larger size
 ```
 
-The larger size is twice the base, up to 224. Each evaluation has 540 seconds
-counted from the top of the call; the runner plans the whole epochs that fit and
-builds its schedule over them, and every row records its epochs planned and run, so a
-trimmed recipe shows. Runs on MPS are not bitwise repeatable and each recipe runs
-once, so the stored detail carries the holdout's standard error: rows within it are a
-tie. Each vision sweep runs in a child process of its own, because torch and lightgbm
-cannot share a process on macOS and a ceilings run over the whole corpus fits lightgbm
-for its tabular rows. It runs overnight on one machine, one dataset after the other:
+The baseline row goes through `baseline()`, the call a run makes: a plain CNN of three
+convolution blocks trained from zero at 64 px for 20 epochs with cosine decay, a fixed
+job with no time cap. Every other row goes through `run()`, the call an agent candidate
+takes. The larger size is twice the base, up to 224. Each of those evaluations has 540
+seconds counted from the top of the call; the runner plans the whole epochs that fit
+and builds its schedule over them, and every row records its epochs planned and run, so
+a trimmed recipe shows. For a number label the label-smoothing row drops out and every
+row also records Pearson and Spearman.
+
+Runs on MPS are not guaranteed bitwise repeatable and each recipe runs once, so for
+accuracy the stored detail carries the holdout's standard error: rows within it are a
+tie. A number label gets none, because its holdout rows can come in groups the sweep
+cannot see: frames of one storm move together, and a per-row formula came out two to
+five times smaller than an error bar that resamples whole storms, depending on the row
+and the formula. The storm example's README carries that one.
+
+A sweep version is in the method, and an image sweep of a newer version replaces the
+stored record of an older one, keeping the older ceiling's number when it was better and
+saying so in the method; the table sweeps keep the better of their two methods as
+before. Each vision sweep runs in a child process of its own, because torch and
+lightgbm cannot share a process on macOS and a ceilings run over the whole corpus fits
+lightgbm for its tabular rows. It runs on one machine, one dataset after the other:
 
 ```bash
-nohup uv run python -m evals.run ceilings --datasets flowers102,eurosat > sweep.log 2>&1 &
+nohup uv run python -m evals.run ceilings --force --datasets cyclone_wind,flowers102,eurosat > sweep.log 2>&1 &
 ```
 
-Measured 2026-09-16 on an Apple M5 with MPS, 28 minutes for both:
+Measured 2026-09-16 on an Apple M5 with MPS, 71 minutes for all three:
 
-| dataset | probe | ceiling | best recipe | headroom | one standard error |
+| dataset | baseline, plain CNN | ceiling | best recipe | headroom | one standard error |
 |---|---|---|---|---|---|
-| flowers102 | 0.8918 | 0.9743 | convnext_tiny fine-tune, 3 epochs, 160 px | 0.083 | 0.004 |
-| eurosat | 0.8989 | 0.9857 | convnext_tiny fine-tune, 3 epochs, 64 px | 0.087 | 0.002 |
+| cyclone_wind (rmse) | 13.12 | 8.87 | resnet18 fine-tune, 3 epochs, 224 px | 4.25 knots | none stored; about 0.4 by storm |
+| flowers102 | 0.5544 | 0.9743 | convnext_tiny fine-tune, 3 epochs, 160 px | 0.420 | 0.004 |
+| eurosat | 0.9496 | 0.9857 | convnext_tiny fine-tune, 3 epochs, 64 px | 0.036 | 0.002 |
 
-Both ceilings are ties: resnet18 at 224 px reached 0.9719 on Flowers102, and resnet50
-and resnet18 at 128 px both reached 0.9850 on EuroSAT. The stronger frozen backbone is
-most of the gain by itself; the convnext_tiny probe scored 0.9566 on Flowers102.
+All three ceilings are ties: convnext_tiny at 160 px reached 8.87 on the storms,
+resnet18 at 224 px 0.9719 on Flowers102, and resnet50 and resnet18 at 128 px both
+0.9850 on EuroSAT. The frozen backbones split the datasets: the resnet18 probe carries
+Flowers102 from 0.554 to 0.892 on its own, while on EuroSAT it does no better than the
+plain CNN, and only fine-tuning passes it. On the storm frames the resnet18 probe ties
+the plain CNN, 13.17 against 13.12, convnext_tiny's frozen features reach 11.62, and
+fine-tuning reaches 8.87. Every pretrained
+row on Flowers102 and EuroSAT matched the first version of the sweep, measured the
+day before, to the fourth decimal.
 
 ## Two corpora, one word
 

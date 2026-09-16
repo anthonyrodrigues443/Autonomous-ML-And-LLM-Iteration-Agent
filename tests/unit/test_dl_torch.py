@@ -94,3 +94,38 @@ def test_timing_a_step_moves_neither_the_weights_nor_the_batch_norm_statistics()
 
 def test_a_head_only_fit_keeps_the_backbones_batch_norm_statistics() -> None:
     assert _check("head_only_keeps_batch_norm") == {"head": True, "all": False}
+
+
+def test_simple_cnn_has_its_parameter_count_for_any_number_of_outputs() -> None:
+    result = _check("simple_cnn_parameters")
+    assert result["counts"] == {str(k): 93_696 + 129 * k for k in (1, 10, 102)}
+    assert result["children"] == ["body", "head"]
+    assert result["shapes"] == [[2, 10], [2, 10]]
+
+
+def test_a_short_fit_learns_a_number_and_prints_train_r2() -> None:
+    """The label is each image's mean brightness."""
+    result = _check("regression_fit")
+    assert result["shape"] == [40]
+    assert result["epochs"] == [15, 15]
+    assert (result["r2_lines"], result["acc_lines"]) == (15, 0)
+    assert result["r2"] > 0.5
+    pairs = result["loss_and_r2"]
+    assert len(pairs) == 15
+    assert all(abs(r2 - (1 - loss)) <= 1.5e-4 for loss, r2 in pairs)
+    assert pairs[-1][1] > 0.5
+
+
+def test_a_ridge_probe_head_copied_into_resnet18_predicts_what_the_probe_predicts() -> None:
+    result = _check("ridge_head_copy")
+    assert result["shape"][0] == result["shape"][1]
+    assert result["gap"] < 1e-4
+
+
+def test_a_fixed_job_runs_every_epoch_where_the_plan_would_refuse() -> None:
+    result = _check("fixed_runs_every_epoch")
+    assert result["epochs"] == [3, 3]
+    assert result["lines"] == 3
+    assert result["plan_calls"] == [0, 1]
+    assert result["refused"].startswith("one epoch needs about 3300s")
+    assert result["refused"].endswith("are left; halve image_size")

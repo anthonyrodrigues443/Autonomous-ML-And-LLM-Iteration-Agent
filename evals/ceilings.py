@@ -7,9 +7,9 @@ hand over an afternoon; this is the method as a command.
 
 Two rules make the number trustworthy:
 
-*The ceiling is measured through the product's own machinery.* Same `load_csv`
-call the CLI makes, same seed, same sealed holdout, same `ModelTarget` pipeline,
-same `core.scoring` ruler. A ceiling measured by a separate script with its own
+*The ceiling is measured through the product's own machinery.* Same loader the
+CLI calls, same seed, same sealed holdout, same `ModelTarget` pipeline, same
+`core.scoring` ruler. A ceiling measured by a separate script with its own
 preprocessing would be comparing the agent against a different game.
 
 *A ceiling is a lower bound and is labelled as one.* It is the best of a fixed
@@ -26,8 +26,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from evals import corpus
 from evals.store import Ceiling
-from iterate.adapters.data.tabular import load_csv
 from iterate.core.scoring import direction as metric_direction
 from iterate.core.scoring import task_for_metric
 from iterate.schemas.experiment import Candidate
@@ -135,7 +135,7 @@ def sweep(
     in the list is deterministic given its seed regardless of how many threads it
     runs on, so the ceiling is reproducible across machines.
     """
-    loaded = load_csv(dataset.path, target=dataset.target)
+    loaded = corpus.load_data(dataset)
     target = ModelTarget(loaded, metric=dataset.metric, name=dataset.name, max_threads=threads)
     direction = metric_direction(dataset.metric)
 
