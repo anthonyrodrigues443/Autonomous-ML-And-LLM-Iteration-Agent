@@ -1,14 +1,15 @@
-"""Measuring a vision ceiling: the best a fixed ladder of transfer-learning recipes
-reaches, no LLM.
+"""Measuring a vision ceiling: the best a fixed ladder of recipes reaches, no LLM.
 
 Same two rules as the model and prompt sweeps. The ceiling is measured through the
-product's own machinery: the `load_csv` call the CLI makes, the `prepare_images`
-step, one `DLModelTarget`, the `core.scoring` ruler. And it is a LOWER BOUND,
-labelled as one: every row is a `Recipe` the agent could have submitted, so an agent
-going past it is a real result and nothing clamps.
+product's own machinery: the loader the CLI calls, the `prepare_images` step, one
+`DLModelTarget`, the `core.scoring` ruler. And it is a LOWER BOUND, labelled as one:
+the first row is the target's own `baseline()` and every other row is a `Recipe` the
+agent could have submitted, so an agent going past it is a real result and nothing
+clamps.
 
-Each recipe runs once, and runs on MPS are not bitwise repeatable, so the detail
-records the holdout's standard error: two rows within it are a tie.
+Each recipe runs once, and runs on MPS are not bitwise repeatable, so for accuracy the
+detail records the holdout's standard error, and two rows within it are a tie; a number
+label records why it has none.
 """
 
 from __future__ import annotations
@@ -26,11 +27,10 @@ from evals import corpus
 from evals.config import REPO_ROOT
 from evals.store import Ceiling
 from iterate.adapters.data.images import prepare_images
-from iterate.adapters.data.tabular import load_csv
 from iterate.core.scoring import direction as metric_direction
 from iterate.core.scoring import task_for_metric
 from iterate.schemas.experiment import Candidate
-from iterate.targets.dl import RECIPE_JSON, DLModelTarget, Recipe
+from iterate.targets.dl import BASELINE, BASELINE_SIZE, RECIPE_JSON, SCRATCH, DLModelTarget, Recipe
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -40,7 +40,11 @@ if TYPE_CHECKING:
     from iterate.targets.dl import Runner
 
 # Bumped when the ladder changes, so a stored ceiling says which sweep produced it.
-METHOD = "vision_recipe_sweep_v1"
+METHOD = "vision_recipe_sweep_v2"
+_METHOD_STEM = "vision_recipe_sweep_v"
+# Rows can come in groups the sweep cannot see, so a per-row formula would understate the error.
+NO_ERROR_BAR = "none: holdout rows from one group move together and the sweep cannot see groups"
+_CARRIED = ", ceiling carried from "
 _LARGEST = 224
 _RESULT = "ceiling-json: "
 _BENCH = Recipe(unfreeze="all", epochs=3)
@@ -56,18 +60,21 @@ class RecipeResult:
     error: str = ""
     epochs_planned: int = 0
     epochs_run: int = 0
+    pearson: float | None = None
+    spearman: float | None = None
 
 
 def larger_size(base: int) -> int:
     return min(_LARGEST, base * 2)
 
 
-def recipes_for(base: int) -> list[Recipe]:
-    """The ladder, grouped by size so each size decodes once. The first is the probe
-    `baseline()` measures; a fine-tune with nothing else set is the Day 1 bench."""
+def recipes_for(base: int, task: str = "classification") -> list[Recipe]:
+    """The ladder, grouped by size so each size decodes once. The first is the fixed
+    recipe `baseline()` runs; a fine-tune with nothing else set is the Day 1 bench. A
+    number has no label smoothing, so its ladder leaves that rung out."""
     bench = replace(_BENCH, image_size=base)
     large = larger_size(base)
-    return [
+    rungs = [
         Recipe(image_size=base),
         Recipe(backbone="convnext_tiny", image_size=base),
         bench,
@@ -81,17 +88,55 @@ def recipes_for(base: int) -> list[Recipe]:
         Recipe(image_size=large),
         replace(bench, image_size=large),
     ]
+    if task == "regression":
+        rungs = [r for r in rungs if r.label_smoothing == 0]
+    return [replace(BASELINE, image_size=min(BASELINE_SIZE, base)), *rungs]
 
 
 def label(recipe: Recipe) -> str:
+    """What differs from the bench, or for a model trained from zero, from the baseline."""
     if recipe.unfreeze == "none":
         return f"probe {recipe.backbone} {recipe.image_size}px"
-    kind = "head" if recipe.unfreeze == "head" else "fine-tune"
+    scratch = recipe.backbone in SCRATCH
+    kind = "from zero" if scratch else "head" if recipe.unfreeze == "head" else "fine-tune"
+    reference = BASELINE if scratch else _BENCH
     parts = [f"{kind} {recipe.backbone} {recipe.image_size}px {recipe.epochs}ep"]
     for name in ("optimizer", "lr", "schedule", "augment", "label_smoothing", "head_init"):
-        if (value := getattr(recipe, name)) != getattr(_BENCH, name):
+        if (value := getattr(recipe, name)) != getattr(reference, name):
             parts.append(f"{name}={value}")
     return " ".join(parts)
+
+
+def standard_error(metric: str, value: float, n: int) -> tuple[float | None, str]:
+    """The holdout's standard error where one exists, or why a number label gets none."""
+    if not n:
+        return None, ""
+    if metric == "accuracy" and 0.0 <= value <= 1.0:
+        return math.sqrt(value * (1 - value) / n), ""
+    if task_for_metric(metric) == "regression":
+        return None, NO_ERROR_BAR
+    return None, ""
+
+
+def carry_stored(stored: Ceiling | None, new: Ceiling) -> tuple[Ceiling, bool]:
+    """The record to write, and whether it replaces the stored one. An older vision sweep
+    is replaced, with its ceiling carried when it was the better one; everything else,
+    tabular sweeps above all, keeps the store's keep-the-better rule."""
+    old = _version(stored.method) if stored is not None else None
+    ours = _version(new.method)
+    if stored is None or old is None or ours is None or old >= ours:
+        return new, False
+    if not _better(stored.ceiling, new.ceiling, new.direction):
+        return new, True
+    _, was_carried, source = stored.method.rpartition(_CARRIED)
+    origin = source if was_carried else stored.method.split()[0]
+    return replace(new, ceiling=stored.ceiling, method=f"{new.method}{_CARRIED}{origin}"), True
+
+
+def _version(method: str) -> int | None:
+    token = next(iter(method.split()), "")
+    number = token.removeprefix(_METHOD_STEM)
+    return int(number) if token.startswith(_METHOD_STEM) and number.isdigit() else None
 
 
 def _better(candidate: float, incumbent: float, direction: str) -> bool:
@@ -106,8 +151,9 @@ def sweep(
     on_progress: Callable[[RecipeResult], None] | None = None,
 ) -> tuple[Ceiling, list[RecipeResult]]:
     """Run the ladder on this dataset and return the best as its ceiling. The first
-    row is the probe, the same number `baseline()` gives."""
-    loaded = load_csv(dataset.path, target=dataset.target, task=task_for_metric(dataset.metric))
+    row is measured through `baseline()`, fixed and uncapped, and is the baseline."""
+    task = task_for_metric(dataset.metric)
+    loaded = corpus.load_data(dataset, task=task)
     prepared = prepare_images(loaded, dataset.path, into=into)
     target = DLModelTarget(
         prepared.dataset,
@@ -122,14 +168,20 @@ def sweep(
 
     results: list[RecipeResult] = []
     best: RecipeResult | None = None
-    for recipe in recipes_for(prepared.image_size):
+    for index, recipe in enumerate(recipes_for(prepared.image_size, task)):
         started = time.monotonic()
         ran: dict[str, Any] = {}
+        values: dict[str, float] = {}
         try:
-            outcome = target.run(
-                Candidate(description=label(recipe), changes=asdict(recipe), rationale="sweep")
+            outcome = (
+                target.baseline()
+                if index == 0
+                else target.run(
+                    Candidate(description=label(recipe), changes=asdict(recipe), rationale="sweep")
+                )
             )
             value = outcome.metrics.primary_value if outcome.metrics is not None else None
+            values = outcome.metrics.values if outcome.metrics is not None else {}
             error = outcome.error or ""
             ran = json.loads(outcome.artifacts.get(RECIPE_JSON, "{}"))
         except Exception as exc:
@@ -141,6 +193,8 @@ def sweep(
             error=error,
             epochs_planned=int(ran.get("epochs_planned", 0)),
             epochs_run=int(ran.get("epochs_run", 0)),
+            pearson=values.get("pearson"),
+            spearman=values.get("spearman"),
         )
         results.append(result)
         if on_progress:
@@ -154,11 +208,8 @@ def sweep(
         raise RuntimeError(f"{dataset.name}: no recipe in the sweep produced a score")
 
     n = prepared.dataset.n_test
-    standard_error = (
-        math.sqrt(best.score * (1 - best.score) / n)
-        if dataset.metric == "accuracy" and 0.0 <= best.score <= 1.0 and n
-        else None
-    )
+    error_bar, assumes = standard_error(dataset.metric, best.score, n)
+    correlations = task == "regression"
     device = target.device
     detail = json.dumps(
         {
@@ -167,11 +218,13 @@ def sweep(
             "image_size": prepared.image_size,
             "holdout": n,
             "left_out": len(prepared.dropped),
-            "standard_error": standard_error,
+            "standard_error": error_bar,
+            "standard_error_note": assumes,
             "recipes": [
                 {
                     "recipe": r.label,
                     "score": r.score,
+                    **({"pearson": r.pearson, "spearman": r.spearman} if correlations else {}),
                     "seconds": round(r.seconds, 1),
                     "epochs_planned": r.epochs_planned,
                     "epochs_run": r.epochs_run,
@@ -244,11 +297,14 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "METHOD",
+    "NO_ERROR_BAR",
     "RecipeResult",
+    "carry_stored",
     "label",
     "larger_size",
     "main",
     "recipes_for",
+    "standard_error",
     "sweep",
     "sweep_in_child",
 ]

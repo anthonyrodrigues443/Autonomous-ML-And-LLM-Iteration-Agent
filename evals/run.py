@@ -57,7 +57,7 @@ def _available(names: list[str] | None) -> list[corpus.Dataset]:
     selected = corpus.select(names)
     missing = [d for d in selected if not d.available]
     for dataset in missing:
-        _say(f"  skip {dataset.name}: no data at {dataset.path}")
+        _say(f"  skip {dataset.name}: no data at {', '.join(map(str, dataset.missing))}")
     return [d for d in selected if d.available]
 
 
@@ -160,8 +160,8 @@ def cmd_ceilings(args: argparse.Namespace) -> int:
 
             try:
                 if dataset.is_vision:
-                    # No LLM: twelve recipes through the vision target's own run(), in
-                    # a child process, so torch never loads beside the tabular sweeps.
+                    # No LLM, in a child process, so torch never loads beside the
+                    # tabular sweeps.
                     ceiling = vision_ceilings.sweep_in_child(dataset, on_line=_say)
                 elif dataset.is_prompt_task:
                     # One model call per record per technique — the slow one, but it
@@ -190,9 +190,16 @@ def cmd_ceilings(args: argparse.Namespace) -> int:
                 _say(f"  FAILED: {type(exc).__name__}: {exc}")
                 continue
 
-            store.put_ceiling(ceiling)
+            if dataset.is_vision:
+                stored = store.get_ceiling(dataset.name, ceiling.dataset_hash, dataset.metric)
+                ceiling, replace = vision_ceilings.carry_stored(stored, ceiling)
+                ceiling = store.put_ceiling(ceiling, replace=replace)
+            else:
+                store.put_ceiling(ceiling)
             gap = f", baseline {ceiling.baseline:.4f}" if ceiling.baseline is not None else ""
             _say(f"  ceiling {ceiling.ceiling:.4f}{gap}")
+            if dataset.is_vision:
+                _say(f"  stored {ceiling.method}")
     return 0
 
 
@@ -215,7 +222,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         cells = store.cells(config.conditions.fingerprint())
         for dataset in corpus.load():
             if not dataset.available:
-                _say(f"  {dataset.name:<24} MISSING  {dataset.path}")
+                _say(f"  {dataset.name:<24} MISSING  {', '.join(map(str, dataset.missing))}")
                 continue
             data_hash = dataset.content_hash()
             ceiling = store.get_ceiling(dataset.name, data_hash, dataset.metric)

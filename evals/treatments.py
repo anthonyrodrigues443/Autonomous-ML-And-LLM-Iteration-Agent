@@ -27,9 +27,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from evals import corpus
 from evals.store import Ceiling
 from iterate.adapters.compute.runner import LocalCodeRunner
-from iterate.adapters.data.tabular import load_csv
 from iterate.core.scoring import direction as metric_direction
 from iterate.core.scoring import task_for_metric
 from iterate.schemas.experiment import Candidate
@@ -243,7 +243,7 @@ def sweep(
     on_progress: Callable[[TreatmentResult], None] | None = None,
 ) -> tuple[Ceiling, list[TreatmentResult]]:
     """Score every treatment through the agent's code path; best one is the ceiling."""
-    loaded = load_csv(dataset.path, target=dataset.target)
+    loaded = corpus.load_data(dataset)
     target = ModelTarget(loaded, metric=dataset.metric, name=dataset.name)
     direction = metric_direction(dataset.metric)
     task = task_for_metric(dataset.metric)

@@ -33,14 +33,18 @@ The layout is flat on purpose: every image is `images/NNNNN.jpg` in shuffled ord
 and the label lives only in the CSV, so a holdout path can never tell a model its
 class. The archive's own filenames repeat the class name, which is exactly why.
 
-**Ceiling, measured by the eval sweep on 2026-09-16:** the resnet18 probe scores
-0.899 and the best of twelve recipes 0.986, convnext_tiny fine-tuned for 3 epochs at
-64 px: 8.7 points of headroom. One standard error on this holdout is 0.16 points, so
-resnet50 and resnet18 at 128 px, both 0.985, tie it.
+**Ceiling, measured by the eval sweep on 2026-09-16:** the baseline, a plain CNN
+trained from zero at 64 px for 20 epochs, scores 0.950, and the best of thirteen
+recipes 0.986, convnext_tiny fine-tuned for 3 epochs at 64 px: 3.6 points of
+headroom, about 22 standard errors, since one is 0.16 points on this holdout. resnet50
+and resnet18 at 128 px, both 0.985, tie the ceiling. The plain CNN beats every frozen
+backbone here, 0.899 for the resnet18 probe and 0.944 for convnext_tiny's: on tiles
+no ImageNet photograph resembles, features learned from the tiles themselves carry
+most of the way, and a pretrained model has to be fine-tuned to pass them.
 
 **Status:** data ready, and `DLModelTarget` measures its ceiling here in the eval
 sweep (`python -m evals.run ceilings --datasets eurosat`). The `iterate run` switch
-for images lands next.
+for images lands later in v0.6.
 
 **License:** MIT, per the Zenodo record. Cite: Helber, Bischke, Dengel, Borth. "EuroSAT: A Novel Dataset and
 Deep Learning Benchmark for Land Use and Land Cover Classification." IEEE JSTARS

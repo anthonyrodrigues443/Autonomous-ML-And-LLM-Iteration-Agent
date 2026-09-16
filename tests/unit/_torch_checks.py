@@ -8,19 +8,30 @@ the pytest process. Each check prints one JSON line.
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sys
+import tempfile
 import time
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pandas as pd
+from PIL import Image
 
+from iterate.adapters.data.images import prepare_images
+from iterate.adapters.data.tabular import load_csv
 from iterate.targets import dl
-from iterate.targets.dl import FitJob, Recipe, TorchRunner
+from iterate.targets.dl import DLModelTarget, FitJob, Recipe, RecipeError, TorchRunner
+
+_REAL_BUILD = dl._build
 
 
-def _tiny_build(torch_: Any, backbone: str, n_classes: int | None, head: Any) -> Any:
+def _tiny_build(torch_: Any, backbone: str, outputs: int | None, head: Any) -> Any:
     """A pinned tiny net whose head is named like resnet's, so freezing by name works."""
 
     class Tiny(torch_.nn.Module):  # type: ignore[misc]
@@ -33,7 +44,7 @@ def _tiny_build(torch_: Any, backbone: str, n_classes: int | None, head: Any) ->
                 torch_.nn.AdaptiveAvgPool2d(1),
                 torch_.nn.Flatten(),
             )
-            self.fc = torch_.nn.Identity() if n_classes is None else torch_.nn.Linear(4, n_classes)
+            self.fc = torch_.nn.Identity() if outputs is None else torch_.nn.Linear(4, outputs)
 
         def forward(self, x: Any) -> Any:
             return self.fc(self.body(x))
@@ -70,8 +81,8 @@ def fit_prints_epochs() -> dict[str, Any]:
     log: list[str] = []
     report = TorchRunner("cpu").fit(_job(2, time.perf_counter() + 120, log))
     return {
-        "shape": list(report.probabilities.shape),
-        "sums": bool(np.allclose(report.probabilities.sum(axis=1), 1.0)),
+        "shape": list(report.outputs.shape),
+        "sums": bool(np.allclose(report.outputs.sum(axis=1), 1.0)),
         "epochs": [report.epochs_planned, report.epochs_run],
         "heads": [line.split()[:2] for line in log],
     }
@@ -87,9 +98,9 @@ def trimmed_plan() -> dict[str, Any]:
         seen["steps"] = steps
         return real_schedule(torch_, opt, recipe, steps)
 
-    def spy_plan(wanted: int, epoch_seconds: float, seconds_left: float) -> int:
+    def spy_plan(wanted: int, epoch_seconds: float, seconds_left: float, **kwargs: Any) -> int:
         seen["epoch_seconds"], seen["left"] = epoch_seconds, seconds_left
-        return real_plan(wanted, epoch_seconds, seconds_left)
+        return real_plan(wanted, epoch_seconds, seconds_left, **kwargs)
 
     dl._schedule = spy_schedule  # type: ignore[assignment]
     dl.plan_epochs = spy_plan  # type: ignore[assignment]
@@ -111,7 +122,7 @@ def cut_epoch() -> dict[str, Any]:
     return {
         "epochs": [report.epochs_planned, report.epochs_run],
         "last": log[-1],
-        "shape": list(report.probabilities.shape),
+        "shape": list(report.outputs.shape),
     }
 
 
@@ -132,7 +143,7 @@ def head_copy() -> dict[str, Any]:
     weight = rng.normal(size=(3, 4)).astype(np.float32)
     bias = rng.normal(size=3).astype(np.float32)
     model = _tiny_build(torch, "resnet18", 3, (weight, bias))
-    predicted = dl._predict(torch, model, holdout, torch.device("cpu"))
+    predicted = dl._predict(torch, model, holdout, torch.device("cpu"), "classification")
     return {"same": bool((predicted.argmax(1) == (features @ weight.T + bias).argmax(1)).all())}
 
 
@@ -177,7 +188,7 @@ def timing_moves_nothing() -> dict[str, Any]:
         loss.backward()
         return loss, logits, yb
 
-    seconds = dl._time_train_step(model, opt, step)
+    seconds = dl._time_train_step(model, opt, step, lambda out, y: int((out.argmax(1) == y).sum()))
     after = model.state_dict()
     return {
         "same": all(bool(torch.equal(before[k], after[k])) for k in before),
@@ -210,6 +221,127 @@ def head_only_keeps_batch_norm() -> dict[str, Any]:
     return out
 
 
+def simple_cnn_parameters() -> dict[str, Any]:
+    torch = dl._torch()
+    counts = {}
+    for outputs in (1, 10, 102):
+        model = _REAL_BUILD(torch, "simple_cnn", outputs, None)
+        counts[str(outputs)] = sum(p.numel() for p in model.parameters())
+    model = _REAL_BUILD(torch, "simple_cnn", 10, None).eval()
+    with torch.no_grad():
+        shapes = [list(model(torch.zeros(2, 3, s, s)).shape) for s in (32, 64)]
+    return {
+        "counts": counts,
+        "children": [name for name, _ in model.named_children()],
+        "shapes": shapes,
+    }
+
+
+def _brightness(n: int, seed: int, size: int = 16) -> tuple[np.ndarray, np.ndarray]:
+    """Noisy grey images whose label is their mean pixel value."""
+    rng = np.random.default_rng(seed)
+    level = rng.integers(20, 236, n)
+    noise = rng.integers(-20, 21, (n, 3, size, size))
+    pixels = np.clip(level[:, None, None, None] + noise, 0, 255).astype(np.uint8)
+    return pixels, pixels.reshape(n, -1).mean(axis=1)
+
+
+def regression_fit() -> dict[str, Any]:
+    dl._build = _REAL_BUILD
+    train, numbers = _brightness(160, 0)
+    holdout, truth = _brightness(40, 1)
+    centre, scale = numbers.mean(), numbers.std()
+    labels = ((numbers - centre) / scale).astype(np.float32)
+    fit = replace(dl.BASELINE, epochs=15, batch_size=16, image_size=16)
+    log: list[str] = []
+    job = FitJob(
+        train, holdout, labels, fit, 1, None, math.inf, log.append, task="regression", fixed=True
+    )
+    report = TorchRunner("cpu").fit(job)
+    predicted = report.outputs * scale + centre
+    r2 = 1 - ((predicted - truth) ** 2).sum() / ((truth - truth.mean()) ** 2).sum()
+    return {
+        "shape": list(report.outputs.shape),
+        "epochs": [report.epochs_planned, report.epochs_run],
+        "r2": float(r2),
+        "r2_lines": sum(" train_r2=" in line for line in log),
+        "acc_lines": sum("train_acc=" in line for line in log),
+        "loss_and_r2": [
+            [float(m[1]), float(m[2])]
+            for line in log
+            if (m := re.search(r"loss=(\S+) train_r2=(\S+)", line))
+        ],
+    }
+
+
+def ridge_head_copy() -> dict[str, Any]:
+    import torchvision.models as tvm
+
+    torch = dl._torch()
+    checkpoints = Path(torch.hub.get_dir()) / "checkpoints"
+    cached = checkpoints / Path(tvm.ResNet18_Weights.IMAGENET1K_V1.url).name
+    if not cached.is_file():
+        return {"skip": f"resnet18 weights are not cached at {cached}; this check never downloads"}
+    dl._build = _REAL_BUILD
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp) / "data"
+        (folder / "images").mkdir(parents=True)
+        pixels, numbers = _brightness(40, 2, size=32)
+        rows = []
+        for i, image in enumerate(pixels):
+            Image.fromarray(image.transpose(1, 2, 0)).save(folder / "images" / f"{i:03d}.png")
+            rows.append({"image": f"images/{i:03d}.png", "label": float(numbers[i])})
+        pd.DataFrame(rows).to_csv(folder / "data.csv", index=False)
+        loaded = load_csv(folder / "data.csv", target="label", task="regression")
+        prepared = prepare_images(loaded, folder / "data.csv", into=Path(tmp) / "cache")
+        target = DLModelTarget(
+            prepared.dataset,
+            column=prepared.column.column,
+            metric="rmse",
+            runner=TorchRunner("cpu"),
+            image_size=32,
+        )
+        probe = target._probe("resnet18", 32)[2]
+        head = target._probe_head("resnet18", 32)
+        _, held = target._decoded(32)
+        model = dl._build(torch, "resnet18", 1, head)
+        copied = dl._predict(torch, model, held, torch.device("cpu"), "regression")
+    return {
+        "shape": [list(copied.shape), list(probe.shape)],
+        "gap": float(np.abs(copied - probe).max()),
+    }
+
+
+def fixed_runs_every_epoch() -> dict[str, Any]:
+    dl.time_steps = lambda step, k=10: 1000.0  # type: ignore[assignment]
+    calls: list[int] = []
+    real_plan = dl.plan_epochs
+
+    def spy_plan(*args: Any, **kwargs: Any) -> int:
+        calls.append(1)
+        return real_plan(*args, **kwargs)
+
+    dl.plan_epochs = spy_plan  # type: ignore[assignment]
+    log: list[str] = []
+    job = replace(_job(3, math.inf, log), fixed=True)
+    report = TorchRunner("cpu").fit(job)
+    lines, fixed_calls = len(log), len(calls)
+    try:
+        scratch = replace(job.recipe, backbone="simple_cnn")
+        TorchRunner("cpu").fit(
+            replace(job, recipe=scratch, fixed=False, deadline=time.perf_counter() + 120)
+        )
+        refused = ""
+    except RecipeError as exc:
+        refused = str(exc)
+    return {
+        "epochs": [report.epochs_planned, report.epochs_run],
+        "lines": lines,
+        "plan_calls": [fixed_calls, len(calls)],
+        "refused": refused,
+    }
+
+
 CHECKS = {
     f.__name__: f
     for f in (
@@ -222,6 +354,10 @@ CHECKS = {
         head_copy,
         mps_starts,
         mps_cap,
+        simple_cnn_parameters,
+        regression_fit,
+        ridge_head_copy,
+        fixed_runs_every_epoch,
     )
 }
 

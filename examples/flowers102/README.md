@@ -32,15 +32,17 @@ The layout is flat on purpose: every image is `images/NNNNN.jpg` in shuffled ord
 and the label lives only in the CSV, so a holdout path can never tell a model its
 class. The script asserts that before writing anything.
 
-**Ceiling, measured by the eval sweep on 2026-09-16:** the resnet18 probe scores
-0.892 and the best of twelve recipes 0.974, convnext_tiny fine-tuned for 3 epochs at
-160 px: 8.3 points of headroom. One standard error on this holdout is 0.4 points, so
-resnet18 fine-tuned at 224 px, 0.972, ties it.
+**Ceiling, measured by the eval sweep on 2026-09-16:** the baseline, a plain CNN
+trained from zero at 64 px for 20 epochs, scores 0.554, and the best of thirteen
+recipes 0.974, convnext_tiny fine-tuned for 3 epochs at 160 px: 42 points of
+headroom. One standard error on this holdout is 0.4 points, so resnet18 fine-tuned at
+224 px, 0.972, ties it. The resnet18 probe on frozen features scores 0.892, so most of
+the headroom is pretrained features, and the rest is fine-tuning them.
 
 **Status:** data ready, and `DLModelTarget` measures its ceiling here in the eval
 sweep (`python -m evals.run ceilings --datasets flowers102`). The `iterate run`
-switch for images lands next; until then a run on this folder stops once it is
-linked.
+switch for images lands later in v0.6; until then a run on this folder stops once it
+is linked.
 
 **License:** Oxford states no license for the images. The script downloads them for
 local use and this repo redistributes nothing. Cite: Nilsback, M-E. and Zisserman,

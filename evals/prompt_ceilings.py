@@ -28,8 +28,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from evals import corpus
 from evals.store import Ceiling
-from iterate.adapters.data.tabular import load_csv, with_smaller_holdout
+from iterate.adapters.data.tabular import with_smaller_holdout
 from iterate.core.prompting import Prompt
 from iterate.core.scoring import direction as metric_direction
 from iterate.targets.prompt import PromptTarget, label_set
@@ -110,8 +111,7 @@ def scoring_techniques(
     return {
         "minimal": Prompt(system=base, user_template="{input}"),
         "describe-the-scale": Prompt(
-            system=base
-            + f"\n\nSay what the endpoints mean before deciding: {low:g} is the "
+            system=base + f"\n\nSay what the endpoints mean before deciding: {low:g} is the "
             f"extreme low end and {high:g} the extreme high end, with the midpoint "
             "meaning a genuine halfway case.",
             user_template="{input}",
@@ -120,8 +120,7 @@ def scoring_techniques(
             system=base + "\n\nWorked examples:\n\n" + worked, user_template="{input}"
         ),
         "use-the-whole-range": Prompt(
-            system=base
-            + "\n\nUse the whole range. Commit to a value near an extreme when the "
+            system=base + "\n\nUse the whole range. Commit to a value near an extreme when the "
             "case warrants it rather than retreating to the middle.",
             user_template="{input}",
         ),
@@ -130,10 +129,8 @@ def scoring_techniques(
             user_template="{input}",
         ),
         "scale-plus-examples": Prompt(
-            system=base
-            + f"\n\n{low:g} is the extreme low end and {high:g} the extreme high end. "
-            "Use the whole range.\n\nWorked examples:\n\n"
-            + worked,
+            system=base + f"\n\n{low:g} is the extreme low end and {high:g} the extreme high end. "
+            "Use the whole range.\n\nWorked examples:\n\n" + worked,
             user_template="{input}",
         ),
     }
@@ -205,7 +202,7 @@ def sweep(
     on_progress: Callable[[TechniqueResult], None] | None = None,
 ) -> tuple[Ceiling, list[TechniqueResult]]:
     """Score every technique on the same records and return the best as the ceiling."""
-    loaded = with_smaller_holdout(load_csv(dataset.path, target=dataset.target), records)
+    loaded = with_smaller_holdout(corpus.load_data(dataset), records)
     direction = metric_direction(dataset.metric)
     columns = list(loaded.features)
 
@@ -267,8 +264,12 @@ def sweep(
             measured_at=datetime.now(UTC).isoformat(),
             detail=json.dumps(
                 [
-                    {"technique": r.name, "score": r.score, "seconds": round(r.seconds, 1),
-                     "error": r.error}
+                    {
+                        "technique": r.name,
+                        "score": r.score,
+                        "seconds": round(r.seconds, 1),
+                        "error": r.error,
+                    }
                     for r in results
                 ]
             ),

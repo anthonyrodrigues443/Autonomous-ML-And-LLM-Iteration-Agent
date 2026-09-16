@@ -300,3 +300,7 @@ examples/eurosat/images/
 examples/eurosat/data.csv
 examples/eurosat/*.zip
 examples/eurosat/.extract/
+examples/cyclone_wind/images/
+examples/cyclone_wind/train.csv
+examples/cyclone_wind/holdout.csv
+examples/cyclone_wind/training_set_*.csv

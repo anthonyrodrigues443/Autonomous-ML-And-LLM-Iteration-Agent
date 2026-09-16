@@ -9,8 +9,9 @@ Public-dataset demos that ship with `iterate`.
 | `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | **working** — but measured at f1_macro 0.989 for a minimal prompt, so it has almost no headroom |
 | `hate_speech_davidson/` | `PromptTarget` | Davidson hate / offensive / neither (public) | **working, the prompt example worth running** |
 | `sts_benchmark/` | `PromptTarget` | STS-B sentence similarity, scored 0-5 (public) | **working** — the REGRESSION example |
-| `flowers102/` | `DLModelTarget` | Oxford Flowers102, 102 species (public) | data ready; the target exists and the eval sweep measures its ceiling; the run switch lands next |
-| `eurosat/` | `DLModelTarget` | EuroSAT satellite land use, 10 classes (public, MIT) | data ready; the target exists and the eval sweep measures its ceiling; the vision certification dataset |
+| `flowers102/` | `DLModelTarget` | Oxford Flowers102, 102 species (public) | data ready; the eval sweep measures its ceiling; the run switch lands later in v0.6 |
+| `eurosat/` | `DLModelTarget` | EuroSAT satellite land use, 10 classes (public, MIT) | data ready; the eval sweep measures its ceiling; the vision certification dataset |
+| `cyclone_wind/` | `DLModelTarget` | NASA storm wind speed from satellite frames (public, CC-BY-4.0) | data ready; the eval sweep measures its ceiling; the NUMBER-label vision example, split by storm |
 
 ### Which prompt example to run
 
