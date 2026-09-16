@@ -23,17 +23,17 @@ from __future__ import annotations
 import hashlib
 import tomllib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 from evals.config import DATASETS_DIR, REPO_ROOT
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 _DEFAULT_DATA_FILE = "data.csv"
 # Enough of a sha256 to make a collision a non-issue while staying readable in a
 # table cell. Same length the package uses for its own data fingerprints.
 _HASH_CHARS = 16
+# Only a vision dataset needs saying: a prompt dataset is known by its task line and
+# everything else is tabular.
+FAMILIES = ("", "tabular", "prompt", "vision")
 
 
 @dataclass(frozen=True)
@@ -50,10 +50,16 @@ class Dataset:
     # Its presence is what tells the harness to sweep prompt techniques for this
     # dataset's ceiling rather than model families.
     task: str = ""
+    # "vision" for a CSV of image paths; the ceiling is then a sweep of recipes.
+    family: str = ""
 
     @property
     def is_prompt_task(self) -> bool:
         return bool(self.task.strip())
+
+    @property
+    def is_vision(self) -> bool:
+        return self.family.strip() == "vision"
 
     @property
     def available(self) -> bool:
@@ -76,7 +82,30 @@ class Dataset:
         with self.path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1 << 20), b""):
                 digest.update(chunk)
+        if self.is_vision:
+            # The CSV holds only paths, so an image swapped behind it would keep the key.
+            digest.update(_image_digest(self.path, self.target).encode())
         return digest.hexdigest()[:_HASH_CHARS]
+
+
+def _image_digest(csv: Path, target: str) -> str:
+    """Every image the CSV names, in row order, by its bytes; a missing one as missing."""
+    import pandas as pd
+
+    from iterate.adapters.data.images import detect_image_column
+
+    frame = pd.read_csv(csv)
+    column = detect_image_column(frame, [c for c in frame.columns if c != target], csv)
+    if column is None:
+        raise BadDatasetSpecError(f"{csv}: a vision dataset needs one column of image paths")
+    digest = hashlib.sha256()
+    for value in frame[column.column].astype(str):
+        path = Path(value) if Path(value).is_absolute() else column.root / value
+        try:
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+        except OSError:
+            digest.update(b"missing")
+    return digest.hexdigest()
 
 
 class BadDatasetSpecError(Exception):
@@ -91,6 +120,20 @@ def _load_one(spec_path: Path) -> Dataset:
     if missing:
         raise BadDatasetSpecError(f"{spec_path}: missing {', '.join(missing)}")
 
+    family = str(raw.get("family", "")).strip()
+    if family not in FAMILIES:
+        raise BadDatasetSpecError(
+            f"{spec_path}: family {family!r} is not one of {', '.join(f for f in FAMILIES if f)}"
+        )
+
+    task = str(raw.get("task", "")).strip()
+    if family == "prompt" and not task:
+        raise BadDatasetSpecError(f"{spec_path}: family 'prompt' needs a task line")
+    if task and family in ("tabular", "vision"):
+        raise BadDatasetSpecError(
+            f"{spec_path}: a task line makes this a prompt dataset, not {family}"
+        )
+
     declared = str(raw.get("data", "")).strip()
     path = (REPO_ROOT / declared) if declared else (spec_path.parent / _DEFAULT_DATA_FILE)
 
@@ -102,6 +145,7 @@ def _load_one(spec_path: Path) -> Dataset:
         source=str(raw.get("source", "")),
         notes=str(raw.get("notes", "")),
         task=str(raw.get("task", "")),
+        family=family,
     )
 
 

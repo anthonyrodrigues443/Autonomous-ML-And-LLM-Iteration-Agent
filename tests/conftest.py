@@ -2,12 +2,18 @@
 
 Populated as the framework lands. v1 conftest stays intentionally light.
 """
+
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @pytest.fixture(autouse=True)
@@ -28,3 +34,12 @@ def repo_root() -> Path:
 def env_has_anthropic_key() -> bool:
     """True if ANTHROPIC_API_KEY is set (skip live-API tests otherwise)."""
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _torch_stays_out_of_the_test_process() -> Iterator[None]:
+    """torch and lightgbm cannot share a process on macOS, so every torch test runs in a
+    child. Checked when the session ends, so a file collected late cannot load it here
+    unnoticed."""
+    yield
+    assert "torch" not in sys.modules, "a test loaded torch into the pytest process"

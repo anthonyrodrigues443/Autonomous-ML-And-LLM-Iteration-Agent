@@ -18,8 +18,8 @@ from typing import Any
 
 from evals import ceilings as ceilings_mod
 from evals import config as config_mod
-from evals import corpus, prompt_ceilings, report, treatments
-from evals.runner import CellSpec, command_for, run_cell, supports_dataset
+from evals import corpus, prompt_ceilings, report, treatments, vision_ceilings
+from evals.runner import CellSpec, command_for, run_cell, skip_reason, supports_dataset
 from evals.store import STATUS_OK, Store
 
 
@@ -84,9 +84,13 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             and (version, dataset.name, dataset.content_hash(), repeat) not in done
         ]
         for version in versions:
-            skipped = [d.name for d in datasets if not supports_dataset(version, d)]
+            skipped = [
+                f"{d.name} ({reason})"
+                for d in datasets
+                if (reason := skip_reason(version, d)) is not None
+            ]
             if skipped:
-                _say(f"  {version}: skipping {', '.join(skipped)} (predates PromptTarget)")
+                _say(f"  {version}: skipping {', '.join(skipped)}")
 
         _say(
             f"{len(todo)} cells to run "
@@ -135,7 +139,9 @@ def cmd_ceilings(args: argparse.Namespace) -> int:
                 )
                 continue
 
-            if dataset.is_prompt_task:
+            if dataset.is_vision:
+                kind = "vision recipes"
+            elif dataset.is_prompt_task:
                 kind = "prompt techniques"
             elif args.treatments:
                 kind = "feature treatments"
@@ -153,7 +159,11 @@ def cmd_ceilings(args: argparse.Namespace) -> int:
                 _say(f"    {label:<44} {value}  {result.seconds:.0f}s")
 
             try:
-                if dataset.is_prompt_task:
+                if dataset.is_vision:
+                    # No LLM: twelve recipes through the vision target's own run(), in
+                    # a child process, so torch never loads beside the tabular sweeps.
+                    ceiling = vision_ceilings.sweep_in_child(dataset, on_line=_say)
+                elif dataset.is_prompt_task:
                     # One model call per record per technique — the slow one, but it
                     # is the only thing that makes a prompt run's number readable,
                     # and the answer cache makes a re-measure free.

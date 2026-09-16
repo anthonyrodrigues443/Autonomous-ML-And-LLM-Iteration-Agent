@@ -2,7 +2,7 @@
 
 Internal. Not a product feature. Regenerate with `make eval-report`.
 
-- generated: 2026-08-11 07:58 UTC
+- generated: 2026-09-15 20:54 UTC
 - model: `gemma4:12b` on `ollama`
 - budget: 10 iterations, patience 3, 2 repeats per cell
 - conditions fingerprint: `25143ee9f9b7`
@@ -24,6 +24,8 @@ Each cell is the median across repeats of the fraction of AVAILABLE gain the age
 | adult_income | f1 | `6fd48562938c85d8` | 0.7187 | 0.7259 | brute_force_sweep_v1 (9 models) | 2026-08-08 |
 | churn | average_precision | `608be8cce4edba4f` | 0.6449 | 0.6467 | feature_treatment_sweep_v2 (best: frequency-encoding, 8 treatments) | 2026-08-10 |
 | diamonds | rmse | `9574730b03aba241` | 549.0567 | 527.4767 | feature_treatment_sweep_v2 (best: numeric-interactions, 7 treatments) | 2026-08-10 |
+| eurosat | accuracy | `cdbad85d28deec04` | 0.8989 | 0.9857 | vision_recipe_sweep_v1 (12 of 12 recipes on mps, best: fine-tune convnext_tiny 64px 3ep) | 2026-09-15 |
+| flowers102 | accuracy | `fc33b843fabf3b0c` | 0.8918 | 0.9743 | vision_recipe_sweep_v1 (12 of 12 recipes on mps, best: fine-tune convnext_tiny 160px 3ep) | 2026-09-15 |
 | hate_speech_davidson | f1_macro | `e63c93bf6eb7d7b9` | 0.5862 | 0.6822 | prompt_technique_sweep_v1 (best: few-shot, 200 records) | 2026-08-09 |
 | heart_risk | average_precision | `f30b84b747c1d263` | 0.8967 | 0.9000 | feature_treatment_sweep_v2 (best: calibrated, 8 treatments) | 2026-08-10 |
 | laptop_price | rmse | `e5cd3296b994d10e` | 411.8904 | 248.8509 | brute_force_sweep_v1 (9 models) | 2026-08-08 |
