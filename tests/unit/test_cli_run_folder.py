@@ -1056,3 +1056,142 @@ def test_a_proven_plan_whose_split_is_refused_stops_without_asking(
     assert result.exit_code != 0
     assert asked == []
     assert "3 classes need at least 3 images on each side" in _plain(result.output)
+
+
+# ─── only the data given ──────────────────────────────────────────────────
+
+
+def _no_client(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    built: list[str] = []
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        built.append("client")
+        raise AssertionError("a client was built")
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", refuse)
+    return built
+
+
+def test_a_csv_row_outside_its_folder_is_refused_before_any_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built = _no_client(monkeypatch)
+    root = tmp_path / "flat"
+    for i in range(24):
+        _png(root / "images" / f"{i:03d}.png", i)
+    _png(tmp_path / "elsewhere" / "secret.png", 99)
+    rows = [f"images/{i:03d}.png" for i in range(24)] + [str(tmp_path / "elsewhere" / "secret.png")]
+    pd.DataFrame({"image": rows, "label": ["a", "b"] * 12 + ["a"]}).to_csv(
+        root / "data.csv", index=False
+    )
+    result = runner.invoke(app, ["run", "--data", str(root / "data.csv"), "--target", "label"])
+    assert result.exit_code == 2, result.output
+    assert "1 image path(s) lead outside" in _plain(result.output)
+    assert built == []
+
+
+def test_a_holdout_csv_is_checked_against_its_own_folder_before_any_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built = _no_client(monkeypatch)
+    train = tmp_path / "train"
+    for i in range(12):
+        _png(train / "images" / f"{i:03d}.png", i)
+    pd.DataFrame(
+        {"image": [f"images/{i:03d}.png" for i in range(12)], "label": ["a", "b"] * 6}
+    ).to_csv(train / "train.csv", index=False)
+    (tmp_path / "holdout").mkdir()
+    pd.DataFrame(
+        {"image": ["../train/images/000.png", "../train/images/001.png"], "label": ["a", "b"]}
+    ).to_csv(tmp_path / "holdout" / "h.csv", index=False)
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--train",
+            str(train / "train.csv"),
+            "--holdout",
+            str(tmp_path / "holdout" / "h.csv"),
+            "--target",
+            "label",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert "h.csv: 2 image path(s) lead outside" in _plain(result.output)
+    assert built == []
+
+
+@pytest.mark.parametrize("kind", ["link_out", "loop"])
+def test_a_folder_that_leads_outside_itself_is_refused_before_any_copy(
+    tmp_path: Path, kind: str
+) -> None:
+    source = _class_tree(tmp_path / "pets")
+    if kind == "link_out":
+        _png(tmp_path / "elsewhere" / "secret.png", 99)
+        (source / "cat" / "late.png").symlink_to(tmp_path / "elsewhere" / "secret.png")
+    else:
+        (source / "cat" / "also").symlink_to("../dog")
+        (source / "dog" / "also").symlink_to("../cat")
+    result = runner.invoke(app, ["run", "--data", str(source), "--yes"])
+    assert result.exit_code == 2, result.output
+    says = "lead outside the folder you gave" if kind == "link_out" else "links go round in a loop"
+    assert says in _plain(result.output)
+    assert not _data_dir(tmp_path).exists()
+
+
+def test_the_kaggle_layout_links_with_labels_beside_the_folder(tmp_path: Path) -> None:
+    root = tmp_path / "dog-breed-identification"
+    breeds = ["beagle", "pug", "whippet"]
+    rows = []
+    for i in range(36):
+        ident = f"{i * 7919:08x}"
+        _png(root / "train" / f"{ident}.jpg", i, klass=i % 3)
+        rows.append({"id": ident, "breed": breeds[i % 3]})
+    pd.DataFrame(rows).to_csv(root / "labels.csv", index=False)
+    for i in range(12):
+        _png(root / "test" / f"{i * 104729:08x}.jpg", 50 + i)
+    pd.DataFrame({"id": [f"{i * 104729:08x}" for i in range(12)]}).to_csv(
+        root / "sample_submission.csv", index=False
+    )
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(root / "train"),
+            "--labels",
+            str(root / "labels.csv"),
+            "--key",
+            "id",
+            "--target",
+            "breed",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "linked:" in _plain(result.output)
+
+
+def test_a_copy_command_prints_on_a_line_of_its_own_that_pastes(tmp_path: Path) -> None:
+    import subprocess
+
+    outside = _class_tree(tmp_path / "elsewhere")
+    root = _class_tree(tmp_path / "My Drive" / "pets")
+    (root / "fox").symlink_to(outside / "dog")
+    result = runner.invoke(app, ["run", "--data", str(root)], env={"COLUMNS": "60"})
+    assert result.exit_code == 2, result.output
+    [command] = [line for line in result.output.splitlines() if line.startswith("cp ")]
+    subprocess.run(command, shell=True, check=True)
+    copy = f"{root.resolve()}-copy"
+    linked = runner.invoke(app, ["run", "--data", copy, "--yes"])
+    assert linked.exit_code == 0, linked.output
+    assert "linked:" in _plain(linked.output)
+
+
+def test_a_link_that_leads_nowhere_is_a_refusal_not_a_traceback(tmp_path: Path) -> None:
+    root = _class_tree(tmp_path / "pets")
+    (root / "cat" / "x.png").symlink_to(root / "cat" / "x.png")
+    result = runner.invoke(app, ["run", "--data", str(root), "--yes"])
+    assert result.exit_code == 2, result.output
+    assert "is a link that leads nowhere" in _plain(result.output)
+    assert not any(line.startswith("cp ") for line in result.output.splitlines())

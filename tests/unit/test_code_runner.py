@@ -24,9 +24,7 @@ from iterate.adapters.compute.runner import (
 
 def test_local_runner_round_trips_inputs_and_outputs() -> None:
     script = (
-        "data = open('in.txt').read()\n"
-        "open('out.txt', 'w').write(data.upper())\n"
-        "print('done')\n"
+        "data = open('in.txt').read()\nopen('out.txt', 'w').write(data.upper())\nprint('done')\n"
     )
     result = LocalCodeRunner().run(
         script,
@@ -253,3 +251,25 @@ def test_run_result_succeeded_logic() -> None:
     assert RunResult(stdout="", stderr="", exit_code=0).succeeded
     assert not RunResult(stdout="", stderr="", exit_code=1).succeeded
     assert not RunResult(stdout="", stderr="", exit_code=0, timed_out=True).succeeded
+
+
+def test_local_runner_install_carries_a_constraints_file_and_the_install_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from iterate.adapters.compute import deps, runner
+
+    commands: list[tuple[list[str], float]] = []
+
+    class _Done:
+        returncode = 0
+        stderr = ""
+
+    def fake(cmd: list[str], **kw: Any) -> _Done:
+        commands.append((cmd, kw["timeout"]))
+        return _Done()
+
+    monkeypatch.setattr("subprocess.run", fake)
+    assert runner._pip_install(["catboost"], timeout=3600) == ""
+    assert commands
+    assert all("-c" in cmd for cmd, _ in commands)
+    assert {timeout for _, timeout in commands} == {deps.INSTALL_TIMEOUT}

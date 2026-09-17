@@ -32,6 +32,14 @@ def config_path() -> Path:
     return config_dir() / "config.toml"
 
 
+def cache_dir() -> Path:
+    """Everything iterate caches outside a project. A relative XDG_CACHE_HOME is
+    ignored, as the XDG spec says. Imports nothing heavy."""
+    base = os.environ.get("XDG_CACHE_HOME", "")
+    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
+    return root / "iterate"
+
+
 def exists() -> bool:
     return config_path().exists()
 
@@ -68,6 +76,7 @@ def _toml_line(key: str, value: Any) -> str:
 
 __all__ = [
     "PERSISTED_KEYS",
+    "cache_dir",
     "config_dir",
     "config_path",
     "exists",

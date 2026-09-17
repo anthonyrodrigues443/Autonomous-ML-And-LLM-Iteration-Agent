@@ -38,7 +38,8 @@ from iterate.config import get_settings
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from iterate.adapters.data.linking import Inventory, LinkedFrames
+    from iterate.adapters.data.images import OutsideDataError
+    from iterate.adapters.data.linking import Inventory, LinkedFrames, LinkError
     from iterate.adapters.data.workspace import Sides
     from iterate.core.interactive import RunController
     from iterate.core.linker import Linker
@@ -116,8 +117,9 @@ def setup() -> None:
             "[dim]On local, generated code runs on THIS machine with your permissions.[/dim]"
         )
         install = typer.confirm(
-            "May iterate pip-install packages your generated code imports "
-            "(into iterate's environment)?",
+            "May iterate install packages your generated code imports into iterate's "
+            "environment? It never changes torch, and an install that would change what "
+            "iterate is running on waits for the next run.",
             default=False,
         )
 
@@ -166,6 +168,15 @@ def _transfer(hint: LinkPlan, inv: Inventory) -> LinkPlan | None:
     return moved.model_copy(update={"notes": [*moved.notes, note]})
 
 
+def _refused(exc: LinkError | OutsideDataError) -> typer.BadParameter:
+    """A refusal as a usage error. A copy command goes first, on a line of its own:
+    the error panel wraps at the terminal width, and a wrapped command does not paste."""
+    if exc.command is None:
+        return typer.BadParameter(str(exc))
+    console.print(exc.command, soft_wrap=True, highlight=False, markup=False)
+    return typer.BadParameter(f"{exc.reason}. The copy command is printed above")
+
+
 def _side(
     inv: Inventory,
     *,
@@ -184,7 +195,7 @@ def _side(
         return linking.plan(inv, labels=labels, key=key, target=target), None, ""
     except linking.LinkError as exc:
         if not exc.ambiguous or labels is not None:
-            raise typer.BadParameter(str(exc)) from exc
+            raise _refused(exc) from exc
         refusal = str(exc)
     if hint is not None:
         moved = _transfer(hint, inv)
@@ -349,7 +360,7 @@ def _link_folder(
     try:
         inventories = [linking.inventory(s) for s in sources]
     except linking.LinkError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise _refused(exc) from exc
 
     remembered = None if labels is not None else workspace.recall_plan(sources, out=out_root)
     plans = _revalidated(remembered, inventories) if remembered else None
@@ -375,7 +386,7 @@ def _link_folder(
     try:
         frames, shown = _combined(plans, inventories)
     except linking.LinkError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise _refused(exc) from exc
 
     both, refused_split = split(shown, frames)
     if recalled and both is not None and workspace.recall_drop(sources, out=out_root):
@@ -515,7 +526,7 @@ def _link_folder(
     try:
         ws = workspace.write(shown, frames, sources=sources, out=out_root, both=both)
     except linking.LinkError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise _refused(exc) from exc
     monitor.save(report, ws.root)
     if any(p.source == "agent" for p in plans) and not recalled:
         asked_to_drop = bool(both.dropped) and shown.split != "ours"
@@ -531,6 +542,28 @@ def _link_folder(
         f"  monitor.json  {found} finding(s){dropped}"
     )
     return ws
+
+
+def _install_saved_packages(*, install: bool | None, compute: str | None) -> None:
+    from iterate.adapters.compute import deps
+
+    cfg = userconfig.load_user_config()
+    venue = (compute or cfg.get("compute") or "local").lower()
+    if venue != "local":
+        return
+    consent = install if install is not None else bool(cfg.get("install", False))
+    installer = deps.Installer(pending=deps.pending_path())
+    waiting = installer.pending()
+    if not waiting:
+        return
+    if not consent:
+        names = ", ".join(sorted(e["package"] for e in waiting))
+        console.print(
+            f"[dim]installs: {escape(names)} saved by an earlier run, waiting for --install[/dim]"
+        )
+        return
+    for line in installer.install_pending():
+        console.print(f"[dim]installs: {escape(line)}[/dim]")
 
 
 @app.command()
@@ -681,7 +714,9 @@ def run(
     install: bool | None = typer.Option(
         None,
         "--install/--no-install",
-        help="Let iterate install packages your code imports (local only; e2b always installs).",
+        help="Let iterate install packages a session imports (local; e2b always installs in "
+        "its sandbox). Cells never install, and on local runs torch and torchvision never "
+        "change mid-run.",
     ),
     max_iterations: int = typer.Option(
         10, "--max-iterations", min=1, help="Hard cap on experiments."
@@ -722,6 +757,9 @@ def run(
     ),
 ) -> None:
     """Run the agent on a tabular dataset."""
+    # An install saved by the last run may move numpy, pandas or scikit-learn, which
+    # this process must not have loaded yet.
+    _install_saved_packages(install=install, compute=compute)
     # Heavy imports live here, not at module top, so `iterate version`/`--help`
     # don't pay the pandas + scikit-learn import cost.
     from iterate.adapters.compute.kernel import E2BKernel, LocalKernel, StatefulKernel
@@ -741,7 +779,7 @@ def run(
     from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor
     from iterate.core.terminator import default_terminator
-    from iterate.llm.factory import build_client
+    from iterate.llm.factory import api_key_for, build_client
     from iterate.targets.model import ModelTarget
 
     # ─── One input split here, or two inputs the user split ────────────────
@@ -897,11 +935,13 @@ def run(
             f"[dim]target {target!r} read as {dataset.task} "
             f"({describe_target(dataset.train_target)}); pass --metric to override[/dim]"
         )
-    from iterate.adapters.data.images import detect_image_column
+    from iterate.adapters.data.images import OutsideDataError, image_column
 
-    first_file = data if data is not None else train
-    assert first_file is not None
-    if detect_image_column(dataset.train_features, dataset.features, first_file) is not None:
+    try:
+        found = image_column(dataset)
+    except OutsideDataError as exc:
+        raise _refused(exc) from exc
+    if found is not None:
         console.print(
             "[dim]this CSV holds image paths; the vision target that runs on it lands "
             "later in v0.6, so this run stops here[/dim]"
@@ -932,6 +972,9 @@ def run(
     metric = run_setup.metric
     direction = metric_direction(metric)
     is_prompt_run = task is not None
+    # ABSOLUTE: the kernel reads this from meta.json in its own temp working
+    # directory, where a relative path would resolve to a throwaway cache.
+    answer_cache = (Path(settings.iterate_runs_dir).parent / "prompt-answers.db").resolve()
     if is_prompt_run:
         from iterate.adapters.data.tabular import with_smaller_holdout
 
@@ -957,9 +1000,7 @@ def run(
             backend=target_backend or backend,
             model=target_model or model,
             base_url=base_url,
-            # ABSOLUTE: the kernel reads this from meta.json in its own temp working
-            # directory, where a relative path would resolve to a throwaway cache.
-            cache_path=(Path(settings.iterate_runs_dir).parent / "prompt-answers.db").resolve(),
+            cache_path=answer_cache,
             allow_free_text=allow_free_text,
         )
     else:
@@ -1104,9 +1145,46 @@ def run(
                 with contextlib.suppress(ValueError, OSError):
                     signal.signal(signal.SIGINT, _sigint)
 
+        from iterate.adapters.compute import confine, deps
+
+        confinement = confine.Confinement(
+            weights=confine.weights_dir(),
+            files=(answer_cache,) if is_prompt_run else (),
+            protected=(
+                Path(settings.iterate_runs_dir).parent.resolve(),
+                resolved_memory_path.resolve(),
+                *(p.resolve() for p in given),
+                *((labels.resolve(),) if labels is not None else ()),
+            ),
+        )
+        target_key = (
+            os.environ.get("ITERATE_TARGET_API_KEY") or api_key_for(target_backend or backend)
+            if is_prompt_run
+            else None
+        )
+        if compute == "local":
+            if confine.sandbox_available():
+                console.print(
+                    "[dim]cells are confined: they open their own folder, "
+                    + ("the answer cache, " if is_prompt_run else "")
+                    + f"and model weights under {escape(_home_tilde(confinement.weights))}, "
+                    "nothing else[/dim]"
+                )
+            else:
+                console.print(
+                    "[dim]cells are NOT confined on this machine (no sandbox here yet): a "
+                    "cell can read any file you can. --compute e2b runs them isolated[/dim]"
+                )
+
+        installer = (
+            deps.Installer(pending=deps.pending_path()) if compute == "local" and install else None
+        )
+
         def make_coder() -> CodingAgent:
             kernel: StatefulKernel = (
-                E2BKernel(api_key=e2b_api_key) if compute == "e2b" else LocalKernel()
+                E2BKernel(api_key=e2b_api_key)
+                if compute == "e2b"
+                else LocalKernel(confinement=confinement, target_key=target_key)
             )
             family: dict[str, Any] = {}
             if is_prompt_run:
@@ -1134,6 +1212,7 @@ def run(
                 metric=metric,
                 average=average,
                 install=(install or compute == "e2b"),
+                installer=installer,
                 context_budget_chars=context_budget,
                 controller=controller,
                 **family,
@@ -1429,6 +1508,12 @@ def _build_prompt_target(
         cache_path=cache_path,
         starting_prompt=_read_starting_prompt(prompt_file) if prompt_file else None,
     )
+
+
+def _home_tilde(path: Path | None) -> str:
+    home = str(Path.home())
+    text = str(path)
+    return "~" + text[len(home) :] if text == home or text.startswith(home + os.sep) else text
 
 
 def _mask(secret: str) -> str:

@@ -8,13 +8,16 @@ and recovers from a cell error mid-session.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
+import pytest
 
-from iterate.adapters.compute.kernel import CellResult, LocalKernel
+from iterate.adapters.compute.deps import Plan, Route
+from iterate.adapters.compute.kernel import Blocked, CellResult, LocalKernel
 from iterate.adapters.data.tabular import load_csv
 from iterate.core.coder import CodingAgent
+from iterate.prompts import PROMPTS
 from iterate.schemas.llm import ChatResponse, Message, ToolCall
 
 if TYPE_CHECKING:
@@ -138,6 +141,9 @@ class _FakeKernel:
 
     def read_output(self, name: str) -> bytes | None:
         return self._predictions
+
+    def blocked(self, error: str | None) -> Blocked | None:
+        return None
 
     def close(self) -> None:
         pass
@@ -816,6 +822,9 @@ class _TimeoutKernel:
     def keepalive(self) -> None:
         pass
 
+    def blocked(self, error: str | None) -> Blocked | None:
+        return None
+
     def close(self) -> None:
         pass
 
@@ -961,3 +970,371 @@ def test_a_broken_inspection_costs_the_run_nothing(tmp_path: Path) -> None:
     agent = CodingAgent(_FakeLLM([]), _DeadKernel([]), metric="f1")  # type: ignore[arg-type]
 
     assert agent.inspect(dataset=ds) == ""
+
+
+# ─── a confined cell refused something (Sprint 4 Day 5) ───────────────────────
+
+
+class _BlockedKernel(_FakeKernel):
+    def blocked(self, error: str | None) -> Blocked | None:
+        if not error or "[Errno 1]" not in error:
+            return None
+        return Blocked(error.rsplit("'", 2)[-2], program=error.endswith("'uv'"))
+
+
+def _observation_after(error: str, tmp_path: Path, family: str = "tabular") -> str:
+    ds = _dataset(tmp_path)
+    kernel = _BlockedKernel(
+        [CellResult("loaded", ""), CellResult("", "", error=error)],
+        predictions=b"0\n" * ds.n_test,
+    )
+    fake = _FakeLLM([_run("pd.read_csv('/Users/someone/data.csv')"), _finish(), _finish()])
+    CodingAgent(fake, kernel, metric="f1", max_cells=2, family=family).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="e"
+    )
+    return next(m.content or "" for m in fake.calls[1] if m.role == "tool")
+
+
+def test_a_cell_refused_a_path_outside_its_folder_is_told_which(tmp_path: Path) -> None:
+    denied = "PermissionError: [Errno 1] Operation not permitted: '/Users/someone/data.csv'"
+    observation = _observation_after(denied, tmp_path)
+    assert observation.startswith(
+        "BLOCKED: /Users/someone/data.csv is outside this session's folder"
+    )
+    assert "Your data is already in X_train, y_train and X_holdout" in observation
+
+
+def test_the_data_line_follows_the_family(tmp_path: Path) -> None:
+    from iterate.prompts import PROMPTS
+
+    lines = PROMPTS["coder"]["outside_folder_inputs"]
+    assert set(lines) >= {"tabular", "prompt"}
+    denied = "PermissionError: [Errno 1] Operation not permitted: '/Users/someone/data.csv'"
+    prompt = _observation_after(denied, tmp_path, family="prompt")
+    assert lines["prompt"] in prompt
+    assert lines["tabular"] not in prompt
+
+
+def test_a_refused_program_gets_its_own_note(tmp_path: Path) -> None:
+    observation = _observation_after(
+        "PermissionError: [Errno 1] Operation not permitted: 'uv'", tmp_path
+    )
+    assert observation.startswith("BLOCKED: uv is a program a cell may not run")
+    assert "outside this session's folder" not in observation
+
+
+def test_a_permission_error_naming_no_path_gets_no_folder_note(tmp_path: Path) -> None:
+    assert "BLOCKED" not in _observation_after("RuntimeError: Operation not permitted", tmp_path)
+
+
+# ─── cells never install; the harness routes a missing import (Sprint 4 Day 5) ───
+
+
+class _RouteKernel(_FakeKernel):
+    def __init__(self, results: list[CellResult], **kw: Any) -> None:
+        super().__init__(results, **kw)
+        self.executed: list[str] = []
+        self.restarts = 0
+
+    def run_cell(self, code: str, *, timeout: float) -> CellResult:
+        self.executed.append(code)
+        return super().run_cell(code, timeout=timeout)
+
+    def loaded_modules(self) -> list[str]:
+        return ["pandas", "narwhals"]
+
+    def restart(self) -> None:
+        self.restarts += 1
+
+
+class _FakeInstaller:
+    def __init__(self, plan: Plan, install_error: str = "") -> None:
+        self._plan = plan
+        self._error = install_error
+        self.installed: list[Plan] = []
+        self.saved: list[tuple[Plan, str]] = []
+        self.asked: list[tuple[str, list[str] | None]] = []
+
+    def plan(
+        self, package: str, *, kernel_modules: list[str] | None, module: str | None = None
+    ) -> Plan:
+        self.asked.append((package, kernel_modules))
+        return self._plan
+
+    def install(self, plan: Plan) -> str:
+        self.installed.append(plan)
+        return self._error
+
+    def save_for_next_run(self, plan: Plan, *, module: str) -> None:
+        self.saved.append((plan, module))
+
+
+def _missing(name: str) -> CellResult:
+    return CellResult("", "", error=f"ModuleNotFoundError: No module named '{name}'")
+
+
+def _tool_replies(fake: _FakeLLM) -> list[str]:
+    return [m.content or "" for m in fake.calls[-1] if m.role == "tool"]
+
+
+def _route_session(
+    tmp_path: Path,
+    plan: Plan,
+    llm: list[ChatResponse],
+    results: list[CellResult],
+    install_error: str = "",
+) -> tuple[Any, _RouteKernel, _FakeInstaller, _FakeLLM]:
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel(results, predictions=b"0\n" * ds.n_test)
+    installer = _FakeInstaller(plan, install_error)
+    fake = _FakeLLM([*llm, _finish(), _finish()])
+    agent = CodingAgent(fake, kernel, metric="f1", max_cells=len(llm) + 2, installer=installer)  # type: ignore[arg-type]
+    out = agent.run(dataset=ds, brief="b", experiment_id="route")
+    return out, kernel, installer, fake
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [
+        "!pip install catboost",
+        "%pip install -q catboost",
+        "import subprocess, sys\nsubprocess.check_call(\n"
+        "    [sys.executable, '-m', 'pip', 'install', 'catboost']\n)",
+        "from pip._internal.cli.main import main\nmain(['install', 'catboost'])",
+    ],
+)
+@pytest.mark.parametrize("install", [True, False])
+def test_a_cell_that_installs_is_refused_unrun_and_free(
+    tmp_path: Path, cell: str, install: bool
+) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel([CellResult("loaded", "")], predictions=b"0\n" * ds.n_test)
+    fake = _FakeLLM([_run(cell), _finish(), _finish(), _finish()])
+    CodingAgent(fake, kernel, metric="f1", max_cells=4, install=install).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="inst"
+    )
+    assert not any("catboost" in code for code in kernel.executed)
+    assert kernel.installed == []
+    key = "installer_refused" if install else "installer_refused_no_install"
+    assert _tool_replies(fake)[0] == PROMPTS["coder"][key]
+
+
+def test_a_cell_that_only_asks_what_is_installed_is_pointed_at_importlib_metadata(
+    tmp_path: Path,
+) -> None:
+    _, kernel, _, fake = _route_session(
+        tmp_path, Plan("x", Route.INSTALL), [_run("!pip list")], [CellResult("loaded", "")]
+    )
+    assert not any("pip list" in code for code in kernel.executed)
+    assert _tool_replies(fake)[0] == PROMPTS["coder"]["installer_query_refused"]
+    assert "importlib.metadata" in PROMPTS["coder"]["installer_query_refused"]
+
+
+def test_a_resent_installer_cell_is_refused_as_an_installer_not_as_a_repeat(
+    tmp_path: Path,
+) -> None:
+    cell = "!pip install catboost"
+    _, _, _, fake = _route_session(
+        tmp_path, Plan("x", Route.INSTALL), [_run(cell), _run(cell)], [CellResult("loaded", "")]
+    )
+    assert _tool_replies(fake)[:2] == [PROMPTS["coder"]["installer_refused"]] * 2
+
+
+def test_six_installer_cells_in_a_row_end_the_session(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel([CellResult("loaded", "")], predictions=b"0\n" * ds.n_test)
+    cells = [f"!pip install pkg{i}" for i in range(6)]
+    fake = _FakeLLM([_run(c) for c in cells] + [_run("print('never')")])
+    CodingAgent(fake, kernel, metric="f1", max_cells=20).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="inst6"
+    )
+    assert len(fake.calls) == 6
+    assert not any("never" in code for code in kernel.executed)
+
+
+def test_the_installer_rule_holds_on_an_e2b_kernel(tmp_path: Path) -> None:
+    from iterate.adapters.compute.kernel import E2BKernel
+
+    ds = _dataset(tmp_path)
+    ran: list[str] = []
+
+    class _Sandbox:
+        files = type(
+            "_Files",
+            (),
+            {
+                "write": lambda self, path, content: None,
+                "read": lambda self, path, format="bytes": b"0\n" * ds.n_test,
+            },
+        )()
+
+        def run_code(self, code: str, timeout: float | None = None) -> Any:
+            ran.append(code)
+            logs = type("_Logs", (), {"stdout": ["ok\n"], "stderr": []})()
+            return type("_Execution", (), {"logs": logs, "error": None})()
+
+        def kill(self) -> None:
+            pass
+
+    fake = _FakeLLM([_run("!pip install catboost"), _finish(), _finish()])
+    CodingAgent(fake, E2BKernel(sandbox_factory=_Sandbox), metric="f1", max_cells=3).run(
+        dataset=ds, brief="b", experiment_id="e2b"
+    )
+    assert not any("catboost" in code for code in ran)
+    assert PROMPTS["coder"]["installer_refused"] in "\n".join(_tool_replies(fake))
+
+
+def test_a_missing_import_with_installs_off_says_so(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel(
+        [CellResult("loaded", ""), _missing("catboost")], predictions=b"0\n" * ds.n_test
+    )
+    fake = _FakeLLM([_run("import catboost"), _finish(), _finish()])
+    CodingAgent(fake, kernel, metric="f1", max_cells=4, install=False).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="off"
+    )
+    assert _tool_replies(fake)[0].startswith(
+        "('catboost' is not installed and installs are off for this run."
+    )
+    assert kernel.installed == []
+
+
+def test_install_route_reruns_the_cell_with_fresh_import_caches(tmp_path: Path) -> None:
+    plan = Plan("tabulate", Route.INSTALL, "0.10.0")
+    _, kernel, installer, fake = _route_session(
+        tmp_path,
+        plan,
+        [_run("import tabulate")],
+        [CellResult("loaded", ""), _missing("tabulate"), CellResult("ok", "")],
+    )
+    assert installer.asked == [("tabulate", ["pandas", "narwhals"])]
+    assert installer.installed == [plan]
+    assert kernel.restarts == 0
+    assert kernel.executed[-1].startswith("__import__('importlib').invalidate_caches()")
+    assert _tool_replies(fake)[0].startswith(
+        "('tabulate' 0.10.0 was installed and your cell re-ran.)"
+    )
+
+
+def test_restart_route_restarts_reruns_the_preamble_and_says_variables_are_gone(
+    tmp_path: Path,
+) -> None:
+    plan = Plan("plotly", Route.RESTART, "7.1.0", {"narwhals": ("1.14.0", "2.26.0")})
+    results = [
+        CellResult("loaded", ""),
+        _missing("plotly"),
+        CellResult("loaded again", ""),
+        CellResult("plotly ok", ""),
+    ]
+    out, kernel, _, fake = _route_session(tmp_path, plan, [_run("import plotly")], results)
+    assert kernel.restarts == 1
+    assert [c.source for c in out.cells[:3]] == ["preamble", "preamble", "agent"]
+    assert out.cells[2].stdout == "plotly ok"
+    reply = _tool_replies(fake)[0]
+    for phrase in (
+        "KERNEL RESTARTED",
+        "narwhals 1.14.0 -> 2.26.0",
+        "Every variable you made is GONE",
+        "loaded again",
+    ):
+        assert phrase in reply
+
+
+def test_a_cell_resent_after_a_restart_runs_again(tmp_path: Path) -> None:
+    plan = Plan("plotly", Route.RESTART, "7.1.0", {"narwhals": ("1.14.0", "2.26.0")})
+    build = "feats = X_train.assign(double=X_train['num'] * 2)"
+    results = [
+        CellResult("loaded", ""),
+        CellResult("built", ""),
+        _missing("plotly"),
+        CellResult("loaded again", ""),
+        CellResult("plotly ok", ""),
+        CellResult("rebuilt", ""),
+    ]
+    _, kernel, _, fake = _route_session(
+        tmp_path, plan, [_run(build), _run("import plotly"), _run(build)], results
+    )
+    assert sum(build in code for code in kernel.executed) == 2
+    assert not any("already ran an identical cell" in reply for reply in _tool_replies(fake))
+
+
+def test_a_restart_starts_the_error_breakers_afresh(tmp_path: Path) -> None:
+    plan = Plan("plotly", Route.RESTART, "7.1.0", {"narwhals": ("1.14.0", "2.26.0")})
+    boom = CellResult("", "", error="ValueError: boom")
+    llm = [
+        _run("a = boom()"),
+        _run("b = boom()"),
+        _run("c = x()"),
+        _run("d = y()"),
+        _run("import plotly"),
+        _run("e = boom()"),
+        _run("print('still here')"),
+    ]
+    results = [
+        CellResult("loaded", ""),
+        boom,
+        boom,
+        CellResult("", "", error="NameError: name 'x' is not defined"),
+        CellResult("", "", error="NameError: name 'y' is not defined"),
+        _missing("plotly"),
+        CellResult("loaded again", ""),
+        CellResult("", "", error="NameError: name 'z' is not defined"),
+        boom,
+        CellResult("still here", ""),
+    ]
+    _, kernel, _, fake = _route_session(tmp_path, plan, llm, results)
+    assert any("still here" in code for code in kernel.executed)
+    assert not any("hit the SAME error repeatedly" in reply for reply in _tool_replies(fake))
+
+
+def test_next_run_route_saves_and_does_not_rerun(tmp_path: Path) -> None:
+    plan = Plan("sktime", Route.NEXT_RUN, "1.1.0", {"pandas": ("3.0.3", "2.3.3")})
+    _, kernel, installer, fake = _route_session(
+        tmp_path, plan, [_run("import sktime")], [CellResult("loaded", ""), _missing("sktime")]
+    )
+    assert installer.saved == [(plan, "sktime")]
+    assert installer.installed == []
+    assert sum("import sktime" in code for code in kernel.executed) == 1
+    assert "will be installed when the next run starts" in _tool_replies(fake)[0]
+
+
+@pytest.mark.parametrize(
+    ("reason", "phrase"),
+    [
+        ("not_found", "does not exist on the package index"),
+        ("frozen", "never installed or changed during a run"),
+        ("frozen_dep", "needs a different torch or torchvision"),
+        ("needs_torch", "installed only at the start of an image run"),
+        ("iterate", "beside the packages iterate runs on"),
+        ("installed", "Nothing to install"),
+        ("network", "the package index is unreachable"),
+        ("no_installer", "the environment, not the package"),
+        ("something_new", "cannot be installed in this environment"),
+    ],
+)
+def test_refuse_route_names_its_reason_and_installs_nothing(
+    tmp_path: Path, reason: str, phrase: str
+) -> None:
+    plan = Plan("x", Route.REFUSE, reason=reason, detail="d")
+    _, kernel, installer, fake = _route_session(
+        tmp_path, plan, [_run("import x")], [CellResult("loaded", ""), _missing("x")]
+    )
+    assert (installer.installed, installer.saved) == ([], [])
+    assert kernel.restarts == 0
+    assert phrase in _tool_replies(fake)[0]
+
+
+def test_a_failed_route_install_keeps_the_original_error_and_never_restarts(
+    tmp_path: Path,
+) -> None:
+    plan = Plan("plotly", Route.RESTART, "7.1.0", {"narwhals": ("1.14.0", "2.26.0")})
+    out, kernel, _, fake = _route_session(
+        tmp_path,
+        plan,
+        [_run("import plotly")],
+        [CellResult("loaded", ""), _missing("plotly")],
+        install_error="boom",
+    )
+    assert kernel.restarts == 0
+    assert "No module named 'plotly'" in (out.cells[1].error or "")
+    assert "auto-install of 'plotly' FAILED: boom" in _tool_replies(fake)[0]

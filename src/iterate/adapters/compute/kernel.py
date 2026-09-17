@@ -1,16 +1,20 @@
 """Stateful kernels: a live namespace that persists across cells.
 
-`LocalKernel` is an IPython kernel on this machine with no isolation; `E2BKernel`
-is one sandbox reused across cells. `run_cell` never raises on a failing cell; the
-traceback is returned. Holdout labels are never written into the kernel's working
-directory, so scoring stays host-side.
+`LocalKernel` is an IPython kernel on this machine, confined to its own folder where
+the platform can enforce it (see `confine`); `E2BKernel` is one sandbox reused across
+cells. `run_cell` never raises on a failing cell; the traceback is returned. Holdout
+labels are never written into the kernel's working directory, so scoring stays
+host-side.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import queue
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -18,10 +22,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from iterate.adapters.compute import confine
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_EPERM_PATH = re.compile(r"\[Errno 1\] Operation not permitted: '([^']+)'")
+
+# Cells get none of the harness's own keys. A prompt kernel gets only its target's key.
+KERNEL_SECRETS = frozenset(
+    {
+        "ITERATE_BACKEND_API_KEY",
+        "ITERATE_TARGET_API_KEY",
+        "E2B_API_KEY",
+        "KAGGLE_USERNAME",
+        "KAGGLE_KEY",
+        "GROQ_API_KEY",
+        "TOGETHER_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "NOTION_API_KEY",
+        "SLACK_WEBHOOK_URL",
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+    }
+)
 
 # Introspects the live namespace so the agent can see what it has defined (and not
 # re-import / re-derive / mis-name). Defensive per-variable; skips modules/functions.
@@ -39,23 +66,24 @@ _NS_SNIPPET = (
     "    except Exception: pass\n"
 )
 
-
-def _run_install(cmd: list[str]) -> str:
-    """Run one install command; "" on success, else the error log (never raises)."""
-    import subprocess
-
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
-    except subprocess.TimeoutExpired:
-        return f"install timed out: {' '.join(cmd)}"
-    except FileNotFoundError:
-        return f"command not found: {cmd[0]}"
-    return "" if proc.returncode == 0 else (proc.stderr.strip() or f"exit code {proc.returncode}")
+_MODULES_SNIPPET = (
+    "(lambda: print(__import__('json').dumps(sorted("
+    "{m.partition('.')[0] for m in list(__import__('sys').modules)}))))()\n"
+)
 
 
 def _strip_ansi(text: str) -> str:
     """IPython tracebacks come colour-coded; strip the escapes for clean feedback."""
     return _ANSI.sub("", text)
+
+
+@dataclass(frozen=True)
+class Blocked:
+    """A path a confined cell was refused outside its folder. ``program`` is set when
+    the refusal was to run it."""
+
+    path: str
+    program: bool
 
 
 @dataclass(frozen=True)
@@ -93,6 +121,19 @@ class StatefulKernel(Protocol):
         missing import). Returns "" on success, else an error log. Best-effort."""
         ...
 
+    def loaded_modules(self) -> list[str] | None:
+        """Top-level names of every module the kernel process has imported, or None
+        when they cannot be read."""
+        ...
+
+    def restart(self) -> None:
+        """Restart the kernel process in place: same working directory, empty namespace."""
+        ...
+
+    def blocked(self, error: str | None) -> Blocked | None:
+        """What a confined cell was refused outside its folder, or None."""
+        ...
+
     def namespace_summary(self) -> str:
         """A compact listing of the user-defined variables currently live (names +
         shapes/types), so the agent builds on what exists instead of re-deriving or
@@ -114,13 +155,33 @@ class StatefulKernel(Protocol):
 
 
 class LocalKernel:
-    """A real IPython kernel on this machine (no isolation; offline)."""
+    """A real IPython kernel on this machine, confined where the platform allows."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        confinement: confine.Confinement | None = None,
+        target_key: str | None = None,
+    ) -> None:
+        self._confinement = confinement or confine.Confinement()
+        self._target_key = target_key
+        self._confined: bool | None = None
+        self._programs: frozenset[str] = frozenset()
         self._km: Any = None
         self._kc: Any = None
         self._tmp: tempfile.TemporaryDirectory[str] | None = None
+        self._scratch: tempfile.TemporaryDirectory[str] | None = None
         self._workdir: Path | None = None
+
+    @property
+    def confined(self) -> bool:
+        if self._confined is None:
+            self._confined = confine.sandbox_available()
+        return self._confined
+
+    @confined.setter
+    def confined(self, value: bool) -> None:
+        self._confined = value
 
     def start(self, inputs: dict[str, bytes]) -> None:
         from jupyter_client.manager import KernelManager
@@ -129,17 +190,40 @@ class LocalKernel:
         self._workdir = Path(self._tmp.name)
         for name, content in inputs.items():
             (self._workdir / name).write_bytes(content)
-
+        # torch_shm_manager binds a unix socket under TMPDIR, capped at 104 bytes.
+        self._scratch = tempfile.TemporaryDirectory(prefix="itk-", dir="/tmp")
+        scratch = Path(os.path.realpath(self._scratch.name))
+        env = {
+            k: v for k, v in os.environ.items() if k != "OLDPWD" and k.upper() not in KERNEL_SECRETS
+        }
+        env |= {
+            "PWD": os.path.realpath(self._workdir),
+            "TMPDIR": str(scratch),
+            "JOBLIB_TEMP_FOLDER": str(scratch),
+            "IPYTHONDIR": str(scratch / "ipython"),
+        }
+        if self._target_key:
+            env["ITERATE_TARGET_API_KEY"] = self._target_key
+        weights = self._confinement.weights
+        if self.confined and weights is not None:
+            env = {k: v for k, v in env.items() if k not in confine.WEIGHTS_OVERRIDES}
+            # The sandbox lets a cell create inside the folder, never its parent.
+            weights.mkdir(parents=True, exist_ok=True)
+            env |= confine.weights_env(weights)
         # Pin the kernel to THIS interpreter. The registered "python3" kernelspec
         # can be a different environment, and `install()` pip-installs into
         # sys.executable.
         km = KernelManager(kernel_name="python3")
-        spec = km.kernel_spec
-        if spec is not None:  # no python3 kernelspec at all: fall back to default
-            spec.argv = [
-                sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"
-            ]
-        km.start_kernel(cwd=str(self._workdir))
+        km.connection_file = str(scratch / "kernel.json")
+        argv = [sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"]
+        if self.confined:
+            self._programs = confine.installer_paths()
+            sandbox = scratch / "kernel.sb"
+            sandbox.write_text(confine.profile(self._workdir, scratch, self._confinement))
+            argv = [confine.SANDBOX_EXEC, "-f", str(sandbox), *argv]
+        if km.kernel_spec is not None:  # no python3 kernelspec at all: fall back to default
+            km.kernel_spec.argv = argv
+        km.start_kernel(cwd=str(self._workdir), env=env)
         kc = km.client()
         kc.start_channels()
         kc.wait_for_ready(timeout=60)
@@ -173,49 +257,84 @@ class LocalKernel:
             if mtype == "stream":
                 (out if content.get("name") == "stdout" else err).append(content.get("text", ""))
                 outputs.append(
-                    {"type": "stream", "name": content.get("name", "stdout"),
-                     "text": content.get("text", "")}
+                    {
+                        "type": "stream",
+                        "name": content.get("name", "stdout"),
+                        "text": content.get("text", ""),
+                    }
                 )
             elif mtype == "execute_result":
                 outputs.append(
-                    {"type": "execute_result", "data": content.get("data", {}),
-                     "metadata": content.get("metadata", {}),
-                     "execution_count": content.get("execution_count")}
+                    {
+                        "type": "execute_result",
+                        "data": content.get("data", {}),
+                        "metadata": content.get("metadata", {}),
+                        "execution_count": content.get("execution_count"),
+                    }
                 )
             elif mtype == "display_data":
                 outputs.append(
-                    {"type": "display_data", "data": content.get("data", {}),
-                     "metadata": content.get("metadata", {})}
+                    {
+                        "type": "display_data",
+                        "data": content.get("data", {}),
+                        "metadata": content.get("metadata", {}),
+                    }
                 )
             elif mtype == "error":
                 tb = "\n".join(content.get("traceback", []))
                 error = _strip_ansi(tb) or f"{content.get('ename')}: {content.get('evalue')}"
                 outputs.append(
-                    {"type": "error", "ename": content.get("ename", ""),
-                     "evalue": content.get("evalue", ""),
-                     "traceback": content.get("traceback", [])}
+                    {
+                        "type": "error",
+                        "ename": content.get("ename", ""),
+                        "evalue": content.get("evalue", ""),
+                        "traceback": content.get("traceback", []),
+                    }
                 )
             elif mtype == "status" and content.get("execution_state") == "idle":
                 break
         return CellResult("".join(out), "".join(err), error=error, outputs=outputs)
 
     def install(self, packages: list[str]) -> str:
-        import shutil
-        import sys
+        from iterate.adapters.compute import deps
 
         if not packages:
             return ""
-        log = _run_install([sys.executable, "-m", "pip", "install", "--quiet", *packages])
-        if not log or "No module named pip" not in log:
-            return log
-        # uv-managed venvs ship without pip — fall back to uv targeting the kernel's
-        # interpreter, else bootstrap pip via ensurepip and retry.
-        if shutil.which("uv"):
-            return _run_install(
-                ["uv", "pip", "install", "--quiet", "--python", sys.executable, *packages]
-            )
-        _run_install([sys.executable, "-m", "ensurepip", "--upgrade"])
-        return _run_install([sys.executable, "-m", "pip", "install", "--quiet", *packages])
+        with tempfile.TemporaryDirectory(prefix="iterate-pins-") as tmp:
+            return deps.install(sys.executable, packages, deps.pin_everything(Path(tmp)))
+
+    def loaded_modules(self) -> list[str] | None:
+        if self._kc is None:
+            return None
+        result = self.run_cell(_MODULES_SNIPPET, timeout=15.0)
+        if result.error or result.timed_out:
+            return None
+        try:
+            return list(json.loads(result.stdout.strip().splitlines()[-1]))
+        except (ValueError, IndexError):
+            return None
+
+    def restart(self) -> None:
+        if self._km is None or self._kc is None:
+            raise RuntimeError("kernel not started")
+        # restart_kernel reuses the launch argv and env, so the sandbox stays on.
+        self._km.restart_kernel(now=True)
+        self._kc.wait_for_ready(timeout=60)
+
+    def blocked(self, error: str | None) -> Blocked | None:
+        if not self.confined or not error or self._workdir is None:
+            return None
+        inside = os.path.realpath(self._workdir) + os.sep
+        for found in _EPERM_PATH.finditer(error):
+            named = found.group(1)
+            real = os.path.realpath(self._workdir / named)
+            # A program run by bare name is refused under the name the cell gave.
+            on_path = shutil.which(named) if os.sep not in named else None
+            if (os.path.realpath(on_path) if on_path else real) in self._programs:
+                return Blocked(named, program=True)
+            if not real.startswith(inside):
+                return Blocked(named, program=False)
+        return None
 
     def namespace_summary(self) -> str:
         if self._kc is None:
@@ -237,9 +356,10 @@ class LocalKernel:
             self._kc.stop_channels()
         if self._km is not None:
             self._km.shutdown_kernel(now=True)
-        if self._tmp is not None:
-            self._tmp.cleanup()
-        self._km = self._kc = self._tmp = self._workdir = None
+        for folder in (self._tmp, self._scratch):
+            if folder is not None:
+                folder.cleanup()
+        self._km = self._kc = self._tmp = self._scratch = self._workdir = None
 
 
 class E2BKernel:
@@ -318,8 +438,12 @@ class E2BKernel:
                 tb_lines = [str(getattr(err, "value", err))]
             error = _strip_ansi("\n".join(tb_lines)) or f"{getattr(err, 'name', 'Error')}"
             outputs.append(
-                {"type": "error", "ename": getattr(err, "name", "Error"),
-                 "evalue": str(getattr(err, "value", "")), "traceback": tb_lines}
+                {
+                    "type": "error",
+                    "ename": getattr(err, "name", "Error"),
+                    "evalue": str(getattr(err, "value", "")),
+                    "traceback": tb_lines,
+                }
             )
         return CellResult(stdout, stderr, error=error, outputs=outputs)
 
@@ -329,6 +453,15 @@ class E2BKernel:
         self._renew_lease()  # a cold wheel install can be slow; don't let the lease lapse
         execution = self._sandbox.run_code(f"!pip install -q {' '.join(packages)}")
         return "".join(execution.logs.stderr)
+
+    def loaded_modules(self) -> list[str] | None:
+        return None
+
+    def restart(self) -> None:
+        raise NotImplementedError("an e2b session installs into its own sandbox and never restarts")
+
+    def blocked(self, error: str | None) -> Blocked | None:
+        return None
 
     def keepalive(self) -> None:
         """A paused session runs no cells, so the sliding lease (renewed only on
@@ -366,9 +499,11 @@ class E2BKernel:
         try:
             from e2b_code_interpreter import Sandbox
         except ImportError as exc:  # pragma: no cover - e2b ships in core; defensive only
-            raise RuntimeError("e2b_code_interpreter failed to import; reinstall iterate-ai") from exc
+            raise RuntimeError(
+                "e2b_code_interpreter failed to import; reinstall iterate-ai"
+            ) from exc
         # e2b SDK v2: Sandbox.create(), not the constructor (see runner.py note).
         return Sandbox.create(api_key=self._api_key)
 
 
-__all__ = ["CellResult", "E2BKernel", "LocalKernel", "StatefulKernel"]
+__all__ = ["KERNEL_SECRETS", "Blocked", "CellResult", "E2BKernel", "LocalKernel", "StatefulKernel"]

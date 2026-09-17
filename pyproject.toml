@@ -60,6 +60,8 @@ dependencies = [
     "threadpoolctl>=3.6.0",
     # Prompt registry (all prompts live in src/iterate/prompts/prompts.yaml)
     "pyyaml>=6.0",
+    # Install planning reads requirement and version strings.
+    "packaging>=23.0",
     # Notebook deliverable (renders a winning run as a runnable .ipynb)
     "nbformat>=5.10.0",
     # Cell-by-cell execution: a real local IPython kernel for stateful sessions

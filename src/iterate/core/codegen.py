@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import sys
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from iterate.core.scoring import direction, requires_proba, score, task_for_metric
@@ -77,6 +79,15 @@ _IMPORT_TO_PACKAGE = {
     "bs4": "beautifulsoup4",
     "skimage": "scikit-image",
     "yaml": "pyyaml",
+    # On PyPI the bare import name is a different project, or nothing.
+    "attr": "attrs",
+    "dateutil": "python-dateutil",
+    "faiss": "faiss-cpu",
+    "fitz": "pymupdf",
+    "imblearn": "imbalanced-learn",
+    "mpl_toolkits": "matplotlib",
+    "open_clip": "open-clip-torch",
+    "umap": "umap-learn",
 }
 
 
@@ -397,6 +408,194 @@ def _called_name(func: ast.expr) -> str | None:
     return None
 
 
+_INSTALLER = re.compile(
+    r"(?<![\w.-])(?:pip[\d.]*|pipx|pipenv|poetry|pdm|rye|pixi|hatch|uvx?|conda|mamba|micromamba"
+    r"|ensurepip)(?![\w-])|-m\s*pip\b"
+)
+_INSTALL_VERB = re.compile(
+    r"(?<![\w-])(?:install|add|sync|download|inject|upgrade|update|create|run|--with|-U)(?![\w-])"
+)
+_INSTALLER_MODULES = frozenset({"pip", "ensurepip"})
+_SPAWN_MODULES = frozenset({"subprocess", "pty", "runpy"})
+_OS_MODULES = frozenset({"os", "posix", "nt"})
+_OS_SPAWNS = frozenset(
+    {
+        "system",
+        "popen",
+        "posix_spawn",
+        "posix_spawnp",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+    }
+)
+_MAGICS = frozenset({"run_line_magic", "run_cell_magic"})
+_SHELL_CALLS = _MAGICS | {"getoutput", "create_subprocess_exec", "create_subprocess_shell"}
+_SPAWN_NAMES = _OS_SPAWNS | _SHELL_CALLS
+# Magics that time, capture or configure Python code: their text is judged as a cell.
+_CODE_MAGICS = frozenset(
+    {"time", "timeit", "capture", "prun", "matplotlib", "load_ext", "autoreload", "config"}
+)
+_MAGIC_OPTIONS = re.compile(r"^\s*(?:-[A-Za-z]+\s*(?:\d+\s+)?)*")
+_LOADERS = frozenset({"import_module", "__import__", "run_module", "find_spec", "load_module"})
+_EVALUATORS = frozenset({"exec", "eval", "compile"})
+
+
+@dataclass(frozen=True)
+class InstallerCell:
+    """Why a cell counts as an installer. ``query`` is set when it only asks what is
+    installed (``!pip list``): still refused, with a pointer at importlib.metadata."""
+
+    evidence: str
+    query: bool
+
+
+def _module_root(name: str | None) -> str:
+    return (name or "").split(".", 1)[0]
+
+
+def _const_str(node: ast.expr) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _text(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+        return node.value.decode(errors="replace")
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _is_platform_system(node: ast.Attribute) -> bool:
+    return isinstance(node.value, ast.Name) and (node.value.id, node.attr) == ("platform", "system")
+
+
+def _literal_strings(call: ast.Call) -> list[str] | None:
+    """The strings a call's arguments hold when every argument is a plain literal that
+    interpolates nothing (IPython expands ``{name}`` and ``$name``), else None."""
+    out: list[str] = []
+    for arg in (*call.args, *(k.value for k in call.keywords)):
+        for node in ast.walk(arg):
+            if (text := _text(node)) is not None:
+                if "{" in text or "$" in text:
+                    return None
+                out.append(text)
+            elif not isinstance(node, (ast.Constant, ast.List, ast.Tuple, ast.expr_context)):
+                return None
+    return out
+
+
+def _parsed(code: str) -> ast.Module | None:
+    from IPython.core.inputtransformer2 import TransformerManager
+
+    try:
+        return ast.parse(TransformerManager().transform_cell(code))  # type: ignore[no-untyped-call]
+    except SyntaxError:
+        return None
+
+
+def runs_installer(code: str) -> InstallerCell | None:
+    """Judged on the whole IPython-transformed cell: a process spawner plus an installer
+    name in a string it can reach, or any load of pip. A spawner called with plain
+    literals reaches only those; any other spawner reaches every string in the cell. A
+    name check, not a boundary: an installer name built from pieces, an obfuscated call
+    (``vars(os)['system']``, an aliased ``exec``, ctypes) and a script one cell writes
+    and the next runs all pass. A cell that does not parse runs nothing, so it is not
+    judged."""
+    tree = _parsed(code)
+    return None if tree is None else _installer_in(tree)
+
+
+def _installer_in(tree: ast.Module) -> InstallerCell | None:
+    strings: list[str] = []
+    spawners: list[tuple[str, list[str] | None]] = []
+    funcs = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _module_root(alias.name) in _INSTALLER_MODULES:
+                    return InstallerCell(f"import {alias.name}", query=False)
+                if _module_root(alias.name) in _SPAWN_MODULES:
+                    spawners.append((f"import {alias.name}", None))
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            root = _module_root(node.module)
+            if root in _INSTALLER_MODULES:
+                return InstallerCell(f"from {node.module} import", query=False)
+            names = {a.name for a in node.names}
+            if (
+                root in _SPAWN_MODULES
+                or (root in _OS_MODULES and "*" in names)
+                or (root != "platform" and names & _SPAWN_NAMES)
+            ):
+                spawners.append((f"from {node.module} import", None))
+        elif isinstance(node, ast.Attribute):
+            # Uncalled, only a module's own spawn function counts: X_train.system is a column.
+            if (
+                id(node) not in funcs
+                and node.attr in _SPAWN_NAMES
+                and isinstance(node.value, ast.Name)
+                and node.value.id in _OS_MODULES
+            ):
+                spawners.append((node.attr, None))
+        elif isinstance(node, ast.Name) and node.id in _SPAWN_MODULES:
+            spawners.append((node.id, None))
+        elif isinstance(node, ast.Call):
+            called = _called_name(node.func)
+            first = _const_str(node.args[0]) if node.args else None
+            if (
+                called in _LOADERS
+                and first is not None
+                and _module_root(first) in _INSTALLER_MODULES
+            ):
+                return InstallerCell(f"loads {first!r}", query=False)
+            if called in _EVALUATORS and first is not None and (inner := runs_installer(first)):
+                return InstallerCell(f"{called} of {inner.evidence}", query=inner.query)
+            if called == "getattr" and len(node.args) > 1:
+                attr = _const_str(node.args[1])
+                if attr in _SPAWN_NAMES:
+                    spawners.append((f"getattr {attr}", None))
+            if called not in _SPAWN_NAMES or (
+                isinstance(node.func, ast.Attribute) and _is_platform_system(node.func)
+            ):
+                continue
+            if called in _MAGICS and first in _CODE_MAGICS:
+                lines = [_const_str(a) for a in node.args[1:]]
+                bodies = [None if t is None else _parsed(_MAGIC_OPTIONS.sub("", t)) for t in lines]
+                if all(body is not None for body in bodies):
+                    for body in bodies:
+                        if body is not None and (inner := _installer_in(body)):
+                            return InstallerCell(f"%{first} of {inner.evidence}", inner.query)
+                    continue
+            spawners.append((str(called), _literal_strings(node)))
+        if (text := _text(node)) is not None:
+            if _module_root(text) in _SPAWN_MODULES:
+                spawners.append((text, None))
+            strings.append(text)
+    if not spawners:
+        return None
+    anywhere = next((evidence for evidence, reach in spawners if reach is None), None)
+    reached: list[tuple[str, list[str] | None]] = (
+        [(anywhere, strings)] if anywhere is not None else spawners
+    )
+    for evidence, texts in reached:
+        for text in texts or ():
+            if found := _INSTALLER.search(text):
+                query = not any(_INSTALL_VERB.search(t) for t in texts or ())
+                return InstallerCell(f"{evidence} with {found.group().strip()!r}", query=query)
+    return None
+
+
 def package_for_import(import_name: str) -> str:
     """The pip distribution name for a top-level import (e.g. 'sklearn'→'scikit-learn'),
     falling back to the import name. Used for install-on-demand of a missing module."""
@@ -596,6 +795,7 @@ __all__ = [
     "PREDICTIONS_CSV",
     "PROBABILITIES_CSV",
     "TRAIN_CSV",
+    "InstallerCell",
     "assemble_script",
     "build_inputs",
     "components_used",
@@ -604,6 +804,7 @@ __all__ = [
     "package_for_import",
     "parse_probabilities",
     "required_imports",
+    "runs_installer",
     "score_predictions",
     "session_preamble",
     "validate_train_and_predict",

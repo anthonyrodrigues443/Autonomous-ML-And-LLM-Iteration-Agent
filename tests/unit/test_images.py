@@ -3,8 +3,14 @@ family rides on."""
 
 from __future__ import annotations
 
+import hashlib
+import os
+import shlex
+import shutil
+import subprocess
 from itertools import pairwise
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import pytest
@@ -14,10 +20,12 @@ from iterate.adapters.data.images import (
     IMAGE_COLUMN,
     LABEL_COLUMN,
     ImageColumn,
+    OutsideDataError,
     content_hash,
     detect_image_column,
     file_hashes,
     frame_from_folder,
+    image_column,
     load_image_folder,
     load_image_split,
     materialise,
@@ -26,6 +34,10 @@ from iterate.adapters.data.images import (
     split_folders,
 )
 from iterate.adapters.data.tabular import load_csv, load_split
+from tests.unit.image_fixtures import png
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 pytestmark = pytest.mark.unit
 
@@ -466,9 +478,8 @@ def test_prepare_leaves_twins_out_of_a_split_it_made_and_not_out_of_a_users(
         prepared.dataset.facts
     )
 
-    train = tmp_path / "user" / "train.csv"
-    holdout = tmp_path / "user" / "holdout.csv"
-    train.parent.mkdir()
+    train = csv.parent / "train.csv"
+    holdout = csv.parent / "holdout.csv"
     rows = pd.read_csv(csv)
     rows["image"] = rows["image"].map(lambda v: str(csv.parent / v))
     rows.iloc[:20].to_csv(train, index=False)
@@ -611,3 +622,312 @@ def test_a_path_named_on_both_sides_is_a_twin_even_when_the_file_is_missing(
     kept, dropped = _without_twins(dataset, column, hashes)
     assert dropped == [gone]
     assert kept.n_test == resolved.n_test - 1
+
+
+# ─── only the data given ──────────────────────────────────────────────────
+
+
+def _rows_csv(
+    folder: Path, extra: Sequence[str] = (), *, n: int = 12, name: str = "data.csv"
+) -> Path:
+    rows = []
+    for i in range(n):
+        png(folder / "images" / f"{i:03d}.png", i, klass=i % 2)
+        rows.append({"image": f"images/{i:03d}.png", "label": "ab"[i % 2]})
+    rows += [{"image": v, "label": "a"} for v in extra]
+    pd.DataFrame(rows).to_csv(folder / name, index=False)
+    return folder / name
+
+
+@pytest.mark.parametrize(
+    ("shape", "says"),
+    [
+        ("absolute", "put those images under that folder"),
+        ("dotdot", "put those images under that folder"),
+        ("link", "images/leak.png is a link to"),
+        ("dotdot_after_link", "sub is a link to"),
+    ],
+)
+def test_a_row_outside_the_csv_folder_is_refused_before_any_copy(
+    tmp_path: Path, shape: str, says: str
+) -> None:
+    from iterate.adapters.data.images import prepare_images
+
+    secret = tmp_path / "elsewhere" / "images" / "secret.png"
+    png(secret, 99, klass=1)
+    folder = tmp_path / "data"
+    (folder / "images").mkdir(parents=True)
+    value = {
+        "absolute": str(secret),
+        "dotdot": "../elsewhere/images/secret.png",
+        "link": "images/leak.png",
+        "dotdot_after_link": "sub/../images/secret.png",
+    }[shape]
+    if shape == "link":
+        (folder / "images" / "leak.png").symlink_to(secret)
+    if shape == "dotdot_after_link":
+        (tmp_path / "elsewhere" / "deep").mkdir()
+        (folder / "sub").symlink_to(tmp_path / "elsewhere" / "deep")
+    csv = _rows_csv(folder, [value])
+    with pytest.raises(
+        OutsideDataError, match=r"1 image path.* lead outside .*the folder this"
+    ) as no:
+        prepare_images(load_csv(csv, target="label"), csv, into=tmp_path / "cache")
+    assert says in str(no.value)
+    assert not (tmp_path / "cache").exists()
+
+
+def test_a_linked_images_folder_is_named_and_the_copy_command_pastes(tmp_path: Path) -> None:
+    big = tmp_path / "big disk" / "eurosat"
+    _rows_csv(big)
+    project = tmp_path / "My Drive" / "project"
+    project.mkdir(parents=True)
+    (project / "images").symlink_to(big / "images")
+    shutil.copyfile(big / "data.csv", project / "data.csv")
+    with pytest.raises(OutsideDataError) as no:
+        image_column(load_csv(project / "data.csv", target="label"))
+    message = str(no.value)
+    assert "12 image path(s) lead outside" in message
+    assert f"images is a link to {(big / 'images').resolve()}" in message
+
+    command = no.value.command
+    assert command is not None
+    assert message.endswith(f"and pass the copy: {command}")
+    copy = f"{project.resolve()}-copy"
+    assert shlex.split(command)[-2:] == [str(project.resolve()), copy]
+    subprocess.run(command, shell=True, check=True)
+    assert not Path(copy, "images").is_symlink()
+    assert image_column(load_csv(Path(copy, "data.csv"), target="label")) is not None
+
+
+def test_absolute_rows_through_a_link_out_get_advice_that_works_and_no_copy_command(
+    tmp_path: Path,
+) -> None:
+    big = tmp_path / "big disk" / "eurosat"
+    _rows_csv(big)
+    project = tmp_path / "My Drive" / "project"
+    project.mkdir(parents=True)
+    (project / "images").symlink_to(big / "images")
+    frame = pd.read_csv(big / "data.csv")
+    relative = frame.copy()
+    frame["image"] = [str(project / v) for v in frame["image"]]
+    frame.to_csv(project / "data.csv", index=False)
+    with pytest.raises(OutsideDataError) as no:
+        image_column(load_csv(project / "data.csv", target="label"))
+    message = str(no.value)
+    assert f"images is a link to {(big / 'images').resolve()}" in message
+    assert no.value.command is None
+    assert "cp " not in message
+    assert "put the CSV beside the images it names" in message
+    assert f"write its image paths relative to {project.resolve()}" in message
+
+    shutil.copyfile(project / "data.csv", big / "beside.csv")
+    assert image_column(load_csv(big / "beside.csv", target="label")) is not None
+
+    relative.to_csv(project / "data.csv", index=False)
+    with pytest.raises(OutsideDataError) as again:
+        image_column(load_csv(project / "data.csv", target="label"))
+    assert again.value.command is not None
+    subprocess.run(again.value.command, shell=True, check=True)
+    copy = Path(f"{project.resolve()}-copy", "data.csv")
+    assert image_column(load_csv(copy, target="label")) is not None
+
+
+@pytest.mark.parametrize(
+    ("rows", "link"),
+    [
+        (["../x.png", "images/1.png"], "images"),
+        (["sub/../../x.png"], None),
+        (["../other/1.png"], None),
+    ],
+)
+def test_a_refusal_names_the_first_link_out_along_any_refused_row(
+    tmp_path: Path, rows: list[str], link: str | None
+) -> None:
+    from iterate.adapters.data.images import refuse_outside
+
+    base = tmp_path.resolve()
+    project = base / "project"
+    (project / "real").mkdir(parents=True)
+    png(base / "x.png", 1)
+    png(base / "pool" / "1.png", 2)
+    (project / "sub").symlink_to(project / "real")
+    (project / "images").symlink_to(base / "pool")
+    (base / "other").symlink_to(base / "pool")
+    with pytest.raises(OutsideDataError) as no:
+        refuse_outside(rows, project / "data.csv")
+    message = str(no.value)
+    if link is None:
+        assert "is a link to" not in message
+        assert no.value.command is None
+    else:
+        assert f": {link} is a link to {base / 'pool'}." in message
+        assert no.value.command is not None
+
+
+def test_absolute_rows_spelled_through_a_linked_folder_are_inside(tmp_path: Path) -> None:
+    from iterate.adapters.data.images import prepare_images
+
+    real = tmp_path / "real"
+    (tmp_path / "link").symlink_to(real, target_is_directory=True)
+    csv = _rows_csv(real)
+    frame = pd.read_csv(csv)
+    frame["image"] = [str(tmp_path / "link" / v) for v in frame["image"]]
+    frame.to_csv(csv, index=False)
+    shown = tmp_path / "link" / "data.csv"
+    prepared = prepare_images(load_csv(shown, target="label"), shown, into=tmp_path / "cache")
+    assert prepared.profile.unreadable == 0
+
+
+def test_a_folder_spelled_in_another_case_is_inside_on_a_case_folding_disk(
+    tmp_path: Path,
+) -> None:
+    csv = _rows_csv(tmp_path / "data")
+    upper = tmp_path / "DATA"
+    if not upper.exists():
+        pytest.skip("this disk tells case apart")
+    frame = pd.read_csv(csv)
+    frame["image"] = [str(tmp_path / "data" / v) for v in frame["image"]]
+    frame.to_csv(csv, index=False)
+    assert image_column(load_csv(upper / "data.csv", target="label")) is not None
+
+
+def test_a_csv_that_is_a_link_reads_from_the_folder_it_leads_to(tmp_path: Path) -> None:
+    from iterate.adapters.data.images import prepare_images
+
+    csv = _rows_csv(tmp_path / "real")
+    shown = tmp_path / "shown" / "data.csv"
+    shown.parent.mkdir()
+    shown.symlink_to(csv)
+    prepared = prepare_images(load_csv(shown, target="label"), shown, into=tmp_path / "cache")
+    assert prepared.profile.unreadable == 0
+
+
+def test_the_frame_holds_the_path_that_was_checked(tmp_path: Path) -> None:
+    folder = tmp_path / "data"
+    csv = _rows_csv(folder)
+    (folder / "images" / "again.png").symlink_to(folder / "images" / "000.png")
+    frame = pd.read_csv(csv)
+    frame.loc[len(frame)] = {"image": "images/./again.png", "label": "a"}
+    frame.to_csv(csv, index=False)
+    loaded = load_csv(csv, target="label")
+    column = image_column(loaded)
+    assert column is not None
+    resolved = resolve_paths(loaded, column)
+    paths = {*resolved.train_features["image"], *resolved.test_features["image"]}
+    assert str(folder.resolve() / "images" / "again.png") not in paths
+    assert not any(os.path.islink(p) for p in paths)
+
+
+def test_a_row_swapped_for_a_link_out_after_the_check_is_refused_at_the_write(
+    tmp_path: Path,
+) -> None:
+    secret = tmp_path / "elsewhere" / "secret.png"
+    png(secret, 99)
+    csv = _rows_csv(tmp_path / "data")
+    loaded = load_csv(csv, target="label")
+    column = image_column(loaded)
+    assert column is not None
+    (csv.parent / "images" / "003.png").unlink()
+    (csv.parent / "images" / "003.png").symlink_to(secret)
+    with pytest.raises(OutsideDataError, match="1 image path"):
+        resolve_paths(loaded, column)
+
+
+def test_each_side_of_a_users_split_resolves_against_its_own_csv(tmp_path: Path) -> None:
+    from iterate.adapters.data.images import prepare_images
+
+    train = _rows_csv(tmp_path / "train", name="train.csv")
+    holdout = _rows_csv(tmp_path / "holdout", n=6, name="holdout.csv")
+    for p in (tmp_path / "holdout" / "images").iterdir():
+        png(p, 100 + int(p.stem), klass=int(p.stem) % 2)
+    prepared = prepare_images(
+        load_split(train, holdout, target="label"), train, into=tmp_path / "cache"
+    )
+    assert prepared.profile.shared_across_split == 0
+    holdout_bytes = {
+        hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        for p in (tmp_path / "holdout" / "images").iterdir()
+    }
+    assert {Path(p).name for p in prepared.dataset.test_features["image"]} == holdout_bytes
+
+
+def test_a_holdout_csv_naming_the_training_folder_is_refused(tmp_path: Path) -> None:
+    train = _rows_csv(tmp_path / "train", name="train.csv")
+    (tmp_path / "holdout").mkdir()
+    pd.DataFrame(
+        {"image": ["../train/images/000.png", "../train/images/001.png"], "label": ["a", "b"]}
+    ).to_csv(tmp_path / "holdout" / "h.csv", index=False)
+    with pytest.raises(OutsideDataError, match=r"h\.csv: 2 image path"):
+        image_column(load_split(train, tmp_path / "holdout" / "h.csv", target="label"))
+
+
+def test_a_holdout_csv_written_beside_the_training_csv_is_refused_with_the_fix(
+    tmp_path: Path,
+) -> None:
+    train = _rows_csv(tmp_path, name="train.csv")
+    for i in range(8):
+        png(tmp_path / "test_images" / f"{i}.png", 50 + i, klass=i % 2)
+    holdout = tmp_path / "test" / "holdout.csv"
+    holdout.parent.mkdir()
+    pd.DataFrame(
+        {"image": [f"test_images/{i}.png" for i in range(8)], "label": ["a", "b"] * 4}
+    ).to_csv(holdout, index=False)
+    with pytest.raises(OutsideDataError) as no:
+        image_column(load_split(train, holdout, target="label"))
+    message = str(no.value)
+    assert f"{holdout.resolve()}: 8 of its first 8 image paths do not exist" in message
+    assert f"in {holdout.parent.resolve()}" in message
+    assert f"they exist beside {train.resolve()}" in message
+
+    pd.DataFrame(
+        {"image": [f"../test_images/{i}.png" for i in range(8)], "label": ["a", "b"] * 4}
+    ).to_csv(holdout, index=False)
+    with pytest.raises(OutsideDataError, match="lead outside"):
+        image_column(load_split(train, holdout, target="label"))
+
+    png(tmp_path / "test" / "test_images" / "0.png", 50)
+    pd.DataFrame({"image": ["test_images/0.png", "gone.png"], "label": ["a", "b"]}).to_csv(
+        holdout, index=False
+    )
+    with pytest.raises(OutsideDataError) as missing:
+        image_column(load_split(train, holdout, target="label"))
+    assert "1 of its first 2 image paths do not exist" in str(missing.value)
+    assert "they exist beside" not in str(missing.value)
+
+
+def test_a_dataset_no_loader_made_needs_its_csv(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    csv = _rows_csv(tmp_path / "data")
+    loaded = replace(load_csv(csv, target="label"), sources=None)
+    with pytest.raises(ValueError, match="needs the CSV it came from"):
+        image_column(loaded)
+    assert image_column(loaded, csv) is not None
+
+
+def test_a_monitor_report_that_is_a_link_is_not_read(tmp_path: Path) -> None:
+    from iterate.adapters.data import monitor
+    from iterate.adapters.data.images import prepare_images
+    from iterate.schemas.monitor import DataReport
+
+    csv = _tiny_csv(tmp_path / "data")
+    report = DataReport(
+        version="1",
+        images=24,
+        train_rows=19,
+        holdout_rows=5,
+        split="ours",
+        seconds=0.0,
+        findings=[],
+    )
+    elsewhere = monitor.save(report, tmp_path / "elsewhere")
+    beside = csv.parent / monitor.REPORT_JSON
+    shutil.copyfile(elsewhere, beside)
+    read = prepare_images(load_csv(csv, target="label"), csv, into=tmp_path / "cache")
+    assert read.dataset.facts == (report.brief(),)
+
+    beside.unlink()
+    beside.symlink_to(elsewhere)
+    linked = prepare_images(load_csv(csv, target="label"), csv, into=tmp_path / "cache")
+    assert linked.dataset.facts == ()

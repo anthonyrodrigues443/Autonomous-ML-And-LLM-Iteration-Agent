@@ -25,6 +25,7 @@ from iterate.schemas.llm import Message, ToolSpec
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
 
+    from iterate.adapters.compute.deps import Installer, Plan
     from iterate.adapters.compute.kernel import CellResult, StatefulKernel
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.core.interactive import RunController
@@ -272,6 +273,7 @@ class CodingAgent:
         extra_inputs: dict[str, bytes] | None = None,
         floor_cell: str | None = None,
         family: str = "tabular",
+        installer: Installer | None = None,
     ) -> None:
         self._client = client
         self._kernel = kernel
@@ -292,6 +294,8 @@ class CodingAgent:
         self._extra_inputs = extra_inputs
         self._floor_cell = floor_cell
         self._family = family
+        # None installs through the kernel itself: an e2b sandbox is disposable.
+        self._installer = installer
 
     def _session_preamble(self) -> str:
         return self._preamble if self._preamble is not None else codegen.session_preamble()
@@ -374,7 +378,10 @@ class CodingAgent:
             # the submitted prompt must be picked up here or it never reaches the
             # experiment record.
             if (submitted := self._kernel.read_output(codegen.PROMPT_JSON)) is not None:
-                artifacts = {**result.artifacts, codegen.PROMPT_JSON: submitted.decode(errors="replace")}
+                artifacts = {
+                    **result.artifacts,
+                    codegen.PROMPT_JSON: submitted.decode(errors="replace"),
+                }
                 if swapped := codegen.submission_was_swapped(submitted, preds):
                     # Predictions on disk are not the ones `submit()` produced, so
                     # they did not come from the model under test. Verifiable, so a
@@ -645,6 +652,22 @@ class CodingAgent:
                 )
                 continue
             truncation_rejections = 0
+            # Before the repeat breaker, so a re-sent installer cell is still named as one.
+            if found := codegen.runs_installer(code):
+                consecutive_errors += 1
+                log.info(
+                    "coder[%s]: refused a cell that runs an installer (%s)",
+                    experiment_id,
+                    found.evidence,
+                )
+                if found.query:
+                    key = "installer_query_refused"
+                else:
+                    key = "installer_refused" if self._install else "installer_refused_no_install"
+                messages.append(_tool_msg(call, _PROMPTS[key]))
+                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    return
+                continue
             # Repeated-cell breaker: a weak model can lock into re-running an identical
             # cell (or cycling a few) whose output never changes — burning turns for no
             # new evidence. Refuse the duplicate (free, no kernel time) and tell it to
@@ -655,7 +678,14 @@ class CodingAgent:
                 continue
             recent_cells.append(normalized)
             del recent_cells[:-_REPEAT_WINDOW]
-            cell_result, note, spent = self._run_with_autoinstall(code)
+            cell_result, note, spent, restarted = self._run_with_installs(
+                code, cells, experiment_id
+            )
+            if restarted:
+                # A restart emptied the namespace, so every earlier output is stale.
+                recent_cells[:] = [normalized]
+                error_sig_counts.clear()
+                consecutive_errors = 0
             work += spent
             cells.append(_cell(code, cell_result, "agent", thinking=response.thinking))
             # Per-cell progress: a long local-model session is otherwise silent for
@@ -691,6 +721,14 @@ class CodingAgent:
             obs = _observation(cell_result)
             if note:
                 obs = note + "\n\n" + obs
+            if blocked := self._kernel.blocked(cell_result.error):
+                if blocked.program:
+                    extra = _PROMPTS["blocked_program_note"].format(path=blocked.path)
+                else:
+                    extra = _PROMPTS["outside_folder_note"].format(
+                        path=blocked.path, inputs=_PROMPTS["outside_folder_inputs"][self._family]
+                    )
+                obs = extra + "\n\n" + obs
             # Same-error breaker: the repeated-cell breaker only catches IDENTICAL code;
             # a weak model also thrashes by re-hitting the SAME error with cosmetically
             # different cells (e.g. swapping the encoder while the real cause — a string
@@ -791,37 +829,105 @@ class CodingAgent:
             experiment_id,
         )
 
-    def _run_with_autoinstall(self, code: str) -> tuple[CellResult, str | None, float]:
-        """Run a cell; if it fails on a missing module and install is on, install it
-        and re-run once. Returns (result, note-for-the-agent, kernel-exec seconds).
-        The note makes the install VISIBLE — especially a failed one, so the agent
-        pivots to another library instead of retrying an import the environment can
-        never satisfy. Install subprocess time is harness overhead, not charged.
+    def _run_with_installs(
+        self, code: str, cells: list[Cell], experiment_id: str
+    ) -> tuple[CellResult, str | None, float, bool]:
+        """Run a cell; on a missing import, take the route the installer plans.
+        Returns (result, note for the agent, kernel seconds, whether the kernel
+        restarted). Planning, installing, restarting and the preamble are harness
+        time and never charged.
 
         Each run is prefixed with RESET_INPUTS so the canonical X_train/y_train/
-        X_holdout are pristine at the top of every cell, no matter what a prior cell
-        did to them in place."""
+        X_holdout are pristine at the top of every cell."""
         runnable = codegen.RESET_INPUTS + code
         t0 = time.monotonic()
         result = self._kernel.run_cell(runnable, timeout=self._cell_timeout)
         spent = time.monotonic() - t0
-        if not self._install or not result.error:
-            return result, None, spent
         missing = _missing_module(result.error)
         if missing is None:
-            return result, None, spent
+            return result, None, spent, False
+        if not self._install:
+            return result, _PROMPTS["install_off_note"].format(module=missing), spent, False
         package = codegen.package_for_import(missing)
-        error_log = self._kernel.install([package])
-        if error_log:
-            note = (
-                f"(auto-install of {package!r} FAILED: {error_log.strip()[-300:]} — do not "
-                "retry this import; switch to a library that is already available)"
+        if self._installer is None:
+            return (*self._install_in_sandbox(runnable, result, package, spent), False)
+        plan = self._installer.plan(
+            package, kernel_modules=self._kernel.loaded_modules(), module=missing
+        )
+        log.info("coder[%s]: %s", experiment_id, _install_line(plan, missing))
+        if plan.route == "refuse":
+            template = _PROMPTS.get(
+                f"install_refused_{plan.reason}", _PROMPTS["install_refused_unresolvable"]
+            )
+            note = template.format(
+                module=missing,
+                package=plan.detail if plan.reason == "installed" and plan.detail else plan.package,
+                version=plan.version or "",
+                detail=plan.detail,
+            )
+            return result, note, spent, False
+        if plan.route == "next_run":
+            self._installer.save_for_next_run(plan, module=missing)
+            note = _PROMPTS["install_next_run"].format(
+                package=plan.package, version=plan.version, moves=plan.moved()
+            )
+            return result, note, spent, False
+        if error_log := self._installer.install(plan):
+            note = _PROMPTS["install_failed"].format(
+                package=plan.package, error=error_log.strip()[-300:]
+            )
+            return result, note, spent, False
+        if plan.route == "restart":
+            self._kernel.restart()
+            pre = self._kernel.run_cell(self._session_preamble(), timeout=self._cell_timeout)
+            cells.append(_cell(self._session_preamble(), pre, "preamble"))
+            note = _PROMPTS["install_restarted"].format(
+                package=plan.package,
+                version=plan.version,
+                moves=plan.moved(),
+                preamble_output=_observation(pre),
+            )
+        else:
+            note = _PROMPTS["install_done"].format(package=plan.package, version=plan.version)
+        t1 = time.monotonic()
+        retried = self._kernel.run_cell(_INVALIDATE + runnable, timeout=self._cell_timeout)
+        return retried, note, spent + time.monotonic() - t1, plan.route == "restart"
+
+    def _install_in_sandbox(
+        self, runnable: str, result: CellResult, package: str, spent: float
+    ) -> tuple[CellResult, str | None, float]:
+        if error_log := self._kernel.install([package]):
+            note = _PROMPTS["install_failed"].format(
+                package=package, error=error_log.strip()[-300:]
             )
             return result, note, spent
         t1 = time.monotonic()
         retried = self._kernel.run_cell(runnable, timeout=self._cell_timeout)
-        spent += time.monotonic() - t1
-        return retried, f"({package!r} was auto-installed and the cell re-ran)", spent
+        note = f"({package!r} was auto-installed and the cell re-ran)"
+        return retried, note, spent + time.monotonic() - t1
+
+
+# The kernel's import caches predate a package the host has just installed.
+_INVALIDATE = "__import__('importlib').invalidate_caches()\n"
+
+
+def _install_line(plan: Plan, module: str) -> str:
+    took = f"({plan.seconds:.1f}s)"
+    if plan.route == "install":
+        return f"install: {plan.package} {plan.version} for import {module} {took}"
+    if plan.route == "restart":
+        return (
+            f"install: {plan.package} {plan.version} moves {plan.moved()}, which the kernel "
+            f"had loaded; restarting the kernel with it {took}"
+        )
+    if plan.route == "next_run":
+        return (
+            f"install: {plan.package} {plan.version} moves {plan.moved()}, which iterate is "
+            f"running on; saved for the next run {took}"
+        )
+    return (
+        f"install: refused {plan.package} for import {module}: {plan.reason} {plan.detail}".rstrip()
+    )
 
 
 _NAME_ERROR = re.compile(r"name '([A-Za-z_][A-Za-z0-9_]*)' is not defined")

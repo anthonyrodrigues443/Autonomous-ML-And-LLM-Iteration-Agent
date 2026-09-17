@@ -40,6 +40,7 @@ from iterate.adapters.data.linking import (
     TABLE_SUFFIXES,
     LinkedFrames,
     LinkError,
+    confine,
 )
 from iterate.adapters.data.tabular import DEFAULT_SEED, DEFAULT_TEST_SIZE, split_frame
 from iterate.schemas.link import LinkPlan
@@ -259,6 +260,8 @@ def write(
     """Write the canonical folder. Idempotent: an existing workspace is reused as is.
     ``both`` is the split the pause showed; without it the same split is made here."""
     sources = [s.resolve() for s in sources]
+    for source in sources:
+        confine(source)
     out = out.resolve()
     _check_relations(sources, out)
     if both is None:
@@ -281,9 +284,17 @@ def write(
     targets = [raw] if len(sources) == 1 else [raw / role for role in ROLES[: len(sources)]]
     raw_of = _raw_of(both.frames, sources, targets)
     for source, target in zip(sources, targets, strict=True):
-        shutil.copytree(
-            source, target, ignore=_ignore, copy_function=shutil.copyfile, dirs_exist_ok=True
-        )
+        try:
+            shutil.copytree(
+                source, target, ignore=_ignore, copy_function=shutil.copyfile, dirs_exist_ok=True
+            )
+        except shutil.Error as exc:
+            errors = exc.args[0]
+            src, _, why = errors[0]
+            raise LinkError(
+                f"{source}: {len(errors)} file(s) could not be copied into {target}, e.g. "
+                f"{src}: {why}"
+            ) from exc
 
     by_class = plan_.task == "classification"
     train_rows = _place(train, root / TRAIN, by_class=by_class, raw_of=raw_of, root=root)

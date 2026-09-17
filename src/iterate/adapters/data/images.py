@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+from iterate import userconfig
+from iterate.adapters.data.inside import Paths, copy_command
 from iterate.adapters.data.tabular import (
     DEFAULT_SEED,
     DEFAULT_TEST_SIZE,
@@ -50,10 +52,96 @@ _FIXED_MTIME = 0
 
 @dataclass(frozen=True)
 class ImageColumn:
-    """Which feature column holds the paths, and what relative paths resolve against."""
+    """Which feature column holds the paths, and the folder each side's paths resolve
+    against: the training CSV's, and the holdout CSV's when the user gave two."""
 
     column: str
     root: Path
+    holdout_root: Path | None = None
+
+
+class OutsideDataError(ValueError):
+    """An image path in a CSV that does not lead to a file inside the folder the CSV is
+    in. ``command``, when set, ends the message: a copy command for a caller to print on
+    a line of its own."""
+
+    def __init__(self, reason: str, *, command: str | None = None) -> None:
+        super().__init__(f"{reason}: {command}" if command else reason)
+        self.reason = reason
+        self.command = command
+
+
+def refuse_outside(values: Iterable[str], csv_path: Path) -> Paths:
+    """Every value checked on its physical path against the CSV's own folder, before any
+    of them is read. Returns that folder's paths for reuse."""
+    paths = Paths(csv_path.resolve().parent)
+    bad = [v for v in dict.fromkeys(values) if not paths.within(paths.physical(v))]
+    if not bad:
+        return paths
+    value, link = next(
+        ((v, link) for v in bad if (link := paths.link_out(v)) is not None), (bad[0], None)
+    )
+    head = (
+        f"{csv_path}: {len(bad)} image path(s) lead outside {paths.root}, the folder this CSV "
+        f"is in, e.g. {value!r}"
+    )
+    if link is not None:
+        named = (
+            f"{head}: {os.path.relpath(link, paths.root)} is a link to "
+            f"{os.path.realpath(link)}. iterate does not follow links out of the folder you "
+            "give it: put the CSV beside the images it names, or "
+        )
+        # A copy with the links replaced still names the original folder in an absolute row.
+        if os.path.isabs(value):
+            raise OutsideDataError(
+                f"{named}write its image paths relative to {paths.root}, and the refusal "
+                "then prints a copy command that replaces the links"
+            )
+        raise OutsideDataError(
+            f"{named}copy the folder with the links replaced and pass the copy",
+            command=copy_command(paths.root),
+        )
+    raise OutsideDataError(
+        f"{head}. iterate reads only the data you give it: put those images under that "
+        "folder and write their paths relative to it, or drop those rows"
+    )
+
+
+def _image_values(frame: pd.DataFrame, features: Sequence[str]) -> pd.Series | None:
+    if len(features) != 1:
+        return None
+    values = frame[features[0]].dropna().astype(str)
+    if values.empty or not values.map(lambda v: Path(v).suffix.lower() in IMAGE_SUFFIXES).all():
+        return None
+    return values
+
+
+def _on_disk(values: pd.Series, paths: Paths) -> bool:
+    return all(os.path.isfile(paths.physical(v)) for v in values.head(_DETECT_SAMPLE))
+
+
+def _refuse_missing_holdout(values: pd.Series, holdout_csv: Path, train_csv: Path) -> None:
+    """A holdout CSV of its own whose sampled rows are not all files beside it. Rows
+    written beside the training CSV are told so, once they are checked inside it."""
+    paths = Paths(holdout_csv.resolve().parent)
+    sample = list(values.head(_DETECT_SAMPLE))
+    missing = [v for v in sample if not os.path.isfile(paths.physical(v))]
+    if not missing:
+        return
+    message = (
+        f"{holdout_csv}: {len(missing)} of its first {len(sample)} image paths do not exist "
+        f"beside it, in {paths.root}, e.g. {missing[0]!r}"
+    )
+    try:
+        train = refuse_outside(sample, train_csv)
+    except OutsideDataError:
+        raise OutsideDataError(message) from None
+    if _on_disk(pd.Series(sample), train):
+        message += (
+            f"; they exist beside {train_csv}. Each CSV's image paths are read beside that "
+            f"CSV: write them relative to {paths.root}"
+        )
+    raise OutsideDataError(message)
 
 
 def detect_image_column(
@@ -62,41 +150,67 @@ def detect_image_column(
     """The feature column holding image files, or None for a tabular frame.
 
     Strict: exactly one feature column, every non-null value ends in an image
-    suffix, and a sample of them exists on disk.
+    suffix, and a sample of them exists on disk. A value leading outside the CSV's
+    folder is refused before the sample.
     """
-    if len(features) != 1:
+    values = _image_values(frame, features)
+    if values is None:
         return None
-    column = features[0]
-    values = frame[column].dropna().astype(str)
-    if values.empty or not values.map(lambda v: Path(v).suffix.lower() in IMAGE_SUFFIXES).all():
-        return None
-    root = csv_path.resolve().parent
-    if not all(_locate(v, root).is_file() for v in values.head(_DETECT_SAMPLE)):
-        return None
-    return ImageColumn(column=column, root=root)
+    paths = refuse_outside(values, csv_path)
+    return ImageColumn(features[0], Path(paths.root)) if _on_disk(values, paths) else None
 
 
-def _locate(value: str, root: Path) -> Path:
-    path = Path(value)
-    return path if path.is_absolute() else root / path
+def image_column(dataset: TabularDataset, csv_path: Path | None = None) -> ImageColumn | None:
+    """``detect_image_column`` for a loaded dataset: the rows of each CSV refused
+    against that CSV's own folder, and the holdout's paths resolved there. ``csv_path``
+    stands in for both sides of a dataset no loader made."""
+    if dataset.sources is not None:
+        train_csv, holdout_csv = dataset.sources
+    elif csv_path is not None:
+        train_csv = holdout_csv = csv_path
+    else:
+        raise ValueError("a dataset no loader made needs the CSV it came from")
+    train = _image_values(dataset.train_features, dataset.features)
+    if train is None:
+        return None
+    holdout = dataset.test_features[dataset.features[0]].dropna().astype(str)
+    if train_csv == holdout_csv:
+        paths = refuse_outside([*train, *holdout], train_csv)
+    else:
+        paths = refuse_outside(train, train_csv)
+        refuse_outside(holdout, holdout_csv)
+    if not _on_disk(train, paths):
+        return None
+    if train_csv != holdout_csv:
+        _refuse_missing_holdout(holdout, holdout_csv, train_csv)
+    return ImageColumn(dataset.features[0], Path(paths.root), holdout_csv.resolve().parent)
 
 
 def resolve_paths(dataset: TabularDataset, column: ImageColumn) -> TabularDataset:
-    """The same dataset with every image path absolute.
+    """The same dataset with every image path physical: absolute, links followed.
 
     The kernel runs in a temporary directory, so a relative path would resolve
-    against the wrong place inside a session.
+    against the wrong place inside a session. The path written is the one the
+    outside check passed, so the hash reads what was checked.
     """
 
-    def absolute(frame: pd.DataFrame) -> pd.DataFrame:
+    def absolute(frame: pd.DataFrame, root: Path) -> pd.DataFrame:
+        paths = Paths(root)
+        real = frame[column.column].map(lambda v: paths.physical(str(v)))
+        away = [r for r in dict.fromkeys(real) if not paths.within(r)]
+        if away:
+            raise OutsideDataError(
+                f"{len(away)} image path(s) lead outside {paths.root}, e.g. {away[0]}. iterate "
+                "reads only the data you give it"
+            )
         out = frame.copy()
-        out[column.column] = out[column.column].map(lambda v: str(_locate(str(v), column.root)))
+        out[column.column] = real
         return out
 
     return replace(
         dataset,
-        train_features=absolute(dataset.train_features),
-        test_features=absolute(dataset.test_features),
+        train_features=absolute(dataset.train_features, column.root),
+        test_features=absolute(dataset.test_features, column.holdout_root or column.root),
     )
 
 
@@ -390,10 +504,8 @@ _SIZE_CEILING = 160
 def image_cache_dir() -> Path:
     """Where byte-named copies live: outside every project and never under .iterate,
     where one hop up from a holdout copy would reach the linked workspace's
-    holdout.csv. A relative XDG_CACHE_HOME is ignored, as the XDG spec says."""
-    base = os.environ.get("XDG_CACHE_HOME", "")
-    root = Path(base) if base and Path(base).is_absolute() else Path.home() / ".cache"
-    return root / "iterate" / "images"
+    holdout.csv."""
+    return userconfig.cache_dir() / "images"
 
 
 def default_image_size(profile: ImageProfile) -> int:
@@ -451,7 +563,10 @@ def _without_twins(
 def _monitor_brief(csv_path: Path) -> list[str]:
     from iterate.adapters.data import monitor
 
-    report = monitor.load(csv_path.resolve().parent)
+    folder = csv_path.resolve().parent
+    if (folder / monitor.REPORT_JSON).is_symlink():
+        return []
+    report = monitor.load(folder)
     return [report.brief()] if report is not None else []
 
 
@@ -467,7 +582,7 @@ def prepare_images(
     out of a holdout this harness split, profile, then copy under byte names. The
     monitor's brief beside the CSV, when there is one, and ``facts`` join the
     dataset's facts after the ones it has; all of them are counts, never a row."""
-    column = detect_image_column(dataset.train_features, dataset.features, csv_path)
+    column = image_column(dataset, csv_path)
     if column is None:
         raise ValueError(f"{csv_path}: the feature column does not hold image paths")
     resolved = resolve_paths(dataset, column)
@@ -489,6 +604,7 @@ __all__ = [
     "SPLIT_FOLDERS",
     "ImageColumn",
     "ImageProfile",
+    "OutsideDataError",
     "Prepared",
     "content_hash",
     "default_image_size",
@@ -496,11 +612,13 @@ __all__ = [
     "file_hashes",
     "frame_from_folder",
     "image_cache_dir",
+    "image_column",
     "load_image_folder",
     "load_image_split",
     "materialise",
     "prepare_images",
     "profile_images",
+    "refuse_outside",
     "resolve_paths",
     "split_folders",
 ]

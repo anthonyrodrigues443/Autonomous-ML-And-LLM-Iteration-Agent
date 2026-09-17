@@ -99,7 +99,7 @@ class Dataset:
             # The CSV holds only paths, so an image swapped behind it would keep the key.
             digest.update(_image_digest(self.path, self.target).encode())
             if self.holdout is not None:
-                digest.update(_image_digest(self.holdout, self.target, self.path).encode())
+                digest.update(_image_digest(self.holdout, self.target).encode())
         return digest.hexdigest()[:_HASH_CHARS]
 
 
@@ -112,21 +112,23 @@ def load_data(dataset: Dataset, *, task: str | None = None) -> TabularDataset:
     return load_csv(dataset.path, target=dataset.target, task=task)
 
 
-def _image_digest(csv: Path, target: str, paths_from: Path | None = None) -> str:
+def _image_digest(csv: Path, target: str) -> str:
     """Every image the CSV names, in row order, by its bytes; a missing one as missing.
-    Relative paths resolve beside `paths_from`, the CSV `prepare_images` is given."""
+    Relative paths resolve beside the CSV, as `prepare_images` resolves each side."""
     import pandas as pd
 
     from iterate.adapters.data.images import detect_image_column
+    from iterate.adapters.data.inside import Paths
 
     frame = pd.read_csv(csv)
     features = [c for c in frame.columns if c != target]
-    column = detect_image_column(frame, features, paths_from or csv)
+    column = detect_image_column(frame, features, csv)
     if column is None:
         raise BadDatasetSpecError(f"{csv}: a vision dataset needs one column of image paths")
+    paths = Paths(column.root)
     digest = hashlib.sha256()
     for value in frame[column.column].astype(str):
-        path = Path(value) if Path(value).is_absolute() else column.root / value
+        path = Path(paths.physical(value))
         try:
             digest.update(hashlib.sha256(path.read_bytes()).digest())
         except OSError:
