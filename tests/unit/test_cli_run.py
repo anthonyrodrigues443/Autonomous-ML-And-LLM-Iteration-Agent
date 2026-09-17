@@ -27,7 +27,8 @@ from iterate.cli import (
 )
 from iterate.schemas.experiment import Candidate, ExperimentResult, Metrics
 
-runner = CliRunner()
+# Error panels wrap at the terminal width, which can split a phrase a test looks for.
+runner = CliRunner(env={"COLUMNS": "1000"})
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
@@ -491,6 +492,8 @@ def _stub_run_supervised(
         from iterate.schemas.experiment import Candidate, Experiment
 
         coder = make_coder()
+        captured["coder"] = coder
+        captured["kernel"] = coder._kernel
         captured["dataset"] = dataset
         captured["supervisor_client"] = supervisor._client
         captured["coder_client"] = coder._client
@@ -780,3 +783,191 @@ def test_an_explicit_metric_names_the_task_for_the_loader(
     assert result.exit_code == 0, result.stdout
     assert captured["dataset"].task == "regression"
     assert "read as" not in _plain(result.output)  # nothing guessed, nothing announced
+
+
+# ─── every local kernel is confined where the machine can (Sprint 4 Day 5) ───
+
+
+def _local_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, sandbox: bool, extra: list[str]
+) -> tuple[Any, str]:
+    captured, output = _captured_local_run(tmp_path, monkeypatch, sandbox=sandbox, extra=extra)
+    return captured["kernel"], output
+
+
+def _captured_local_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, sandbox: bool, extra: list[str]
+) -> tuple[dict[str, Any], str]:
+    from iterate.adapters.compute import confine
+    from iterate.config import get_settings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(confine, "sandbox_available", lambda: sandbox)
+    get_settings.cache_clear()
+    captured = _stub_run_supervised(monkeypatch)
+    try:
+        result = runner.invoke(app, ["run", "--compute", "local", "--no-research", *extra])
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code == 0, result.output
+    return captured, _plain(result.output)
+
+
+def test_a_local_run_confines_its_kernel_to_what_the_run_gave_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.adapters.compute.kernel import LocalKernel
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    memory = tmp_path / "elsewhere" / "m.db"
+    kernel, output = _local_run(
+        tmp_path,
+        monkeypatch,
+        sandbox=True,
+        extra=["--data", "d.csv", "--target", "churn", "--metric", "f1", "--memory", str(memory)],
+    )
+    assert isinstance(kernel, LocalKernel)
+    confinement = kernel._confinement
+    assert confinement.weights == tmp_path / "cache" / "iterate" / "weights"
+    assert confinement.files == ()
+    assert set(confinement.protected) == {
+        (tmp_path / ".iterate").resolve(),
+        memory.resolve(),
+        data.resolve(),
+    }
+    assert kernel._target_key is None
+    assert (
+        "cells are confined: they open their own folder, and model weights under "
+        "~/cache/iterate/weights, nothing else"
+    ) in output
+
+
+def test_a_local_run_without_a_sandbox_says_its_cells_are_not_confined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_tiny_csv(tmp_path / "d.csv")
+    _, output = _local_run(
+        tmp_path,
+        monkeypatch,
+        sandbox=False,
+        extra=["--data", "d.csv", "--target", "churn", "--metric", "f1"],
+    )
+    assert "cells are NOT confined on this machine" in output
+    assert "cells are confined" not in output
+
+
+def test_the_weights_folder_is_shown_from_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+
+    from iterate.cli import _home_tilde
+
+    monkeypatch.setenv("HOME", "/Users/tony")
+    assert _home_tilde(Path("/Users/tony/.cache/iterate/weights")) == "~/.cache/iterate/weights"
+    assert _home_tilde(Path("/Users/tonyx/weights")) == "/Users/tonyx/weights"
+
+
+def test_a_prompt_kernel_gets_the_answer_cache_and_the_key_from_the_project_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lines = ["text,label"] + [
+        f"comment {i},{'toxic' if i % 3 == 0 else 'clean'}" for i in range(30)
+    ]
+    (tmp_path / "eval.csv").write_text("\n".join(lines), encoding="utf-8")
+    (tmp_path / ".env").write_text("GROQ_API_KEY=gsk-only-in-the-project\n", encoding="utf-8")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("ITERATE_TARGET_API_KEY", raising=False)
+    kernel, output = _local_run(
+        tmp_path,
+        monkeypatch,
+        sandbox=True,
+        extra=[
+            "--data",
+            "eval.csv",
+            "--target",
+            "label",
+            "--metric",
+            "f1",
+            "--task",
+            "say whether the comment is toxic",
+            "--target-backend",
+            "groq",
+            "--target-model",
+            "llama-3.3-70b",
+            "--memory",
+            str(tmp_path / "m.db"),
+        ],
+    )
+    assert kernel._target_key == "gsk-only-in-the-project"
+    assert kernel._confinement.files == ((tmp_path / ".iterate" / "prompt-answers.db").resolve(),)
+    assert "they open their own folder, the answer cache, and model weights" in output
+
+
+# ─── cells never install; the harness installs for local runs with consent ───
+
+
+def test_a_local_run_with_install_consent_gives_each_session_an_installer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.adapters.compute import deps
+
+    _write_tiny_csv(tmp_path / "d.csv")
+    run = ["--data", "d.csv", "--target", "churn", "--metric", "f1"]
+    captured, _ = _captured_local_run(
+        tmp_path, monkeypatch, sandbox=False, extra=[*run, "--install"]
+    )
+    coder = captured["coder"]
+    assert coder._install is True
+    assert isinstance(coder._installer, deps.Installer)
+    assert coder._installer._pending.parent == tmp_path / "cache" / "iterate" / "installs"
+    captured, _ = _captured_local_run(tmp_path, monkeypatch, sandbox=False, extra=run)
+    assert (captured["coder"]._install, captured["coder"]._installer) == (False, None)
+
+
+def _saved(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    from iterate.adapters.compute import deps
+
+    ran: list[str] = []
+
+    def install_pending(self: Any) -> list[str]:
+        ran.append("install_pending")
+        return ["installed sktime 1.1.0 saved by an earlier run (pandas 3.0.3 -> 2.3.3)"]
+
+    monkeypatch.setattr(deps.Installer, "pending", lambda self: [{"package": "sktime"}])
+    monkeypatch.setattr(deps.Installer, "install_pending", install_pending)
+    return ran
+
+
+def test_saved_installs_run_first_in_a_run_with_install_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_tiny_csv(tmp_path / "d.csv")
+    ran = _saved(monkeypatch)
+    run = ["--data", "d.csv", "--target", "churn", "--metric", "f1", "--install"]
+    _, output = _captured_local_run(tmp_path, monkeypatch, sandbox=True, extra=run)
+    assert ran == ["install_pending"]
+    line = "installs: installed sktime 1.1.0 saved by an earlier run (pandas 3.0.3 -> 2.3.3)"
+    assert output.index(line) < output.index("cells are confined")
+
+
+def test_saved_installs_wait_for_install_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_tiny_csv(tmp_path / "d.csv")
+    ran = _saved(monkeypatch)
+    run = ["--data", "d.csv", "--target", "churn", "--metric", "f1"]
+    _, output = _captured_local_run(tmp_path, monkeypatch, sandbox=True, extra=run)
+    assert ran == []
+    assert "installs: sktime saved by an earlier run, waiting for --install" in output
+
+
+def test_an_e2b_run_leaves_saved_installs_alone(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ran = _saved(monkeypatch)
+    cli_module._install_saved_packages(install=True, compute="e2b")
+    assert ran == []
+    assert "installs" not in capsys.readouterr().out

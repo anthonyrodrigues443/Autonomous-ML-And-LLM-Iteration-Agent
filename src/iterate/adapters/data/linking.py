@@ -13,8 +13,10 @@ exactly as a rules plan before anything is built.
 
 from __future__ import annotations
 
-import contextlib
+import functools
 import logging
+import os
+import posixpath
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from iterate.adapters.data.inside import Paths, copy_command
 from iterate.adapters.data.tabular import looks_like_classification
 from iterate.schemas.link import KeyMethod, LinkPlan, Shape, Source, Task
 
@@ -94,19 +97,24 @@ HOW: dict[KeyMethod, str] = {
 ACCEPT = 0.98
 PAUSE = 0.90
 MAX_DEPTH = 6
-LINK_VERSION = "1"  # bump when a rung or a check changes, so remembered plans are looked at again
+LINK_VERSION = "2"  # bump when a rung or a check changes, so remembered plans are looked at again
 
 
 class LinkError(ValueError):
     """The folder cannot be read as a labelled image dataset; the message says why.
 
     ``ambiguous`` marks a refusal a choice would settle, as against a fault in the
-    data: only those may go to the Linker.
+    data: only those may go to the Linker. ``command``, when set, ends the message: a
+    copy command for a caller to print on a line of its own.
     """
 
-    def __init__(self, message: str, *, ambiguous: bool = False) -> None:
-        super().__init__(message)
+    def __init__(
+        self, message: str, *, ambiguous: bool = False, command: str | None = None
+    ) -> None:
+        super().__init__(f"{message}: {command}" if command else message)
         self.ambiguous = ambiguous
+        self.reason = message
+        self.command = command
 
 
 @dataclass
@@ -171,11 +179,105 @@ def _split_pair(root: Path) -> tuple[tuple[Path, Path] | None, list[str]]:
     return (train, holdout), ignored
 
 
+def _hub_snapshot(root: str, targets: Sequence[str]) -> str | None:
+    """The cache repo folder when ``root`` is inside a Hugging Face snapshot whose files
+    are links into that repo's blobs/, else None."""
+    parts = Path(root).parts
+    if "snapshots" not in parts:
+        return None
+    repo = Path(*parts[: len(parts) - 1 - parts[::-1].index("snapshots")])
+    blobs = os.path.realpath(repo / "blobs")
+    return str(repo) if all(os.path.dirname(t) == blobs for t in targets) else None
+
+
+def _identity(directory: str) -> tuple[int, int]:
+    st = os.stat(directory)
+    return st.st_dev, st.st_ino
+
+
+def _entries(directory: str) -> list[os.DirEntry[str]]:
+    """The visible entries of a folder, last name first, so popping walks in name order."""
+    try:
+        with os.scandir(directory) as it:
+            kept = [e for e in it if not e.name.startswith(".") and e.name not in SKIP_DIRS]
+    except OSError:
+        return []
+    return sorted(kept, key=lambda e: e.name, reverse=True)
+
+
+def confine(folder: str | Path) -> None:
+    """Refuse a folder holding a link that leads outside it, a link that leads nowhere,
+    or links that go round in a loop. Every visible entry at any depth, since the copy
+    into raw_files has no depth limit; a link that stays inside is walked once, a link
+    out never is."""
+    paths = Paths(folder)
+    away: list[tuple[str, str]] = []
+    nowhere: list[str] = []
+    done: set[tuple[int, int]] = set()
+    walk = [(_identity(paths.root), _entries(paths.root))]
+    while walk:
+        key, pending = walk[-1]
+        if not pending:
+            walk.pop()
+            done.add(key)
+            continue
+        entry = pending.pop()
+        if entry.is_symlink():
+            # A copy of the folder cannot follow it, so no copy command is offered.
+            if not os.path.exists(entry.path):
+                nowhere.append(entry.path)
+                continue
+            real = os.path.realpath(entry.path)
+            if real != paths.root and not paths.within(real):
+                away.append((entry.path, real))
+                continue
+            if not os.path.isdir(real):
+                continue
+        elif entry.is_dir(follow_symlinks=False):
+            real = entry.path
+        else:
+            continue
+        # A folder is known by its inode: a case-folding disk spells one folder many ways.
+        identity = _identity(real)
+        if any(identity == open_ for open_, _ in walk):
+            raise LinkError(
+                f"{paths.root}: links go round in a loop, "
+                f"{os.path.relpath(entry.path, paths.root)} -> {os.path.relpath(real, paths.root)}"
+                ", so the folder never ends. Remove the link"
+            )
+        if identity not in done:
+            walk.append((identity, _entries(real)))
+    if nowhere:
+        raise LinkError(
+            f"{paths.root}: {os.path.relpath(min(nowhere), paths.root)} is a link that leads "
+            f"nowhere ({len(nowhere)} such link(s)), so the folder cannot be read or copied. "
+            "Remove the link"
+        )
+    if not away:
+        return
+    first, target = min(away)
+    if (repo := _hub_snapshot(paths.root, [t for _, t in away])) is not None:
+        raise LinkError(
+            f"{paths.root} is a Hugging Face cache snapshot: its {len(away)} file(s) are links "
+            f"into {repo}/blobs, outside the folder you gave. iterate reads only the data you "
+            "give it: download it with snapshot_download(..., local_dir=<folder>) and pass "
+            "that folder, or copy it and pass the copy",
+            command=copy_command(paths.root),
+        )
+    raise LinkError(
+        f"{paths.root}: {len(away)} link(s) lead outside the folder you gave, e.g. "
+        f"{os.path.relpath(first, paths.root)} -> {target}. iterate reads only the data you "
+        "give it: copy the folder with the links replaced and pass the copy",
+        command=copy_command(paths.root),
+    )
+
+
 def inventory(folder: str | Path) -> Inventory:
     """Walk a folder to depth six; hidden entries and archive litter are skipped."""
     root = Path(folder).resolve()
     if not root.is_dir():
         raise LinkError(f"{root} is not a folder")
+    confine(root)
     root, collapsed = _collapse_wrappers(root)
     pair, ignored = _split_pair(root)
     inv = Inventory(root=root, collapsed=collapsed, split_pair=pair, ignored=ignored)
@@ -206,13 +308,16 @@ def inventory(folder: str | Path) -> Inventory:
 def _keys_for(image: Path, root: Path, table_dir: Path) -> dict[KeyMethod, set[str]]:
     rel = image.relative_to(root).as_posix()
     keys: dict[KeyMethod, set[str]] = {
-        "path": {rel, rel.lower()},
+        "path": {
+            rel,
+            rel.lower(),
+            image.as_posix(),
+            posixpath.relpath(image.as_posix(), table_dir.as_posix()),
+        },
         "basename": {image.name, image.name.lower()},
         "stem": {image.stem, image.stem.lower()},
         "stem_int": set(),
     }
-    with contextlib.suppress(ValueError):
-        keys["path"].add(image.relative_to(table_dir).as_posix())
     if image.stem.isdigit():
         keys["stem_int"].add(str(int(image.stem)))
     return keys
@@ -242,14 +347,21 @@ def _key_strings(values: pd.Series) -> list[str]:
 def _claimed(
     values: pd.Series, index: dict[str, list[Path]], method: KeyMethod
 ) -> list[Path | None]:
-    """The image each row names, or None when the key names nothing or several."""
+    """The image each row names, or None when the key names nothing or several. An
+    absolute key is also looked up with its folder's links followed, since the index
+    holds each image under the folder's physical path."""
     out: list[Path | None] = []
+    real_dir = functools.cache(os.path.realpath)
     for v in _key_strings(values):
         candidates = (index.get(v) or index.get(v.lower()) or []) if v else []
         if method == "stem_int" and v.isdigit():
             candidates = index.get(str(int(v))) or candidates
         if method == "path" and v and not candidates:
-            candidates = index.get(v.replace("\\", "/").lstrip("./")) or []
+            key = posixpath.normpath(v.replace("\\", "/"))
+            candidates = index.get(key) or index.get(key.lstrip("/")) or []
+            if not candidates and posixpath.isabs(key):
+                head, name = posixpath.split(key)
+                candidates = index.get(posixpath.join(real_dir(head), name)) or []
         out.append(candidates[0] if len(candidates) == 1 else None)
     return out
 
@@ -861,6 +973,7 @@ __all__ = [
     "TableRows",
     "apply",
     "class_of",
+    "confine",
     "inventory",
     "join_rates",
     "plan",

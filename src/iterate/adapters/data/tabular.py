@@ -16,13 +16,10 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_SEED = 42
@@ -50,6 +47,7 @@ class TabularDataset:
     user_split: bool = False  # the caller supplied train and holdout; nothing was shuffled
     task: str = "classification"  # the one place the task is decided; explicit metric wins
     facts: tuple[str, ...] = ()  # host-run check lines, aggregate only, never a holdout row
+    sources: tuple[Path, Path] | None = None  # the train and holdout files, links followed
 
     @property
     def n_train(self) -> int:
@@ -245,7 +243,7 @@ def load_csv(
     task: str | None = None,
 ) -> TabularDataset:
     """Load a CSV and return a deterministic train/holdout split."""
-    return split_frame(
+    dataset = split_frame(
         _read_csv_any_encoding(path),
         target,
         test_size=test_size,
@@ -253,6 +251,7 @@ def load_csv(
         stratify=stratify,
         task=task,
     )
+    return replace(dataset, sources=(Path(path).resolve(), Path(path).resolve()))
 
 
 def load_split(
@@ -264,13 +263,14 @@ def load_split(
     task: str | None = None,
 ) -> TabularDataset:
     """Two CSVs the user split themselves; the holdout is sealed as it stands."""
-    return dataset_from_frames(
+    dataset = dataset_from_frames(
         _read_csv_any_encoding(train_path),
         _read_csv_any_encoding(holdout_path),
         target,
         seed=seed,
         task=task,
     )
+    return replace(dataset, sources=(Path(train_path).resolve(), Path(holdout_path).resolve()))
 
 
 def with_smaller_holdout(dataset: TabularDataset, n: int) -> TabularDataset:

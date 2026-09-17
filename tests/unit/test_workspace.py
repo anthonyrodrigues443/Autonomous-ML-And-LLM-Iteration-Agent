@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -10,7 +11,7 @@ import pytest
 
 from iterate.adapters.data import workspace
 from iterate.adapters.data.images import detect_image_column, resolve_paths
-from iterate.adapters.data.linking import apply, inventory, plan
+from iterate.adapters.data.linking import LinkError, apply, inventory, plan
 from iterate.adapters.data.tabular import load_split
 from tests.unit.image_fixtures import CLASSES, class_tree, png
 
@@ -445,3 +446,31 @@ def test_the_memory_keeps_whether_the_twins_were_dropped(tmp_path: Path) -> None
     assert workspace.recall_plan([root], out=out) == [plan_]
     workspace.remember_plan([plan_], sources=[root], out=out)  # type: ignore[list-item]
     assert workspace.recall_drop([root], out=out) is False
+
+
+def test_write_refuses_a_link_out_made_after_the_inventory(tmp_path: Path) -> None:
+    source = _class_tree(tmp_path / "pets")
+    inv = inventory(source)
+    p = plan(inv)
+    frames = apply(p, inv)
+    png(tmp_path / "elsewhere" / "secret.png", 99)
+    (source / "cat" / "late.png").symlink_to(tmp_path / "elsewhere" / "secret.png")
+    with pytest.raises(LinkError, match=r"1 link.* lead outside the folder you gave"):
+        workspace.write(p, frames, sources=[source], out=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_copy_that_fails_is_a_link_error_not_a_traceback(tmp_path: Path) -> None:
+    source = _class_tree(tmp_path / "pets")
+    locked = source / "notes.txt"
+    locked.write_text("x", encoding="utf-8")
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("this user reads any file")
+        inv = inventory(source)
+        p = plan(inv)
+        with pytest.raises(LinkError, match=r"1 file\(s\) could not be copied into .*notes\.txt"):
+            workspace.write(p, apply(p, inv), sources=[source], out=tmp_path / "out")
+    finally:
+        locked.chmod(0o644)

@@ -109,9 +109,7 @@ class LocalCodeRunner:
                     timed_out=True,
                 )
             collected = {
-                name: (workdir / name).read_bytes()
-                for name in outputs
-                if (workdir / name).exists()
+                name: (workdir / name).read_bytes() for name in outputs if (workdir / name).exists()
             }
             return RunResult(
                 stdout=proc.stdout,
@@ -208,23 +206,20 @@ def _missing_packages(packages: list[str]) -> list[str]:
 
 
 def _pip_install(packages: list[str], *, timeout: float) -> str:
-    """Best-effort ``pip install`` into the current interpreter. Returns a log line
-    on failure (prepended to stderr so the agent sees it), "" on success/no-op."""
+    """Install into the current interpreter, pinned to every installed version. Returns
+    a log line on failure (prepended to stderr so the agent sees it), "" on success."""
+    from iterate.adapters.compute import deps
+
     if not packages:
         return ""
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", *packages],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+    with tempfile.TemporaryDirectory(prefix="iterate-pins-") as tmp:
+        log = deps.install(
+            sys.executable,
+            packages,
+            deps.pin_everything(Path(tmp)),
+            timeout=min(timeout, deps.INSTALL_TIMEOUT),
         )
-    except subprocess.TimeoutExpired:
-        return f"[iterate] pip install timed out for {packages}\n"
-    if proc.returncode != 0:
-        return f"[iterate] pip install failed for {packages}:\n{proc.stderr}\n"
-    return ""
+    return f"[iterate] install failed for {packages}:\n{log}\n" if log else ""
 
 
 def _try_read(sandbox: Any, path: str) -> bytes | None:

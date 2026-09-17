@@ -17,6 +17,16 @@ def test_config_path_honors_xdg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert userconfig.config_path() == tmp_path / "iterate" / "config.toml"
 
 
+def test_cache_dir_honors_xdg_and_ignores_a_relative_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert userconfig.cache_dir() == tmp_path / "xdg" / "iterate"
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative/cache")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert userconfig.cache_dir() == tmp_path / "home" / ".cache" / "iterate"
+
+
 def test_save_then_load_round_trips(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     assert not userconfig.exists()

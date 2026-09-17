@@ -190,7 +190,7 @@ coder:
     HOW THE SESSION WORKS
     1. ONE cell per turn via run_cell; you then see its output AND the variables now in memory (names, shapes, types). Variables you create PERSIST: if one you need exists in that list, USE it; never re-load data or recompute preprocessing already run.
     2. Already loaded: X_train (features), y_train (training target), X_holdout (FEATURES ONLY; labels sealed). These three RESET to their original state atop EVERY cell: a column you add to them is GONE next cell, while every variable YOU create persists. Engineer features freely, into your OWN derived frames. To submit, write one prediction per X_holdout row to '{predictions_csv}', one value per line, no header, in X_holdout order.
-    3. Missing libraries auto-install with a note (installed-and-reran, or FAILED-so-switch; do not retry a failed import).
+    3. Never install packages in a cell (no pip, uv or conda, no !pip or %pip). Such a cell is refused unrun. Just import what you need. A missing library is handled for you with a note: installed and your cell re-ran, kernel restarted with it (your variables are gone), saved for the next run, or refused. After a saved or refused note, switch library and do not retry that import.
     4. The budget charges KERNEL-EXECUTION seconds only; thinking is free. A warning arrives near the end.
     5. To end, call the finish TOOL (not Python); rejected unless a valid '{predictions_csv}' exists. A finish() shim only prints guidance. Always END your turn with a run_cell or finish tool call.{proba_requirement}
 
@@ -406,6 +406,70 @@ coder:
     which means your message was cut off. Re-send the COMPLETE cell; if it was long,
     split it into two smaller cells.
 
+  # Sent instead of running a cell that runs an installer (codegen.runs_installer).
+  installer_refused: >-
+    (not run: a cell never installs packages. Import the library in a normal cell. If
+    it is missing, iterate handles the install and tells you what happened.)
+  installer_refused_no_install: >-
+    (not run: a cell never installs packages, and installs are off for this run. Use a
+    library that already imports.)
+  installer_query_refused: >-
+    (not run: a cell never runs pip, uv or conda, not even to look. To see what is
+    installed, use importlib.metadata.version('name') or importlib.metadata.distributions().)
+
+  # Prepended to the observation of a cell that failed on a missing import.
+  # Placeholders: {module}, {package}, {version}, {moves}, {detail}, {error}, {preamble_output}
+  install_off_note: >-
+    ('{module}' is not installed and installs are off for this run. Use a library that
+    already imports. Do not retry this import.)
+  install_done: >-
+    ('{package}' {version} was installed and your cell re-ran.)
+  install_restarted: |-
+    (KERNEL RESTARTED: '{package}' {version} needed {moves}, which this session had already loaded, so the kernel restarted with it installed. Every variable you made is GONE.
+    The session setup ran again and printed:
+    {preamble_output}
+    Your cell then re-ran from the top in the fresh kernel. Its output is below. Rebuild only what you still need, one cell at a time.)
+  install_next_run: >-
+    ('{package}' {version} is NOT installed: it needs {moves}, and iterate itself is
+    running on those versions now. It is saved and will be installed when the next run
+    starts. For this session use a library that already imports. Do not retry this
+    import.)
+  install_failed: >-
+    (auto-install of '{package}' FAILED: {error}. Do not retry this import: switch to a
+    library that is already available.)
+  install_refused_frozen: >-
+    ('{package}' is never installed or changed during a run. Use what this session
+    already has. Do not retry this import.)
+  install_refused_frozen_dep: >-
+    ('{package}' needs a different torch or torchvision ({detail}), and those never
+    change during a run. Use another library. Do not retry this import.)
+  install_refused_needs_torch: >-
+    ('{package}' needs {detail}, which this environment does not have, and torch is
+    installed only at the start of an image run. Use another library. Do not retry
+    this import.)
+  install_refused_installed: >-
+    ('{package}' {version} is installed, but '{module}' is not part of it. Nothing to
+    install: fix the import for this version of the library.)
+  install_refused_not_found: >-
+    ('{package}' does not exist on the package index, so '{module}' cannot be installed.
+    Check the import name, or use another library. Do not retry this import.)
+  install_refused_no_wheel: >-
+    ('{package}' has no build for this machine ({detail}). Use another library. Do not
+    retry this import.)
+  install_refused_network: >-
+    ('{package}' could not be installed: the package index is unreachable. Use a library
+    that already imports. Do not retry this import.)
+  install_refused_no_installer: >-
+    ('{package}' could not be installed: this environment has no pip and uv was not
+    found, so nothing can install here. That is the environment, not the package. Use a
+    library that already imports. Do not retry this import.)
+  install_refused_iterate: >-
+    ('{package}' cannot be installed beside the packages iterate runs on ({detail}). Use
+    another library. Do not retry this import.)
+  install_refused_unresolvable: >-
+    ('{package}' cannot be installed in this environment ({detail}). Use another
+    library. Do not retry this import.)
+
   # Sent when a cell is identical to one already run this session (not executed again).
   repeat_rejected: >-
     You already ran an identical cell; its output is above and will not change.
@@ -421,6 +485,22 @@ coder:
     approach NOW: switch to a faster model family (LogisticRegression instead of a
     boosted tree), subsample the rows, or cut features. If valid predictions were
     already written, protect them and call finish.
+
+  # Prepended when a confined cell was refused a path outside its own folder.
+  # Placeholders: {path}, {inputs} (the line for this session's family)
+  outside_folder_note: >-
+    BLOCKED: {path} is outside this session's folder, so the cell could not open it.
+    A cell opens only its own folder (and the files you write there) and the files
+    this run handed it. {inputs} Pretrained weights download into the folders named
+    by TORCH_HOME and HF_HOME.
+  outside_folder_inputs:
+    tabular: Your data is already in X_train, y_train and X_holdout. There is nothing else to read.
+    prompt: Your rows are already in X_train, y_train and X_holdout, and ask() reaches the model. There is nothing else to read.
+  # Prepended when a confined cell was refused running a program. Placeholder: {path}
+  blocked_program_note: >-
+    BLOCKED: {path} is a program a cell may not run. Cells never run installers or
+    programs they wrote. Import what you need in a normal cell. A missing library is
+    handled for you.
 
   # Prepended to the observation when the SAME error recurs. Placeholder: {error}
   same_error_nudge: >-

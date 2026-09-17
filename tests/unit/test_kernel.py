@@ -17,6 +17,7 @@ from iterate.adapters.compute.kernel import CellResult, E2BKernel, LocalKernel, 
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 
 # ─── LocalKernel (real kernel, offline) ──────────────────────────────────
@@ -104,20 +105,21 @@ def test_install_falls_back_to_uv_when_venv_has_no_pip(
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _Proc:
         calls.append(list(cmd))
-        if "pip" in cmd and cmd[0] != "uv":
+        if "pip" in cmd and cmd[0] != "/usr/local/bin/uv":
             return _Proc(1, "/x/python3: No module named pip")
         return _Proc(0)
 
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/uv")
     assert LocalKernel().install(["catboost"]) == ""
-    assert calls[1][:3] == ["uv", "pip", "install"]  # the fallback actually fired
+    assert calls[1][:3] == ["/usr/local/bin/uv", "pip", "install"]  # the fallback actually fired
     assert "catboost" in calls[1]
 
 
 def test_install_bootstraps_ensurepip_when_uv_is_absent(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     calls: list[list[str]] = []
     pip_attempts = 0
 
@@ -271,6 +273,51 @@ def test_e2b_lease_renewal_is_best_effort_and_never_breaks_a_cell() -> None:
     assert k.run_cell("a = 1", timeout=30).ok  # cell still runs despite set_timeout raising
 
 
+def test_restart_empties_the_namespace_and_keeps_the_working_directory() -> None:
+    k = LocalKernel()
+    k.start({"meta.json": b"{}"})
+    try:
+        assert k.run_cell("kept = 42\nopen('mine.txt', 'w').write('x')", timeout=30).ok
+        k.restart()
+        after = k.run_cell(
+            "print('kept' in dir(), sorted(__import__('os').listdir('.')))", timeout=30
+        )
+        assert after.stdout.strip() == "False ['meta.json', 'mine.txt']"
+    finally:
+        k.close()
+
+
+def test_loaded_modules_lists_what_the_kernel_imported_and_nothing_it_did_not() -> None:
+    k = LocalKernel()
+    k.start({})
+    try:
+        before = k.loaded_modules() or []
+        assert k.run_cell("import mailbox", timeout=30).ok
+        namespace = k.namespace_summary()
+        after = k.loaded_modules() or []
+        assert "mailbox" in after
+        assert "mailbox" not in before
+        assert k.namespace_summary() == namespace
+    finally:
+        k.close()
+
+
+def test_a_kernel_never_started_cannot_restart_or_list_modules() -> None:
+    k = LocalKernel()
+    assert k.loaded_modules() is None
+    with pytest.raises(RuntimeError, match="not started"):
+        k.restart()
+
+
+def test_an_e2b_kernel_lists_no_modules_names_no_block_and_never_restarts() -> None:
+    k = E2BKernel(sandbox_factory=lambda: _FakeSandbox(store={}))
+    k.start({})
+    assert k.loaded_modules() is None
+    assert k.blocked("PermissionError: [Errno 1] Operation not permitted: '/etc/x'") is None
+    with pytest.raises(NotImplementedError):
+        k.restart()
+
+
 def test_both_kernels_satisfy_the_protocol() -> None:
     assert isinstance(LocalKernel(), StatefulKernel)
     assert isinstance(E2BKernel(), StatefulKernel)
@@ -312,3 +359,34 @@ def test_a_chatty_cell_still_hits_the_cell_timeout() -> None:
     # The cell wants 40s. Bounded by its own deadline it must stop near 2s, with
     # slack for kernel round-trips rather than for the 0.2s print interval.
     assert elapsed < 15.0, f"cell ran {elapsed:.1f}s against a 2s timeout"
+
+
+# ─── the plain install pins every installed version (Sprint 4 Day 5) ─────────
+
+
+def test_local_install_pins_every_installed_distribution(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.metadata
+    from pathlib import Path
+
+    seen: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _Proc:
+        seen.append(Path(cmd[cmd.index("-c") + 1]).read_text().split())
+        return _Proc(0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert LocalKernel().install(["catboost"]) == ""
+    [pins] = seen
+    assert f"pandas=={importlib.metadata.version('pandas')}" in pins
+    assert len(pins) == len({d.metadata["Name"] for d in importlib.metadata.distributions()})
+
+
+def test_local_install_refuses_torch_before_running_anything(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def never(*a: Any, **k: Any) -> None:
+        pytest.fail("an installer ran")
+
+    monkeypatch.setattr("subprocess.run", never)
+    assert LocalKernel().install(["torch"]) == "torch never changes during a run"
+    assert LocalKernel().install(["torchvision>=0.24"]) == "torchvision never changes during a run"

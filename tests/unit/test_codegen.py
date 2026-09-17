@@ -393,3 +393,143 @@ def test_integer_class_labels_still_coerce_to_the_class(tmp_path: Path) -> None:
     ints = pd.Series([1, 0])
     assert codegen._coerce(["1.7", "0.2"], target=ints, task="classification") == [1, 0]
     assert codegen._coerce(["1.7", "0.2"], target=ints, task="regression") == [1.7, 0.2]
+
+
+# ─── a cell never runs an installer (Sprint 4 Day 5) ─────────────────────────
+
+_INSTALLER_CELLS = [
+    "!pip install catboost",
+    "%pip install -q catboost",
+    "!uv pip install catboost",
+    "%uv pip install catboost",
+    "%conda install -y catboost",
+    "%mamba install catboost",
+    "%micromamba install catboost",
+    "import sys\n!{sys.executable} -m pip install catboost",
+    "out = !!pip install catboost",
+    "%%bash\npip install catboost",
+    "%%script bash\nconda install -y catboost",
+    "%system pip install catboost",
+    "for p in ['catboost']:\n    !pip install {p}",
+    "import subprocess, sys\ncmd = [sys.executable, '-m', 'pip', 'install', 'catboost']\n"
+    "subprocess.run(cmd, check=True)",
+    "import subprocess, sys\nsubprocess.check_call(\n"
+    "    [sys.executable, '-m', 'pip', 'install', 'catboost']\n)",
+    'import subprocess, sys\nsubprocess.run(\n    ["uv", "pip", "install", "--python", '
+    'sys.executable, "catboost"],\n    check=True,\n)',
+    "from subprocess import run as r\nimport sys\nr([sys.executable, '-mpip', 'install', 'catboost'])",
+    "import os\nos.system('conda install -y catboost')",
+    "from os import system\nsystem('pip install catboost')",
+    "import os, sys\nos.execv(sys.executable, [sys.executable, '-m', 'pip', 'install', 'x'])",
+    "import pty\npty.spawn(['uv', 'pip', 'install', 'catboost'])",
+    "import runpy, sys\nsys.argv = ['pip', 'install', 'catboost']\n"
+    "runpy.run_module('pip', run_name='__main__')",
+    "from pip._internal.cli.main import main\nmain(['install', 'catboost'])",
+    "import importlib\nimportlib.import_module('pip._internal.cli.main').main(['install', 'x'])",
+    "import ensurepip\nensurepip.bootstrap()",
+    "ip = get_ipython()\nip.getoutput('uv pip install catboost')",
+    "import asyncio\nawait asyncio.create_subprocess_exec('pip', 'install', 'catboost')",
+    "import sys\nsys.modules['subprocess'].run(['uv', 'pip', 'install', 'x'])",
+]
+
+# Shapes a plain name check first let through, each of which really installed a package.
+_EVASIONS = [
+    "exec(\"import subprocess, sys\\nsubprocess.check_call([sys.executable, '-m', 'pip', "
+    "'install', 'tabulate'])\")",
+    'exec(\'from pip._internal.cli.main import main; main(["install", "tabulate"])\')',
+    "from posix import system\nsystem('pip install tabulate')",
+    "from IPython.utils.process import system\nsystem('pip install tabulate')",
+    "from IPython.utils.process import getoutput\nprint(getoutput('uv pip install tabulate'))",
+    "ip = get_ipython()\ngetattr(ip, 'system')('pip install tabulate')",
+    "from asyncio import create_subprocess_exec\n"
+    "proc = await create_subprocess_exec('pip', 'install', 'tabulate')\nawait proc.wait()",
+    "!pipenv install tabulate",
+    "!poetry add tabulate",
+    "import platform\nplatform.os.system('pip install tabulate')",
+    "from os import *\nsystem('pip install tabulate')",
+    "!pdm add tabulate",
+    "!rye add tabulate",
+    "!pixi add tabulate",
+    "%%capture\n!pip install tabulate",
+    "%timeit -n1 __import__('os').system('pip install tabulate')",
+    "cmd = 'pip install tabulate'\n!{cmd}",
+]
+
+_QUERY_CELLS = [
+    "!pip list",
+    "!pip show torch",
+    "!pip freeze",
+    "!conda list",
+    "!pip --version",
+    "!uv pip list",
+    "import subprocess, sys\nprint(subprocess.run([sys.executable, '-m', 'pip', 'list'], "
+    "capture_output=True, text=True).stdout)",
+]
+
+_HONEST_CELLS = [
+    "from sklearn.pipeline import Pipeline\npipe = Pipeline([('m', None)])",
+    "import os\nos.system('ls')",
+    "!nvidia-smi",
+    "X_train['uv'] = X_train['uv_index'] * 2",
+    "import platform\nprint(platform.system(), X_train['uv'].mean())",
+    "import subprocess\nprint(subprocess.run(['nproc'], capture_output=True).stdout)",
+    "# do not pip install here\nprint(1)",
+    "x = 'pip'\nprint(x)",
+    "import shutil\nprint(shutil.which('uv'))",
+    "import timm\nm = timm.create_model('resnet18', pretrained=True)",
+    "%timeit sum(range(10))",
+    "from platform import system\nprint(system(), X_train['uv'].mean())",
+    "X_train['system'] = 1\nprint(X_train['uv'])",
+    "fn = getattr(model, 'predict')\nprint(fn(X_holdout))",
+    "exec('x = 1')",
+    "print(eval(\"X_train['uv'].sum()\"))",
+    "%%time\npreds = [ask(f'Is this text poetry or prose? {t}') for t in X_holdout['text']]",
+    "%%capture\nlabels = ['black mamba', 'python', 'cobra']\nprint(labels)",
+    "%matplotlib inline\nimport matplotlib.pyplot as plt\nplt.hist(X_train['uv'])",
+    "%time m = X_train.groupby('conda').size()",
+    "%timeit -n 3 X_train['uv'].sum()",
+    "%load_ext autoreload\nprompt = 'Classify this poem vs poetry'",
+    "!nvidia-smi\nprint(X_train['pip'].mean())",
+    "print(X_train.system.value_counts(), X_train['uv'].mean())",
+    "x = X_train.system\nprint(X_train['uv'].mean())",
+]
+
+
+@pytest.mark.parametrize("cell", _INSTALLER_CELLS + _EVASIONS)
+def test_runs_installer_catches_every_installer_shape(cell: str) -> None:
+    found = codegen.runs_installer(cell)
+    assert found is not None
+    assert not found.query
+
+
+@pytest.mark.parametrize("cell", _QUERY_CELLS)
+def test_a_cell_that_only_asks_what_is_installed_is_still_an_installer(cell: str) -> None:
+    found = codegen.runs_installer(cell)
+    assert found is not None
+    assert found.query
+
+
+@pytest.mark.parametrize("cell", _HONEST_CELLS)
+def test_runs_installer_passes_near_misses(cell: str) -> None:
+    assert codegen.runs_installer(cell) is None
+
+
+def test_runs_installer_passes_every_harness_cell() -> None:
+    harness = [
+        codegen.session_preamble(),
+        codegen.prompt_session_preamble(),
+        codegen.RESET_INPUTS,
+        codegen.prompt_fallback_baseline(),
+        *(
+            codegen.fallback_baseline(t, with_proba=p)
+            for t in ("classification", "regression")
+            for p in (False, True)
+        ),
+    ]
+    assert [codegen.runs_installer(c) for c in harness] == [None] * len(harness)
+
+
+def test_an_import_name_that_is_another_project_on_pypi_maps_to_the_real_one() -> None:
+    assert codegen.package_for_import("umap") == "umap-learn"
+    assert codegen.package_for_import("imblearn.over_sampling") == "imbalanced-learn"
+    assert codegen.package_for_import("tabulate") == "tabulate"

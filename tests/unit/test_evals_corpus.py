@@ -290,19 +290,19 @@ def test_a_vision_holdout_moves_the_key_when_one_of_its_images_changes(tmp_path:
     assert dataset.content_hash() != before
 
 
-def test_a_vision_holdout_in_another_folder_reads_its_image_paths_beside_the_train_csv(
+def test_a_vision_holdout_in_another_folder_reads_its_image_paths_beside_its_own_csv(
     tmp_path: Path,
 ) -> None:
     from PIL import Image
 
     _tiles(tmp_path, "train.csv", 0, 4)
-    _tiles(tmp_path, "holdout.csv", 4, 2)
-    (tmp_path / "elsewhere").mkdir()
-    (tmp_path / "holdout.csv").rename(tmp_path / "elsewhere" / "holdout.csv")
+    _tiles(tmp_path / "elsewhere", "holdout.csv", 4, 2)
     (dataset,) = corpus.load(_held(tmp_path, "vision", holdout="elsewhere/holdout.csv"))
     before = dataset.content_hash()
     Image.new("RGB", (4, 4), (0, 255, 0)).save(tmp_path / "images" / "5.png")
+    assert dataset.content_hash() == before
 
+    Image.new("RGB", (4, 4), (0, 255, 0)).save(tmp_path / "elsewhere" / "images" / "5.png")
     assert dataset.content_hash() != before
 
 

@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from iterate.adapters.data import linking
+from iterate.adapters.data.inside import copy_command
 from iterate.adapters.data.linking import LinkError, apply, inventory, plan, render
 from tests.unit.image_fixtures import CLASSES, class_tree, png
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 pytestmark = pytest.mark.unit
 
@@ -729,3 +731,181 @@ def test_render_names_both_sides_when_the_frames_carry_them(tmp_path: Path) -> N
         "split: none given, 14 images split here 80/20, 9 train / 3 holdout "
         "(2 left out as byte copies of a training image)"
     ) in render(p, inv, both, dropped=2)
+
+
+# ─── only the folder given ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("where", ["file", "class_folder", "readme", "wrapper", "docs"])
+def test_a_folder_with_a_link_leading_out_is_refused(tmp_path: Path, where: str) -> None:
+    outside = class_tree(tmp_path / "elsewhere")
+    root = tmp_path / "pets"
+    if where == "wrapper":
+        root.mkdir()
+        (root / "data").symlink_to(outside)
+    else:
+        class_tree(root)
+        link, to = {
+            "file": (root / "cat" / "x.png", outside / "dog" / "dog_0.png"),
+            "class_folder": (root / "fox", outside / "dog"),
+            "readme": (root / "README.md", outside / "dog" / "dog_0.png"),
+            "docs": (root / "meta" / "docs", outside),
+        }[where]
+        link.parent.mkdir(exist_ok=True)
+        link.symlink_to(to)
+    with pytest.raises(LinkError, match=r"1 link.* lead outside the folder you gave"):
+        inventory(root)
+
+
+@pytest.mark.parametrize("kind", ["self", "mutual", "root"])
+def test_links_that_go_round_in_a_loop_are_refused(tmp_path: Path, kind: str) -> None:
+    root = class_tree(tmp_path / "pets")
+    if kind == "self":
+        (root / "cat" / "again").symlink_to(root / "cat")
+    elif kind == "mutual":
+        (root / "cat" / "also").symlink_to("../dog")
+        (root / "dog" / "also").symlink_to("../cat")
+    else:
+        (root / "emu" / "top").symlink_to(root)
+    with pytest.raises(LinkError, match="links go round in a loop"):
+        inventory(root)
+
+
+@pytest.mark.parametrize("kind", ["loops_on_itself", "dangling_inside", "dangling_out"])
+def test_a_link_that_leads_nowhere_is_named_with_no_copy_command(tmp_path: Path, kind: str) -> None:
+    outside = class_tree(tmp_path / "elsewhere")
+    root = class_tree(tmp_path / "pets")
+    link = root / "cat" / "x.png"
+    link.symlink_to(
+        {
+            "loops_on_itself": link,
+            "dangling_inside": root / "cat" / "gone.png",
+            "dangling_out": outside / "nowhere.png",
+        }[kind]
+    )
+    with pytest.raises(LinkError, match=r"cat/x\.png is a link that leads nowhere") as no:
+        inventory(root)
+    assert no.value.command is None
+    assert "cp " not in str(no.value)
+
+
+def test_links_that_stay_inside_are_kept(tmp_path: Path) -> None:
+    root = class_tree(tmp_path / "pets")
+    (root / "cat" / "same.png").symlink_to(root / "dog" / "dog_0.png")
+    assert len(inventory(root).images) == 13
+    versions = tmp_path / "versions"
+    class_tree(versions / "v2")
+    (versions / "latest").symlink_to("v2")
+    linking.confine(versions)
+
+
+def test_the_copy_advice_pastes_for_a_folder_with_a_space(tmp_path: Path) -> None:
+    outside = class_tree(tmp_path / "elsewhere")
+    root = class_tree(tmp_path / "My Drive" / "pets")
+    (root / "fox").symlink_to(outside / "dog")
+    with pytest.raises(LinkError) as no:
+        inventory(root)
+    command = no.value.command
+    assert command is not None
+    assert str(no.value).endswith(f"and pass the copy: {command}")
+    copy = f"{root.resolve()}-copy"
+    assert shlex.split(command)[-2:] == [str(root.resolve()), copy]
+    subprocess.run(command, shell=True, check=True)
+    assert len(inventory(copy).images) == 16
+
+
+@pytest.mark.parametrize(
+    ("platform", "flags"), [("darwin", "-RLc"), ("linux", "-RL --reflink=auto")]
+)
+def test_the_copy_command_clones_where_the_platform_can(
+    monkeypatch: pytest.MonkeyPatch, platform: str, flags: str
+) -> None:
+    monkeypatch.setattr(sys, "platform", platform)
+    assert copy_command("/data/My Drive/pets") == (
+        f"cp {flags} '/data/My Drive/pets' '/data/My Drive/pets-copy'"
+    )
+
+
+def test_a_hugging_face_snapshot_gets_its_own_advice(tmp_path: Path) -> None:
+    repo = tmp_path / "hub" / "datasets--someone--flowers"
+    snapshot = repo / "snapshots" / "abc123"
+    for k, name in enumerate(("daisy", "rose")):
+        for i in range(3):
+            blob = repo / "blobs" / f"{k}{i:039d}"
+            _png(blob.with_suffix(".png"), i, klass=k)
+            blob.with_suffix(".png").rename(blob)
+            link = snapshot / "train" / name / f"{i}.png"
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(os.path.relpath(blob, link.parent))
+    with pytest.raises(LinkError, match=r"Hugging Face cache snapshot.*snapshot_download.*cp -RL"):
+        inventory(snapshot)
+
+
+def test_a_table_key_leading_out_names_no_image_and_a_nested_one_still_links(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "flat"
+    for i in range(4):
+        _png(root / "images" / f"{i}.png", i)
+    _png(root / "outside" / "secret.png", 9)
+    _png(tmp_path / "elsewhere" / "images" / "0.png", 9)
+    (root / "meta").mkdir()
+    keys = [
+        "../images/0.png",
+        str((root / "images" / "1.png").resolve()),
+        "../../outside/secret.png",
+        "../outside/secret.png",
+        "/images/2.png",
+        "\\images\\3.png",
+        str(tmp_path / "elsewhere" / "images" / "0.png"),
+    ]
+    pd.DataFrame({"image": keys, "label": list("abababa")}).to_csv(
+        root / "meta" / "labels.csv", index=False
+    )
+    inv = inventory(root)
+    rows = linking.table_rows(inv, inv.tables[0], "image", "path", target_column="label")
+    named = [None if p is None else p.relative_to(inv.root).as_posix() for p in rows.claimed]
+    assert named == [
+        "images/0.png",
+        "images/1.png",
+        None,
+        "outside/secret.png",
+        "images/2.png",
+        "images/3.png",
+        None,
+    ]
+
+
+def test_a_table_key_written_from_the_root_with_a_slash_links(tmp_path: Path) -> None:
+    root = tmp_path / "scans"
+    rows = []
+    for s in range(3):
+        for i in range(10):
+            _png(root / f"shard{s}" / f"{i}.png", i * 3 + s, klass=s)
+            rows.append({"image": f"/shard{s}/{i}.png", "label": "ab"[(i + s) % 2]})
+    pd.DataFrame(rows).to_csv(root / "labels.csv", index=False)
+    inv = inventory(root)
+    table_rows = linking.table_rows(inv, inv.tables[0], "image", "path", target_column="label")
+    assert sum(p is not None for p in table_rows.resolved) == 30
+    p = plan(inv)
+    assert (p.shape, p.key_to_file, p.coverage) == ("csv_of_paths", "path", 1.0)
+
+
+def test_absolute_table_keys_spelled_through_a_link_to_the_folder_still_link(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "real"
+    for i in range(10):
+        _png(real / "imgs" / f"{i}.png", i, klass=i % 2)
+    (tmp_path / "alias").symlink_to(real, target_is_directory=True)
+    spellings = [tmp_path / "alias"]
+    if str(tmp_path).startswith("/private/"):
+        spellings.append(Path(str(tmp_path).removeprefix("/private")) / "real")
+    for spelled in spellings:
+        keys = [str(spelled / "imgs" / f"{i}.png") for i in range(10)]
+        pd.DataFrame({"image": keys, "label": ["a", "b"] * 5}).to_csv(
+            real / "labels.csv", index=False
+        )
+        inv = inventory(tmp_path / "alias")
+        rows = linking.table_rows(inv, inv.tables[0], "image", "path", target_column="label")
+        assert sum(p is not None for p in rows.resolved) == 10, spelled
