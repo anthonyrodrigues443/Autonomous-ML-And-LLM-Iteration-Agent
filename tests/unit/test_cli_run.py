@@ -27,7 +27,8 @@ from iterate.cli import (
 )
 from iterate.schemas.experiment import Candidate, ExperimentResult, Metrics
 
-runner = CliRunner()
+# Error panels wrap at the terminal width, which can split a phrase a test looks for.
+runner = CliRunner(env={"COLUMNS": "1000"})
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────

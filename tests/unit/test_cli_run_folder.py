@@ -21,7 +21,8 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.unit
 
-runner = CliRunner()
+# Error panels wrap at the terminal width, which can split a phrase a test looks for.
+runner = CliRunner(env={"COLUMNS": "1000"})
 
 
 def _plain(output: str) -> str:
