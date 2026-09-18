@@ -34,6 +34,15 @@ PROBABILITIES_CSV = "probabilities.csv"
 # predictions it produced. A run's real output is the prompt you can put into
 # production, and a notebook cannot tell you which of its cells held the winner.
 PROMPT_JSON = "prompt.json"
+# The image path's twin of PROMPT_JSON: the recipe (or own-model line) that produced
+# the predictions on disk, with their digest.
+RECIPE_JSON = "recipe.json"
+# Written by the host before the session starts: the recipe the carried best used, so
+# `fit()` in a new session starts where the last one finished.
+INCUMBENT_JSON = "incumbent.json"
+# Where a session records a module an import could not find. A cell that caught the
+# ImportError leaves no traceback, so this file is the only evidence.
+MISSING_IMPORTS = ".missing-imports"
 
 # The single function the agent must define; the harness calls it.
 ENTRY_POINT = "train_and_predict"
@@ -101,6 +110,54 @@ def assemble_script(code: str) -> str:
     return _PREAMBLE + code.strip() + "\n" + _POSTAMBLE
 
 
+# Plain text, not an import of iterate: an e2b kernel has no iterate package.
+# Appended LAST on sys.meta_path, so it is asked only after every real finder failed,
+# and it records a name only when the import came straight from a cell — a library
+# probing its own optional dependencies records nothing.
+IMPORT_WATCH = f"""\
+def _iterate_watch(log):
+    import linecache, os, sys
+    for found in sys.meta_path:
+        if hasattr(found, 'iterate_log'):
+            found.iterate_log = log
+            return
+    machinery = os.path.dirname(__import__('importlib').__file__)
+    class MissingImportWatch:
+        iterate_log = log
+        seen = set()
+        def find_spec(self, name, path=None, target=None):
+            if name in self.seen or name.partition('.')[0] in sys.stdlib_module_names:
+                return None
+            frame = sys._getframe(1)
+            while frame is not None and (
+                frame.f_code.co_filename.startswith(('<frozen', machinery))
+            ):
+                frame = frame.f_back
+            entry = linecache.cache.get(frame.f_code.co_filename) if frame else None
+            if entry is None or entry[1] is not None:
+                return None
+            parent = name.rpartition('.')[0]
+            if parent and getattr(sys.modules.get(parent), '__file__', 1) is not None:
+                return None
+            for later in sys.meta_path[sys.meta_path.index(self) + 1:]:
+                try:
+                    if later.find_spec(name, path, target) is not None:
+                        return None
+                except Exception:
+                    pass
+            self.seen.add(name)
+            try:
+                with open(self.iterate_log, 'a') as out:
+                    out.write(name + chr(10))
+            except OSError:
+                pass
+            return None
+    sys.meta_path.append(MissingImportWatch())
+_iterate_watch(__import__('os').path.realpath({MISSING_IMPORTS!r}))
+del _iterate_watch
+"""
+
+
 def session_preamble() -> str:
     """The trusted first cell of a session: loads ``X_train`` / ``y_train`` /
     ``X_holdout`` (features only) and prints the shapes.
@@ -130,6 +187,7 @@ def session_preamble() -> str:
         "    print('finish is a tool call, not a Python function. This cell still ran; "
         "now invoke the finish tool to end the session.')\n"
         "print('loaded:', X_train.shape, 'train /', X_holdout.shape, 'holdout; target:', _target)\n"
+        + IMPORT_WATCH
     )
 
 
@@ -214,7 +272,7 @@ def prompt_session_preamble() -> str:
         # The first live prompt run called .split() on a Prompt and then handed one
         # to re.sub: the wording said what the objects were and never showed one
         # being used, and the session died without submitting.
-        "print(chr(10).join(" + repr(_WORKED_EXAMPLE) + "))\n"
+        "print(chr(10).join(" + repr(_WORKED_EXAMPLE) + "))\n" + IMPORT_WATCH
     )
 
 
@@ -341,6 +399,143 @@ def prompt_fallback_baseline() -> str:
         "    json.dump(BASELINE_PROMPT.as_dict(), _f)\n"
         "print('fallback banked the majority answer', repr(_fb_answer), 'for', "
         "len(X_holdout), 'rows')\n"
+    )
+
+
+def vision_session_preamble() -> str:
+    """The image session's opening cell: `start()` decodes the images, carves the
+    validation fold and returns every name the agent's cells work with.
+
+    No thread caps, unlike the tabular preamble: torch sizes its own pools, and the
+    device variables are set inside `start` before torch is first imported.
+    """
+    return (
+        "import json, random, numpy as np, pandas as pd\n"
+        "random.seed(42); np.random.seed(42)\n"
+        "from iterate.core import vision_session as _vs\n"
+        "globals().update(_vs.start('.'))\n"
+        f"with open({META_JSON!r}) as _f:\n"
+        "    _meta = json.load(_f)\n"
+        f"_train = pd.read_csv({TRAIN_CSV!r})\n"
+        "X_train = _train.drop(columns=[_meta['target']])\n"
+        "y_train = _train[_meta['target']]\n"
+        f"X_holdout = pd.read_csv({HOLDOUT_CSV!r})  # FILE NAMES ONLY — labels held back\n"
+        "_pristine_inputs = {'X_train': X_train.copy(), 'y_train': y_train.copy(), "
+        "'X_holdout': X_holdout.copy()}\n"
+        "def finish(*args, **kwargs):\n"
+        "    print('finish is a tool call, not a Python function. This cell still ran; "
+        "now invoke the finish tool to end the session.')\n" + IMPORT_WATCH
+    )
+
+
+# First statement of every image cell: frees the last cell's device memory and starts
+# this cell's fit clock, then restores the three input frames. `__import__` rather than
+# a name, so a cell that deleted SESSION or re-bound the helpers still gets them back.
+VISION_CELL_PREFIX = (
+    "__import__('iterate.core.vision_session').core.vision_session.begin_cell(globals())\n"
+    + RESET_INPUTS
+)
+
+
+def vision_worked_example(task: str) -> list[str]:
+    """The shape of a correct image cell, printed by `start()` once the task is known.
+
+    Task-aware because the two versions differ at line one: a number to predict has no
+    CLASSES to size the head with, and a cross-entropy loss will not train it.
+    """
+    common = [
+        "",
+        "HOW TO WORK, one fit per cell:",
+        "  f = fit(backbone='resnet18')      # every lever you do not pass stays as it is",
+        "  submit(f)                         # the holdout predictions THIS fit made",
+        "  g = fit(image_size=128)           # same recipe, new size, same fold",
+        "  print(g.val, 'vs', f.val)         # like for like: both scored on VAL_IDX",
+        "",
+        "YOUR OWN MODEL, from any library research names:",
+        "  import time, timm, torch",
+        "  import torch.nn.functional as F",
+        "  NAME = 'efficientnet_b0'",
+    ]
+    if task == "regression":
+        body = [
+            "  model = timm.create_model(NAME, pretrained=True, num_classes=1).to(DEVICE)",
+            "  size = IMAGE_SIZE",
+            "  train_x, hold_x = pixels(size)",
+            "  centre = float(labels[FIT_IDX].mean()); spread = float(labels[FIT_IDX].std())",
+            "  opt = torch.optim.AdamW(model.parameters(), lr=3e-4)",
+            "  t0 = time.perf_counter()",
+            "  for epoch in range(3):",
+            "      model.train()",
+            "      for rows in batches(FIT_IDX, 64):",
+            "          out = model(as_input(train_x[rows])).reshape(-1)",
+            "          loss = F.mse_loss(out, (as_labels(rows) - centre) / spread)",
+            "          opt.zero_grad(); loss.backward(); opt.step()",
+            "      if seconds_left() < (time.perf_counter() - t0) / (epoch + 1):",
+            "          break",
+            "  val = predict(model, train_x[VAL_IDX]) * spread + centre",
+            "  evaluate(val, model=NAME, image_size=size, epochs=epoch + 1)",
+            "  submit_numbers(predict(model, hold_x) * spread + centre, model=NAME)",
+            "",
+            "Train on scaled labels, as fit() does, and give evaluate() and",
+            "submit_numbers() numbers in the label's own units.",
+        ]
+    else:
+        body = [
+            "  model = timm.create_model(NAME, pretrained=True, "
+            "num_classes=len(CLASSES)).to(DEVICE)",
+            "  cfg = model.pretrained_cfg",
+            "  size = cfg['input_size'][-1] if cfg.get('fixed_input_size') else IMAGE_SIZE",
+            "  train_x, hold_x = pixels(size)",
+            "  opt = torch.optim.AdamW(model.parameters(), lr=3e-4)",
+            "  t0 = time.perf_counter()",
+            "  for epoch in range(3):",
+            "      model.train()",
+            "      for rows in batches(FIT_IDX, 64):",
+            "          loss = F.cross_entropy(model(as_input(train_x[rows])), as_labels(rows))",
+            "          opt.zero_grad(); loss.backward(); opt.step()",
+            "      if seconds_left() < (time.perf_counter() - t0) / (epoch + 1):",
+            "          break",
+            "  evaluate(predict(model, train_x[VAL_IDX]), model=NAME, image_size=size, "
+            "epochs=epoch + 1)",
+            "  submit_probabilities(predict(model, hold_x), model=NAME)",
+        ]
+    return [
+        *common,
+        *body,
+        "",
+        "model=NAME is REQUIRED on evaluate, submit_probabilities and submit_numbers:",
+        "it is how this run records which model was tried.",
+        "predict() reads .logits for you, so a Hugging Face model works as it is.",
+        "",
+    ]
+
+
+def vision_fallback_baseline() -> str:
+    """The image floor: the most common training class, or the training mean, for every
+    holdout image, with class-share probabilities.
+
+    It reads only the three files the host wrote, so it cannot fail on the device, the
+    network or a spent fit budget — which is exactly the state a session is in when the
+    floor fires.
+    """
+    return (
+        "import json, numpy as np, pandas as pd\n"
+        f"with open({META_JSON!r}) as _f:\n"
+        "    _fb_meta = json.load(_f)\n"
+        f"_fb_y = pd.read_csv({TRAIN_CSV!r})[_fb_meta['target']]\n"
+        f"_fb_n = len(pd.read_csv({HOLDOUT_CSV!r}))\n"
+        "if _fb_meta['task'] == 'regression':\n"
+        "    _fb_pred = [float(_fb_y.astype(float).mean())] * _fb_n\n"
+        "else:\n"
+        "    _fb_classes = _fb_meta['classes']\n"
+        "    _fb_share = _fb_y.astype(str).value_counts(normalize=True)\n"
+        "    _fb_p = np.array([_fb_share.get(str(c), 0.0) for c in _fb_classes])\n"
+        "    _fb_p = _fb_p / _fb_p.sum()\n"
+        "    pd.DataFrame(np.tile(_fb_p, (_fb_n, 1)))"
+        f".to_csv({PROBABILITIES_CSV!r}, index=False, header=False)\n"
+        "    _fb_pred = [_fb_classes[int(_fb_p.argmax())]] * _fb_n\n"
+        f"pd.Series(_fb_pred).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
+        "print('fallback banked', _fb_pred[0], 'for', _fb_n, 'holdout images')\n"
     )
 
 
@@ -791,10 +986,15 @@ def _failed(experiment_id: str, reason: str) -> ExperimentResult:
 __all__ = [
     "ENTRY_POINT",
     "HOLDOUT_CSV",
+    "IMPORT_WATCH",
+    "INCUMBENT_JSON",
     "META_JSON",
+    "MISSING_IMPORTS",
     "PREDICTIONS_CSV",
     "PROBABILITIES_CSV",
+    "RECIPE_JSON",
     "TRAIN_CSV",
+    "VISION_CELL_PREFIX",
     "InstallerCell",
     "assemble_script",
     "build_inputs",
@@ -808,4 +1008,7 @@ __all__ = [
     "score_predictions",
     "session_preamble",
     "validate_train_and_predict",
+    "vision_fallback_baseline",
+    "vision_session_preamble",
+    "vision_worked_example",
 ]

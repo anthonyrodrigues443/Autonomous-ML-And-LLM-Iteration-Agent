@@ -11,10 +11,12 @@ don't repeat flags.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 from datetime import UTC, datetime
@@ -774,7 +776,6 @@ def run(
     from iterate.core.proposer import Proposer, summarize_dataset
     from iterate.core.reconstructor import Reconstructor
     from iterate.core.researcher import Researcher
-    from iterate.core.scoring import AVERAGES, CLASSIFICATION_METRICS, REGRESSION_METRICS
     from iterate.core.scoring import direction as metric_direction
     from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor
@@ -793,15 +794,16 @@ def run(
             "--data is split here; --train and --holdout are your own split. Pass one "
             "form, not both"
         )
-    if data is None and not code:
-        raise typer.BadParameter(
-            "--train and --holdout are not supported on the --spec fast lane; pass --data"
-        )
     if train is not None and holdout is not None and train.resolve() == holdout.resolve():
         raise typer.BadParameter("--train and --holdout are the same file")
 
     given = [p for p in (data, train, holdout) if p is not None]
     folders = [p for p in given if p.is_dir()]
+    # A folder pair on --spec gets the image refusal below, which says what --spec is.
+    if data is None and not code and not folders:
+        raise typer.BadParameter(
+            "--train and --holdout are not supported on the --spec fast lane; pass --data"
+        )
     if folders and len(folders) != len(given):
         raise typer.BadParameter("give folders for every input, or files for every input")
     if not folders:
@@ -840,10 +842,23 @@ def run(
                 f"(ITERATE_BACKEND_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / …)"
             )
 
+    # ─── Everything that needs no data, before anything is written ─────────
+    # A folder is known to be images from its shape alone, so its refusals come
+    # before the link copies a file or an install downloads a gigabyte.
+    if folders:
+        _refuse_for_images(compute=compute, task=task, code=code)
+    if baseline is not None and source is None:
+        raise typer.BadParameter("--baseline requires --source")
+    metric, average = _checked_names(metric, average)
+    _need_key()
+    linked_task: str | None = None
+
     # ─── A folder of images is linked first and shown before anything runs ──
     # Rules alone where they can prove it; the Linker only where they could not,
     # so a rules-only folder never builds a client and needs no key.
     if folders:
+        _ensure_torch(install)
+
         from iterate.core.linker import Linker
 
         def _make_linker() -> Linker:
@@ -860,35 +875,83 @@ def run(
             yes=yes,
             make_linker=_make_linker,
         )
-        console.print(
-            "[dim]the folder is ready; the vision target that runs on it lands later in "
-            f"v0.6, so this run stops here. Its CSVs: {ws.train_csv} and {ws.holdout_csv}[/dim]"
-        )
-        raise typer.Exit(code=0)
+        # The linker's plan decided the task; re-reading numbered class folders as a
+        # frame would lose it.
+        linked_task = json.loads(ws.plan_file.read_text(encoding="utf-8"))["plan"]["task"]
+        data, train, holdout, target = None, ws.train_csv, ws.holdout_csv, "label"
     assert target is not None  # a CSV run was checked above
-    _need_key()
-
-    # ─── Validate ──────────────────────────────────────────────────────────
-    if baseline is not None and source is None:
-        raise typer.BadParameter("--baseline requires --source")
-    if metric is not None:
-        metric = metric.lower()
-        if metric not in CLASSIFICATION_METRICS and metric not in REGRESSION_METRICS:
-            raise typer.BadParameter(
-                f"unknown metric {metric!r}; expected one of "
-                f"{sorted(CLASSIFICATION_METRICS | REGRESSION_METRICS)}"
-            )
-    if average is not None:
-        average = average.lower()
-        if average not in AVERAGES:
-            raise typer.BadParameter(
-                f"unknown average {average!r}; expected one of {list(AVERAGES)}"
-            )
 
     resolved_memory_path = memory_path or Path(settings.iterate_memory_db)
 
+    # The TUI installs its own log handler; a stdout handler would vanish into the
+    # alternate screen. Interactivity needs FOREGROUND tty ownership: a backgrounded
+    # job reading its tty gets SIGTTIN and the whole process is suspended.
+    interactive_tty = _stdin_owns_tty()
+    use_tui = code and not plain and interactive_tty and sys.stdout.isatty()
+    if not use_tui:
+        _configure_logging()
+
+    # ─── Load data ─────────────────────────────────────────────────────────
+    # An explicit metric names the task; only without one does the loader guess.
+    from iterate.adapters.data.tabular import describe_target
+    from iterate.core.scoring import task_for_metric as _task_for_metric
+
+    named_task = _task_for_metric(metric) if metric is not None else None
+    try:
+        if data is not None:
+            dataset = load_csv(data, target=target, task=named_task)
+        else:
+            assert train is not None  # validated above
+            assert holdout is not None
+            dataset = load_split(train, holdout, target=target, task=named_task or linked_task)
+    except ValueError as exc:
+        # A split that cannot be made is a message, not a scikit-learn traceback.
+        raise typer.BadParameter(f"the data could not be split as given: {exc}") from None
+    if not folders and data is None:
+        console.print(
+            f"[dim]your split: {dataset.n_train} train rows, {dataset.n_test} holdout rows, "
+            "sealed as given[/dim]"
+        )
+    from iterate.adapters.data.images import OutsideDataError, image_column
+
+    try:
+        found = image_column(dataset)
+    except OutsideDataError as exc:
+        raise _refused(exc) from exc
+    from iterate.core import setup as run_setup_mod
+
+    if found is not None:
+        # A CSV of image paths only reads as images once it is loaded, so its
+        # refusals and its install land here instead of above the link.
+        if not folders:
+            _refuse_for_images(compute=compute, task=task, code=code)
+        if refusal := run_setup_mod.refuse_labels(dataset, metric=metric, average=average):
+            raise typer.BadParameter(refusal)
+        if not folders:
+            _ensure_torch(install)
+    if named_task is None:
+        how = describe_target(dataset.train_target)
+        console.print(
+            f"[dim]labels read as {'classes' if dataset.task == 'classification' else 'numbers'} "
+            f"({how})[/dim]"
+            if found is not None
+            else f"[dim]target {target!r} read as {dataset.task} ({how}); pass --metric to "
+            "override[/dim]"
+        )
+    elif linked_task is not None and named_task != linked_task:
+        console.print(
+            f"[dim]--metric {metric} reads the labels as {named_task}, where the link read "
+            f"them as {linked_task}[/dim]"
+        )
+    prepared = (
+        _prepare_image_run(dataset, metric=metric, average=average) if found is not None else None
+    )
+    if prepared is not None:
+        dataset = prepared.dataset
+
     # ─── New chapter? Archive the existing db. ─────────────────────────────
-    # Any of --fresh, --source, --baseline+--source means "new chapter."
+    # Any of --fresh, --source, --baseline+--source means "new chapter." Below every
+    # refusal, so a run that cannot start leaves the memory it had.
     starting_new_chapter = fresh or source is not None
     if starting_new_chapter:
         archived = _archive_memory_db(resolved_memory_path)
@@ -906,48 +969,7 @@ def run(
             "(get a free key at e2b.dev)."
         )
 
-    # The TUI installs its own log handler; a stdout handler would vanish into the
-    # alternate screen. Interactivity needs FOREGROUND tty ownership: a backgrounded
-    # job reading its tty gets SIGTTIN and the whole process is suspended.
-    interactive_tty = _stdin_owns_tty()
-    use_tui = code and not plain and interactive_tty and sys.stdout.isatty()
-    if not use_tui:
-        _configure_logging()
-
-    # ─── Load data ─────────────────────────────────────────────────────────
-    # An explicit metric names the task; only without one does the loader guess.
-    from iterate.adapters.data.tabular import describe_target
-    from iterate.core.scoring import task_for_metric as _task_for_metric
-
-    named_task = _task_for_metric(metric) if metric is not None else None
-    if data is not None:
-        dataset = load_csv(data, target=target, task=named_task)
-    else:
-        assert train is not None  # validated above
-        assert holdout is not None
-        dataset = load_split(train, holdout, target=target, task=named_task)
-        console.print(
-            f"[dim]your split: {dataset.n_train} train rows, {dataset.n_test} holdout rows, "
-            "sealed as given[/dim]"
-        )
-    if named_task is None:
-        console.print(
-            f"[dim]target {target!r} read as {dataset.task} "
-            f"({describe_target(dataset.train_target)}); pass --metric to override[/dim]"
-        )
-    from iterate.adapters.data.images import OutsideDataError, image_column
-
-    try:
-        found = image_column(dataset)
-    except OutsideDataError as exc:
-        raise _refused(exc) from exc
-    if found is not None:
-        console.print(
-            "[dim]this CSV holds image paths; the vision target that runs on it lands "
-            "later in v0.6, so this run stops here[/dim]"
-        )
-        raise typer.Exit(code=0)
-    data_summary = summarize_dataset(dataset)
+    data_summary = prepared.profile.render() if prepared is not None else summarize_dataset(dataset)
 
     # ─── LLM clients + memory ──────────────────────────────────────────────
     # Two clients on purpose: thinking applies to the CODER only. The supervisor
@@ -968,6 +990,7 @@ def run(
         data_summary=data_summary,
         client=client,
         enabled=research and metric is None,
+        family="vision" if prepared is not None else "tabular",
     )
     metric = run_setup.metric
     direction = metric_direction(metric)
@@ -1003,11 +1026,14 @@ def run(
             cache_path=answer_cache,
             allow_free_text=allow_free_text,
         )
+    elif prepared is not None:
+        model_target = _image_target(prepared, metric=metric, average=average)
     else:
         model_target = ModelTarget(dataset, metric=metric, average=average)
     if line := run_setup.render():
         console.print(f"[dim]{line}[/dim]")
-        if run_setup.starting_model:
+        # An image run's first model is fixed: the plain CNN baseline, never a proposal.
+        if run_setup.starting_model and prepared is None:
             console.print(f"[dim]starting model: {run_setup.starting_model}[/dim]")
 
     # NOTE: the sqlite Memory is deliberately NOT constructed here. A sqlite
@@ -1026,12 +1052,21 @@ def run(
         f"\n[dim]Running on {model_target.name}; target={target!r}, metric={metric}, "
         f"mode={mode}, compute={compute}[/dim]\n"
     )
+    if prepared is not None:
+        from iterate.targets.dl import BASELINE, BASELINE_SIZE
+
+        console.print(
+            f"[dim]the baseline runs first: a plain CNN trained from zero for {BASELINE.epochs} "
+            f"epochs at {min(BASELINE_SIZE, prepared.image_size)} px, with no time limit[/dim]\n"
+        )
 
     if code:
         # --until bounds the WHOLE run via the terminator; a session's budget is
         # kernel-execution seconds. Tool-only roles use the no-think client even
         # under --think, because thinking crowds out the call.
-        if not is_prompt_run:
+        if prepared is not None:
+            supervisor_family = "vision"
+        elif not is_prompt_run:
             supervisor_family = "tabular"
         else:
             from iterate.core.scoring import task_for_metric
@@ -1040,11 +1075,17 @@ def run(
                 "prompt_scoring" if task_for_metric(metric) == "regression" else "prompt"
             )
         n_classes = int(dataset.train_target.nunique()) if not is_prompt_run else 0
+        if prepared is not None and dataset.task == "regression":
+            n_classes = 0
+        role_family = "vision" if prepared is not None else "prompt" if is_prompt_run else "tabular"
         supervisor = Supervisor(
             client,
             metric=metric,
             family=supervisor_family,
             multiclass=n_classes > 2,
+            task=dataset.task,
+            image_size=prepared.image_size if prepared is not None else None,
+            image_width=prepared.profile.widths[1] if prepared is not None else None,
         )
         summarizer = Summarizer(client, metric=metric)
         # Same no-think client as the other strict roles: the Researcher must emit
@@ -1055,7 +1096,7 @@ def run(
                 client,
                 metric=metric,
                 direction=direction,
-                family="prompt" if is_prompt_run else "tabular",
+                family=role_family,
             )
             if critique
             else None
@@ -1065,7 +1106,7 @@ def run(
                 client,
                 metric=metric,
                 direction=direction,
-                family="prompt" if is_prompt_run else "tabular",
+                family=role_family,
                 cache_dir=Path(settings.iterate_runs_dir).parent / "research",
             )
             if research
@@ -1148,6 +1189,7 @@ def run(
         from iterate.adapters.compute import confine, deps
 
         confinement = confine.Confinement(
+            reads=(prepared.cache_dir.resolve(),) if prepared is not None else (),
             weights=confine.weights_dir(),
             files=(answer_cache,) if is_prompt_run else (),
             protected=(
@@ -1167,6 +1209,11 @@ def run(
                 console.print(
                     "[dim]cells are confined: they open their own folder, "
                     + ("the answer cache, " if is_prompt_run else "")
+                    + (
+                        f"this run's images under {escape(_home_tilde(prepared.cache_dir))}, "
+                        if prepared is not None
+                        else ""
+                    )
                     + f"and model weights under {escape(_home_tilde(confinement.weights))}, "
                     "nothing else[/dim]"
                 )
@@ -1206,6 +1253,24 @@ def run(
                     "deadline_seconds": 1800.0,
                     "wall_ceiling_seconds": 5400.0,
                 }
+            elif prepared is not None:
+                family = {
+                    "preamble": codegen.vision_session_preamble(),
+                    "extra_inputs": {codegen.META_JSON: model_target.meta_json()},
+                    "floor_cell": codegen.vision_fallback_baseline(),
+                    "family": "vision",
+                    # Frees the last cell's device memory and starts this cell's fit clock.
+                    "cell_prefix": codegen.VISION_CELL_PREFIX,
+                    # The floor writes predictions from the labels alone; there is no
+                    # recipe in it for a later cell to carry.
+                    "floor_carries_code": False,
+                    "data_summary": data_summary,
+                    # One fit's 540 s budget, plus decode at a new size, predict, scoring
+                    # and a first weights download.
+                    "cell_timeout": 750.0,
+                    "deadline_seconds": 2700.0,
+                    "wall_ceiling_seconds": 5400.0,
+                }
             return CodingAgent(
                 coder_client,
                 kernel,
@@ -1221,6 +1286,8 @@ def run(
         def on_experiment(
             *, experiment: Experiment, baseline: ExperimentResult, is_best: bool, run_id: str
         ) -> None:
+            if prepared is not None:
+                _copy_report(dataset, Path(settings.iterate_runs_dir) / run_id)
             # Incremental deliverable: each finished iteration's notebook is saved
             # NOW (and best.ipynb tracks the best-so-far), so a crash or Ctrl-C
             # mid-run still leaves everything finished on disk.
@@ -1256,6 +1323,7 @@ def run(
                 critic=critic_agent,
                 on_experiment=on_experiment,
                 controller=controller,
+                family=role_family,
             )
 
         if use_tui and controller is not None:
@@ -1326,6 +1394,9 @@ def run(
 
     # ─── The deliverable the user actually leaves with ─────────────────────
     run_dir = Path(settings.iterate_runs_dir) / (result.run_id or "run")
+    # A run that got an id but no finished experiment still leaves the checks behind.
+    if prepared is not None and result.run_id:
+        _copy_report(dataset, run_dir)
     if is_prompt_run:
         # For a prompt run the artifact is the prompt, and a notebook cannot say
         # which of its cells held the winner. Written by the harness, never by the
@@ -1372,6 +1443,128 @@ def run(
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+
+def _checked_names(metric: str | None, average: str | None) -> tuple[str | None, str | None]:
+    """--metric and --average are names, not data, so they are checked before a run
+    hashes a folder, installs torch or archives memory."""
+    from iterate.core.scoring import AVERAGES, CLASSIFICATION_METRICS, REGRESSION_METRICS
+
+    if metric is not None:
+        metric = metric.lower()
+        if metric not in CLASSIFICATION_METRICS and metric not in REGRESSION_METRICS:
+            raise typer.BadParameter(
+                f"unknown metric {metric!r}; expected one of "
+                f"{sorted(CLASSIFICATION_METRICS | REGRESSION_METRICS)}"
+            )
+    if average is not None:
+        average = average.lower()
+        if average not in AVERAGES:
+            raise typer.BadParameter(
+                f"unknown average {average!r}; expected one of {list(AVERAGES)}"
+            )
+    return metric, average
+
+
+def _refuse_for_images(*, compute: str, task: str | None, code: bool) -> None:
+    """The three flags an image run cannot take, each named for what it would do."""
+    if compute == "e2b":
+        raise typer.BadParameter(
+            "an image run trains on this machine, where its images and torch are; "
+            "--compute e2b would see neither. Pass --compute local"
+        )
+    if task is not None:
+        raise typer.BadParameter(
+            "--task starts a prompt run, which reads text; these are images, so the run "
+            "improves a model. Drop --task"
+        )
+    if not code:
+        raise typer.BadParameter(
+            "--spec picks a table estimator from a fixed list; an image run writes its own "
+            "cells. Drop --spec"
+        )
+
+
+def _ensure_torch(consent: bool) -> None:
+    from iterate.adapters.compute import deps
+
+    if set(deps.installed()) >= deps.FROZEN:
+        return
+    if consent:
+        console.print(
+            "[dim]installs: torch and torchvision for this image run, about a gigabyte, "
+            "with no time limit[/dim]"
+        )
+    if reason := deps.ensure_torch(consent=consent):
+        raise typer.BadParameter(reason[-2000:])
+    importlib.invalidate_caches()
+    console.print("[dim]installs: torch and torchvision are in[/dim]")
+
+
+def _prepare_image_run(dataset: Any, *, metric: str | None, average: str | None) -> Any:
+    """Byte-named copies of every image, then the label checks again: dropping a
+    holdout twin can empty a class that was full when the labels were first read."""
+    from iterate.adapters.data import images
+    from iterate.core import setup as run_setup_mod
+
+    assert dataset.sources is not None  # both loaders set it
+    try:
+        prepared = images.prepare_images(dataset, dataset.sources[0])
+    except images.OutsideDataError as exc:
+        raise _refused(exc) from exc
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    if refusal := run_setup_mod.refuse_labels(prepared.dataset, metric=metric, average=average):
+        raise typer.BadParameter(refusal)
+    # Builds the target once with the metric the run would take, so a label a model
+    # cannot learn from is a message here instead of a failure after the baseline.
+    _image_target(
+        prepared,
+        metric=metric or run_setup_mod.default_setup(prepared.dataset).metric,
+        average=average,
+    )
+    left = (
+        f", {len(prepared.dropped)} holdout images left out as byte copies of training images"
+        if prepared.dropped
+        else ""
+    )
+    console.print(
+        f"[dim]images: {prepared.dataset.n_train} train / {prepared.dataset.n_test} holdout, "
+        f"copied under names made from their bytes to "
+        f"{escape(_home_tilde(prepared.cache_dir))}{left}[/dim]"
+    )
+    return prepared
+
+
+def _image_target(prepared: Any, *, metric: str, average: str | None) -> Any:
+    from iterate.targets.dl import DLModelTarget
+
+    try:
+        return DLModelTarget(
+            prepared.dataset,
+            column=prepared.column.column,
+            metric=metric,
+            average=average,
+            image_size=prepared.image_size,
+            profile=prepared.profile,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+
+def _copy_report(dataset: Any, run_dir: Path) -> None:
+    """The monitor's report beside the training CSV the run read, into the run folder.
+    A report that is a link is the user's own file, which prepare_images also skips."""
+    from iterate.adapters.data import monitor
+
+    if dataset.sources is None:
+        return
+    source = dataset.sources[0].parent / monitor.REPORT_JSON
+    copy = run_dir / monitor.REPORT_JSON
+    if copy.exists() or source.is_symlink() or not source.is_file():
+        return
+    run_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, copy)
 
 
 def _rescore_winner_on_full_holdout(
@@ -1646,6 +1839,7 @@ def _resolve_setup(
     data_summary: str,
     client: Any,
     enabled: bool,
+    family: str = "tabular",
 ) -> Any:
     """Decide the run's metric + starting model. Never raises: every failure path
     lands on the deterministic default, so the dial can only upgrade a working run."""
@@ -1657,16 +1851,28 @@ def _resolve_setup(
 
     from iterate.core.researcher import Researcher
 
+    images = family == "vision"
     task = run_setup_mod.target_task(dataset)
-    allowed = CLASSIFICATION_METRICS if task == "classification" else REGRESSION_METRICS
+    allowed = (
+        run_setup_mod.offered_for_images(dataset)
+        if images
+        else sorted(CLASSIFICATION_METRICS if task == "classification" else REGRESSION_METRICS)
+    )
     try:
-        findings = Researcher(client).research(
-            profile=data_summary, choose_setup=True, allowed_metrics=sorted(allowed)
+        findings = Researcher(client, family=family).research(
+            profile=data_summary,
+            choose_setup=True,
+            allowed_metrics=allowed,
+            # The loop's own Researcher suggests techniques; this pass only picks a ruler.
+            suggest=not images,
+            allow_without_papers=images,
         )
         proposed = findings.setup
     except Exception:  # a specialist must never stop a run from starting
         proposed = None
-    resolved = run_setup_mod.resolve(dataset, proposed=proposed)
+    resolved = run_setup_mod.resolve(
+        dataset, proposed=proposed, offered=allowed if images else None
+    )
     if proposed is not None and not resolved.chosen_by_agent and resolved.why:
         logging.getLogger(__name__).info("setup: %s", resolved.why)
     return resolved

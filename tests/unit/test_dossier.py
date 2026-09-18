@@ -97,6 +97,42 @@ def test_val_trail_keeps_order_and_drops_consecutive_repeats() -> None:
     assert dossier.build(_experiment(cells)).val_trail == [0.55, 0.61, 0.58]
 
 
+def test_an_image_sessions_own_payload_lines_are_not_validation_scores() -> None:
+    """Live on EuroSAT, 2026-09-18: FIT and SUBMITTED carry `"val"` inside their JSON,
+    so the last float on the line is whatever the payload ends with, and the run's
+    best.ipynb read `0.9737 -> 0.0000 -> 0.9804`."""
+    recipe = (
+        '{"backbone": "resnet18", "image_size": 64, "epochs": 3, "label_smoothing": 0.0, '
+        '"val": 0.9737, "seed": 42}'
+    )
+    cells = [
+        _cell(
+            f"FIT {recipe}\n"
+            "val f1_macro = 0.9737 (resnet18 64px, 3/3 epochs, 79s)\n"
+            "Validation Score: 0.9736982918764658\n"
+            f"SUBMITTED {recipe}\n"
+            "submitted 5400 predictions for the holdout"
+        )
+    ]
+    # Both remaining entries are scores the session really printed, at two precisions.
+    assert dossier.build(_experiment(cells)).val_trail == [0.9737, 0.9736982918764658]
+
+
+def test_an_own_code_cells_model_line_is_not_a_validation_score() -> None:
+    """Live iteration 3, the cell that actually caused the misread: its only payload is a
+    MODEL line, whose last float is `val_accuracy`, and that fed the critic 0.9440
+    against a validation score of 0.9417."""
+    cells = [
+        _cell(
+            'MODEL {"model": "efficientnet_b0", "image_size": 64, "epochs": 3, '
+            '"seconds": 143, "val": 0.9417115871541657, "val_accuracy": 0.944}\n'
+            "val f1_macro = 0.9417 (efficientnet_b0)\n"
+            "submitted 5400 predictions for the holdout"
+        )
+    ]
+    assert dossier.build(_experiment(cells)).val_trail == [0.9417]
+
+
 def test_failures_dedupe_on_the_error_signature() -> None:
     """Same signature as the coder's own breaker, so both agree on "same failure"."""
     cells = [
@@ -183,13 +219,7 @@ def test_the_result_filter_does_not_eat_ordinary_data_facts() -> None:
     """
     kept = dossier.build(
         _experiment(
-            [
-                _cell(
-                    "missing values: 11\n"
-                    "unique values in PaymentMethod: 4\n"
-                    "interval columns: 3\n"
-                )
-            ]
+            [_cell("missing values: 11\nunique values in PaymentMethod: 4\ninterval columns: 3\n")]
         )
     ).data_facts
 

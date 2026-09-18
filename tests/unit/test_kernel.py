@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from iterate.adapters.compute import kernel as compute_kernel
 from iterate.adapters.compute.kernel import CellResult, E2BKernel, LocalKernel, StatefulKernel
 
 if TYPE_CHECKING:
@@ -87,6 +88,42 @@ def test_local_kernel_catches_timeout(kernel: LocalKernel) -> None:
     result = kernel.run_cell("import time; time.sleep(10)", timeout=1.0)
     assert result.timed_out
     assert not result.ok
+    assert not result.restarted
+
+
+def test_the_cell_after_a_timeout_runs(kernel: LocalKernel) -> None:
+    """ipykernel ABORTS a request that arrives before the interrupted cell goes idle,
+    and an aborted cell comes back as a success with no output, so the next cell
+    silently did not run. Fails without the settle wait."""
+    kernel.run_cell("import time; time.sleep(10)", timeout=1.0)
+    result = kernel.run_cell("open('marker.txt', 'w').write('ran')\nprint('after')", timeout=30)
+    assert result.ok, result.error
+    assert result.stdout.strip() == "after"
+    assert kernel.read_output("marker.txt") == b"ran"
+
+
+def test_a_cell_that_swallows_the_interrupt_is_restarted_out_of_the_way(
+    kernel: LocalKernel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare `except:` catches the interrupt, so the cell keeps running and every
+    request behind it would be aborted. The settle is shortened here; the cell itself
+    ignores two interrupts and then ends."""
+    monkeypatch.setattr(compute_kernel, "INTERRUPT_SETTLE_SECONDS", 1.0)
+    kernel.run_cell("first = 1", timeout=30)
+    result = kernel.run_cell(
+        "import time\n"
+        "for _ in range(40):\n"
+        "    try:\n"
+        "        time.sleep(0.2)\n"
+        "    except:\n"
+        "        pass\n",
+        timeout=1.0,
+    )
+    assert result.timed_out
+    assert result.restarted
+    after = kernel.run_cell("print('first' in dir())", timeout=30)
+    assert after.ok, after.error
+    assert after.stdout.strip() == "False"  # the namespace is empty, as a restart leaves it
 
 
 # ─── install fallback (uv venvs ship without pip) ────────────────────────

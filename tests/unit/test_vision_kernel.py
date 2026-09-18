@@ -1,0 +1,128 @@
+"""The image session on a real kernel, in its own child process.
+
+Everything else about the session is tested with a fake runner and no torch. This is
+the one check that the preamble, the cell prefix, `fit`, `submit`, the own-model
+helpers, a restart and the floor all work in a kernel that is confined the way a run
+confines it. Skipped where torch is absent, so CI without the vision extra passes.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import subprocess
+import sys
+from typing import Any
+
+import pytest
+
+from evals.config import REPO_ROOT
+
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.slow,
+    pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="torch is not installed"),
+]
+
+
+def _check(name: str) -> dict[str, Any]:
+    out = subprocess.run(
+        [sys.executable, "-m", "tests.unit._vision_kernel_check", name],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    result: dict[str, Any] = json.loads(out.stdout.strip().splitlines()[-1])
+    return result
+
+
+@pytest.fixture(scope="module")
+def session() -> dict[str, Any]:
+    return _check("session")
+
+
+@pytest.fixture(scope="module")
+def experiment() -> dict[str, Any]:
+    return _check("experiment")
+
+
+def test_torch_never_loads_in_the_test_process() -> None:
+    assert "torch" not in sys.modules
+
+
+def test_the_preamble_decodes_the_images_and_prints_the_worked_example(
+    session: dict[str, Any],
+) -> None:
+    assert session["preamble_error"] is None
+    assert session["loaded"]
+    assert session["example_printed"]
+
+
+def test_a_fit_trains_submits_and_records_the_recipe_it_submitted(
+    session: dict[str, Any],
+) -> None:
+    assert session["fit_error"] is None
+    (fit,) = session["fit"]
+    assert (fit["backbone"], fit["epochs_run"]) == ("simple_cnn", 1)
+    assert session["submitted"] == session["fit"]
+    assert len(session["predictions"].split()) == 8
+    assert set(session["predictions"].split()) <= {"cat", "dog"}
+    assert session["probabilities_rows"] == 8
+    assert session["recipe"]["predictions_sha256"]
+
+
+def test_the_own_model_helpers_score_and_submit_under_their_name(
+    session: dict[str, Any],
+) -> None:
+    assert session["own_error"] is None
+    (model,) = session["model_lines"]
+    assert model["model"] == "tiny_net"
+    assert session["own_submitted"][-1]["model"] == "tiny_net"
+
+
+def test_a_model_that_fixes_its_input_size_gets_pixels_at_that_size(
+    session: dict[str, Any],
+) -> None:
+    assert session["fixed_error"] is None
+    assert session["fixed_decoded"]
+
+
+def test_predict_reads_the_logits_a_hugging_face_model_answers_with(
+    session: dict[str, Any],
+) -> None:
+    """timm answers with a tensor; a Hugging Face image model answers with an object."""
+    assert session["logits"] == "[8, 2] 8.0"
+
+
+def test_a_restart_rebuilds_the_session_and_the_recipe_it_had_reached(
+    session: dict[str, Any],
+) -> None:
+    assert session["restart_error"] is None
+    assert session["recipe_after_restart"]["augment"] == "flip"
+
+
+def test_the_floor_submits_after_a_reset(session: dict[str, Any]) -> None:
+    assert session["floor_error"] is None
+    assert session["floor_predictions"].split() == ["cat"] * 8
+
+
+def test_a_cell_cannot_read_outside_the_folders_this_run_named(
+    session: dict[str, Any],
+) -> None:
+    if not session["confined"]:
+        pytest.skip("this platform has no sandbox")
+    assert session["outside_blocked"] is False  # refused as a path, not as a program
+
+
+def test_one_image_experiment_runs_the_way_a_run_runs_it(experiment: dict[str, Any]) -> None:
+    """The seam the CLI lane could only stub: the real CodingAgent with the vision
+    family, a confined kernel, and the host scoring what the session submitted."""
+    assert experiment["error"] is None
+    assert experiment["score"] == 1.0
+    assert experiment["sources"] == ["preamble", "agent"]  # no floor was needed
+    assert experiment["stdout_has_fit"]
+    assert experiment["artifacts"] == ["recipe.json"]
+    assert experiment["recipe"]["backbone"] == "simple_cnn"
+    assert experiment["recipe"]["predictions_sha256"]

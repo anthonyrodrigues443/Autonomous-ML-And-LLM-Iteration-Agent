@@ -382,6 +382,7 @@ class ImageProfile:
     shared_across_split: int
     facts: tuple[str, ...] = ()
     short_sides: tuple[int, int, int] = (0, 0, 0)
+    per_class: tuple[int, int, int] = (0, 0, 0)
 
     def render(self) -> str:
         w, h = self.widths, self.heights
@@ -392,10 +393,14 @@ class ImageProfile:
                 f"Spread: mean={mean:.4g}, std={std:.4g}, min={low:.4g}, max={high:.4g}."
             )
         else:
+            # Only the six largest shares are shown, so the smallest class reaches the
+            # reader through these counts and nowhere else.
             target = (
                 f"Classes: {self.classes}. Class balance: "
                 + ", ".join(f"{c!r}: {p:.0%}" for c, p in self.class_balance[:6])
-                + "."
+                + ". Training images per class: smallest {}, median {}, largest {}.".format(
+                    *self.per_class
+                )
             )
         lines = [
             f"Rows: {self.n_train} train / {self.n_test} test (sealed holdout). "
@@ -412,7 +417,8 @@ class ImageProfile:
             f"{self.shared_across_split}.",
         ]
         if self.facts:
-            lines.append("Data checks: " + " ".join(self.facts))
+            told = " ".join(self.facts)
+            lines.append(told if told.startswith("Data checks") else "Data checks: " + told)
         return "\n".join(lines)
 
 
@@ -455,6 +461,12 @@ def profile_images(
         if classification
         else dataset.train_target.iloc[0:0]
     )
+    sizes = (
+        sorted(int(n) for n in dataset.train_target.astype(str).value_counts())
+        if classification
+        else []
+    )
+    per_class = (sizes[0], int(median(sizes)), sizes[-1]) if sizes else (0, 0, 0)
     spread = None
     if not classification:
         # Over the numbers only: the vision target refuses the rest, with a count.
@@ -491,6 +503,7 @@ def profile_images(
         shared_across_split=len(train_digests & test_digests),
         facts=dataset.facts,
         short_sides=extent(shorts),
+        per_class=per_class,
     )
 
 

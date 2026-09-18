@@ -92,10 +92,9 @@ FIRST_PROMPT_VERSION = (0, 5, 0)
 # The same failure one family later: before v0.6 a CSV of image paths runs as a
 # tabular problem on file names.
 FIRST_VISION_VERSION = (0, 6, 0)
-# The working tree links a folder and then stops until the vision run is wired, so a
-# dev cell would record a run that never trained. Lifted with the CLI's guard; a test
-# runs the real command so the two cannot drift apart.
-DEV_RUNS_VISION = False
+# Lifted with the CLI's guard, so a dev cell only runs vision once the CLI trains on
+# it; a test runs the real command so the two cannot drift apart.
+DEV_RUNS_VISION = True
 
 
 def skip_reason(version: str, dataset: Dataset) -> str | None:

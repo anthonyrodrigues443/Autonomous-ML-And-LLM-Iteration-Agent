@@ -193,11 +193,34 @@ def test_a_module_under_a_namespace_another_package_shares_plans_its_own_distrib
     )
     assert run.calls[0][0][-1] == "google-generativeai"
 
-    unknown = SKOPT.replace("skopt", "google-genai")
-    run = _Scripted([_uv(ok=False, error=unknown), _uv(" + google==3.0.0\n")])
-    plan = _installer(run).plan("google", kernel_modules=[], module="google.genai")
-    assert (plan.package, plan.route) == ("google", Route.INSTALL)
-    assert [c[0][-1] for c in run.calls] == ["google-genai", "google"]
+
+def test_a_module_under_a_namespace_nothing_provides_is_refused_not_guessed() -> None:
+    """Reverses a Day 5 assertion (sprint 4 Day 6). Falling back to the bare top name
+    planned PyPI's unrelated `google` 3.0.0 for `google.colab`, a notebook idiom the
+    import watch now hands to the installer."""
+    unknown = SKOPT.replace("skopt", "google-colab")
+    run = _Scripted([_uv(ok=False, error=unknown)])
+    plan = _installer(run).plan("google", kernel_modules=[], module="google.colab")
+    assert (plan.package, plan.route, plan.reason) == ("google-colab", Route.REFUSE, "not_found")
+    assert [c[0][-1] for c in run.calls] == ["google-colab"]
+
+
+def test_a_module_two_levels_under_a_namespace_takes_the_longest_name_that_exists() -> None:
+    run = _Scripted([_uv(" + google-cloud-storage==3.5.0\n")])
+    plan = _installer(run).plan("google", kernel_modules=[], module="google.cloud.storage")
+    assert (plan.package, plan.route, plan.version) == (
+        "google-cloud-storage",
+        Route.INSTALL,
+        "3.5.0",
+    )
+    assert [c[0][-1] for c in run.calls] == ["google-cloud-storage"]
+
+    # The longest name first, and the shorter one only when it does not exist.
+    missing = SKOPT.replace("skopt", "google-cloud-storage")
+    run = _Scripted([_uv(ok=False, error=missing), _uv(" + google-cloud==0.34.0\n")])
+    plan = _installer(run).plan("google", kernel_modules=[], module="google.cloud.storage")
+    assert (plan.package, plan.route) == ("google-cloud", Route.INSTALL)
+    assert [c[0][-1] for c in run.calls] == ["google-cloud-storage", "google-cloud"]
 
 
 def test_a_package_that_needs_another_torch_is_refused() -> None:

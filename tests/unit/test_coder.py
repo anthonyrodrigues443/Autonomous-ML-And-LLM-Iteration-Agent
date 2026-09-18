@@ -8,6 +8,8 @@ and recovers from a cell error mid-session.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
@@ -16,6 +18,7 @@ import pytest
 from iterate.adapters.compute.deps import Plan, Route
 from iterate.adapters.compute.kernel import Blocked, CellResult, LocalKernel
 from iterate.adapters.data.tabular import load_csv
+from iterate.core import codegen
 from iterate.core.coder import CodingAgent
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import ChatResponse, Message, ToolCall
@@ -54,7 +57,9 @@ def _run(code: str) -> ChatResponse:
 
 
 def _finish() -> ChatResponse:
-    return ChatResponse(model="fake-model", tool_calls=[ToolCall(id="f", name="finish", arguments={})])
+    return ChatResponse(
+        model="fake-model", tool_calls=[ToolCall(id="f", name="finish", arguments={})]
+    )
 
 
 _FIT_AND_WRITE = """
@@ -210,7 +215,10 @@ def test_zero_deadline_ends_before_any_llm_call(tmp_path: Path) -> None:
     ds = _dataset(tmp_path)
     fake = _FakeLLM([])  # any chat would raise IndexError — proves none happens
     out = CodingAgent(
-        fake, _FakeKernel([CellResult("loaded", "")]), metric="f1", deadline_seconds=0.0  # type: ignore[arg-type]
+        fake,
+        _FakeKernel([CellResult("loaded", "")]),
+        metric="f1",
+        deadline_seconds=0.0,  # type: ignore[arg-type]
     ).run(dataset=ds, brief="b", experiment_id="e9")
     assert fake.calls == []
     assert not out.result.succeeded  # captured failure, not a crash
@@ -268,8 +276,11 @@ def test_starting_code_seeds_the_prompt(tmp_path: Path) -> None:
     ds = _dataset(tmp_path)
     fake = _FakeLLM([_run(_FIT_AND_WRITE), _finish(), _finish()])
     CodingAgent(fake, LocalKernel(), metric="f1").run(
-        dataset=ds, brief="b", experiment_id="e",
-        starting_code="WINNING_PIPELINE = 1  # prior best", starting_score=0.55,
+        dataset=ds,
+        brief="b",
+        experiment_id="e",
+        starting_code="WINNING_PIPELINE = 1  # prior best",
+        starting_score=0.55,
     )
     sent = "\n".join(m.content or "" for m in fake.calls[0])
     assert "BEST APPROACH SO FAR" in sent  # the prior best is offered as a starting point
@@ -364,7 +375,9 @@ def test_identical_cell_is_not_executed_twice(tmp_path: Path) -> None:
     ds = _dataset(tmp_path)
     kernel = _CountingKernel([CellResult("loaded", "")], predictions=b"0\n" * ds.n_test)
     # the model submits the SAME cell twice, then finishes
-    fake = _FakeLLM([_run("print(X_train.shape)"), _run("print(X_train.shape)"), _finish(), _finish()])
+    fake = _FakeLLM(
+        [_run("print(X_train.shape)"), _run("print(X_train.shape)"), _finish(), _finish()]
+    )
     out = CodingAgent(fake, kernel, metric="f1", max_cells=6).run(  # type: ignore[arg-type]
         dataset=ds, brief="b", experiment_id="e14"
     )
@@ -381,9 +394,7 @@ def test_breaker_catches_a_cycle_within_the_window(tmp_path: Path) -> None:
     ds = _dataset(tmp_path)
     kernel = _CountingKernel([CellResult("loaded", "")], predictions=b"0\n" * ds.n_test)
     # cycle A,B,A,B — the second A and second B must both be rejected (window > 1)
-    fake = _FakeLLM(
-        [_run("a"), _run("b"), _run("a"), _run("b"), _finish(), _finish()]
-    )
+    fake = _FakeLLM([_run("a"), _run("b"), _run("a"), _run("b"), _finish(), _finish()])
     CodingAgent(fake, kernel, metric="f1", max_cells=10).run(  # type: ignore[arg-type]
         dataset=ds, brief="b", experiment_id="e15"
     )
@@ -501,8 +512,11 @@ def test_fallback_banks_the_carried_best_before_the_canned_baseline(tmp_path: Pa
     ds = _dataset(tmp_path)
     fake = _FakeLLM([_run("x = 1")])
     out = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=1).run(
-        dataset=ds, brief="b", experiment_id="e3b",
-        starting_code=_FIT_AND_WRITE, starting_score=0.6,
+        dataset=ds,
+        brief="b",
+        experiment_id="e3b",
+        starting_code=_FIT_AND_WRITE,
+        starting_score=0.6,
     )
     assert out.result.succeeded, out.result.error
     fallback = [c for c in out.cells if c.source == "fallback"]
@@ -518,8 +532,11 @@ def test_fallback_falls_through_to_the_canned_baseline_when_carried_code_errors(
     ds = _dataset(tmp_path)
     fake = _FakeLLM([_run("x = 1")])
     out = CodingAgent(fake, LocalKernel(), metric="f1", max_cells=1).run(
-        dataset=ds, brief="b", experiment_id="e3d",
-        starting_code="raise RuntimeError('carried code broken')", starting_score=0.6,
+        dataset=ds,
+        brief="b",
+        experiment_id="e3d",
+        starting_code="raise RuntimeError('carried code broken')",
+        starting_score=0.6,
     )
     assert out.result.succeeded, out.result.error
     fallback = [c for c in out.cells if c.source == "fallback"]
@@ -552,7 +569,9 @@ def test_identical_submission_gets_one_corrective_nudge_then_accepts(tmp_path: P
     kernel = _FakeKernel([CellResult("loaded", ""), CellResult("ok", "")], predictions=preds)
     fake = _FakeLLM([_run("x = 1"), _finish(), _finish(), _finish()])
     out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
-        dataset=ds, brief="b", experiment_id="g1",
+        dataset=ds,
+        brief="b",
+        experiment_id="g1",
         # the matching digest is a NON-best sibling's — the gate must still fire
         seen_digests={"unrelated-digest", _hashlib.sha256(preds).hexdigest()},
     )
@@ -570,7 +589,9 @@ def test_briefed_lever_missing_from_code_gets_one_corrective_nudge(tmp_path: Pat
     )
     fake = _FakeLLM([_run("x = 1"), _finish(), _finish(), _finish()])
     out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
-        dataset=ds, brief="b", experiment_id="g2",
+        dataset=ds,
+        brief="b",
+        experiment_id="g2",
         brief_markers=("class_weight", "scale_pos_weight", "smote", "threshold"),
     )
     assert out.result.succeeded, out.result.error
@@ -588,9 +609,13 @@ def test_lever_gate_ignores_markers_inherited_from_the_carried_code(tmp_path: Pa
         [CellResult("loaded", ""), CellResult("ok", "")], predictions=b"0\n" * ds.n_test
     )
     # the coder byte-copies the carried threshold line and adds nothing lever-shaped
-    fake = _FakeLLM([_run("preds = (proba >= 0.4)  # threshold write"), _finish(), _finish(), _finish()])
+    fake = _FakeLLM(
+        [_run("preds = (proba >= 0.4)  # threshold write"), _finish(), _finish(), _finish()]
+    )
     out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
-        dataset=ds, brief="b", experiment_id="g4",
+        dataset=ds,
+        brief="b",
+        experiment_id="g4",
         starting_code=carried,
         brief_markers=("class_weight", "scale_pos_weight", "smote", "threshold"),
     )
@@ -608,7 +633,9 @@ def test_lever_gate_accepts_a_new_line_bearing_the_marker(tmp_path: Path) -> Non
     # a genuinely NEW threshold sweep line — the lever was pulled this session
     fake = _FakeLLM([_run("best_threshold = sweep(0.2, 0.6)"), _finish(), _finish()])
     out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
-        dataset=ds, brief="b", experiment_id="g5",
+        dataset=ds,
+        brief="b",
+        experiment_id="g5",
         starting_code=carried,
         brief_markers=("class_weight", "scale_pos_weight", "smote", "threshold"),
     )
@@ -624,8 +651,11 @@ def test_gates_stay_quiet_when_the_lever_landed_and_predictions_differ(tmp_path:
     )
     fake = _FakeLLM([_run("model = HGB(class_weight='balanced')"), _finish(), _finish()])
     out = CodingAgent(fake, kernel, metric="f1", max_cells=8).run(  # type: ignore[arg-type]
-        dataset=ds, brief="b", experiment_id="g3",
-        brief_markers=("class_weight",), seen_digests={"some-other-digest"},
+        dataset=ds,
+        brief="b",
+        experiment_id="g3",
+        brief_markers=("class_weight",),
+        seen_digests={"some-other-digest"},
     )
     assert out.result.succeeded, out.result.error
     sent = "\n".join(m.content or "" for call in fake.calls for m in call)
@@ -740,7 +770,11 @@ def test_pause_suspends_the_wall_ceiling(tmp_path: Path) -> None:
     ctrl.submit_line("pause")
     threading.Timer(1.2, lambda: ctrl.submit_line("resume")).start()
     agent = CodingAgent(
-        fake, LocalKernel(), metric="f1", max_cells=8, controller=ctrl,
+        fake,
+        LocalKernel(),
+        metric="f1",
+        max_cells=8,
+        controller=ctrl,
         wall_ceiling_seconds=0.8,  # smaller than the pause: fires unless suspended
     )
     coding = agent.run(dataset=_dataset(tmp_path), brief="b", experiment_id="pause-test")
@@ -836,10 +870,12 @@ def test_timeouts_get_a_nudge_count_toward_the_breaker_and_enrich_the_failure(
 
     # Each turn's cell differs slightly (as a real model retries) so the
     # repeated-cell breaker does not swallow them before the timeout counter.
-    fake = _FakeLLM([
-        _run(f"model_{i} = HistGradientBoostingClassifier(random_state=42).fit(Xa, ya)")
-        for i in range(_MAX_CONSECUTIVE_ERRORS + 2)
-    ])
+    fake = _FakeLLM(
+        [
+            _run(f"model_{i} = HistGradientBoostingClassifier(random_state=42).fit(Xa, ya)")
+            for i in range(_MAX_CONSECUTIVE_ERRORS + 2)
+        ]
+    )
     agent = CodingAgent(fake, _TimeoutKernel(), metric="f1", max_cells=20)  # type: ignore[arg-type]
     coding = agent.run(dataset=_dataset(tmp_path), brief="b", experiment_id="to-test")
     # the breaker sees timeouts: the session ended after the cap, not max_cells
@@ -1338,3 +1374,370 @@ def test_a_failed_route_install_keeps_the_original_error_and_never_restarts(
     assert kernel.restarts == 0
     assert "No module named 'plotly'" in (out.cells[1].error or "")
     assert "auto-install of 'plotly' FAILED: boom" in _tool_replies(fake)[0]
+
+
+# ─── an import a cell caught itself (sprint 4 Day 6) ───────────────────────────
+
+
+class _WatchKernel(_RouteKernel):
+    """A kernel with a working directory: what the watch recorded, and the predictions."""
+
+    def __init__(self, results: list[CellResult], *, files: dict[str, bytes], **kw: Any) -> None:
+        super().__init__(results, **kw)
+        self.files = dict(files)
+        self.reads: list[str] = []
+        self.started: dict[str, bytes] = {}
+
+    def start(self, inputs: dict[str, bytes]) -> None:
+        self.started = dict(inputs)
+
+    def read_output(self, name: str) -> bytes | None:
+        self.reads.append(name)
+        return self.files.get(name)
+
+
+def _caught_session(
+    tmp_path: Path,
+    plan: Plan,
+    results: list[CellResult],
+    *,
+    recorded: bytes = b"catboost\n",
+    install: bool = True,
+    installer: bool = True,
+    code: str = "try:\n    import catboost\nexcept ImportError:\n    pass",
+) -> tuple[Any, _WatchKernel, _FakeInstaller, _FakeLLM]:
+    ds = _dataset(tmp_path)
+    kernel = _WatchKernel(
+        results,
+        files={
+            codegen.MISSING_IMPORTS: recorded,
+            codegen.PREDICTIONS_CSV: b"0\n" * ds.n_test,
+        },
+    )
+    fake_installer = _FakeInstaller(plan)
+    fake = _FakeLLM([_run(code), _finish(), _finish()])
+    agent = CodingAgent(
+        fake,
+        kernel,  # type: ignore[arg-type]
+        metric="f1",
+        max_cells=4,
+        install=install,
+        installer=fake_installer if installer else None,
+    )
+    out = agent.run(dataset=ds, brief="b", experiment_id="caught")
+    return out, kernel, fake_installer, fake
+
+
+def test_a_caught_import_is_installed_and_the_cell_is_not_rerun(tmp_path: Path) -> None:
+    plan = Plan("catboost", Route.INSTALL, "1.2.10")
+    _, kernel, installer, fake = _caught_session(
+        tmp_path, plan, [CellResult("loaded", ""), CellResult("used the fallback", "")]
+    )
+    assert installer.installed == [plan]
+    assert sum("import catboost" in code for code in kernel.executed) == 1
+    note = _tool_replies(fake)[0]
+    assert note.startswith(PROMPTS["coder"]["install_caught"].format(module="catboost"))
+    assert PROMPTS["coder"]["install_caught_ran_without"].strip() in note
+    assert "Import it plainly" in note
+
+
+def test_a_caught_import_is_planned_once_a_session(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _WatchKernel(
+        [CellResult("loaded", ""), CellResult("first", ""), CellResult("second", "")],
+        files={
+            codegen.MISSING_IMPORTS: b"catboost\n",
+            codegen.PREDICTIONS_CSV: b"0\n" * ds.n_test,
+        },
+    )
+    installer = _FakeInstaller(Plan("catboost", Route.INSTALL, "1.2.10"))
+    fake = _FakeLLM([_run("import x"), _run("import y"), _finish(), _finish()])
+    CodingAgent(fake, kernel, metric="f1", max_cells=5, installer=installer).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="once"
+    )
+    assert len(installer.asked) == 1
+
+
+@pytest.mark.parametrize(
+    ("result", "finished"),
+    [
+        (CellResult("banked the fallback", ""), True),
+        (CellResult("", "", error="ValueError: something else broke"), False),
+        (CellResult("", "", timed_out=True), False),
+    ],
+)
+def test_a_caught_import_never_reruns_the_cell_however_it_ended(
+    tmp_path: Path, result: CellResult, finished: bool
+) -> None:
+    """An image cell is a fit of minutes: re-running one to reach an import it already
+    worked around would spend the session's budget twice."""
+    plan = Plan("timm", Route.INSTALL, "1.0.29")
+    _, kernel, installer, fake = _caught_session(
+        tmp_path, plan, [CellResult("loaded", ""), result], recorded=b"timm\n"
+    )
+    assert installer.installed == [plan]
+    assert kernel.restarts == 0
+    assert sum("import catboost" in code for code in kernel.executed) == 1
+    note = _tool_replies(fake)[0]
+    assert (PROMPTS["coder"]["install_caught_ran_without"].strip() in note) is finished
+
+
+def test_a_caught_import_that_would_restart_the_kernel_does_not(tmp_path: Path) -> None:
+    plan = Plan("plotly", Route.RESTART, "7.1.0", {"narwhals": ("1.14.0", "2.26.0")})
+    _, kernel, installer, fake = _caught_session(
+        tmp_path, plan, [CellResult("loaded", ""), CellResult("ok", "")], recorded=b"plotly\n"
+    )
+    assert (kernel.restarts, installer.installed) == (0, [])
+    assert "in a cell of its own" in _tool_replies(fake)[0]
+
+
+def test_a_caught_import_saved_for_the_next_run_is_saved(tmp_path: Path) -> None:
+    plan = Plan("sktime", Route.NEXT_RUN, "1.1.0", {"pandas": ("3.0.3", "2.3.3")})
+    _, _, installer, fake = _caught_session(
+        tmp_path, plan, [CellResult("loaded", ""), CellResult("ok", "")], recorded=b"sktime\n"
+    )
+    assert installer.saved == [(plan, "sktime")]
+    assert "will be installed when the next run starts" in _tool_replies(fake)[0]
+
+
+def test_a_caught_import_that_is_refused_says_why(tmp_path: Path) -> None:
+    plan = Plan("notathing", Route.REFUSE, reason="not_found", detail="d")
+    _, _, installer, fake = _caught_session(
+        tmp_path, plan, [CellResult("loaded", ""), CellResult("ok", "")], recorded=b"notathing\n"
+    )
+    assert installer.installed == []
+    assert "does not exist on the package index" in _tool_replies(fake)[0]
+
+
+def test_with_installs_off_a_caught_import_is_only_reported(tmp_path: Path) -> None:
+    """The pair a local run without `--install` builds: no installer at all. The agent is
+    still told the module was missing, as the raised-import path already tells it."""
+    _, _, installer, fake = _caught_session(
+        tmp_path,
+        Plan("catboost", Route.INSTALL, "1.2.10"),
+        [CellResult("loaded", ""), CellResult("ok", "")],
+        install=False,
+        installer=False,
+    )
+    assert installer.installed == []
+    assert PROMPTS["coder"]["install_off_note"].format(module="catboost") in _tool_replies(fake)[0]
+
+
+def test_on_e2b_a_caught_import_is_left_to_the_sandbox(tmp_path: Path) -> None:
+    """Installs on with no installer of the harness's own is e2b, which installs through
+    its own kernel: telling that session installs are off would be false."""
+    _, _, installer, fake = _caught_session(
+        tmp_path,
+        Plan("catboost", Route.INSTALL, "1.2.10"),
+        [CellResult("loaded", ""), CellResult("ok", "")],
+        installer=False,
+    )
+    assert installer.asked == []
+    reply = _tool_replies(fake)[0]
+    assert PROMPTS["coder"]["install_caught"].format(module="catboost") not in reply
+
+
+def test_an_environment_probe_a_cell_caught_is_never_planned(tmp_path: Path) -> None:
+    """google.colab and the kaggle names are missing here by definition, and what PyPI
+    holds under them is not what the cell was asking for. Where no installed package owns
+    the `google` folder, the parent import fails first and the bare top name is the one
+    the watch is asked for."""
+    _, _, installer, fake = _caught_session(
+        tmp_path,
+        Plan("google", Route.INSTALL, "3.0.0"),
+        [CellResult("loaded", ""), CellResult("ok", "")],
+        recorded=b"google\ngoogle.colab\nkaggle_secrets\n",
+    )
+    assert installer.asked == []
+    assert "was missing" not in _tool_replies(fake)[0]
+
+
+def test_a_record_file_that_is_not_a_module_name_plans_nothing(tmp_path: Path) -> None:
+    _, _, installer, _ = _caught_session(
+        tmp_path,
+        Plan("x", Route.INSTALL, "1.0"),
+        [CellResult("loaded", ""), CellResult("ok", "")],
+        recorded=b"0\n0\n0\n",
+    )
+    assert installer.asked == []
+
+
+def test_a_sandbox_kernel_never_reads_the_record_file(tmp_path: Path) -> None:
+    """e2b installs through the kernel itself and keeps main's behaviour."""
+    _, kernel, _, _ = _caught_session(
+        tmp_path,
+        Plan("catboost", Route.INSTALL, "1.2.10"),
+        [CellResult("loaded", ""), CellResult("ok", "")],
+        installer=False,
+    )
+    assert codegen.MISSING_IMPORTS not in kernel.reads
+    assert kernel.installed == []
+
+
+def test_a_raised_missing_import_still_installs_and_reruns_the_cell(tmp_path: Path) -> None:
+    """The plain path is unchanged: a traceback names the module, so the cell is worth
+    re-running, and the watch must not handle it a second time."""
+    plan = Plan("category_encoders", Route.INSTALL, "2.9.0")
+    _, kernel, installer, _ = _caught_session(
+        tmp_path,
+        plan,
+        [
+            CellResult("loaded", ""),
+            _missing("category_encoders"),
+            CellResult("worked after install", ""),
+        ],
+        recorded=b"category_encoders\n",
+        code="import category_encoders",
+    )
+    assert len(installer.asked) == 1
+    assert sum("import category_encoders" in code for code in kernel.executed) == 2
+
+
+# ─── the family's own cell prefix, floor and profile ──────────────────────────
+
+
+def test_the_cell_prefix_is_the_familys_own(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel([CellResult("loaded", "")], predictions=b"0\n" * ds.n_test)
+    fake = _FakeLLM([_run("print(1)"), _finish(), _finish()])
+    CodingAgent(
+        fake,
+        kernel,  # type: ignore[arg-type]
+        metric="f1",
+        max_cells=3,
+        cell_prefix="PREFIX\n",
+    ).run(dataset=ds, brief="b", experiment_id="prefix")
+    assert kernel.executed[-1] == "PREFIX\nprint(1)"
+
+
+def test_the_floor_runs_the_familys_prefix_and_may_skip_the_carried_code(
+    tmp_path: Path,
+) -> None:
+    """The image floor writes predictions from the labels alone; re-running the carried
+    best there would be a fit of minutes, at the moment the session has no budget left."""
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel([CellResult("loaded", "")], predictions=None)
+    fake = _FakeLLM([_run("print('nothing submitted')"), _finish(), _finish(), _finish()])
+    CodingAgent(
+        fake,
+        kernel,  # type: ignore[arg-type]
+        metric="f1",
+        max_cells=3,
+        cell_prefix="PREFIX\n",
+        floor_carries_code=False,
+        floor_cell="FLOOR\n",
+    ).run(dataset=ds, brief="b", experiment_id="floor", starting_code="CARRIED\n")
+    assert any(c.startswith("PREFIX\nFLOOR") for c in kernel.executed)
+    assert not any("CARRIED" in code for code in kernel.executed)
+
+
+def test_the_carried_best_is_still_the_first_floor_on_a_table(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel([CellResult("loaded", "")], predictions=None)
+    fake = _FakeLLM([_run("print('nothing submitted')"), _finish(), _finish(), _finish()])
+    CodingAgent(fake, kernel, metric="f1", max_cells=3).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="floor", starting_code="CARRIED\n"
+    )
+    assert any("CARRIED" in code for code in kernel.executed)
+
+
+def test_the_family_may_hand_the_coder_its_own_profile(tmp_path: Path) -> None:
+    """A table profile of one column of file names says nothing about images."""
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel([CellResult("loaded", "")], predictions=b"0\n" * ds.n_test)
+    fake = _FakeLLM([_finish(), _finish()])
+    CodingAgent(
+        fake,
+        kernel,  # type: ignore[arg-type]
+        metric="f1",
+        max_cells=2,
+        data_summary="Images: 40 train / 10 holdout at 64px.",
+    ).run(dataset=ds, brief="b", experiment_id="profile")
+    assert any("Images: 40 train" in (m.content or "") for m in fake.calls[0])
+
+
+def test_the_data_line_has_wording_for_every_family() -> None:
+    """A BLOCKED cell reads this by family; a missing key would be a KeyError in the
+    middle of a live session."""
+    lines = PROMPTS["coder"]["outside_folder_inputs"]
+    assert set(lines) == {"tabular", "prompt", "vision"}
+    assert "train_px" in lines["vision"]
+
+
+# ─── what the host carries in, and what it keeps ──────────────────────────────
+
+
+def test_starting_files_reach_the_kernels_working_directory(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _WatchKernel(
+        [CellResult("loaded", "")], files={codegen.PREDICTIONS_CSV: b"0\n" * ds.n_test}
+    )
+    fake = _FakeLLM([_finish(), _finish()])
+    CodingAgent(fake, kernel, metric="f1", max_cells=2).run(  # type: ignore[arg-type]
+        dataset=ds,
+        brief="b",
+        experiment_id="carry",
+        starting_files={codegen.INCUMBENT_JSON: b'{"backbone": "resnet18"}'},
+    )
+    assert kernel.started[codegen.INCUMBENT_JSON] == b'{"backbone": "resnet18"}'
+    assert codegen.TRAIN_CSV in kernel.started
+
+
+def test_the_recipe_is_kept_only_while_it_describes_the_predictions(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    predictions = b"0\n" * ds.n_test
+    digest = hashlib.sha256(predictions).hexdigest()
+    for recorded, kept in (
+        (json.dumps({"backbone": "resnet18", "predictions_sha256": digest}).encode(), True),
+        (json.dumps({"backbone": "resnet18", "predictions_sha256": "beef"}).encode(), False),
+        (b"not json", False),
+    ):
+        kernel = _WatchKernel(
+            [CellResult("loaded", "")],
+            files={codegen.PREDICTIONS_CSV: predictions, codegen.RECIPE_JSON: recorded},
+        )
+        fake = _FakeLLM([_finish(), _finish()])
+        out = CodingAgent(fake, kernel, metric="f1", max_cells=2).run(  # type: ignore[arg-type]
+            dataset=ds, brief="b", experiment_id="recipe"
+        )
+        assert (codegen.RECIPE_JSON in out.result.artifacts) is kept
+
+
+# ─── a cell that would not stop ───────────────────────────────────────────────
+
+
+def test_a_cell_the_kernel_had_to_be_restarted_for_re_runs_the_preamble(tmp_path: Path) -> None:
+    ds = _dataset(tmp_path)
+    kernel = _RouteKernel(
+        [
+            CellResult("loaded", ""),
+            CellResult("", "", timed_out=True, restarted=True),
+            CellResult("session ready again", ""),
+        ],
+        predictions=b"0\n" * ds.n_test,
+    )
+    fake = _FakeLLM([_run("while True: pass"), _finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=4).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="stuck"
+    )
+    assert [c.source for c in out.cells] == ["preamble", "preamble", "agent"]
+    note = _tool_replies(fake)[0]
+    assert "kernel was RESTARTED" in note
+    assert "session ready again" in note
+
+
+def test_a_cell_that_would_not_stop_still_counts_towards_ending_the_session(
+    tmp_path: Path,
+) -> None:
+    """Resetting the breaker on every restart would let one runaway cell repeat forever."""
+    ds = _dataset(tmp_path)
+    stuck = CellResult("", "", timed_out=True, restarted=True)
+    kernel = _RouteKernel(
+        [CellResult("loaded", ""), *[x for _ in range(6) for x in (stuck, CellResult("ok", ""))]],
+        predictions=b"0\n" * ds.n_test,
+    )
+    fake = _FakeLLM([_run(f"while True: pass  # {i}") for i in range(7)])
+    CodingAgent(fake, kernel, metric="f1", max_cells=10).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="stuck6"
+    )
+    assert len(fake.calls) == 6
