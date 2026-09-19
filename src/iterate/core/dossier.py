@@ -145,6 +145,8 @@ def _val_trail(cells: list[dict[str, Any]]) -> list[float]:
     trail: list[float] = []
     for cell in cells:
         for raw in (cell.get("stdout") or "").splitlines():
+            if raw.startswith(("FIT ", "MODEL ", "SUBMITTED ")):
+                continue  # an image session's own payloads; the val line beside them scores
             low = raw.lower()
             if "val" not in low and "score" not in low:
                 continue

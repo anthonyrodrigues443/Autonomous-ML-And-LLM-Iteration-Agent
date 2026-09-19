@@ -322,11 +322,19 @@ class Installer:
         if module and (providers := mapping.get(top)):
             if (owner := _shipper(providers, module)) is not None:
                 return done(Route.REFUSE, versions.get(owner), reason="installed", detail=owner)
-            dotted = canonical(f"{top}-{inner.partition('.')[0]}") if inner else name
-            if dotted != name:
-                planned = self.plan(dotted, kernel_modules=kernel_modules)
-                if planned.reason != "not_found":
-                    return planned
+            # The longest name first: google.cloud.storage is google-cloud-storage, not
+            # google-cloud, and the bare top name is PyPI's unrelated `google`.
+            parts = [p for p in inner.split(".") if p]
+            under: Plan | None = None
+            for depth in range(len(parts), 0, -1):
+                dotted = canonical("-".join([top, *parts[:depth]]))
+                if dotted == name:
+                    continue
+                under = self.plan(dotted, kernel_modules=kernel_modules)
+                if under.reason != "not_found":
+                    return under
+            if under is not None:
+                return under
         own = own_requirements()
         latest = self._dry_run(package, ())
         if not latest.ok:

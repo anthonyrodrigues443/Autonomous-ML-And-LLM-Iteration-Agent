@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import difflib
 import hashlib
+import json
 import logging
 import re
 import time
@@ -23,7 +24,7 @@ from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Sequence
+    from collections.abc import Callable, Collection, Sequence
 
     from iterate.adapters.compute.deps import Installer, Plan
     from iterate.adapters.compute.kernel import CellResult, StatefulKernel
@@ -45,6 +46,23 @@ _PROMPTS = PROMPTS["coder"]
 # high ceiling remains, to bound a pathological dump (e.g. printing the whole frame).
 _OBSERVATION_TAIL = 20000
 _MISSING_MODULE = re.compile(r"No module named ['\"]([\w.]+)['\"]")
+# The watch's file is written by cells; anything that is not an import name is ignored.
+_MODULE_NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
+# Modules a notebook imports only to learn where it is running. They are missing here by
+# definition, and installing what PyPI happens to hold under those names buys nothing.
+# `google` is here beside `google.colab` because a dotted import whose top-level package
+# is absent fails on the parent, so that is the name the watch records.
+_PROBES = frozenset(
+    {
+        "google",
+        "google.colab",
+        "kaggle_secrets",
+        "kaggle_datasets",
+        "kaggle_web_client",
+        "torch_xla",
+        "apex",
+    }
+)
 _REPEAT_WINDOW = 6  # how many recent executed cells the repeated-cell breaker remembers
 _SAME_ERROR_LIMIT = 3  # recurrences of one error signature before escalating the nudge
 # Consecutive errored cells (no success in between) before the session is ended
@@ -274,6 +292,9 @@ class CodingAgent:
         floor_cell: str | None = None,
         family: str = "tabular",
         installer: Installer | None = None,
+        cell_prefix: str = codegen.RESET_INPUTS,
+        floor_carries_code: bool = True,
+        data_summary: str | None = None,
     ) -> None:
         self._client = client
         self._kernel = kernel
@@ -296,9 +317,26 @@ class CodingAgent:
         self._family = family
         # None installs through the kernel itself: an e2b sandbox is disposable.
         self._installer = installer
+        self._cell_prefix = cell_prefix
+        # An image floor writes predictions from the labels alone: there is no recipe in
+        # the carried code for it to re-run, and re-running one is a fit of minutes.
+        self._floor_carries_code = floor_carries_code
+        self._data_summary = data_summary
+        self._watched: set[str] = set()
+
+    def _nudge(self, key: str) -> str:
+        """The family's own wording for a nudge where it has one. The tabular nudges
+        name LogisticRegression and fitted transformers, which an image cell has not
+        got, and a floor model follows what it reads."""
+        return str(_PROMPTS.get(f"{self._family}_{key}") or _PROMPTS[key])
 
     def _session_preamble(self) -> str:
         return self._preamble if self._preamble is not None else codegen.session_preamble()
+
+    def _summary(self, dataset: TabularDataset) -> str:
+        from iterate.core.proposer import summarize_dataset
+
+        return self._data_summary if self._data_summary is not None else summarize_dataset(dataset)
 
     def run(
         self,
@@ -310,9 +348,11 @@ class CodingAgent:
         starting_score: float | None = None,
         brief_markers: Sequence[str] | None = None,
         seen_digests: Collection[str] | None = None,
+        starting_files: dict[str, bytes] | None = None,
+        starting_recipe: dict[str, Any] | None = None,
+        lever_gate: Callable[[list[Cell]], bool] | None = None,
+        lever_name: str = "",
     ) -> CodingResult:
-        from iterate.core.proposer import summarize_dataset
-
         cells: list[Cell] = []
         if self._controller is not None:
             # Share the live transcript by reference: a question typed mid-run
@@ -322,6 +362,8 @@ class CodingAgent:
         inputs = codegen.build_inputs(dataset)
         if self._extra_inputs:
             inputs.update(self._extra_inputs)
+        if starting_files:
+            inputs.update(starting_files)
         self._kernel.start(inputs)
         try:
             pre = self._session_preamble()
@@ -329,7 +371,7 @@ class CodingAgent:
             cells.append(_cell(pre, pre_result, "preamble"))
 
             messages = _build_messages(
-                data_summary=summarize_dataset(dataset),
+                data_summary=self._summary(dataset),
                 metric=self._metric,
                 direction=direction(self._metric),
                 brief=brief,
@@ -337,6 +379,7 @@ class CodingAgent:
                 starting_code=starting_code,
                 starting_score=starting_score,
                 family=self._family,
+                starting_recipe=starting_recipe,
             )
             self._drive(
                 messages,
@@ -346,6 +389,8 @@ class CodingAgent:
                 brief_markers=tuple(brief_markers or ()),
                 seen_digests=frozenset(seen_digests or ()),
                 carried=_carried_lines(starting_code),
+                lever_gate=lever_gate,
+                lever_name=lever_name,
             )
 
             preds = self._kernel.read_output(codegen.PREDICTIONS_CSV)
@@ -389,6 +434,16 @@ class CodingAgent:
                     log.warning("coder[%s]: %s", experiment_id, swapped)
                     result = result.model_copy(update={"error": swapped, "metrics": None})
                 result = result.model_copy(update={"artifacts": artifacts})
+            # The image path's twin: the recipe a submit helper recorded, kept only when
+            # it still describes the predictions on disk (a later cell, or the floor,
+            # can have written over them).
+            recorded = self._kernel.read_output(codegen.RECIPE_JSON)
+            if recorded is not None and _recipe_describes(recorded, preds):
+                artifacts = {
+                    **result.artifacts,
+                    codegen.RECIPE_JSON: recorded.decode(errors="replace"),
+                }
+                result = result.model_copy(update={"artifacts": artifacts})
             if result.error:
                 forensics = _failure_forensics(cells)
                 if forensics:
@@ -418,8 +473,6 @@ class CodingAgent:
         The findings travel the Researcher's seam, as text folded into the next
         `decide()`. Returns "" when nothing worth carrying was printed.
         """
-        from iterate.core.proposer import summarize_dataset
-
         cells: list[Cell] = []
         if self._controller is not None:
             self._controller.live_cells = cells
@@ -436,7 +489,7 @@ class CodingAgent:
                 Message(
                     role="user",
                     content=_PROMPTS["inspect_user_template"].format(
-                        data_summary=summarize_dataset(dataset),
+                        data_summary=self._summary(dataset),
                         metric=self._metric,
                         brief=brief.strip() or "(no particular question — profile the data)",
                         preamble_output=_observation(pre_result),
@@ -472,6 +525,8 @@ class CodingAgent:
         carried: frozenset[str] = frozenset(),
         inspect: bool = False,
         max_cells: int | None = None,
+        lever_gate: Callable[[list[Cell]], bool] | None = None,
+        lever_name: str = "",
     ) -> None:
         """The tool loop: run_cell, feed the output back, repeat, until a VERIFIED
         finish or the deadline. The deadline charges kernel-execution seconds only.
@@ -529,7 +584,7 @@ class CodingAgent:
                 messages.append(
                     Message(
                         role="user",
-                        content=_PROMPTS["budget_nudge"].format(
+                        content=self._nudge("budget_nudge").format(
                             predictions_csv=codegen.PREDICTIONS_CSV
                         ),
                     )
@@ -569,11 +624,13 @@ class CodingAgent:
                 if reason is None:
                     # Lever gate (once): the briefed change never reached a single
                     # executed cell — a submission without it is not this experiment.
-                    if (
-                        brief_markers
-                        and not lever_nudged
+                    gate_open = (
+                        not lever_gate(cells)
+                        if lever_gate is not None
+                        else bool(brief_markers)
                         and not _markers_present(cells, brief_markers, carried)
-                    ):
+                    )
+                    if gate_open and not lever_nudged:
                         lever_nudged = True
                         log.info(
                             "coder[%s]: lever gate fired — briefed change absent from all cells",
@@ -582,8 +639,8 @@ class CodingAgent:
                         messages.append(
                             _tool_msg(
                                 call,
-                                _PROMPTS["lever_missing_nudge"].format(
-                                    lever=", ".join(brief_markers[:3]),
+                                self._nudge("lever_missing_nudge").format(
+                                    lever=lever_name or ", ".join(brief_markers[:3]),
                                     predictions_csv=codegen.PREDICTIONS_CSV,
                                 ),
                             )
@@ -605,7 +662,7 @@ class CodingAgent:
                         messages.append(
                             _tool_msg(
                                 call,
-                                _PROMPTS["identical_submission_nudge"].format(
+                                self._nudge("identical_submission_nudge").format(
                                     predictions_csv=codegen.PREDICTIONS_CSV
                                 ),
                             )
@@ -619,7 +676,7 @@ class CodingAgent:
                         messages.append(
                             _tool_msg(
                                 call,
-                                _PROMPTS["improve_nudge"].format(
+                                self._nudge("improve_nudge").format(
                                     predictions_csv=codegen.PREDICTIONS_CSV
                                 ),
                             )
@@ -630,7 +687,7 @@ class CodingAgent:
                 messages.append(
                     _tool_msg(
                         call,
-                        _PROMPTS["finish_rejected"].format(
+                        self._nudge("finish_rejected").format(
                             reason=reason, predictions_csv=codegen.PREDICTIONS_CSV
                         ),
                     )
@@ -685,7 +742,10 @@ class CodingAgent:
                 # A restart emptied the namespace, so every earlier output is stale.
                 recent_cells[:] = [normalized]
                 error_sig_counts.clear()
-                consecutive_errors = 0
+                # A cell that had to be restarted out of the way still failed: leaving
+                # the count intact keeps the timeout breaker able to end the session.
+                if not cell_result.timed_out:
+                    consecutive_errors = 0
             work += spent
             cells.append(_cell(code, cell_result, "agent", thinking=response.thinking))
             # Per-cell progress: a long local-model session is otherwise silent for
@@ -747,7 +807,9 @@ class CodingAgent:
                     )
                     return
                 obs = (
-                    _PROMPTS["timeout_nudge"].format(seconds=int(self._cell_timeout)) + "\n\n" + obs
+                    self._nudge("timeout_nudge").format(seconds=int(self._cell_timeout))
+                    + "\n\n"
+                    + obs
                 )
             elif cell_result.error:
                 consecutive_errors += 1
@@ -764,7 +826,7 @@ class CodingAgent:
                 sig = _error_signature(cell_result.error)
                 error_sig_counts[sig] = error_sig_counts.get(sig, 0) + 1
                 if error_sig_counts[sig] >= _SAME_ERROR_LIMIT:
-                    obs = _PROMPTS["same_error_nudge"].format(error=sig) + "\n\n" + obs
+                    obs = self._nudge("same_error_nudge").format(error=sig) + "\n\n" + obs
             else:
                 consecutive_errors = 0
             if not cell_result.timed_out:
@@ -792,7 +854,7 @@ class CodingAgent:
         coder — and the coder's prompt never mentions it, so the pressure to submit
         stays on the model."""
         candidates: list[tuple[str, str]] = []
-        if starting_code and starting_code.strip():
+        if self._floor_carries_code and starting_code and starting_code.strip():
             candidates.append(("carried-forward best", starting_code.strip()))
         candidates.append(
             (
@@ -811,7 +873,7 @@ class CodingAgent:
         self._kernel.run_cell(self._session_preamble(), timeout=self._cell_timeout)
         for label, code in candidates:
             cell_result = self._kernel.run_cell(
-                codegen.RESET_INPUTS + code, timeout=self._cell_timeout
+                self._cell_prefix + code, timeout=self._cell_timeout
             )
             cells.append(_cell(code, cell_result, "fallback"))
             if (
@@ -837,15 +899,26 @@ class CodingAgent:
         restarted). Planning, installing, restarting and the preamble are harness
         time and never charged.
 
-        Each run is prefixed with RESET_INPUTS so the canonical X_train/y_train/
-        X_holdout are pristine at the top of every cell."""
-        runnable = codegen.RESET_INPUTS + code
+        Each run is prefixed with the family's cell prefix, so the canonical
+        X_train/y_train/X_holdout are pristine at the top of every cell."""
+        runnable = self._cell_prefix + code
         t0 = time.monotonic()
         result = self._kernel.run_cell(runnable, timeout=self._cell_timeout)
         spent = time.monotonic() - t0
+        if result.restarted:
+            # The cell ignored the interrupt, so the kernel was replaced under it.
+            pre = self._kernel.run_cell(self._session_preamble(), timeout=self._cell_timeout)
+            cells.append(_cell(self._session_preamble(), pre, "preamble"))
+            note = _PROMPTS["timeout_restarted"].format(preamble_output=_observation(pre))
+            return result, note, spent, True
         missing = _missing_module(result.error)
         if missing is None:
-            return result, None, spent, False
+            # No traceback names a module, so the only evidence of a missing import is
+            # what the watch recorded: the cell caught the ImportError itself.
+            caught = self._caught_imports()
+            note = self._caught_import_note(caught[0], result, experiment_id) if caught else None
+            return result, note, spent, False
+        self._watched.add(missing)
         if not self._install:
             return result, _PROMPTS["install_off_note"].format(module=missing), spent, False
         package = codegen.package_for_import(missing)
@@ -855,23 +928,8 @@ class CodingAgent:
             package, kernel_modules=self._kernel.loaded_modules(), module=missing
         )
         log.info("coder[%s]: %s", experiment_id, _install_line(plan, missing))
-        if plan.route == "refuse":
-            template = _PROMPTS.get(
-                f"install_refused_{plan.reason}", _PROMPTS["install_refused_unresolvable"]
-            )
-            note = template.format(
-                module=missing,
-                package=plan.detail if plan.reason == "installed" and plan.detail else plan.package,
-                version=plan.version or "",
-                detail=plan.detail,
-            )
-            return result, note, spent, False
-        if plan.route == "next_run":
-            self._installer.save_for_next_run(plan, module=missing)
-            note = _PROMPTS["install_next_run"].format(
-                package=plan.package, version=plan.version, moves=plan.moved()
-            )
-            return result, note, spent, False
+        if plan.route in ("refuse", "next_run"):
+            return result, self._route_note(plan, missing), spent, False
         if error_log := self._installer.install(plan):
             note = _PROMPTS["install_failed"].format(
                 package=plan.package, error=error_log.strip()[-300:]
@@ -893,6 +951,84 @@ class CodingAgent:
         retried = self._kernel.run_cell(_INVALIDATE + runnable, timeout=self._cell_timeout)
         return retried, note, spent + time.monotonic() - t1, plan.route == "restart"
 
+    def _route_note(self, plan: Plan, module: str) -> str:
+        """The note for a plan that installs nothing now: refused, or saved for the next
+        run. Shared by a raised import and one a cell caught."""
+        if plan.route == "next_run":
+            if self._installer is not None:
+                self._installer.save_for_next_run(plan, module=module)
+            return str(
+                _PROMPTS["install_next_run"].format(
+                    package=plan.package, version=plan.version, moves=plan.moved()
+                )
+            )
+        template = _PROMPTS.get(
+            f"install_refused_{plan.reason}", _PROMPTS["install_refused_unresolvable"]
+        )
+        return str(
+            template.format(
+                module=module,
+                package=plan.detail if plan.reason == "installed" and plan.detail else plan.package,
+                version=plan.version or "",
+                detail=plan.detail,
+            )
+        )
+
+    def _caught_imports(self) -> list[str]:
+        """Modules this session's cells failed to import without raising. Local only: an
+        e2b sandbox is disposable and installs through the kernel, and it is the one
+        venue where installs are on and the harness holds no installer of its own. A
+        local run without `--install` still reads the watch, so a caught import reaches
+        the agent as a note rather than as silence."""
+        if self._installer is None and self._install:
+            return []
+        raw = self._kernel.read_output(codegen.MISSING_IMPORTS) or b""
+        names = dict.fromkeys(raw.decode(errors="replace").split())
+        return [
+            n
+            for n in names
+            if _MODULE_NAME.fullmatch(n) and n not in self._watched and n not in _PROBES
+        ]
+
+    def _caught_import_note(self, module: str, result: CellResult, experiment_id: str) -> str:
+        """Install what a cell caught, and tell the agent to import it plainly next time.
+
+        The cell is never re-run and the kernel is never restarted here, whatever the
+        cell did: an image cell is a fit of minutes, and re-running one to reach an
+        import it already worked around would cost the session twice over.
+        """
+        self._watched.add(module)
+        lead = str(_PROMPTS["install_caught"].format(module=module))
+        if result.ok:
+            lead += str(_PROMPTS["install_caught_ran_without"])
+        lead += " "
+        if not self._install or self._installer is None:
+            return lead + str(_PROMPTS["install_off_note"].format(module=module))
+        plan = self._installer.plan(
+            codegen.package_for_import(module),
+            kernel_modules=self._kernel.loaded_modules(),
+            module=module,
+        )
+        log.info("coder[%s]: caught import: %s", experiment_id, _install_line(plan, module))
+        if plan.route == "restart":
+            return lead + str(
+                _PROMPTS["install_caught_restart"].format(
+                    package=plan.package, version=plan.version, moves=plan.moved(), module=module
+                )
+            )
+        if plan.route != "install":
+            return lead + self._route_note(plan, module)
+        if error_log := self._installer.install(plan):
+            return lead + str(
+                _PROMPTS["install_failed"].format(
+                    package=plan.package, error=error_log.strip()[-300:]
+                )
+            )
+        self._kernel.run_cell(_INVALIDATE, timeout=self._cell_timeout)
+        return lead + str(
+            _PROMPTS["install_caught_done"].format(package=plan.package, version=plan.version)
+        )
+
     def _install_in_sandbox(
         self, runnable: str, result: CellResult, package: str, spent: float
     ) -> tuple[CellResult, str | None, float]:
@@ -909,6 +1045,18 @@ class CodingAgent:
 
 # The kernel's import caches predate a package the host has just installed.
 _INVALIDATE = "__import__('importlib').invalidate_caches()\n"
+
+
+def _recipe_describes(recipe_json: bytes, predictions: bytes | None) -> bool:
+    """True when recipe.json still describes the predictions on disk. A submit helper
+    records their digest, so a later cell (or the floor) writing over them is visible."""
+    if not predictions:
+        return False
+    try:
+        recorded = json.loads(recipe_json).get("predictions_sha256")
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return bool(recorded) and hashlib.sha256(predictions).hexdigest() == recorded
 
 
 def _install_line(plan: Plan, module: str) -> str:
@@ -967,6 +1115,7 @@ def _build_messages(
     starting_code: str | None = None,
     starting_score: float | None = None,
     family: str = "tabular",
+    starting_recipe: dict[str, Any] | None = None,
 ) -> list[Message]:
     """The session's opening messages.
 
@@ -974,6 +1123,17 @@ def _build_messages(
     swapped words. The tabular system message is dense with advice about dtype
     splits, imputation and encoders, and on a floor model that advice is not merely
     irrelevant to prompt work — it gets followed."""
+    if family == "vision":
+        return _vision_messages(
+            data_summary=data_summary,
+            metric=metric,
+            direction=direction,
+            brief=brief,
+            preamble_output=preamble_output,
+            starting_code=starting_code,
+            starting_score=starting_score,
+            starting_recipe=starting_recipe,
+        )
     if family == "prompt":
         system = _PROMPTS["prompt_system"].format(
             metric=metric,
@@ -1006,6 +1166,57 @@ def _build_messages(
         predictions_csv=codegen.PREDICTIONS_CSV,
         preamble_output=preamble_output,
         starting_point=starting_point,
+    )
+    return [Message(role="system", content=system), Message(role="user", content=user)]
+
+
+def _vision_messages(
+    *,
+    data_summary: str,
+    metric: str,
+    direction: str,
+    brief: str,
+    preamble_output: str,
+    starting_code: str | None,
+    starting_score: float | None,
+    starting_recipe: dict[str, Any] | None,
+) -> list[Message]:
+    """The image pair. The best is carried as a RECIPE, not as code to rebuild: fit()
+    already starts from it, and re-running it costs a whole fit's budget. Only an
+    own-code best has no recipe fit() can take, so that one travels as its code."""
+    from iterate.core import vision_levers
+
+    system = _PROMPTS["vision_system"].format(
+        metric=metric,
+        direction=direction,
+        predictions_csv=codegen.PREDICTIONS_CSV,
+        metric_note=metric_guidance(metric),
+    )
+    starting_point = ""
+    if starting_recipe:
+        score = f"{starting_score:.4f}" if starting_score is not None else "unscored"
+        recipe = vision_levers.describe(starting_recipe)
+        if starting_recipe.get("model") and starting_code and starting_code.strip():
+            # Concatenation, not str.format — the code carries braces.
+            head, tail = _PROMPTS["vision_starting_code"].split("{code}", 1)
+            starting_point = (
+                head.replace("{metric}", metric)
+                .replace("{score}", score)
+                .replace("{recipe}", recipe)
+                + starting_code.strip()
+                + tail
+            )
+        else:
+            starting_point = _PROMPTS["vision_starting_point"].format(
+                metric=metric, score=score, recipe=recipe
+            )
+    user = (
+        _PROMPTS["vision_user_template"]
+        .replace("{data_summary}", data_summary)
+        .replace("{brief}", brief or "(no brief: choose a strong first try yourself)")
+        .replace("{starting_point}", starting_point)
+        .replace("{predictions_csv}", codegen.PREDICTIONS_CSV)
+        .replace("{preamble_output}", preamble_output)
     )
     return [Message(role="system", content=system), Message(role="user", content=user)]
 

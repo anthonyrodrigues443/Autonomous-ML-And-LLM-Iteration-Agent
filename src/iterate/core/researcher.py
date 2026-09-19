@@ -93,8 +93,8 @@ def _queries_tool() -> ToolSpec:
     )
 
 
-def _suggest_tool() -> ToolSpec:
-    spec = _PROMPTS["suggest_tool"]
+def _suggest_tool(key: str = "suggest_tool") -> ToolSpec:
+    spec = _PROMPTS[key]
     fields = spec["fields"]
     return ToolSpec(
         name=spec["name"],
@@ -138,9 +138,33 @@ def _setup_tool() -> ToolSpec:
     )
 
 
+def _vision_setup_tool(allowed: Sequence[str]) -> ToolSpec:
+    """The image metric choice, as an enum: the model can only name a metric that
+    scores these labels."""
+    spec = _PROMPTS["vision_setup_tool"]
+    fields = spec["fields"]
+    return ToolSpec(
+        name=spec["name"],
+        description=spec["description"],
+        parameters={
+            "type": "object",
+            "properties": {
+                "metric": {
+                    "type": "string",
+                    "enum": sorted(allowed),
+                    "description": fields["metric"],
+                },
+                "why": {"type": "string", "description": fields["why"]},
+            },
+            "required": ["metric", "why"],
+        },
+    )
+
+
 CHOOSE_SETUP = _setup_tool()
 PLAN_QUERIES = _queries_tool()
 SUGGEST_TECHNIQUES = _suggest_tool()
+VISION_SUGGEST = _suggest_tool("vision_suggest_tool")
 
 
 class Researcher:
@@ -177,6 +201,8 @@ class Researcher:
         tried: Sequence[str] = (),
         choose_setup: bool = False,
         allowed_metrics: Sequence[str] = (),
+        suggest: bool = True,
+        allow_without_papers: bool = False,
     ) -> Findings:
         """One research pass. Never raises; empty findings mean the run proceeds
         without literature grounding, exactly like a failed digest."""
@@ -188,7 +214,11 @@ class Researcher:
             # to research finding nothing, and only one of those is a problem.
             log.info("researcher: query planning failed (%s: %s)", type(exc).__name__, exc)
             queries = []
-        if not queries:
+        # An image run chooses its metric even when the search comes back empty: a failed
+        # search must not quietly decide how the run is measured. A table or prompt run
+        # takes the deterministic default there, as it did before images.
+        ungrounded = choose_setup and allow_without_papers
+        if not queries and not ungrounded:
             return Findings()
 
         papers: list[Paper] = []
@@ -200,7 +230,7 @@ class Researcher:
         for paper in papers:
             unique.setdefault(paper.identifier, paper)
         shortlist = sorted(unique.values(), key=lambda p: -p.cited_by)[:_PAPERS_SHOWN]
-        if not shortlist:
+        if not shortlist and not ungrounded:
             return Findings(queries=queries)
 
         setup: Setup | None = None
@@ -214,11 +244,12 @@ class Researcher:
             except Exception as exc:
                 log.info("researcher: setup choice failed (%s: %s)", type(exc).__name__, exc)
 
-        try:
-            suggestions = self._suggest(profile, tried_text, shortlist)
-        except Exception as exc:
-            log.info("researcher: suggestion failed (%s: %s)", type(exc).__name__, exc)
-            suggestions = []
+        suggestions: list[Suggestion] = []
+        if suggest and shortlist:
+            try:
+                suggestions = self._suggest(profile, tried_text, shortlist)
+            except Exception as exc:
+                log.info("researcher: suggestion failed (%s: %s)", type(exc).__name__, exc)
         return Findings(
             suggestions=suggestions,
             queries=queries,
@@ -227,18 +258,22 @@ class Researcher:
         )
 
     def _plan_queries(self, profile: str, tried: str) -> list[str]:
+        # An image run with no metric yet is searching for how a problem like this one
+        # is measured; every other pass is searching for what raises a metric it has.
+        setup_pass = self._family == "vision" and not self._metric
+        system = {"prompt": "prompt_queries_system", "vision": "vision_queries_system"}.get(
+            self._family, "queries_system"
+        )
         messages = [
             Message(
                 role="system",
-                content=_PROMPTS[
-                    "prompt_queries_system" if self._family == "prompt" else "queries_system"
-                ].format(
+                content=_PROMPTS["vision_setup_queries_system" if setup_pass else system].format(
                     metric=self._metric, direction=self._direction
                 ),
             ),
             Message(
                 role="user",
-                content=_PROMPTS["queries_user"].format(
+                content=_PROMPTS["setup_queries_user" if setup_pass else "queries_user"].format(
                     metric=self._metric, profile=profile.strip(), tried=tried
                 ),
             ),
@@ -255,9 +290,9 @@ class Researcher:
         messages = [
             Message(
                 role="system",
-                content=_PROMPTS["suggest_system"].format(
-                    metric=self._metric, direction=self._direction
-                ),
+                content=_PROMPTS[
+                    "vision_suggest_system" if self._family == "vision" else "suggest_system"
+                ].format(metric=self._metric, direction=self._direction),
             ),
             Message(
                 role="user",
@@ -266,7 +301,9 @@ class Researcher:
                 ),
             ),
         ]
-        args = self._call(messages, SUGGEST_TECHNIQUES)
+        args = self._call(
+            messages, VISION_SUGGEST if self._family == "vision" else SUGGEST_TECHNIQUES
+        )
         raw = args.get("suggestions") if args else None
         if not isinstance(raw, list):
             return []
@@ -291,19 +328,25 @@ class Researcher:
     def _choose_setup(
         self, profile: str, papers: list[Paper], *, allowed: Sequence[str]
     ) -> Setup | None:
-        listing = "\n".join(f"{i + 1}. {p.brief()}\n   {p.abstract}" for i, p in enumerate(papers))
+        listing = (
+            "\n".join(f"{i + 1}. {p.brief()}\n   {p.abstract}" for i, p in enumerate(papers))
+            or _PROMPTS["no_papers"]
+        )
         metrics = ", ".join(sorted(allowed))
+        vision = self._family == "vision"
         messages = [
-            Message(role="system", content=_PROMPTS["setup_system"]),
+            Message(
+                role="system", content=_PROMPTS["vision_setup_system" if vision else "setup_system"]
+            ),
             Message(
                 role="user",
-                content=_PROMPTS["setup_user"]
+                content=_PROMPTS["vision_setup_user" if vision else "setup_user"]
                 .replace("{profile}", profile.strip())
                 .replace("{metrics}", metrics)
                 .replace("{papers}", listing),
             ),
         ]
-        args = self._call(messages, CHOOSE_SETUP)
+        args = self._call(messages, _vision_setup_tool(allowed) if vision else CHOOSE_SETUP)
         if not args:
             return None
         metric = str(args.get("metric") or "").strip()

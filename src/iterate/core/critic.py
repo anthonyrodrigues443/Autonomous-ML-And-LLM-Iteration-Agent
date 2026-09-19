@@ -10,6 +10,7 @@ accepts the experiment.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,8 @@ from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from iterate.llm.base import LLMClient
     from iterate.schemas.experiment import Experiment
 
@@ -120,6 +123,12 @@ class Critic:
         code = experiment.candidate.changes.get("code")
         if not isinstance(code, str) or not code.strip():
             return Verdict()
+        cells = experiment.candidate.changes.get("cells")
+        submitted_code = (
+            vision_submit_code(cells)
+            if self._family == "vision" and isinstance(cells, list)
+            else submit_path_code(code)
+        )
 
         record = dossier.build(experiment)
         holdout = result.metrics.primary_value
@@ -129,7 +138,7 @@ class Critic:
                 previous_best=("none" if previous_best is None else f"{previous_best:.4f}"),
                 val_trail=(" -> ".join(f"{v:.4f}" for v in record.val_trail) or "none printed"),
                 comparison=_compare(holdout, record.val_trail, self._metric),
-                code=_tail(submit_path_code(code), _CODE_CAP),
+                code=_tail(submitted_code, _CODE_CAP),
             )
         except Exception as exc:
             log.info("critic: review failed (%s: %s)", type(exc).__name__, exc)
@@ -141,7 +150,11 @@ class Critic:
         mirage = _coerce_bool(args.get("mirage"))
         reason = str(args.get("reason") or "").strip()[:_REASON_CAP]
         if leak or mirage:
-            log.info("critic: %s (%s)", "LEAK" if leak else "suspicious gain", reason or "no reason given")
+            log.info(
+                "critic: %s (%s)",
+                "LEAK" if leak else "suspicious gain",
+                reason or "no reason given",
+            )
         return Verdict(leak=leak, mirage=mirage, reason=reason)
 
     def _call(self, **fields: str) -> dict[str, Any] | None:
@@ -149,18 +162,16 @@ class Critic:
             Message(
                 role="system",
                 content=_PROMPTS[
-                    "prompt_system" if self._family == "prompt" else "system"
-                ].format(
-                    metric=self._metric, direction=self._direction
-                ),
+                    {"prompt": "prompt_system", "vision": "vision_system"}.get(
+                        self._family, "system"
+                    )
+                ].format(metric=self._metric, direction=self._direction),
             ),
             Message(
                 role="user",
                 # Concatenated field-by-field rather than one .format over the code:
                 # generated code contains braces and would break str.format.
-                content=_fill(
-                    _PROMPTS["user_template"], {"metric": self._metric, **fields}
-                ),
+                content=_fill(_PROMPTS["user_template"], {"metric": self._metric, **fields}),
             ),
         ]
         for attempt in range(2):
@@ -170,14 +181,32 @@ class Critic:
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
             )
-            call = next(
-                (c for c in response.tool_calls if c.name == REVIEW_EXPERIMENT.name), None
-            )
+            call = next((c for c in response.tool_calls if c.name == REVIEW_EXPERIMENT.name), None)
             if call is not None:
                 return dict(call.arguments)
             if attempt == 0:
                 messages = [*messages, Message(role="user", content=_PROMPTS["retry_nudge"])]
         return None
+
+
+_SUBMITS = re.compile(r"\bsubmit(?:_probabilities|_numbers)?\s*\(")
+
+
+def vision_submit_code(cells: Sequence[Any]) -> str:
+    """The agent cells up to the last one that submitted: what can have shaped the
+    predictions. An image session writes them through a helper, so there is no file
+    write to slice back from. An errored cell is kept, because every statement before
+    its failing line still ran and every name it bound is still in the namespace."""
+    agent = [c for c in cells if isinstance(c, dict) and c.get("source") == "agent"]
+    last = max(
+        (
+            i
+            for i, c in enumerate(agent)
+            if not c.get("error") and _SUBMITS.search(str(c.get("code") or ""))
+        ),
+        default=len(agent) - 1,
+    )
+    return "\n\n".join(str(c.get("code") or "") for c in agent[: last + 1])
 
 
 def _fill(template: str, fields: dict[str, str]) -> str:
@@ -208,9 +237,7 @@ def _compare(holdout: float, val_trail: list[float], metric: str) -> str:
         return "no validation scores were printed, so no comparison is possible"
     best_val = min(val_trail) if metric_direction(metric) == "minimize" else max(val_trail)
     gap = abs(holdout - best_val)
-    better = (
-        holdout < best_val if metric_direction(metric) == "minimize" else holdout > best_val
-    )
+    better = holdout < best_val if metric_direction(metric) == "minimize" else holdout > best_val
     verdict = "BETTER than" if better else "worse than or equal to"
     return (
         f"the holdout score ({holdout:.4f}) is {verdict} the best validation score "

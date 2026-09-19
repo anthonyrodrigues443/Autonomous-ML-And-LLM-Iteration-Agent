@@ -533,3 +533,82 @@ def test_an_import_name_that_is_another_project_on_pypi_maps_to_the_real_one() -
     assert codegen.package_for_import("umap") == "umap-learn"
     assert codegen.package_for_import("imblearn.over_sampling") == "imbalanced-learn"
     assert codegen.package_for_import("tabulate") == "tabulate"
+
+
+# ─── the image session's cells (sprint 4 Day 6) ───────────────────────────────
+
+
+def test_the_image_preamble_is_valid_python_and_loads_torch_only_through_start() -> None:
+    """The device variables are read at torch's static init, so `start()` must set them
+    before the first import of torch, and nothing else may import it first."""
+    import inspect
+
+    from iterate.core import vision_session
+
+    preamble = codegen.vision_session_preamble()
+    compile(preamble, "<preamble>", "exec")
+    assert "torch" not in preamble
+    source = inspect.getsource(vision_session.start)
+    assert source.index("set_device_env()") < source.index("import torch")
+
+
+def test_the_image_cell_prefix_frees_the_device_before_it_resets_the_inputs() -> None:
+    assert codegen.VISION_CELL_PREFIX.startswith("__import__('iterate.core.vision_session')")
+    assert "begin_cell(globals())" in codegen.VISION_CELL_PREFIX.splitlines()[0]
+    assert codegen.VISION_CELL_PREFIX.endswith(codegen.RESET_INPUTS)
+    compile(codegen.VISION_CELL_PREFIX, "<prefix>", "exec")
+
+
+def test_the_image_cell_prefix_is_a_no_op_before_the_preamble_has_run() -> None:
+    """It is also the floor's prefix, and the floor can run after a `%reset -f`."""
+    exec(compile(codegen.VISION_CELL_PREFIX, "<prefix>", "exec"), {})
+
+
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_the_image_floor_writes_a_submission_the_host_accepts(tmp_path: Path, task: str) -> None:
+    """The floor fires when a session has lost the device or the clock, so it reads the
+    three files and nothing else: no torch, no network, no fit."""
+    import json
+
+    from iterate.core.coder import _validate_predictions, _validate_probabilities
+
+    labels = ["a", "a", "b"] * 4 if task == "classification" else [1.0, 2.0, 3.0] * 4
+    pd.DataFrame({"image": [f"{i}.png" for i in range(12)], "label": labels}).to_csv(
+        tmp_path / codegen.TRAIN_CSV, index=False
+    )
+    pd.DataFrame({"image": [f"h{i}.png" for i in range(5)]}).to_csv(
+        tmp_path / codegen.HOLDOUT_CSV, index=False
+    )
+    meta = {
+        "target": "label",
+        "task": task,
+        "classes": ["a", "b"] if task == "classification" else None,
+    }
+    (tmp_path / codegen.META_JSON).write_text(json.dumps(meta))
+
+    import os
+
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        exec(compile(codegen.vision_fallback_baseline(), "<floor>", "exec"), {})
+    finally:
+        os.chdir(cwd)
+    predictions = (tmp_path / codegen.PREDICTIONS_CSV).read_bytes()
+    assert _validate_predictions(predictions, 5) is None
+    if task == "classification":
+        assert predictions.decode().split() == ["a"] * 5  # the most common training class
+        probabilities = (tmp_path / codegen.PROBABILITIES_CSV).read_bytes()
+        assert _validate_probabilities(probabilities, 5) is None
+    else:
+        assert [float(v) for v in predictions.decode().split()] == [2.0] * 5
+
+
+def test_runs_installer_passes_every_image_harness_cell() -> None:
+    harness = [
+        codegen.vision_session_preamble(),
+        codegen.VISION_CELL_PREFIX,
+        codegen.vision_fallback_baseline(),
+        codegen.IMPORT_WATCH,
+    ]
+    assert [codegen.runs_installer(c) for c in harness] == [None] * len(harness)

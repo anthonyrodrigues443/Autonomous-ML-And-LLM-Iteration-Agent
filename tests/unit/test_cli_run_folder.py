@@ -1,6 +1,6 @@
 """Tests for `iterate run` on a folder of images: the flags, the refusals, the folder
 it writes, the Linker where the rules stop, the conversation at the pause, the plan
-remembered from an earlier yes, and the stop it makes until the vision target exists."""
+remembered from an earlier yes, and the run it then starts on the vision target."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from iterate import cli as cli_module
 from iterate.adapters.data import linking
 from iterate.cli import app
 from iterate.core.linker import Proposal
-from tests.unit.image_fixtures import class_tree, png
+from tests.unit.image_fixtures import class_tree, png, stub_image_run
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -45,11 +45,19 @@ def _isolated_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cli_module.get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def loop_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Every folder that links now goes on into the loop, which this stops at its door."""
+    return stub_image_run(monkeypatch, tmp_path)
+
+
 def _data_dir(tmp_path: Path) -> Path:
     return tmp_path / "dot" / "data"
 
 
-def test_a_folder_needs_no_target_and_stops_after_linking(tmp_path: Path) -> None:
+def test_a_folder_needs_no_target_and_runs_after_linking(
+    tmp_path: Path, loop_calls: list[dict[str, Any]]
+) -> None:
     source = _class_tree(tmp_path / "pets")
     result = runner.invoke(app, ["run", "--data", str(source)])
     assert result.exit_code == 0, result.output
@@ -57,7 +65,7 @@ def test_a_folder_needs_no_target_and_stops_after_linking(tmp_path: Path) -> Non
     assert "labels: the folder names (3 classes)" in text
     assert "split: none given, 18 images split here 80/20" in text
     assert "linked:" in text
-    assert "this run stops here" in text
+    assert [type(c["target"]).__name__ for c in loop_calls] == ["DLModelTarget"]
     roots = list(_data_dir(tmp_path).iterdir())
     assert len(roots) == 1
     assert (roots[0] / "train.csv").exists()
@@ -456,7 +464,9 @@ def test_flags_still_beat_a_remembered_plan_and_the_linker(
     assert fake_linker.built == 1
 
 
-def test_a_csv_of_image_paths_stops_before_the_loop(tmp_path: Path) -> None:
+def test_a_csv_of_image_paths_reaches_the_loop(
+    tmp_path: Path, loop_calls: list[dict[str, Any]]
+) -> None:
     root = tmp_path / "flat"
     for i in range(12):
         _png(root / "images" / f"{i:03d}.png", i)
@@ -476,7 +486,7 @@ def test_a_csv_of_image_paths_stops_before_the_loop(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "this CSV holds image paths" in _plain(result.output)
+    assert [type(c["target"]).__name__ for c in loop_calls] == ["DLModelTarget"]
 
 
 # ─── what the review forced ──────────────────────────────────────────────────
@@ -572,7 +582,9 @@ def test_a_correction_reaches_only_the_folder_the_rules_refused(
     fake_linker.script = ["species_code", "region"]
     _answers(monkeypatch, ["for the holdout use region", "yes"])
     result = runner.invoke(app, ["run", "--train", str(a), "--holdout", str(b)])
-    assert result.exit_code == 0, result.output
+    # Two label columns that name different things: the link is the thing under test,
+    # and the run that follows it refuses labels no metric could score across the split.
+    assert "linked:" in _plain(result.output), result.output
     assert [c["root"].name for c in fake_linker.calls] == ["test", "test"]
     assert all(c["refusal"] for c in fake_linker.calls)
     cached = _cached_plans(tmp_path)
@@ -585,7 +597,7 @@ def test_a_correction_reaches_only_the_folder_the_rules_refused(
     fake_linker.script = ["species_code", "region"]
     _answers(monkeypatch, ["use region", "yes"])
     result = runner.invoke(app, ["run", "--train", str(a2), "--holdout", str(b2)])
-    assert result.exit_code == 0, result.output
+    assert "linked:" in _plain(result.output), result.output
     assert [c["root"].name for c in fake_linker.calls] == ["train2", "train2"]
 
 
@@ -654,14 +666,21 @@ def test_a_class_folder_train_and_an_agent_holdout_are_remembered_together(
     assert "remembered from an earlier yes" in _plain(again.output)
 
 
-def test_a_rules_only_folder_needs_no_api_key_on_a_cloud_backend(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_rules_only_folder_on_a_cloud_backend_asks_for_the_key_before_it_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loop_calls: list[dict[str, Any]]
 ) -> None:
+    """The rules alone can read this folder, but the run that follows the link cannot
+    start without a key, so the key is asked for before anything is copied."""
     monkeypatch.setattr("iterate.core.linker.Linker", _NeverBuilt)
     monkeypatch.setattr(cli_module, "_resolved_api_key_from_env", lambda settings, backend: None)
     source = _class_tree(tmp_path / "pets")
     result = runner.invoke(app, ["run", "--data", str(source), "--backend", "groq"])
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 2, result.output
+    text = _plain(result.output)
+    assert "requires --api-key" in text
+    assert "linked:" not in text
+    assert not _data_dir(tmp_path).exists()
+    assert loop_calls == []
 
 
 def test_the_linker_on_a_cloud_backend_needs_the_key(
@@ -1185,8 +1204,9 @@ def test_a_copy_command_prints_on_a_line_of_its_own_that_pastes(tmp_path: Path) 
     subprocess.run(command, shell=True, check=True)
     copy = f"{root.resolve()}-copy"
     linked = runner.invoke(app, ["run", "--data", copy, "--yes"])
-    assert linked.exit_code == 0, linked.output
-    assert "linked:" in _plain(linked.output)
+    # The copied 'fox' holds the dog images byte for byte, so the split that follows
+    # the link leaves a holdout short of a class; the copy and the link are the point.
+    assert "linked:" in _plain(linked.output), linked.output
 
 
 def test_a_link_that_leads_nowhere_is_a_refusal_not_a_traceback(tmp_path: Path) -> None:

@@ -12,12 +12,14 @@ are stored on the candidate so the notebook deliverable can render the real sess
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from iterate.adapters.compute.local import run_in_process
+from iterate.core import vision_levers as vl
 from iterate.core.critic import stamp as stamp_verdict
 from iterate.core.critic import was_rejected
 from iterate.core.orchestrator import RunResult
@@ -85,6 +87,9 @@ def run_supervised(
     max_inspect_calls: int = 2,
     on_experiment: Callable[..., None] | None = None,
     controller: RunController | None = None,
+    # Which family's arm each iteration takes. "vision" carries the recipe the coder
+    # starts from and gates the briefed lever on this run's own helper lines.
+    family: str = "tabular",
 ) -> RunResult:
     """Run the Supervisor + Coder loop until the terminator (or supervisor) stops.
 
@@ -100,9 +105,12 @@ def run_supervised(
     baseline = run_in_process(target)  # spec default = the bar to beat
     if not baseline.succeeded or baseline.metrics is None:
         log.warning("agent loop: baseline failed (%s); aborting", baseline.error)
-        return RunResult(baseline=baseline, history=[], best=None, stopped_because="baseline_failed")
+        return RunResult(
+            baseline=baseline, history=[], best=None, stopped_because="baseline_failed"
+        )
 
     run_id = memory.start_run(target.name, baseline)
+    vision = _vision_refs(baseline, target) if family == "vision" else None
     direction = baseline.metrics.direction
     current_run: list[Experiment] = []
     best: Experiment | None = None
@@ -122,16 +130,22 @@ def run_supervised(
         # the closure always sees exactly the experiments the user is watching —
         # never a prior run's iteration 3 answering for this run's iteration 3.
         controller.interpreter = _make_interpreter(
-            controller=controller, supervisor=supervisor,
-            experiments=current_run, baseline=baseline, data_summary=data_summary,
+            controller=controller,
+            supervisor=supervisor,
+            experiments=current_run,
+            baseline=baseline,
+            data_summary=data_summary,
         )
 
         def _snapshot() -> RunResult:
             # The hard quit renders the summary from whatever has FINISHED at
             # this instant; the loop itself may still be blocked inside a cell.
             return RunResult(
-                baseline=baseline, history=list(current_run), best=best,
-                stopped_because="stopped-by-user", run_id=run_id,
+                baseline=baseline,
+                history=list(current_run),
+                best=best,
+                stopped_because="stopped-by-user",
+                run_id=run_id,
             )
 
         controller.snapshot = _snapshot
@@ -162,12 +176,19 @@ def run_supervised(
                 # Iteration 1 always researches: with no history there is nothing for
                 # the supervisor to base a want_research judgement on. After that it
                 # is the supervisor's ask, bounded by the run cap.
-                if researcher is not None and (iteration == 1 or wants_research) and (
-                    research_calls < max_research_calls
+                if (
+                    researcher is not None
+                    and (iteration == 1 or wants_research)
+                    and (research_calls < max_research_calls)
                 ):
                     research_calls += 1
                     findings = researcher.research(
-                        profile=data_summary, tried=run_ledger(memory.history(target.name)).tried_components
+                        profile=data_summary,
+                        tried=(
+                            vl.tried_components(current_run)
+                            if vision is not None
+                            else run_ledger(memory.history(target.name)).tried_components
+                        ),
                     )
                     wants_research = False
                     if findings:
@@ -175,7 +196,8 @@ def run_supervised(
                         extra["research"] = findings.render()
                         log.info(
                             "agent loop: researched %d papers -> %d suggestions",
-                            findings.papers_seen, len(findings.suggestions),
+                            findings.papers_seen,
+                            len(findings.suggestions),
                         )
                 if wants_inspect and inspect_calls < max_inspect_calls:
                     inspect_calls += 1
@@ -193,6 +215,12 @@ def run_supervised(
                         )
                 if last_inspection:
                     extra["inspection"] = last_inspection
+                if vision is not None:
+                    # Every image run is named "vision-model", so memory can hold an
+                    # earlier run's rows; the levers open and close on this run alone.
+                    extra["this_run"] = list(current_run)
+                    if last_findings is not None:
+                        extra["known_findings"] = last_findings.render()
                 # Memory already holds every recorded experiment (line below records each
                 # one) — adding current_run would feed this run's experiments in twice.
                 decision = supervisor.decide(
@@ -223,17 +251,29 @@ def run_supervised(
                     controller.emit(
                         "brief", iteration=iteration, title=decision.title, brief=decision.brief
                     )
-                start_code = _winning_code(best)  # carry the best working code forward
+                start_code = (
+                    _own_code(best) if vision is not None else _winning_code(best)
+                )  # carry the best working code forward
                 start_score = (
                     best.result.metrics.primary_value
-                    if best is not None and best.result is not None and best.result.metrics is not None
+                    if best is not None
+                    and best.result is not None
+                    and best.result.metrics is not None
                     else None
                 )
                 try:
                     experiment, preds_digest = _run_experiment(
-                        make_coder(), dataset, decision, iteration, target.name,
-                        start_code, start_score, seen_digests=frozenset(seen_digests),
+                        make_coder(),
+                        dataset,
+                        decision,
+                        iteration,
+                        target.name,
+                        start_code,
+                        start_score,
+                        seen_digests=frozenset(seen_digests),
                         findings=last_findings,
+                        vision=vision,
+                        best=best,
                     )
                 except Exception as exc:  # one bad experiment must not kill the run
                     # e.g. the LLM backend timing out after retries, or a kernel dying.
@@ -278,12 +318,18 @@ def run_supervised(
                     if result.succeeded and result.metrics is not None:
                         log.info(
                             "agent loop: iteration %d %r -> %s=%.4f",
-                            iteration, decision.title, result.metrics.primary,
+                            iteration,
+                            decision.title,
+                            result.metrics.primary,
                             result.metrics.primary_value,
                         )
                     else:
-                        log.info("agent loop: iteration %d %r -> failed (%s)", iteration,
-                                 decision.title, result.error)
+                        log.info(
+                            "agent loop: iteration %d %r -> failed (%s)",
+                            iteration,
+                            decision.title,
+                            result.error,
+                        )
                     if (
                         result.succeeded
                         and _improves(result, best, baseline, direction)
@@ -295,16 +341,21 @@ def run_supervised(
                         outcome = "no_improvement"
                     if controller is not None:
                         controller.emit(
-                            "score", iteration=iteration,
-                            score=(result.metrics.primary_value
-                                   if result.metrics is not None else None),
-                            error=result.error, is_best=(best is experiment),
+                            "score",
+                            iteration=iteration,
+                            score=(
+                                result.metrics.primary_value if result.metrics is not None else None
+                            ),
+                            error=result.error,
+                            is_best=(best is experiment),
                         )
                     if on_experiment is not None:
                         try:
                             on_experiment(
-                                experiment=experiment, baseline=baseline,
-                                is_best=(best is experiment), run_id=run_id,
+                                experiment=experiment,
+                                baseline=baseline,
+                                is_best=(best is experiment),
+                                run_id=run_id,
                             )
                         except Exception:  # a deliverable hook must never kill the run
                             log.warning("agent loop: on_experiment hook failed", exc_info=True)
@@ -335,13 +386,18 @@ def run_supervised(
         # Ctrl-C: keep what the run already earned. Memory still gets finalized and the
         # best-so-far notebook is already on disk (on_experiment saves per iteration), so
         # an interrupt exits like a short run, not a stack trace.
-        log.warning("agent loop: interrupted; finalizing with %d kept experiment(s)", len(current_run))
+        log.warning(
+            "agent loop: interrupted; finalizing with %d kept experiment(s)", len(current_run)
+        )
         stopped_because = "interrupted"
 
     memory.finish_run(run_id, stopped_because)
     return RunResult(
-        baseline=baseline, history=current_run, best=best,
-        stopped_because=stopped_because, run_id=run_id,
+        baseline=baseline,
+        history=current_run,
+        best=best,
+        stopped_because=stopped_because,
+        run_id=run_id,
     )
 
 
@@ -370,8 +426,9 @@ def _make_interpreter(
                 try:
                     kind = route(text, live_session=live_session)
                 except Exception:  # classification degrades, never crashes
-                    log.warning("agent loop: route_message failed; treating as a steer",
-                                exc_info=True)
+                    log.warning(
+                        "agent loop: route_message failed; treating as a steer", exc_info=True
+                    )
             if kind == "question":
                 if callable(answer):
                     try:
@@ -381,8 +438,11 @@ def _make_interpreter(
                             else None
                         )
                         reply = answer(
-                            text, history=experiments, baseline=baseline,
-                            data_summary=data_summary, live_session=live,
+                            text,
+                            history=experiments,
+                            baseline=baseline,
+                            data_summary=data_summary,
+                            live_session=live,
                         )
                     except Exception as exc:
                         reply = f"(could not answer: {exc})"
@@ -426,7 +486,8 @@ def _sanitize_unmeasured_digest(experiment: Experiment, brief: str) -> Experimen
         if not markers:
             return experiment
         kept = [
-            item for item in experiment.digest.what_helped
+            item
+            for item in experiment.digest.what_helped
             if not any(m in item.lower() for m in markers)
         ]
     else:
@@ -448,6 +509,31 @@ def _digest(summarizer: Summarizer, experiment: Experiment, iteration: int) -> E
         log.warning("agent loop: iteration %d summarizer failed", iteration, exc_info=True)
         return experiment
     return experiment.model_copy(update={"digest": digest})
+
+
+def _vision_refs(baseline: ExperimentResult, target: Any) -> dict[str, Any]:
+    """What an image run measures its tries against: the recipe the host's own baseline
+    scored, and the image size the session decodes at."""
+    raw = baseline.artifacts.get("recipe.json") or "{}"
+    try:
+        scored = json.loads(raw)
+    except ValueError:
+        scored = {}
+    base = {k: v for k, v in scored.items() if k not in ("epochs_planned", "epochs_run")}
+    meta = json.loads(target.meta_json()) if hasattr(target, "meta_json") else {}
+    return {"baseline": base, "default_size": meta.get("image_size")}
+
+
+def _own_code(best: Experiment | None) -> str | None:
+    """The best's cells up to its submission when that submission was the agent's own
+    model, the only way back to it. A fit() best travels as its recipe instead, so no
+    session spends a fit rebuilding what the harness already holds."""
+    if best is None or "model" not in vl.recipe_of(best):
+        return None
+    from iterate.core.critic import vision_submit_code
+
+    cells = best.candidate.changes.get("cells")
+    return vision_submit_code(cells) if isinstance(cells, list) else None
 
 
 def _winning_code(best: Experiment | None) -> str | None:
@@ -488,21 +574,56 @@ def _run_experiment(
     *,
     seen_digests: frozenset[str] = frozenset(),
     findings: Findings | None = None,
+    vision: dict[str, Any] | None = None,
+    best: Experiment | None = None,
 ) -> tuple[Experiment, str | None]:
     """Run one briefed session; returns the experiment and the sha256 of its
     submitted predictions (for later sessions' identical-submission gate)."""
+    from iterate.core import codegen
     from iterate.core.coder import lever_executed
 
-    markers = lever_markers_for_brief(decision.brief)
+    markers = () if vision is not None else lever_markers_for_brief(decision.brief)
+    extra: dict[str, Any] = {}
+    gate: Callable[[list[Any]], bool] | None = None
+    if vision is not None:
+        # What the run carried in, for the gate and the prompt, and separately the
+        # recipe the kernel's fit() may depart from: an own-model win is the carried
+        # best for both, but it is not a recipe, so incumbent.json takes its session's
+        # last fit instead.
+        carried = vl.recipe_of(best) or vision["baseline"]
+        incumbent = vl.fit_recipe_of(best) or vision["baseline"]
+        lever = vl.lever_class(decision.brief) or ""
+
+        def gate(cells: list[Any]) -> bool:
+            if lever:
+                return vl.moved(lever, cells, carried)
+            return bool(vl.moved_levers(cells, carried))
+
+        extra = {
+            "starting_files": {codegen.INCUMBENT_JSON: json.dumps(incumbent).encode()},
+            "starting_recipe": carried,
+            "lever_gate": gate,
+            "lever_name": lever,
+        }
     coding = coder.run(
-        dataset=dataset, brief=decision.brief, experiment_id=f"iter-{iteration:02d}",
-        starting_code=starting_code, starting_score=starting_score,
+        dataset=dataset,
+        brief=decision.brief,
+        experiment_id=f"iter-{iteration:02d}",
+        starting_code=starting_code,
+        starting_score=starting_score,
         brief_markers=markers,
         seen_digests=seen_digests,
+        **extra,
     )
     cells = [
-        {"code": c.code, "stdout": c.stdout, "error": c.error, "source": c.source,
-         "outputs": c.outputs, "thinking": c.thinking}
+        {
+            "code": c.code,
+            "stdout": c.stdout,
+            "error": c.error,
+            "source": c.source,
+            "outputs": c.outputs,
+            "thinking": c.thinking,
+        }
         for c in coding.cells
     ]
     # The code fingerprint includes fallback cells: when the submission came from the
@@ -514,7 +635,15 @@ def _run_experiment(
         or "# (no code)"
     )
     changes: dict[str, object] = {"code": code, "cells": cells}
-    if markers and not lever_executed(coding.cells, markers, starting_code):
+    if vision is not None and gate is not None:
+        agent_cells = [c for c in cells if c["source"] == "agent"]
+        carried = vl.recipe_of(best) or vision["baseline"]
+        if (recipe := vl.submitted(agent_cells)) is not None:
+            changes["recipe"] = recipe
+        changes["levers_moved"] = vl.moved_levers(agent_cells, carried)
+        if not gate(agent_cells):
+            changes["lever_unmeasured"] = True
+    elif markers and not lever_executed(coding.cells, markers, starting_code):
         # The commissioned lever never ran successfully — the score is the carried
         # pipeline's, not the lever's, and the supervisor must not credit it.
         changes["lever_unmeasured"] = True

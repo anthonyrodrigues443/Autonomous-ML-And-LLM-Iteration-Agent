@@ -195,16 +195,16 @@ def test_the_dev_gate_moves_with_the_cli_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The real command, in both forms a vision run takes: a folder, and the CSV of
-    image paths a dev cell passes. While `iterate run` stops before training on either,
-    dev must skip vision cells; the day either one runs, this fails until the gate in
-    the eval runner lifts with it."""
+    image paths a dev cell passes, with only the loop entry stubbed. Dev runs vision
+    cells exactly when both forms reach the loop on the vision target."""
     import pandas as pd
     from typer.testing import CliRunner
 
     from iterate import cli as cli_module
     from iterate.cli import app
-    from tests.unit.image_fixtures import class_tree
+    from tests.unit.image_fixtures import class_tree, stub_image_run
 
+    calls = stub_image_run(monkeypatch, tmp_path)
     folder = class_tree(tmp_path / "pets", per_class=8)
     images = sorted(folder.rglob("*.png"))
     csv = tmp_path / "pets.csv"
@@ -213,16 +213,17 @@ def test_the_dev_gate_moves_with_the_cli_guard(
     ).to_csv(csv, index=False)
     cell = command_for(DEV_VERSION, replace(VISION, path=csv), CONDITIONS)
     forms = {
-        "folder": ["run", "--data", str(folder)],
+        "folder": ["run", "--data", str(folder), "--plain"],
         "dev cell": cell[cell.index("iterate") + 1 :],
     }
     monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "dot" / "runs"))
     cli_module.get_settings.cache_clear()
     try:
         for name, argv in forms.items():
+            calls.clear()
             result = CliRunner().invoke(app, argv)
             assert result.exit_code == 0, (name, result.output)
-            stops = "this run stops here" in " ".join(result.output.split())
-            assert stops is not DEV_RUNS_VISION, name
+            reached = [type(c["target"]).__name__ for c in calls] == ["DLModelTarget"]
+            assert reached is DEV_RUNS_VISION, name
     finally:
         cli_module.get_settings.cache_clear()

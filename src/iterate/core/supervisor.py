@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from iterate.core import codegen, ledger
+from iterate.core import vision_levers as vl
 from iterate.core.scoring import direction, metric_guidance, threshold_free
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
@@ -55,7 +56,24 @@ class SupervisorDecision:
     want_inspect: bool = False
 
 
-def _build_tool() -> ToolSpec:
+def _build_tool(family: str = "tabular") -> ToolSpec:
+    if family == "vision":
+        tool = _PROMPTS["vision_tool"]
+        fields = tool["fields"]
+        return ToolSpec(
+            name=tool["name"],
+            description=tool["description"],
+            parameters={
+                "type": "object",
+                "properties": {
+                    "stop": {"type": "boolean", "description": fields["stop"]},
+                    "title": {"type": "string", "description": fields["title"]},
+                    "brief": {"type": "string", "description": fields["brief"]},
+                    "want_research": {"type": "boolean", "description": fields["want_research"]},
+                },
+                "required": ["stop", "brief"],
+            },
+        )
     tool = _PROMPTS["tool"]
     fields = tool["fields"]
     return ToolSpec(
@@ -103,6 +121,12 @@ class Supervisor:
         # measured no-op there whatever the metric, which the metric alone cannot
         # tell us.
         multiclass: bool = False,
+        # An image run's own facts. A number run cannot take a class-only lever such
+        # as label smoothing, and a lever that changes the size needs the size it
+        # would change and the width the images carry.
+        task: str = "classification",
+        image_size: int | None = None,
+        image_width: int | None = None,
     ) -> None:
         self._client = client
         self._metric = metric
@@ -111,6 +135,10 @@ class Supervisor:
         self._max_retries = max_retries
         self._family = family
         self._multiclass = multiclass
+        self._task = task
+        self._image_size = image_size
+        self._image_width = image_width
+        self._tool = _build_tool(family)
 
     def decide(
         self,
@@ -123,6 +151,8 @@ class Supervisor:
         standing_rules: Sequence[str] = (),
         research: str = "",
         inspection: str = "",
+        known_findings: str = "",
+        this_run: Sequence[Experiment] | None = None,
     ) -> SupervisorDecision:
         """Plan the next experiment. ``carried_best`` is the loop's CURRENT best —
         the experiment whose code the coder will actually receive as its starting
@@ -133,9 +163,28 @@ class Supervisor:
         ``standing_rules`` (instructions that hold for every remaining experiment)
         enter as ONE lean appended message; the guards below judge the decision
         AFTER the model has read them, so guidance can steer a brief but can never
-        re-commission banked work or bypass a gate."""
+        re-commission banked work or bypass a gate.
+
+        ``this_run`` is the experiments of THIS run alone. Every image run shares one
+        target name, so ``history`` can hold a previous run's rows; a lever is opened
+        and closed on numbers this run actually produced."""
         if baseline.metrics is None:
             raise SupervisorError("baseline has no metrics")
+        vision = self._family == "vision"
+        run_history = list(this_run) if this_run is not None else history
+        ready = (
+            vl.ready(
+                run_history,
+                carried_best,
+                task=self._task,
+                direction=direction(self._metric),
+                findings=known_findings or research,
+                median_width=self._image_width,
+                default_size=self._image_size,
+            )
+            if vision
+            else []
+        )
         messages = _build_messages(
             data_summary=data_summary,
             metric=self._metric,
@@ -143,6 +192,8 @@ class Supervisor:
             score=baseline.metrics.primary_value,
             history=history,
             family=self._family,
+            ready_line=vl.ready_line(ready) if vision else "",
+            run_history=run_history,
         )
         guidance = _guidance_message(user_guidance, standing_rules)
         if guidance is not None:
@@ -173,12 +224,13 @@ class Supervisor:
         banked_nudged = False
         lost_nudged = False
         lint_nudged = False
+        vision_nudged = False
         for attempt in range(self._max_retries + 1):
             last_attempt = attempt == self._max_retries
             try:
                 response = self._client.chat(
                     messages,
-                    tools=[PLAN_NEXT],
+                    tools=[self._tool],
                     temperature=self._temperature,
                     max_tokens=self._max_tokens,
                 )
@@ -193,7 +245,7 @@ class Supervisor:
             call = next((c for c in response.tool_calls if c.name == PLAN_NEXT.name), None)
             if call is not None:
                 decision = _to_decision(call.arguments)
-                if decision.stop or not history:
+                if decision.stop or (not history and not vision):
                     return decision  # experiment 1 has no so-far slot to ground
                 # Guards, in order. One corrective retry per violation; a second
                 # violation, or a spent budget, gets a deterministic fallback brief
@@ -202,12 +254,23 @@ class Supervisor:
                 # Tabular levers only; on the prompt path the check can only misfire.
                 dead_reason = (
                     None
-                    if self._family.startswith("prompt")
+                    if self._family.startswith("prompt") or vision
                     else dead_lever_reason(
                         decision.brief, self._metric, multiclass=self._multiclass
                     )
                 )
-                if dead_reason:
+                if vision:
+                    violation = _vision_violation(
+                        decision,
+                        run_history,
+                        carried_best,
+                        ready,
+                        task=self._task,
+                        metric=self._metric,
+                        seen=vision_nudged,
+                    )
+                    vision_nudged = vision_nudged or violation is not None
+                elif dead_reason:
                     violation = (
                         f"dead lever for this metric — {dead_reason}",
                         _PROMPTS["dead_lever_nudge"].format(reason=dead_reason),
@@ -259,16 +322,18 @@ class Supervisor:
                         lint_nudged,
                     )
                     lint_nudged = True
+                wants_research = decision.want_research
                 if violation is not None:
-                    reason, nudge, seen = violation
-                    if seen or last_attempt:
-                        fallback = (
-                            _prompt_fallback_move(history)
-                            if self._family == "prompt"
-                            else _fallback_move(history, self._metric)
-                        )
+                    if seen_or_last := (violation[2] or last_attempt):
+                        if vision:
+                            fallback = vl.fallback_move(ready)
+                        elif self._family == "prompt":
+                            fallback = _prompt_fallback_move(history)
+                        else:
+                            fallback = _fallback_move(history, self._metric)
                     else:
                         fallback = None
+                    reason, nudge, _ = violation
                     if fallback is not None:
                         title, move = fallback
                         log.info(
@@ -277,10 +342,18 @@ class Supervisor:
                             title,
                         )
                         decision = SupervisorDecision(stop=False, title=title, brief=move)
-                    elif not (seen or last_attempt):
+                    elif not seen_or_last:
                         log.info("supervisor: rejected a %s", reason)
                         messages.append(Message(role="user", content=nudge))
                         continue
+                    elif vision:
+                        # Nothing this run's numbers open, and the model will not brief
+                        # inside the guards: accepting its retry would switch the
+                        # evidence gate off for the rest of the run, so ask for papers.
+                        log.info(
+                            "supervisor: %s persisted with no lever ready; researching", reason
+                        )
+                        wants_research = True
                     # else: no untried class remains — accept the model's brief.
                 return SupervisorDecision(
                     stop=False,
@@ -290,8 +363,12 @@ class Supervisor:
                         metric=self._metric,
                         baseline_score=baseline.metrics.primary_value,
                         carried=carried_best,
-                        dead_ends=_dead_ends(history),
+                        dead_ends="" if vision else _dead_ends(history),
+                        family=self._family,
                     ),
+                    # Tabular and prompt runs keep reading the asks from a stopping or
+                    # first decision only, as they did before images arrived.
+                    want_research=wants_research if vision else False,
                 )
             detail = "model replied without calling plan_next"
             messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
@@ -576,6 +653,7 @@ def _grounded_brief(
     baseline_score: float,
     carried: Experiment | None,
     dead_ends: str = "",
+    family: str = "tabular",
 ) -> str:
     """The brief with its "so far:" slot composed by CODE from the loop's real state.
 
@@ -595,7 +673,90 @@ def _grounded_brief(
         cleaned = _SO_FAR_CLAIM.sub("", llm_brief, count=1).strip()
         move = f"next: {cleaned or llm_brief.strip()}"
     tail = f" {dead_ends}" if dead_ends else ""
-    return f"{_so_far(metric, baseline_score, carried)} {move}{tail}"
+    slot = (
+        _vision_so_far(metric, baseline_score, carried)
+        if family == "vision"
+        else _so_far(metric, baseline_score, carried)
+    )
+    return f"{slot} {move}{tail}"
+
+
+def _vision_so_far(metric: str, baseline_score: float, carried: Experiment | None) -> str:
+    """The recipe the coder's session starts from, in words. An image session rebuilds
+    nothing: fit() already holds the carried best, so the slot names it instead of
+    describing code."""
+    if carried is None or carried.result is None or carried.result.metrics is None:
+        return (
+            f"so far: baseline {metric}={baseline_score:.4f}, a small CNN trained from zero, "
+            "is the bar to beat; no carried best yet."
+        )
+    recipe = vl.describe(vl.recipe_of(carried))
+    note = f" (recipe: {recipe})" if recipe else ""
+    return (
+        f"so far: best {metric}={carried.result.metrics.primary_value:.4f} via "
+        f"'{_word_cut(carried.candidate.description.strip(), 60)}'{note}."
+    )
+
+
+def _vision_violation(
+    decision: SupervisorDecision,
+    history: Sequence[Experiment],
+    carried: Experiment | None,
+    ready: Sequence[vl.Ready],
+    *,
+    task: str,
+    metric: str,
+    seen: bool,
+) -> tuple[str, str, bool] | None:
+    """The image guards, in order. Every one but "not ready" runs whether or not a lever
+    is open: with nothing ready, an unguarded retry is what turns the gate off."""
+    named = vl.classes_named(decision.brief)
+    ready_text = vl.ready_line(ready)
+    if len(named) >= 2:
+        reason = f"the move names two lever classes ({' and '.join(named[:2])}); brief exactly ONE"
+        return (
+            f"ill-formed move — {reason}",
+            _PROMPTS["move_lint_nudge"].format(reason=reason),
+            seen,
+        )
+    if not named:
+        return (
+            f"no lever class ({decision.title!r})",
+            _PROMPTS["vision_no_class_nudge"].format(ready=ready_text),
+            seen,
+        )
+    lever = named[0]
+    if no_value := vl.missing_value(decision.brief):
+        return (
+            f"no value — {no_value}",
+            _PROMPTS["vision_no_value_nudge"].format(reason=no_value, ready=ready_text),
+            seen,
+        )
+    if (
+        task == "regression"
+        and lever == "regularisation"
+        and "smooth" in _move_text(decision.brief)
+    ):
+        return (
+            "dead lever — label smoothing on a number",
+            _PROMPTS["vision_dead_lever_nudge"].format(ready=ready_text),
+            seen,
+        )
+    if ready and lever not in {r.lever for r in ready}:
+        return (
+            f"lever not ready — {lever}",
+            _PROMPTS["vision_not_ready_nudge"].format(lever=lever, ready=ready_text),
+            seen,
+        )
+    if spent := vl.banked(decision.brief, carried) or vl.measured_lost(
+        decision.brief, history, carried, direction(metric)
+    ):
+        return (
+            f"banked-work re-brief — {spent}",
+            _PROMPTS["banked_rebrief_nudge"].format(reason=spent),
+            seen,
+        )
+    return None
 
 
 def _so_far(metric: str, baseline_score: float, carried: Experiment | None) -> str:
@@ -964,35 +1125,47 @@ def _build_messages(
     score: float,
     history: list[Experiment],
     family: str = "tabular",
+    ready_line: str = "",
+    run_history: Sequence[Experiment] | None = None,
 ) -> list[Message]:
     prompt_family = family.startswith("prompt")
     # A scoring run and a classification run are both prompt runs, and their rungs
     # do not transfer: "define the hard case" names an edge between two answers, and
     # a number has no answers to sit between.
-    key = (
-        "prompt_scoring_system"
-        if family == "prompt_scoring"
-        else ("prompt_system" if prompt_family else "system")
-    )
+    key = {
+        "prompt_scoring": "prompt_scoring_system",
+        "prompt": "prompt_system",
+        "vision": "vision_system",
+    }.get(family, "system")
     system = _PROMPTS[key].format(
         metric=metric, direction=direction, metric_note=metric_guidance(metric)
     )
     if history:
         recent = history[-_HISTORY_LIMIT:]
-        lines = _format_history(recent, metric)
+        lines = _format_history(recent, metric, family)
         # The ledger scans the FULL history, not the display window. Tabular only:
         # its levers are matched on sklearn identifiers, which a prompt cell never
         # contains.
-        blocks = (
-            (_technique_table(recent, metric),)
-            if prompt_family
-            else (_technique_table(recent, metric), _lever_ledger(history))
-        )
+        if family == "vision":
+            blocks: tuple[str, ...] = (
+                vl.ledger_line(list(run_history) if run_history is not None else history),
+                ready_line,
+            )
+        elif prompt_family:
+            blocks = (_technique_table(recent, metric),)
+        else:
+            blocks = (_technique_table(recent, metric), _lever_ledger(history))
         extras = "".join(block + "\n\n" for block in blocks if block)
         history_section = _PROMPTS["history_header"] + "\n" + "\n".join(lines) + "\n\n" + extras
     else:
         history_section = "No experiments yet — brief the first one.\n\n"
-    user = _PROMPTS["prompt_user_template" if prompt_family else "user_template"].format(
+        if ready_line:
+            history_section += ready_line + "\n\n"
+    if family == "vision":
+        user_key = "vision_user_template"
+    else:
+        user_key = "prompt_user_template" if prompt_family else "user_template"
+    user = _PROMPTS[user_key].format(
         data_summary=data_summary,
         metric=metric,
         score=f"{score:.4f}",
@@ -1019,6 +1192,8 @@ def _validation_trail(exp: Experiment) -> str:
         stdout = cell.get("stdout") if isinstance(cell, dict) else None
         for line in (stdout or "").splitlines():
             low = line.lower()
+            if line.startswith(("FIT ", "MODEL ", "SUBMITTED ")):
+                continue  # the harness's own payloads; the fit line already reads them
             if "val" not in low and "score" not in low:
                 continue
             floats = _FLOAT.findall(line)
@@ -1269,24 +1444,17 @@ _PROMPT_MOVES: dict[str, str] = {
         "add 3 to 6 examples drawn from TRAINING rows, chosen to cover the confusions "
         "the mistakes revealed rather than the easy cases"
     ),
-    "output-discipline": (
-        "make the answer format unmistakable so no reply comes back unusable"
-    ),
+    "output-discipline": ("make the answer format unmistakable so no reply comes back unusable"),
     "decision-rule": (
-        "state the rule the correct answers imply, as a rule, instead of describing "
-        "the task"
+        "state the rule the correct answers imply, as a rule, instead of describing the task"
     ),
-    "role-framing": (
-        "give the model a role that matches the judgement it is being asked to make"
-    ),
+    "role-framing": ("give the model a role that matches the judgement it is being asked to make"),
 }
 
 
 def _prompt_fallback_move(history: list[Experiment]) -> tuple[str, str] | None:
     """A prompt move never briefed this run, or None when they are all spent."""
-    briefed = " ".join(
-        f"{e.candidate.description} {e.hypothesis}".casefold() for e in history
-    )
+    briefed = " ".join(f"{e.candidate.description} {e.hypothesis}".casefold() for e in history)
     for lever, move in _PROMPT_MOVES.items():
         if lever not in briefed:
             return f"untried move: {lever}", f"next: {lever}: {move}."
@@ -1338,13 +1506,14 @@ def _was_floor_banked(exp: Experiment) -> bool:
     )
 
 
-def _format_history(history: list[Experiment], metric: str) -> list[str]:
+def _format_history(history: list[Experiment], metric: str, family: str = "tabular") -> list[str]:
     lines = []
     for exp in history:
         desc = exp.candidate.description.strip()[:90]
         code = exp.candidate.changes.get("code")
         used = ""
-        if isinstance(code, str):
+        # An image cell's components are 'AdamW' and 'Linear', which name no lever.
+        if isinstance(code, str) and family != "vision":
             comps = codegen.components_used(code)
             if comps:
                 used = f" [used: {', '.join(comps)}]"
@@ -1379,6 +1548,9 @@ def _format_history(history: list[Experiment], metric: str) -> list[str]:
         else:
             outcome = "not run"
         lines.append(f"- {desc}{used} -> {outcome}{_validation_trail(exp)}")
+        cells = exp.candidate.changes.get("cells")
+        if family == "vision" and isinstance(cells, list) and (fit := vl.evidence(cells, metric)):
+            lines.append(f"    fit: {fit}")
         # The Summarizer's digest is the cross-notebook knowledge: what the data
         # showed and what helped or hurt, so the supervisor can compound winners.
         if exp.digest is not None:

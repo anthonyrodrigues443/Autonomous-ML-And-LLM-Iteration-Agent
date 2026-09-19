@@ -29,6 +29,10 @@ if TYPE_CHECKING:
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _EPERM_PATH = re.compile(r"\[Errno 1\] Operation not permitted: '([^']+)'")
+# How long an interrupted cell is given to stop. ipykernel aborts an execute request
+# that arrives before the stopped cell goes idle, and the aborted cell comes back as a
+# success with no output, so the next cell silently does not run.
+INTERRUPT_SETTLE_SECONDS = 10.0
 
 # Cells get none of the harness's own keys. A prompt kernel gets only its target's key.
 KERNEL_SECRETS = frozenset(
@@ -97,6 +101,9 @@ class CellResult:
     error: str | None = None  # the exception/traceback if the cell raised
     timed_out: bool = False
     outputs: list[dict[str, Any]] = field(default_factory=list)
+    # The cell would not stop when it was interrupted, so the kernel was restarted
+    # under it and the namespace is empty.
+    restarted: bool = False
 
     @property
     def ok(self) -> bool:
@@ -243,13 +250,11 @@ class LocalKernel:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._km.interrupt_kernel()
-                return CellResult("".join(out), "".join(err), timed_out=True, outputs=outputs)
+                return self._stopped(msg_id, out, err, outputs)
             try:
                 msg = self._kc.get_iopub_msg(timeout=remaining)
             except queue.Empty:
-                self._km.interrupt_kernel()
-                return CellResult("".join(out), "".join(err), timed_out=True, outputs=outputs)
+                return self._stopped(msg_id, out, err, outputs)
             if msg.get("parent_header", {}).get("msg_id") != msg_id:
                 continue  # a message from an earlier cell; ignore
             mtype = msg["msg_type"]
@@ -294,6 +299,38 @@ class LocalKernel:
             elif mtype == "status" and content.get("execution_state") == "idle":
                 break
         return CellResult("".join(out), "".join(err), error=error, outputs=outputs)
+
+    def _stopped(
+        self, msg_id: str, out: list[str], err: list[str], outputs: list[dict[str, Any]]
+    ) -> CellResult:
+        """End a cell that ran past its limit: interrupt it, and wait for it to stop.
+
+        A cell that swallows the interrupt (a bare `except:` around a training loop) is
+        still running, so every request behind it would be aborted unrun. Restarting is
+        the only way to give the next cell a kernel that answers."""
+        restarted = not self._interrupt(msg_id)
+        if restarted:
+            self.restart()
+        return CellResult(
+            "".join(out), "".join(err), timed_out=True, outputs=outputs, restarted=restarted
+        )
+
+    def _interrupt(self, msg_id: str) -> bool:
+        """True once the interrupted cell has gone idle."""
+        self._km.interrupt_kernel()
+        deadline = time.monotonic() + INTERRUPT_SETTLE_SECONDS
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                msg = self._kc.get_iopub_msg(timeout=left)
+            except queue.Empty:
+                break
+            if (
+                msg.get("parent_header", {}).get("msg_id") == msg_id
+                and msg["msg_type"] == "status"
+                and msg["content"].get("execution_state") == "idle"
+            ):
+                return True
+        return False
 
     def install(self, packages: list[str]) -> str:
         from iterate.adapters.compute import deps
