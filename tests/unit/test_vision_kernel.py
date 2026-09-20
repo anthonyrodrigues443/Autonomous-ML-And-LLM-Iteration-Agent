@@ -113,6 +113,9 @@ def test_a_restart_rebuilds_the_session_and_the_recipe_it_had_reached(
 ) -> None:
     assert session["restart_error"] is None
     assert session["recipe_after_restart"]["augment"] == "flip"
+    # The opening line is the first thing a coder reads about the recipe, so a run that
+    # set no layer field opens on the keys it always opened on.
+    assert not {"layers", "head", "drop_stages"} & set(session["recipe_after_restart"])
 
 
 def test_the_floor_submits_after_a_reset(session: dict[str, Any]) -> None:

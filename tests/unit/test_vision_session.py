@@ -153,6 +153,17 @@ def test_asking_for_the_probe_back_drops_the_carried_head(capsys: Any) -> None:
     assert "the carried head was dropped" in capsys.readouterr().out
 
 
+def test_epochs_zero_asks_for_the_probe_back_the_same_way(capsys: Any) -> None:
+    """`fit(epochs=0)` is the other spelling of the probe, so it drops the carried head
+    too, rather than earning a refusal for a head the cell never typed."""
+    topped = Recipe(backbone="resnet18", unfreeze="head", epochs=4, head="linear(512)")
+    built = _merge(topped, {"epochs": 0})
+    assert (built.unfreeze, built.epochs, built.head) == ("none", 0, None)
+    dropped = Recipe(backbone="resnet50", unfreeze="head", epochs=4, drop_stages=1)
+    assert _merge(dropped, {"epochs": 0}).drop_stages == 0
+    assert capsys.readouterr().out.count("the carried head was dropped") == 2
+
+
 def test_a_head_the_run_never_asked_for_leaves_the_probe_head_alone() -> None:
     """head_init is only reset when this fit is the one that sets a head."""
     probe_started = Recipe(
@@ -299,6 +310,8 @@ def test_a_fit_that_sets_no_layer_field_prints_the_keys_it_always_printed(
 ) -> None:
     """The lever gate matches SUBMITTED to FIT by equality, and a recorded history has
     to read the same on this version as on the one before it."""
+    import inspect
+
     session = _session(tmp_path, per_class=10)
     session.submit(session.fit(backbone="resnet18", epochs=2))
     out = capsys.readouterr().out
@@ -308,6 +321,10 @@ def test_a_fit_that_sets_no_layer_field_prints_the_keys_it_always_printed(
     assert not {"layers", "head", "drop_stages"} & set(fit["from"])
     recorded = json.loads((session.workdir / codegen.RECIPE_JSON).read_text())
     assert not {"layers", "head", "drop_stages"} & set(recorded)
+    # The preamble prints the recipe a third time and imports torch, so it cannot be
+    # called here; the line itself is what the contract holds.
+    opening = inspect.getsource(vision_session.start).split('"recipe now: "')[1]
+    assert "printed(session.best)" in opening.splitlines()[0]
 
 
 def test_a_fit_on_a_stack_names_it_in_the_line_and_in_the_words(

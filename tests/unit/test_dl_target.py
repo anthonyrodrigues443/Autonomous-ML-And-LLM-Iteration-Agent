@@ -539,7 +539,8 @@ def test_the_meta_names_the_task_the_spread_the_baseline_and_every_backbone(
         [train.mean(), train.std(), train.min(), train.max()]
     )
     for meta in (classes, numbers):
-        assert meta["baseline"] == asdict(replace(dl.BASELINE, image_size=32))
+        assert meta["baseline"] == dl.printed(replace(dl.BASELINE, image_size=32))
+        assert not {"layers", "head", "drop_stages"} & set(meta["baseline"])
         assert meta["backbones"] == [
             "resnet18",
             "resnet50",

@@ -41,7 +41,8 @@ BACKBONES: dict[str, tuple[str, str]] = {
 # Trained from zero, so no probe and no head-only fit: name to head module.
 SCRATCH: dict[str, str] = {"simple_cnn": "head", "layers_net": "head"}
 # Each backbone's stages from the stem up, with the feature width each one ends on.
-# `drop_stages=N` turns the last N into Identity. Read from torchvision 0.26.
+# `drop_stages=N` turns the last N into Identity. Read from torchvision 0.26, and the
+# names and widths checked again on 0.29.
 STAGES: dict[str, tuple[tuple[tuple[str, ...], int], ...]] = {
     "resnet18": ((("layer1",), 64), (("layer2",), 128), (("layer3",), 256), (("layer4",), 512)),
     "resnet50": ((("layer1",), 256), (("layer2",), 512), (("layer3",), 1024), (("layer4",), 2048)),
@@ -187,7 +188,7 @@ def _same_shape_as_the_table(model: Any, backbone: str, head_name: str, width: i
     raise RecipeError(
         f"torchvision {_installed('torchvision')} builds {backbone} in a shape this iterate "
         "does not know, so head= and drop_stages= cannot change it; fit without them, or "
-        "install torchvision 0.24 to 0.26"
+        "install torchvision 0.24 or newer, and if you are on one already, report this version"
     )
 
 
@@ -344,6 +345,22 @@ def checked_meta(saved: Any, path: str | Path) -> dict[str, Any]:
     if not isinstance(recipe, dict) or recipe.get("backbone") not in (*BACKBONES, *SCRATCH):
         known = ", ".join((*BACKBONES, *SCRATCH))
         raise refuse(f"its backbone is not one of {known}")
+    # model_for cuts stages and builds a head straight from these three, so they are
+    # checked here with the rest and not where they would fail as an index error.
+    dropped = recipe.get("drop_stages") or 0
+    if not _is_int(dropped) or not 0 <= dropped <= MAX_DROP_STAGES:
+        raise refuse(
+            f"its drop_stages is {dropped!r}, not a whole number from 0 to {MAX_DROP_STAGES}"
+        )
+    if dropped and recipe["backbone"] not in STAGES:
+        raise refuse(
+            f"{recipe['backbone']} has no stages to drop, and its drop_stages is {dropped}"
+        )
+    try:
+        arch.parse(recipe.get("layers"), "layers")
+        arch.parse(recipe.get("head"), "head")
+    except RecipeError as exc:
+        raise refuse(str(exc)) from None
     if task not in ("classification", "regression"):
         raise refuse(f"its task is {task!r}, not classification or regression")
     size, (low, high) = meta.get("image_size"), SIZE_RANGE

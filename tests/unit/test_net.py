@@ -346,7 +346,7 @@ def test_a_torchvision_that_moved_the_stages_is_refused_by_name(
     with pytest.raises(net.RecipeError, match=r"builds resnet18 in a shape this iterate"):
         _built({"backbone": "resnet18", "drop_stages": 1}, monkeypatch, missing)
     resized = _stock("resnet18", features=99)
-    with pytest.raises(net.RecipeError, match=r"install torchvision 0\.24 to 0\.26"):
+    with pytest.raises(net.RecipeError, match=r"install torchvision 0\.24 or newer"):
         _built({"backbone": "resnet18", "head": [("linear", 64)]}, monkeypatch, resized)
 
 
@@ -397,6 +397,11 @@ def _meta(**changes: Any) -> dict[str, Any]:
 
 def _saved(meta: dict[str, Any]) -> dict[str, Any]:
     return {net.SAVED_KEY: meta, "state_dict": {"fc.weight": np.zeros((3, 4), np.float32)}}
+
+
+def _tampered(**changes: Any) -> dict[str, Any]:
+    """A saved file whose recipe says something no iterate run would write."""
+    return _saved(_meta(recipe={**_meta()["recipe"], **changes}))
 
 
 def test_the_metadata_is_plain_python_and_names_everything_a_loader_needs() -> None:
@@ -457,6 +462,8 @@ def test_recipe_values_that_came_from_numpy_are_saved_as_plain_values() -> None:
 def test_a_file_a_run_saved_passes_every_check() -> None:
     meta = _meta()
     assert net.checked_meta(_saved(meta), "net.pt") is meta
+    topped = _meta(recipe={**meta["recipe"], "drop_stages": 2, "head": [["linear", 64]]})
+    assert net.checked_meta(_saved(topped), "net.pt") is topped
 
 
 @pytest.mark.parametrize(
@@ -468,6 +475,16 @@ def test_a_file_a_run_saved_passes_every_check() -> None:
         (_saved(_meta(format=2)), "is saved-network format 2 and this iterate reads format 1"),
         (_saved(_meta(recipe={"backbone": "hf_hub:someone/net"})), "its backbone is not one of"),
         (_saved(_meta(recipe="resnet18")), "its backbone is not one of"),
+        (_tampered(drop_stages=99), "its drop_stages is 99, not a whole number from 0 to 2"),
+        (_tampered(drop_stages=-1), "its drop_stages is -1"),
+        (_tampered(drop_stages=1.5), "its drop_stages is 1.5"),
+        (_tampered(drop_stages=True), "its drop_stages is True"),
+        (
+            _tampered(backbone="simple_cnn", drop_stages=1),
+            "simple_cnn has no stages to drop",
+        ),
+        (_tampered(layers=[["conv", 999999]]), "channels=999999 is outside 4 to 512"),
+        (_tampered(head=[["linear", 4096]]), "linear takes one width between 8 and 2048"),
         (_saved(_meta(task="ranking")), "its task is 'ranking'"),
         (_saved(_meta(image_size=100_000)), "its image_size is 100000, outside 32 to 384"),
         (_saved(_meta(image_size=True)), "its image_size is True"),

@@ -36,7 +36,6 @@ MAX_PARAMS = 30_000_000
 # The compute cap is per image: an epoch costs the same multiply-adds whatever the batch
 # size is, so a smaller batch must not buy a more expensive network.
 MAX_MACS = 8_000_000_000
-MAX_BATCH_MACS = MAX_MACS * 64
 MAX_ACTIVATION_BYTES = 6 * 2**30
 CHANNELS = (4, 512)
 WIDTHS = (8, 2048)
@@ -546,7 +545,6 @@ __all__ = [
     "EXAMPLE",
     "HEAD_EXAMPLE",
     "MAX_ACTIVATION_BYTES",
-    "MAX_BATCH_MACS",
     "MAX_HEAD",
     "MAX_LAYERS",
     "MAX_MACS",

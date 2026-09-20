@@ -929,7 +929,7 @@ class DLModelTarget:
             "average": self._average,
             "family": "vision",
             "image_size": self._image_size,
-            "baseline": asdict(self._baseline_recipe()),
+            "baseline": printed(self._baseline_recipe()),
             "backbones": [*BACKBONES, *SCRATCH],
             "budget_seconds": self._budget,
             "seed": self._dataset.seed,

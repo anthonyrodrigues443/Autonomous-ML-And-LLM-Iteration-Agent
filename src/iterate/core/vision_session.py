@@ -107,13 +107,17 @@ def _tops(base: dict[str, Any], changes: dict[str, Any]) -> None:
     """A carried probe and a carried head cannot both stand, so the setting the cell just
     typed wins and the line says which way it went."""
     asked_head = changes.get("head") is not None or changes.get("drop_stages")
+    # epochs=0 is the other spelling of the probe, and merge turns it into one below.
+    probing = changes.get("unfreeze") == "none" or (
+        "unfreeze" not in changes and changes.get("epochs") == 0
+    )
     if asked_head and base["unfreeze"] == "none" and "unfreeze" not in changes:
         base["unfreeze"], base["epochs"] = "head", BENCH_EPOCHS
         print(
             f"the carried recipe was a linear probe; your head trains it for "
             f"{BENCH_EPOCHS} epochs (pass unfreeze= and epochs= to choose)"
         )
-    elif changes.get("unfreeze") == "none" and (base["head"] or base["drop_stages"]):
+    elif probing and (base["head"] or base["drop_stages"]):
         base["head"], base["drop_stages"] = None, 0
         print("the probe fits one linear layer on the whole backbone; the carried head was dropped")
 
@@ -825,6 +829,8 @@ def start(workdir: str = ".") -> dict[str, Any]:
     """The preamble's one call: every name the agent's cells see."""
     import pandas as pd
 
+    from iterate.targets.dl import printed
+
     set_device_env()
     import torch
 
@@ -885,7 +891,7 @@ def start(workdir: str = ".") -> dict[str, Any]:
         f"fold: {len(session.fit_idx)} images to fit, {len(session.val_idx)} to validate "
         "(FIT_IDX, VAL_IDX), the same fold every session"
     )
-    print("recipe now: " + json.dumps(asdict(session.best)))
+    print("recipe now: " + json.dumps(printed(session.best)))
     print("\n".join(codegen.vision_worked_example(session.task)))
     gc.collect()
     return names

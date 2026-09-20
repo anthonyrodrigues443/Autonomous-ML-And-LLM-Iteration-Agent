@@ -559,13 +559,19 @@ def layers_shapes_and_counts() -> dict[str, Any]:
 
 
 def layers_fit() -> dict[str, Any]:
-    """A whole network from a stack, trained on the CPU. The 25-row set leaves a last
-    batch of one, which batch norm in train mode cannot take."""
+    """A whole network from a stack, trained on the CPU. Four stride-2 convs take 16px
+    down to a 1px map, and the 25-row set leaves a last batch of one, which batch norm
+    in train mode cannot take at that size: without the skip this fit raises."""
     dl._build = _REAL_BUILD
     train, labels = _data(9)
     holdout, _ = _data(3)
     recipe = Recipe(
-        backbone="layers_net", layers=STACK, unfreeze="all", epochs=2, batch_size=8, image_size=16
+        backbone="layers_net",
+        layers=[("conv", 16, 3, 2)] * 4,
+        unfreeze="all",
+        epochs=2,
+        batch_size=8,
+        image_size=16,
     )
     log: list[str] = []
     job = FitJob(
