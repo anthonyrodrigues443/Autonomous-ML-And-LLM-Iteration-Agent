@@ -19,7 +19,6 @@ import os
 import re
 import sys
 import time
-from collections import OrderedDict
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
@@ -33,6 +32,22 @@ from iterate.adapters.compute.base import CodeJob
 from iterate.core import codegen
 from iterate.core.scoring import direction, requires_proba, score, task_for_metric
 from iterate.schemas.experiment import ExperimentResult, Metrics
+from iterate.targets.net import (
+    BACKBONES,
+    EMBED_BATCH,
+    SAVED_KEY,
+    SCRATCH,
+    SIZE_RANGE,
+    RecipeError,
+    _as_rgb,
+    _build,
+    _fitted,
+    _predict,
+    _to_device,
+    model_for,
+    pick_device,
+    saved_meta,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -47,7 +62,6 @@ BASELINE_SIZE = 64
 PRETRAINED_EPOCHS = 12
 FIT_BUDGET_SECONDS = 540.0
 RECIPE_JSON = "recipe.json"
-EMBED_BATCH = 256
 TIMED_STEPS = 10
 PIXEL_RAM_SHARE = 0.25
 # A step in train mode, with its scheduler step, costs a little more than the timed one.
@@ -58,19 +72,9 @@ SHORT_SCHEDULE = 10
 MPS_HIGH_RATIO = "0.7"
 MPS_LOW_RATIO = "0.56"
 _OUTPUT_TAIL_CHARS = 2000
-_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
-_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
 _T = TypeVar("_T")
 _COPY_NAME = re.compile(r"(missing-)?[0-9a-f]{16}")
 
-# Pinned enums: torchvision's DEFAULT may change between releases and move every score.
-BACKBONES: dict[str, tuple[str, str]] = {
-    "resnet18": ("ResNet18_Weights.IMAGENET1K_V1", "fc"),
-    "resnet50": ("ResNet50_Weights.IMAGENET1K_V2", "fc"),
-    "convnext_tiny": ("ConvNeXt_Tiny_Weights.IMAGENET1K_V1", "classifier.2"),
-}
-# Trained from zero, so no probe and no head-only fit: name to head module.
-SCRATCH: dict[str, str] = {"simple_cnn": "head"}
 _CHOICES: dict[str, tuple[str, ...]] = {
     "backbone": (*BACKBONES, *SCRATCH),
     "unfreeze": ("none", "head", "all"),
@@ -80,17 +84,13 @@ _CHOICES: dict[str, tuple[str, ...]] = {
     "head_init": ("random", "probe"),
 }
 _RANGES: dict[str, tuple[float, float]] = {
-    "image_size": (32, 384),
+    "image_size": SIZE_RANGE,
     "epochs": (0, 30),
     "batch_size": (8, 256),
     "lr": (1e-5, 1.0),
     "label_smoothing": (0.0, 0.3),
     "seed": (0, 2**32 - 1),
 }
-
-
-class RecipeError(ValueError):
-    """A recipe the runner will not execute, with a reason the agent can act on."""
 
 
 @dataclass(frozen=True)
@@ -183,6 +183,7 @@ class FitJob:
     log: Callable[[str], None]
     task: str = "classification"
     fixed: bool = False
+    save_to: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,22 @@ class FitReport:
     outputs: np.ndarray
     epochs_planned: int
     epochs_run: int
+
+
+@dataclass(frozen=True)
+class Network:
+    """What a submitted fit needs to become a file: the staged weights of a trained fit,
+    or the probe head to put on the stock backbone. `centre` and `spread` map a number
+    back to the label's own units."""
+
+    recipe: Recipe
+    task: str
+    classes: list[Any]
+    outputs: int
+    centre: float = 0.0
+    spread: float = 1.0
+    weights: Path | None = None
+    head: tuple[np.ndarray, np.ndarray] | None = None
 
 
 class DeviceOutOfMemoryError(RuntimeError):
@@ -328,9 +345,7 @@ class TorchRunner:
     @property
     def device(self) -> str:
         if self._device is None:
-            torch = _torch()
-            cuda, mps = torch.cuda.is_available(), torch.backends.mps.is_available()
-            self._device = "cuda" if cuda else "mps" if mps else "cpu"
+            self._device = pick_device(_torch())
         return self._device
 
     def fit(self, job: FitJob) -> FitReport:
@@ -344,7 +359,7 @@ class TorchRunner:
         rng = np.random.default_rng(recipe.seed)
         dev = torch.device(self.device)
         cuda = dev.type == "cuda"
-        model = _build(torch, recipe.backbone, job.outputs, job.head).to(dev)
+        model = model_for(torch, asdict(recipe), job.outputs, job.head, build=_build).to(dev)
         if cuda:
             torch.backends.cudnn.benchmark = True
             model = model.to(memory_format=torch.channels_last)
@@ -405,7 +420,30 @@ class TorchRunner:
             return f"loss={total / n:.4f} train_acc={tallied / n:.4f}"
 
         ran = run_epochs(one_epoch, planned, job.log)
-        return FitReport(_predict(torch, model, job.holdout, dev, job.task), planned, ran)
+        outputs = _predict(torch, model, job.holdout, dev, job.task)
+        if job.save_to is not None:
+            _stage(torch, model, job.save_to, job.log)
+        return FitReport(outputs, planned, ran)
+
+    def save(self, network: Network, path: Path) -> None:
+        """One file: the weights and the plain metadata `iterate.vision.load` rebuilds
+        the network from."""
+        torch, recipe = _torch(), asdict(network.recipe)
+        if network.weights is not None:
+            state = torch.load(network.weights, map_location="cpu", weights_only=True)
+        else:
+            built = model_for(torch, recipe, network.outputs, network.head, build=_build)
+            state = built.state_dict()
+        meta = saved_meta(
+            torch,
+            recipe,
+            task=network.task,
+            classes=network.classes,
+            outputs=network.outputs,
+            centre=network.centre,
+            spread=network.spread,
+        )
+        torch.save({SAVED_KEY: meta, "state_dict": state}, path)
 
     def embed(self, pixels: np.ndarray, *, backbone: str) -> np.ndarray:
         where = f"image_size={pixels.shape[-1]} with {backbone}"
@@ -421,6 +459,15 @@ class TorchRunner:
                 batch = _to_device(torch, pixels[start : start + EMBED_BATCH], dev)
                 parts.append(model(batch).cpu())
         return np.asarray(torch.cat(parts).numpy(), dtype=np.float32)
+
+
+def _stage(torch: Any, model: Any, path: Path, log: Callable[[str], None]) -> None:
+    # torch.save reports a full disk as RuntimeError; neither may cost the fit its predictions.
+    try:
+        torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, path)
+    except (OSError, RuntimeError) as exc:
+        path.unlink(missing_ok=True)
+        log(f"this fit has no weights file: {exc}")
 
 
 def _oom_text(kind: str, device: str, where: str) -> str:
@@ -439,40 +486,6 @@ def _torch() -> Any:
     import torch
 
     return torch
-
-
-def _simple_cnn(torch: Any, outputs: int) -> Any:
-    nn = torch.nn
-    layers: list[Any] = []
-    for cin, cout in ((3, 32), (32, 64), (64, 128)):
-        conv = nn.Conv2d(cin, cout, 3, padding=1)
-        layers += [conv, nn.BatchNorm2d(cout), nn.ReLU(), nn.MaxPool2d(2)]
-    body = nn.Sequential(*layers, nn.AdaptiveAvgPool2d(1), nn.Flatten())
-    return nn.Sequential(OrderedDict(body=body, head=nn.Linear(128, outputs)))
-
-
-def _build(
-    torch: Any, backbone: str, outputs: int | None, head: tuple[np.ndarray, np.ndarray] | None
-) -> Any:
-    if backbone in SCRATCH:
-        if outputs is None or head is not None:
-            raise RecipeError(
-                f"{backbone} has no pretrained features to embed or probe head to copy"
-            )
-        return _simple_cnn(torch, outputs)
-    import torchvision.models as tvm
-
-    weights, head_name = BACKBONES[backbone]
-    enum, member = weights.split(".")
-    model = getattr(tvm, backbone)(weights=getattr(getattr(tvm, enum), member), progress=False)
-    features = model.get_submodule(head_name).in_features
-    new = torch.nn.Identity() if outputs is None else torch.nn.Linear(features, outputs)
-    if head is not None:
-        with torch.no_grad():
-            new.weight.copy_(torch.from_numpy(head[0]))
-            new.bias.copy_(torch.from_numpy(head[1]))
-    model.set_submodule(head_name, new)
-    return model
 
 
 def _head_name(backbone: str) -> str:
@@ -519,45 +532,6 @@ def _augment(batch: np.ndarray, augment: str, rng: np.random.Generator) -> np.nd
     return out
 
 
-def _to_device(torch: Any, batch: np.ndarray, dev: Any) -> Any:
-    x = torch.from_numpy(np.ascontiguousarray(batch)).to(dev).float().div_(255.0)
-    return (x - torch.from_numpy(_MEAN).to(dev)) / torch.from_numpy(_STD).to(dev)
-
-
-def _predict(torch: Any, model: Any, holdout: np.ndarray, dev: Any, task: str) -> np.ndarray:
-    regression = task == "regression"
-    model.eval()
-    parts = []
-    with torch.no_grad():
-        for start in range(0, len(holdout), EMBED_BATCH):
-            out = model(_to_device(torch, holdout[start : start + EMBED_BATCH], dev)).float()
-            parts.append((out.squeeze(1) if regression else torch.softmax(out, dim=1)).cpu())
-    values = np.asarray(torch.cat(parts).numpy(), dtype=np.float64)
-    if regression:
-        return values
-    return np.asarray(values / values.sum(axis=1, keepdims=True), dtype=np.float64)
-
-
-_WIDE_MODES = frozenset({"I", "I;16", "I;16B", "I;16L", "I;16N", "F"})
-
-
-def _as_rgb(im: Any) -> Any:
-    """8-bit RGB. A 16-bit or float image is scaled to 0..255 first: `convert` clips it,
-    so a 16-bit image reads as white and a 0..1 float one as black."""
-    from PIL import Image
-
-    if im.mode not in _WIDE_MODES:
-        return im.convert("RGB")
-    values = np.asarray(im, dtype=np.float64)
-    if im.mode.startswith("I;16"):
-        scale = 65535.0
-    else:
-        top = float(values.max()) if values.size else 0.0
-        scale = next(s for s in (1.0, 255.0, 65535.0, max(top, 1.0)) if top <= s)
-    grey = np.clip(values / scale * 255.0, 0.0, 255.0).astype(np.uint8)
-    return Image.fromarray(grey).convert("RGB")
-
-
 def decode(paths: Sequence[str], size: int) -> np.ndarray:
     from PIL import Image, UnidentifiedImageError
 
@@ -568,11 +542,7 @@ def decode(paths: Sequence[str], size: int) -> np.ndarray:
                 rgb = _as_rgb(im)
         except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
             continue
-        scale = size / min(rgb.size)
-        w, h = max(size, round(rgb.width * scale)), max(size, round(rgb.height * scale))
-        rgb = rgb.resize((w, h), Image.Resampling.BILINEAR)
-        left, top = (w - size) // 2, (h - size) // 2
-        out[i] = np.asarray(rgb.crop((left, top, left + size, top + size))).transpose(2, 0, 1)
+        out[i] = _fitted(rgb, size)
     return out
 
 
@@ -841,6 +811,7 @@ __all__ = [
     "DeviceOutOfMemoryError",
     "FitJob",
     "FitReport",
+    "Network",
     "Recipe",
     "RecipeError",
     "Runner",
