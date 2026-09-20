@@ -1977,7 +1977,7 @@ def _save_best_model(
     recipe: dict[str, Any] = {}
     if network is not None:
         recipe = {"recipe": spec.get("recipe")}
-        artifact = saved_model.deliver(network, path)
+        artifact = saved_model.deliver(network, path, sha256=_recorded_network(best_result))
         if artifact is not None:
             load_hint = (
                 f"load it: from iterate.vision import load; "
@@ -2026,6 +2026,20 @@ def _save_best_model(
         console.print(f"\n[bold]saved best model[/bold] → {artifact}\n[dim]{load_hint}[/dim]")
     else:
         console.print(f"\n[dim]{load_hint}[/dim]")
+
+
+def _recorded_network(result: ExperimentResult) -> str | None:
+    """The network digest in the try's recipe.json, `""` when it names none, and None
+    when the try carries no recipe.json to check a file against."""
+    from iterate.core import codegen
+
+    recorded = result.artifacts.get(codegen.RECIPE_JSON)
+    if recorded is None:
+        return None
+    try:
+        return str(json.loads(recorded).get("model_sha256") or "")
+    except (ValueError, AttributeError):
+        return ""
 
 
 def _render_experiment(

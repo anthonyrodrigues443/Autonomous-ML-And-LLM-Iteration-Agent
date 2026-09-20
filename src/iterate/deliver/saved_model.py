@@ -4,6 +4,7 @@ folder keeps only the best experiment's. No torch here; `iterate.vision` opens t
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat
@@ -27,10 +28,15 @@ def settle(staged: Path, best: Path, *, is_best: bool) -> None:
         best.unlink(missing_ok=True)
 
 
-def deliver(kept: Path, wanted: Path) -> Path | None:
+def deliver(kept: Path, wanted: Path, *, sha256: str | None = None) -> Path | None:
     """The run folder's network, moved to where `--output` asked for it. None when the
-    winner left no file: a file already at `wanted` is then some other run's."""
+    winner left no file: a file already at `wanted` is then some other run's. `sha256` is
+    what the winner's recipe.json recorded, and a file it does not match is removed: a
+    settle that failed leaves an earlier best's network in the run folder."""
     if not kept.exists():
+        return None
+    if sha256 is not None and _sha256(kept) != sha256:
+        kept.unlink()
         return None
     if not (wanted.exists() and wanted.samefile(kept)):
         _place(kept, wanted)
@@ -44,6 +50,9 @@ def _place(src: Path, dst: Path) -> None:
         # A copy, then a rename inside one folder: the staging slot can sit on another
         # volume, and a stop part way must leave the earlier file whole.
         shutil.copyfile(src, part)
+        if dst.exists():
+            # Windows will not replace a read-only file.
+            dst.chmod(_READ_ONLY | stat.S_IWUSR)
         os.replace(part, dst)
     finally:
         part.unlink(missing_ok=True)
@@ -51,6 +60,11 @@ def _place(src: Path, dst: Path) -> None:
     # of replacing the scored file.
     dst.chmod(_READ_ONLY)
     src.unlink()
+
+
+def _sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 __all__ = ["BEST_MODEL", "deliver", "settle"]

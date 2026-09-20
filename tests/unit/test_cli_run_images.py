@@ -5,6 +5,7 @@ stubbed; nothing trains."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -446,6 +447,7 @@ def _run_with_a_winner(
     network: bytes | None,
     recipe: dict[str, Any] | None = None,
     wins: bool = True,
+    recorded: dict[str, Any] | None = None,
     extra: tuple[str, ...] = (),
 ) -> tuple[Any, Path]:
     """The real `iterate run` around a loop that stages `network` the way a session's
@@ -461,6 +463,7 @@ def _run_with_a_winner(
         )
         return ExperimentResult(experiment_id=name, metrics=metrics)
 
+    artifacts = {} if recorded is None else {codegen.RECIPE_JSON: json.dumps(recorded)}
     staging: list[Path] = []
 
     def loop(**kw: Any) -> RunResult:
@@ -477,7 +480,7 @@ def _run_with_a_winner(
             hypothesis="h",
             status="completed",
             iteration=1,
-            result=scored("e1", 0.9),
+            result=scored("e1", 0.9).model_copy(update={"artifacts": artifacts}),
         )
         return RunResult(
             baseline=scored("baseline", 0.5),
@@ -549,6 +552,36 @@ def test_a_fit_winner_whose_file_never_arrived_says_so(
     result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=None)
     assert result.exit_code == 0, result.output
     assert "no network was saved: the winning try left no network file" in _plain(result.output)
+
+
+def test_a_network_the_winners_recipe_json_vouches_for_is_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded = {**_FIT, "model_sha256": hashlib.sha256(b"weights").hexdigest()}
+    result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=b"weights", recorded=recorded)
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    assert kept.read_bytes() == b"weights"
+    assert json.loads(kept.with_name("best.json").read_text())["artifact_path"] == str(kept)
+
+
+@pytest.mark.parametrize(
+    "recorded", [{**_FIT, "model_sha256": hashlib.sha256(b"the winner's").hexdigest()}, _FIT]
+)
+def test_another_trys_network_in_the_run_folder_is_never_delivered_as_the_winners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded: dict[str, Any]
+) -> None:
+    """What a failed settle leaves behind: the run folder still holds the earlier best."""
+    result, _ = _run_with_a_winner(
+        tmp_path, monkeypatch, network=b"an earlier best's", recorded=recorded
+    )
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    assert not kept.exists()
+    assert json.loads(kept.with_name("best.json").read_text())["artifact_path"] is None
+    said = _plain(result.output)
+    assert "no network was saved: the winning try left no network file" in said
+    assert "saved best model" not in said
 
 
 def test_a_run_no_try_won_says_why_there_is_no_network(

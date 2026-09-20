@@ -3,6 +3,7 @@ each experiment, and the move `--output` asks for. No torch; the files are marke
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import stat
 import subprocess
@@ -115,6 +116,27 @@ def test_a_winner_with_no_network_never_claims_a_file_already_at_output(tmp_path
     wanted.write_bytes(b"an earlier run's")
     assert deliver(tmp_path / "runs" / "r1" / BEST_MODEL, wanted) is None
     assert wanted.read_bytes() == b"an earlier run's"
+
+
+def test_a_network_the_winners_recipe_vouches_for_is_delivered(tmp_path: Path) -> None:
+    kept = tmp_path / "runs" / "r1" / BEST_MODEL
+    settle(_slot(tmp_path, b"winner"), kept, is_best=True)
+    assert deliver(kept, kept, sha256=hashlib.sha256(b"winner").hexdigest()) == kept
+    assert kept.read_bytes() == b"winner"
+
+
+@pytest.mark.parametrize("recorded", [hashlib.sha256(b"the winner").hexdigest(), ""])
+def test_another_trys_network_is_never_delivered_as_the_winners(
+    tmp_path: Path, recorded: str
+) -> None:
+    """A settle that failed leaves the earlier best in the run folder. `""` is a winner
+    whose recipe.json names no network at all."""
+    kept = tmp_path / "runs" / "r1" / BEST_MODEL
+    settle(_slot(tmp_path, b"an earlier best"), kept, is_best=True)
+    wanted = tmp_path / "models" / "flowers.pt"
+    assert deliver(kept, wanted, sha256=recorded) is None
+    assert not kept.exists()
+    assert not wanted.exists()
 
 
 def test_the_host_side_loads_no_torch() -> None:
