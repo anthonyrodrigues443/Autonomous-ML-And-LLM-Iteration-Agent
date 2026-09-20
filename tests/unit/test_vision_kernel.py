@@ -73,6 +73,18 @@ def test_a_fit_trains_submits_and_records_the_recipe_it_submitted(
     assert session["recipe"]["predictions_sha256"]
 
 
+def test_a_confined_cell_stages_a_fit_and_leaves_its_network_beside_the_predictions(
+    session: dict[str, Any],
+) -> None:
+    assert session["staged"]
+    assert session["recipe"]["model_sha256"] == session["network_digest"]
+
+
+def test_an_own_model_submission_leaves_no_network_behind(session: dict[str, Any]) -> None:
+    assert not session["network_after_own"]
+    assert not session["own_recipe_names_a_network"]
+
+
 def test_the_own_model_helpers_score_and_submit_under_their_name(
     session: dict[str, Any],
 ) -> None:
@@ -126,3 +138,16 @@ def test_one_image_experiment_runs_the_way_a_run_runs_it(experiment: dict[str, A
     assert experiment["artifacts"] == ["recipe.json"]
     assert experiment["recipe"]["backbone"] == "simple_cnn"
     assert experiment["recipe"]["predictions_sha256"]
+
+
+def test_the_network_outlives_the_kernel_and_predicts_what_the_session_submitted(
+    experiment: dict[str, Any],
+) -> None:
+    """The three hops end to end: the confined cell writes the file, the coder copies it
+    out before `close()` deletes the folder, and `iterate.vision.load` opens it."""
+    assert experiment["kernel_folder_gone"]
+    assert experiment["network_kept"]
+    assert experiment["network_digest_matches"]
+    assert len(experiment["written"]) == 8
+    assert experiment["predicted"] == experiment["written"]
+    assert experiment["probability_gap"] < 1e-4

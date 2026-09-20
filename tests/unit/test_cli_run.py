@@ -906,6 +906,44 @@ def test_a_prompt_kernel_gets_the_answer_cache_and_the_key_from_the_project_env(
     assert "they open their own folder, the answer cache, and model weights" in output
 
 
+def test_a_table_run_and_a_prompt_run_hand_the_coder_no_network_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`keep_model` is the image family's alone: without it the coder never asks the
+    kernel for a network, so these two families run exactly as they did."""
+    import tempfile
+
+    from iterate.core import coder as coder_module
+
+    real, built = coder_module.CodingAgent, []
+    monkeypatch.setattr(
+        coder_module, "CodingAgent", lambda *a, **kw: built.append(kw) or real(*a, **kw)
+    )
+    monkeypatch.setattr(
+        tempfile, "mkdtemp", lambda *a, **kw: pytest.fail("only an image run stages a network")
+    )
+    _write_tiny_csv(tmp_path / "d.csv")
+    lines = ["text,label"] + [
+        f"comment {i},{'toxic' if i % 3 == 0 else 'clean'}" for i in range(30)
+    ]
+    (tmp_path / "eval.csv").write_text("\n".join(lines), encoding="utf-8")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    table = ["--data", "d.csv", "--target", "churn", "--metric", "f1"]
+    prompt = [
+        *["--data", "eval.csv", "--target", "label", "--metric", "f1"],
+        *["--task", "say whether the comment is toxic"],
+        *["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+    ]
+    for argv in (table, prompt):
+        built.clear()
+        extra = [*argv, "--memory", str(tmp_path / "m.db")]
+        captured, _ = _captured_local_run(tmp_path, monkeypatch, sandbox=False, extra=extra)
+        (kw,) = built
+        assert "keep_model" not in kw
+        assert captured["coder"]._keep_model is None
+    assert built[0]["family"] == "prompt"
+
+
 # ─── cells never install; the harness installs for local runs with consent ───
 
 

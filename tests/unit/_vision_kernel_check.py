@@ -8,6 +8,7 @@ PNGs and drives the session the way the coder does. It prints one JSON line.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -173,9 +174,15 @@ def session() -> dict[str, Any]:
                 (kernel.read_output(codegen.PROBABILITIES_CSV) or b"").split()
             )
             out["recipe"] = json.loads(kernel.read_output(codegen.RECIPE_JSON) or b"{}")
+            network = kernel.read_output(codegen.NETWORK_PT) or b""
+            out["network_digest"] = hashlib.sha256(network).hexdigest()
+            out["staged"] = kernel.read_output(".fits/1.pt") is not None
 
             own = kernel.run_cell(prefix + _OWN_MODEL, timeout=600)
             out["own_error"] = own.error
+            out["network_after_own"] = kernel.read_output(codegen.NETWORK_PT) is not None
+            own_recipe = json.loads(kernel.read_output(codegen.RECIPE_JSON) or b"{}")
+            out["own_recipe_names_a_network"] = "model_sha256" in own_recipe
             out["model_lines"] = _tagged(own.stdout, "MODEL")
             out["own_submitted"] = _tagged(own.stdout, "SUBMITTED")
 
@@ -237,12 +244,43 @@ class _FakeLLM:
         return ChatResponse(model="fake-model", tool_calls=[call])
 
 
+class _Remembering(LocalKernel):
+    """Keeps what the host read, since the kernel's folder is gone once `run` returns."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.read: dict[str, bytes | None] = {}
+
+    def read_output(self, name: str) -> bytes | None:
+        self.read[name] = super().read_output(name)
+        return self.read[name]
+
+
+def _opened_again(kept: Path, images: list[str], read: dict[str, bytes | None]) -> dict[str, Any]:
+    """The delivered file through the public loader, against what the session submitted."""
+    import numpy as np
+
+    from iterate.vision import load
+
+    model = load(kept)
+    written = (read[codegen.PREDICTIONS_CSV] or b"").decode().splitlines()
+    rows = (read[codegen.PROBABILITIES_CSV] or b"").decode().splitlines()
+    probs = np.array([[float(v) for v in row.split(",")] for row in rows])
+    return {
+        "loaded_on": model.device,
+        "predicted": [str(name) for name in model.predict(images)],
+        "written": written,
+        "probability_gap": float(np.abs(model.predict_proba(images) - probs).max()),
+    }
+
+
 def experiment() -> dict[str, Any]:
     """One image experiment the way `iterate run` runs it: the real CodingAgent, the
     vision family the CLI passes, a confined kernel, and the host scoring what the
-    session submitted."""
+    session submitted. Then the network it left, opened the way a user's app opens it."""
     from iterate.adapters.data.tabular import load_split
     from iterate.core.coder import CodingAgent
+    from iterate.deliver import saved_model
 
     out: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="vision-coder-") as tmp:
@@ -258,9 +296,15 @@ def experiment() -> dict[str, Any]:
             work / codegen.TRAIN_CSV, work / "sealed.csv", "label", task="classification"
         )
         meta = json.loads((work / codegen.META_JSON).read_text())
+        kernel = _Remembering(
+            confinement=confine.Confinement(reads=(images,), weights=root / "weights")
+        )
+        slot = root / "slot" / saved_model.BEST_MODEL
+        slot.parent.mkdir()
+        slot.write_bytes(b"an earlier session's network")
         agent = CodingAgent(
             _FakeLLM(["f = fit(epochs=1)\nsubmit(f)\n"]),
-            LocalKernel(confinement=confine.Confinement(reads=(images,), weights=root / "weights")),
+            kernel,
             metric="accuracy",
             max_cells=4,
             install=False,
@@ -274,6 +318,7 @@ def experiment() -> dict[str, Any]:
             cell_timeout=750.0,
             deadline_seconds=2700.0,
             wall_ceiling_seconds=5400.0,
+            keep_model=slot,
         )
         coded = agent.run(
             dataset=dataset,
@@ -281,6 +326,7 @@ def experiment() -> dict[str, Any]:
             experiment_id="iter-01",
             starting_files={codegen.INCUMBENT_JSON: json.dumps(meta["baseline"]).encode()},
         )
+        read = dict(kernel.read)
         out["error"] = coded.result.error
         out["score"] = None if coded.result.metrics is None else coded.result.metrics.primary_value
         out["artifacts"] = sorted(coded.result.artifacts)
@@ -288,6 +334,16 @@ def experiment() -> dict[str, Any]:
         out["recipe"] = json.loads(recipe) if recipe else None
         out["sources"] = [c.source for c in coded.cells]
         out["stdout_has_fit"] = any("FIT {" in (c.stdout or "") for c in coded.cells)
+        out["kernel_folder_gone"] = kernel.read_output(codegen.PREDICTIONS_CSV) is None
+        out["network_kept"] = slot.is_file()
+        if slot.is_file() and out["recipe"]:
+            digest = hashlib.sha256(slot.read_bytes()).hexdigest()
+            out["network_digest_matches"] = digest == out["recipe"].get("model_sha256")
+            kept = root / "runs" / "r1" / saved_model.BEST_MODEL
+            saved_model.settle(slot, kept, is_best=True)
+            # The rows the kernel predicted, in its order: load_split shuffles the holdout.
+            asked = [str(p) for p in dataset.test_features["image"]]
+            out.update(_opened_again(kept, asked, read))
     return out
 
 

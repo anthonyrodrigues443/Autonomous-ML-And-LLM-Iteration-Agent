@@ -37,6 +37,10 @@ PROMPT_JSON = "prompt.json"
 # The image path's twin of PROMPT_JSON: the recipe (or own-model line) that produced
 # the predictions on disk, with their digest.
 RECIPE_JSON = "recipe.json"
+# The network behind a submitted `fit()`, beside the predictions it made; recipe.json
+# carries its digest. Dotted and harness-only: `model.pt` and `best_model.pt` are the
+# names an agent's own torch code writes.
+NETWORK_PT = ".iterate-network.pt"
 # Written by the host before the session starts: the recipe the carried best used, so
 # `fit()` in a new session starts where the last one finished.
 INCUMBENT_JSON = "incumbent.json"
@@ -990,6 +994,7 @@ __all__ = [
     "INCUMBENT_JSON",
     "META_JSON",
     "MISSING_IMPORTS",
+    "NETWORK_PT",
     "PREDICTIONS_CSV",
     "PROBABILITIES_CSV",
     "RECIPE_JSON",

@@ -25,6 +25,7 @@ from iterate.schemas.llm import Message, ToolSpec
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Sequence
+    from pathlib import Path
 
     from iterate.adapters.compute.deps import Installer, Plan
     from iterate.adapters.compute.kernel import CellResult, StatefulKernel
@@ -295,6 +296,7 @@ class CodingAgent:
         cell_prefix: str = codegen.RESET_INPUTS,
         floor_carries_code: bool = True,
         data_summary: str | None = None,
+        keep_model: Path | None = None,
     ) -> None:
         self._client = client
         self._kernel = kernel
@@ -322,6 +324,9 @@ class CodingAgent:
         # the carried code for it to re-run, and re-running one is a fit of minutes.
         self._floor_carries_code = floor_carries_code
         self._data_summary = data_summary
+        # One host-side slot for the session's saved network: `close()` deletes the
+        # kernel's folder before the loop knows whether the try won.
+        self._keep_model = keep_model
         self._watched: set[str] = set()
 
     def _nudge(self, key: str) -> str:
@@ -364,6 +369,8 @@ class CodingAgent:
             inputs.update(self._extra_inputs)
         if starting_files:
             inputs.update(starting_files)
+        if self._keep_model is not None:
+            self._keep_model.unlink(missing_ok=True)
         self._kernel.start(inputs)
         try:
             pre = self._session_preamble()
@@ -444,6 +451,7 @@ class CodingAgent:
                     codegen.RECIPE_JSON: recorded.decode(errors="replace"),
                 }
                 result = result.model_copy(update={"artifacts": artifacts})
+                self._keep(recorded, experiment_id)
             if result.error:
                 forensics = _failure_forensics(cells)
                 if forensics:
@@ -458,6 +466,28 @@ class CodingAgent:
             if self._controller is not None:
                 self._controller.live_cells = None
             self._kernel.close()
+
+    def _keep(self, recipe_json: bytes, experiment_id: str) -> None:
+        """The network recipe.json names, copied out before `close()` deletes the kernel's
+        folder, and only when its digest is the recorded one."""
+        if self._keep_model is None:
+            return
+        wanted = json.loads(recipe_json).get("model_sha256")
+        saved = self._kernel.read_output(codegen.NETWORK_PT) if wanted else None
+        if saved is None or hashlib.sha256(saved).hexdigest() != wanted:
+            if wanted:
+                log.warning(
+                    "coder[%s]: the saved network does not match recipe.json", experiment_id
+                )
+            return
+        # Through a second name: a copy that stops part way must never sit in the slot,
+        # where the loop would take it for the winner's network.
+        part = self._keep_model.with_name(self._keep_model.name + ".part")
+        try:
+            part.write_bytes(saved)
+            part.replace(self._keep_model)
+        except OSError as exc:
+            log.warning("coder[%s]: could not keep %s: %s", experiment_id, self._keep_model, exc)
 
     def inspect(
         self,

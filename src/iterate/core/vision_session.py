@@ -10,6 +10,10 @@ returns, ``MODEL`` when `evaluate()` scores the agent's own model, and ``SUBMITT
 when a submit helper writes predictions. Those lines, not the text of a cell, are how
 the run knows which lever moved. A fit submitted after a better-validated fit prints
 ``KEPT`` and writes nothing, so the last ``SUBMITTED`` line still names the file on disk.
+
+A runner that can save leaves the network of a submitted `fit()` beside its predictions,
+under a name only the harness uses, with its digest in recipe.json. No printed line
+says so: the lever gate matches ``SUBMITTED`` to ``FIT`` by equality.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
@@ -32,7 +37,7 @@ from iterate.core import codegen
 if TYPE_CHECKING:
     import pandas as pd
 
-    from iterate.targets.dl import Recipe, Runner
+    from iterate.targets.dl import Network, Recipe, Runner
 
 VAL_SHARE = 0.2
 DECODE_THREADS = 8
@@ -41,6 +46,9 @@ SESSION_JSON = ".vision-session.json"
 BENCH_EPOCHS = 3
 SIZE_STEP = 32
 SIZE_FLOOR = 32
+FITS_DIR = ".fits"
+STAGED_BYTES = 2**30
+_PART = codegen.NETWORK_PT + ".part"
 
 
 def set_device_env() -> None:
@@ -93,6 +101,7 @@ class Fit:
 
     line: dict[str, Any]
     _holdout_out: np.ndarray = field(repr=False)
+    _network: Network | None = field(default=None, repr=False)
 
     @property
     def val(self) -> float:
@@ -151,6 +160,11 @@ class Session:
         self._models: dict[str, dict[str, Any]] = {}
         self._pixels: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._features: dict[tuple[str, int], np.ndarray] = {}
+        self._staged: list[tuple[Path, float]] = []
+        self._fits = 0
+        # After a restart no Fit object can reach the weights an earlier session staged.
+        shutil.rmtree(workdir / FITS_DIR, ignore_errors=True)
+        (workdir / _PART).unlink(missing_ok=True)
 
     # ─── the fold, the carried recipe, the session's own state ───
 
@@ -290,7 +304,7 @@ class Session:
     # ─── fit ───
 
     def fit(self, **changes: Any) -> Fit:
-        from iterate.targets.dl import FitJob, RecipeError
+        from iterate.targets.dl import FitJob, Network, RecipeError
 
         tick = self._tick()
         recipe, start = merge(self.best, changes, self.task, baseline=self.baseline)
@@ -305,13 +319,17 @@ class Session:
         n_val = len(self.val_idx)
         fit_labels, centre, spread = self._fit_labels()
         outputs = 1 if self.task == "regression" else len(self.classes)
+        saves = hasattr(self.runner, "save")
+        staged: Path | None = None
+        folded: tuple[np.ndarray, np.ndarray] | None = None
         if recipe.unfreeze == "none":
-            out = self._probe(recipe.backbone, size, train_px, stack, fit_labels)
+            out, folded = self._probe(recipe.backbone, size, train_px, stack, fit_labels)
             planned, ran = 0, 0
         else:
             head = None
             if recipe.head_init == "probe":
                 head = self._probe_head(recipe.backbone, size, train_px, fit_labels)
+            staged = self._staging() if saves else None
             job = FitJob(
                 np.asarray(train_px[self.fit_idx]),
                 stack,
@@ -322,6 +340,7 @@ class Session:
                 tick + self.budget,
                 print,
                 task=self.task,
+                save_to=staged,
             )
             try:
                 report = self.runner.fit(job)
@@ -353,7 +372,37 @@ class Session:
             f"val {self.metric} = {line['val']:.4f} ({recipe.backbone} {size}px, "
             f"{ran}/{recipe.epochs} epochs, {line['seconds']}s)"
         )
-        return Fit(line, out[n_val:])
+        network: Network | None = None
+        if saves:
+            network = Network(
+                recipe, self.task, self.classes, outputs, centre, spread, staged, folded
+            )
+            self._cap_staged(staged, float(line["val"]))
+        return Fit(line, out[n_val:], network)
+
+    def _staging(self) -> Path:
+        folder = self.workdir / FITS_DIR
+        folder.mkdir(exist_ok=True)
+        self._fits += 1
+        return folder / f"{self._fits}.pt"
+
+    def _cap_staged(self, staged: Path | None, val: float) -> None:
+        """Staged weights stay under STAGED_BYTES. The oldest file goes first and the
+        best-validated one never does: it is the fit a session submits."""
+        from iterate.core.scoring import direction
+
+        if staged is not None and staged.exists():
+            self._staged.append((staged, val))
+        sign = 1.0 if direction(self.metric) == "minimize" else -1.0
+
+        def rank(entry: tuple[Path, float]) -> float:
+            return sign * entry[1] if math.isfinite(entry[1]) else math.inf
+
+        while len(self._staged) > 1 and sum(_size(p) for p, _ in self._staged) > STAGED_BYTES:
+            best = min(self._staged, key=rank)
+            oldest = next(entry for entry in self._staged if entry is not best)
+            oldest[0].unlink(missing_ok=True)
+            self._staged.remove(oldest)
 
     def _fit_labels(self) -> tuple[np.ndarray, float, float]:
         labels = self.labels[self.fit_idx]
@@ -368,23 +417,9 @@ class Session:
             self._features[key] = self.runner.embed(np.asarray(pixels), backbone=backbone)
         return self._features[key]
 
-    def _probe(
-        self, backbone: str, size: int, train_px: np.ndarray, stack: np.ndarray, y: np.ndarray
-    ) -> np.ndarray:
-        from sklearn.linear_model import LogisticRegression, Ridge
-        from sklearn.preprocessing import StandardScaler
-
-        features = self._embed(backbone, size, train_px[self.fit_idx], "fit")
-        scaler = StandardScaler().fit(features)
-        held = scaler.transform(self._embed(backbone, size, stack, "stack"))
-        if self.task == "regression":
-            return np.asarray(Ridge(alpha=1.0).fit(scaler.transform(features), y).predict(held))
-        model = LogisticRegression(max_iter=3000).fit(scaler.transform(features), y)
-        return _widen(model.predict_proba(held), model.classes_, len(self.classes))
-
-    def _probe_head(
+    def _probe_fit(
         self, backbone: str, size: int, train_px: np.ndarray, y: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[Any, Any]:
         from sklearn.linear_model import LogisticRegression, Ridge
         from sklearn.preprocessing import StandardScaler
 
@@ -394,6 +429,26 @@ class Session:
             model: Any = Ridge(alpha=1.0).fit(scaler.transform(features), y)
         else:
             model = LogisticRegression(max_iter=3000).fit(scaler.transform(features), y)
+        return scaler, model
+
+    def _probe(
+        self, backbone: str, size: int, train_px: np.ndarray, stack: np.ndarray, y: np.ndarray
+    ) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
+        """The probe's outputs on `stack`, and the same probe folded into one linear
+        layer: what a saved probe puts on the stock backbone."""
+        scaler, model = self._probe_fit(backbone, size, train_px, y)
+        held = scaler.transform(self._embed(backbone, size, stack, "stack"))
+        folded = self._folded(scaler, model)
+        if self.task == "regression":
+            return np.asarray(model.predict(held)), folded
+        return _widen(model.predict_proba(held), model.classes_, len(self.classes)), folded
+
+    def _probe_head(
+        self, backbone: str, size: int, train_px: np.ndarray, y: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self._folded(*self._probe_fit(backbone, size, train_px, y))
+
+    def _folded(self, scaler: Any, model: Any) -> tuple[np.ndarray, np.ndarray]:
         weight = np.atleast_2d(model.coef_) / scaler.scale_
         bias = np.atleast_1d(model.intercept_) - weight @ scaler.mean_
         if self.task == "classification":
@@ -447,7 +502,8 @@ class Session:
         return [order[i : i + size] for i in range(0, len(order), size)]
 
     def as_input(self, pixels: np.ndarray) -> Any:
-        from iterate.targets.dl import _to_device, _torch
+        from iterate.targets.dl import _torch
+        from iterate.targets.net import _to_device
 
         torch = _torch()
         return _to_device(torch, np.asarray(pixels), torch.device(self.device))
@@ -504,7 +560,7 @@ class Session:
                 else "submit_probabilities(probs, model=NAME)"
             )
             raise TypeError(f"submit() takes what fit() returned; for your own model call {helper}")
-        self._write(fit._holdout_out, dict(fit.line))
+        self._write(fit._holdout_out, dict(fit.line), fit._network)
 
     def submit_probabilities(self, probs: Any, *, model: str) -> None:
         if self.task == "regression":
@@ -548,7 +604,26 @@ class Session:
         val = saved.get("val")
         return float(val) if isinstance(val, int | float) and math.isfinite(val) else None
 
-    def _write(self, out: np.ndarray, line: dict[str, Any]) -> None:
+    def _save_part(self, network: Network | None) -> tuple[Path | None, str]:
+        """The network of the fit being written, under a name nothing reads yet, or why
+        there is none. Any other error takes the part with it and goes on up, so the
+        earlier submission's files still describe each other."""
+        save = getattr(self.runner, "save", None)
+        if network is None or save is None:
+            return None, ""
+        if network.weights is not None and not network.weights.exists():
+            return None, "this fit has no weights file"
+        part = self.workdir / _PART
+        try:
+            save(network, part)
+        except BaseException as exc:
+            part.unlink(missing_ok=True)
+            if not isinstance(exc, OSError | RuntimeError):
+                raise
+            return None, f"its network file was not written: {exc}"
+        return part, ""
+
+    def _write(self, out: np.ndarray, line: dict[str, Any], network: Network | None = None) -> None:
         import pandas as pd
 
         from iterate.core.scoring import direction
@@ -564,6 +639,7 @@ class Session:
                     f"is not beaten by {float(new):.4f}"
                 )
                 return
+        part, unsaved = self._save_part(network)
         if self.task == "regression":
             predictions = pd.Series(np.asarray(out, dtype=np.float64))
             (self.workdir / codegen.PROBABILITIES_CSV).unlink(missing_ok=True)
@@ -578,11 +654,23 @@ class Session:
             )
         predictions.to_csv(self.workdir / codegen.PREDICTIONS_CSV, index=False, header=False)
         digest = hashlib.sha256((self.workdir / codegen.PREDICTIONS_CSV).read_bytes()).hexdigest()
+        # The network goes in after the predictions it made and before the recipe that
+        # names both: a cell stopped part way leaves a digest that does not match, which
+        # the host and `_kept_val` already read as no submission.
+        final = self.workdir / codegen.NETWORK_PT
+        saved: dict[str, str] = {}
+        if part is not None:
+            os.replace(part, final)
+            saved = {"model_sha256": _file_sha256(final)}
+        else:
+            final.unlink(missing_ok=True)
         (self.workdir / codegen.RECIPE_JSON).write_text(
-            json.dumps({**line, "predictions_sha256": digest}, default=str)
+            json.dumps({**line, "predictions_sha256": digest, **saved}, default=str)
         )
         print("SUBMITTED " + json.dumps(line, default=str))
         print(f"submitted {len(out)} predictions for the holdout")
+        if unsaved:
+            print(f"predictions were submitted; {unsaved}")
 
 
 # ─── what IPython keeps of the last cell ───
@@ -658,6 +746,18 @@ def _numbers(out: np.ndarray, rows: int, order: str) -> np.ndarray:
     if not np.isfinite(out).all():
         raise ValueError(f"{int((~np.isfinite(out)).sum())} of {rows} predictions are not finite")
     return out
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _widen(proba: np.ndarray, seen: np.ndarray, classes: int) -> np.ndarray:
