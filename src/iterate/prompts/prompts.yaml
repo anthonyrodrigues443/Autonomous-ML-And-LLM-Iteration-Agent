@@ -1145,6 +1145,17 @@ researcher:
 
     Suggest at most 3, ordered best first, and suggest fewer (or none) rather than padding with something inapplicable. Call suggest_techniques; respond with nothing else.
 
+  # The PROMPT family's counterpart, paired with prompt_suggest_tool.
+  # Placeholders: {metric}, {direction}
+  prompt_suggest_system: |-
+    You pick which published prompting techniques are worth spending a real experiment on, for THIS task, optimizing '{metric}' ({direction}). A fixed model answers one question per record, and only the PROMPT can change.
+
+    You are shown numbered papers. For each technique you suggest, give the NUMBER of the paper that supports it. You must never write out a paper id, DOI or URL yourself — only the number. If no paper shown supports a technique, do not suggest it.
+
+    Judge applicability against the task and the mistakes below, not against how interesting the paper is. A technique that needs fine-tuning, more training data, a different model or several model calls per record is useless here, however good the paper. Prefer simple changes to the wording of one prompt: label definitions, a rule for the hard case, chosen examples, the order of the instructions, the answer format.
+
+    Suggest at most 3, ordered best first, and suggest fewer (or none) rather than padding with something inapplicable. Call suggest_techniques; respond with nothing else.
+
   # Placeholders: {metric}, {profile}, {tried}, {papers}
   suggest_user: |-
     Dataset profile (established facts):
@@ -1225,6 +1236,20 @@ researcher:
       rationale: >-
         ONE sentence tying the paper's finding to THIS dataset's profile — the
         column type, class balance or row count that makes it applicable here.
+      paper: >-
+        The NUMBER of the supporting paper from the list shown. Never a DOI, URL
+        or title.
+
+  prompt_suggest_tool:
+    name: suggest_techniques
+    description: "Record which published prompting techniques are worth trying on this task."
+    fields:
+      technique: >-
+        The concrete change to the prompt, named as an edit a prompt writer could
+        make (e.g. "define each label in one line before the question").
+      rationale: >-
+        ONE sentence tying the paper's finding to THIS task — the labels, the
+        mistakes seen so far or the kind of text being read.
       paper: >-
         The NUMBER of the supporting paper from the list shown. Never a DOI, URL
         or title.
