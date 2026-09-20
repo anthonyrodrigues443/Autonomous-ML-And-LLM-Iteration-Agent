@@ -298,6 +298,7 @@ examples/flowers102/*.mat
 examples/flowers102/.extract/
 examples/eurosat/images/
 examples/eurosat/data.csv
+examples/eurosat/oom_check.csv
 examples/eurosat/*.zip
 examples/eurosat/.extract/
 examples/cyclone_wind/images/
