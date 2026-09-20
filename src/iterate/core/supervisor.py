@@ -1299,6 +1299,7 @@ def _recommissions_a_measured_lost_technique(
     if carried is None or carried.result is None or carried.result.metrics is None:
         return None
     best = carried.result.metrics.primary_value
+    minimize = carried.result.metrics.direction == "minimize"
     move = _technique_mentions(brief)
     for markers in _LEVER_MARKERS.values():
         for marker in markers:
@@ -1322,7 +1323,7 @@ def _recommissions_a_measured_lost_technique(
                 )
                 if marker in _technique_mentions(exp.hypothesis or "") or marker in submitted:
                     score = exp.result.metrics.primary_value
-                    if score < best:
+                    if (score > best) if minimize else (score < best):
                         return (
                             f"'{marker}' was already measured this run (holdout "
                             f"{score:.4f}, did not beat {best:.4f}); pick a different "

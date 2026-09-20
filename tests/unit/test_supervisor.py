@@ -975,6 +975,66 @@ def test_refining_the_winning_technique_is_not_blocked_by_the_lost_guard() -> No
     assert len(fake.calls) == 1
 
 
+def _rmse_experiment(desc: str, score: float, hypothesis: str = "h") -> Experiment:
+    return Experiment(
+        candidate=Candidate(description=desc, changes={"code": "x"}, rationale="r"),
+        target="t",
+        hypothesis=hypothesis,
+        status="completed",
+        result=ExperimentResult(
+            experiment_id=desc,
+            metrics=Metrics(values={"rmse": score}, primary="rmse", direction="minimize"),
+        ),
+    )
+
+
+_FOREST_HYPOTHESIS = "so far: x. next: model-swap: swap the estimator for RandomForestRegressor."
+_FOREST_REBRIEF = "next: model-swap: try a RandomForest with 500 trees."
+
+
+def test_on_a_lower_is_better_metric_a_technique_that_lost_is_refused() -> None:
+    from iterate.core.supervisor import _recommissions_a_measured_lost_technique
+
+    best = _rmse_experiment("best", 4.10)
+    lost = _rmse_experiment("rf", 4.90, _FOREST_HYPOTHESIS)
+    reason = _recommissions_a_measured_lost_technique(_FOREST_REBRIEF, [best, lost], best)
+    assert reason is not None
+    assert "4.9000" in reason
+    assert "4.1000" in reason
+
+
+def test_on_a_lower_is_better_metric_a_technique_that_won_is_not_called_a_loser() -> None:
+    from iterate.core.supervisor import _recommissions_a_measured_lost_technique
+
+    best = _rmse_experiment("best", 4.10)
+    earlier_win = _rmse_experiment("rf", 3.80, _FOREST_HYPOTHESIS)
+    assert (
+        _recommissions_a_measured_lost_technique(_FOREST_REBRIEF, [earlier_win, best], best) is None
+    )
+
+
+def test_an_rmse_run_refuses_a_rebrief_of_the_technique_that_lost() -> None:
+    best = _rmse_experiment("best", 4.10)
+    lost = _rmse_experiment("rf", 4.90, _FOREST_HYPOTHESIS)
+    fake = _FakeLLM(
+        [
+            _plan(False, "again", _FOREST_REBRIEF),
+            _plan(False, "enc", "next: categorical-encoding: frequency-encode the brand column."),
+        ]
+    )
+    baseline = ExperimentResult(
+        experiment_id="b",
+        metrics=Metrics(values={"rmse": 5.20}, primary="rmse", direction="minimize"),
+    )
+    d = Supervisor(fake, metric="rmse").decide(
+        data_summary="d", baseline=baseline, history=[best, lost], carried_best=best
+    )
+    assert d.title == "enc"
+    sent = "\n".join(m.content or "" for m in fake.calls[1])
+    assert "already measured this run" in sent
+    assert "4.9000" in sent
+
+
 def test_a_move_claiming_a_phantom_best_score_is_rejected() -> None:
     # run 13 i6: the move cited "previous best was 0.6552" — a validation-split
     # number that never existed on the holdout.
