@@ -484,7 +484,6 @@ class CodingAgent:
         # where the loop would take it for the winner's network.
         part = self._keep_model.with_name(self._keep_model.name + ".part")
         try:
-            self._keep_model.parent.mkdir(parents=True, exist_ok=True)
             part.write_bytes(saved)
             part.replace(self._keep_model)
         except OSError as exc:

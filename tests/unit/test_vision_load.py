@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from evals.config import REPO_ROOT
 from iterate import vision
@@ -189,12 +190,16 @@ def _model(
 ) -> tuple[vision.SavedModel, list[Any]]:
     seen: list[Any] = []
 
-    def pixels_of(images: Any, size: int) -> np.ndarray:
+    def pixels_of(images: Any, size: int, *, first: int = 0) -> np.ndarray:
         seen.append((list(images), size))
-        return np.zeros((len(images), 3, size, size), np.uint8)
+        return np.full((len(images), 3, size, size), first, np.uint16)
+
+    def predict(torch: Any, network: Any, pixels: np.ndarray, dev: Any, task: str) -> np.ndarray:
+        first = int(pixels[0, 0, 0, 0])
+        return outputs[first : first + len(pixels)]
 
     monkeypatch.setattr(net, "pixels_of", pixels_of)
-    monkeypatch.setattr(net, "_predict", lambda torch, network, pixels, dev, task: outputs)
+    monkeypatch.setattr(net, "_predict", predict)
     return vision.SavedModel(_file(**file)[net.SAVED_KEY], _Network(), "cpu"), seen
 
 
@@ -205,7 +210,7 @@ def test_predict_answers_in_class_names_of_the_labels_own_type(
     model, seen = _model(monkeypatch, torch_, probs, classes=[3, 7, 11])
     assert model.predict(["a.jpg", Path("b.jpg")]) == [11, 3]
     assert seen == [(["a.jpg", Path("b.jpg")], 64)]
-    assert model.predict_proba(["a.jpg", "b.jpg"]) is probs
+    assert np.array_equal(model.predict_proba(["a.jpg", "b.jpg"]), probs)
 
 
 def test_a_number_model_answers_in_the_labels_own_units(
@@ -226,6 +231,42 @@ def test_one_path_in_place_of_a_list_is_refused_with_the_fix(
     with pytest.raises(TypeError, match=r"predict\(\['a\.jpg'\]\)"):
         model.predict("a.jpg")
     assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("one", "fix"),
+    [
+        (b"a.jpg", r"predict\(\[b'a\.jpg'\]\)"),
+        (np.zeros((48, 60, 3), np.uint8), r"predict\(\[array\]\)"),
+        (np.zeros((48, 60), np.uint8), r"predict\(\[array\]\)"),
+        (Image.new("RGB", (60, 48)), r"predict\(\[image\]\)"),
+    ],
+)
+def test_one_image_in_place_of_a_list_is_refused_with_the_fix(
+    monkeypatch: pytest.MonkeyPatch, torch_: Any, one: Any, fix: str
+) -> None:
+    """`list()` of one HWC array is its pixel rows, and each would be predicted on."""
+    model, seen = _model(monkeypatch, torch_, np.zeros((1, 3)))
+    with pytest.raises(TypeError, match=fix):
+        model.predict(one)
+    assert seen == []
+
+
+def test_a_batch_array_is_one_image_per_row(monkeypatch: pytest.MonkeyPatch, torch_: Any) -> None:
+    model, seen = _model(monkeypatch, torch_, np.array([[0.1, 0.2, 0.7], [0.8, 0.1, 0.1]]))
+    assert model.predict(np.zeros((2, 48, 60, 3), np.uint8)) == ["emu", "cat"]
+    assert [len(images) for images, _ in seen] == [2]
+
+
+def test_a_long_list_is_decoded_one_batch_at_a_time(
+    monkeypatch: pytest.MonkeyPatch, torch_: Any
+) -> None:
+    count = 2 * net.EMBED_BATCH + 3
+    probs = np.eye(3)[np.arange(count) % 3]
+    model, seen = _model(monkeypatch, torch_, probs)
+    assert np.array_equal(model.predict_proba([f"{i}.jpg" for i in range(count)]), probs)
+    assert [len(images) for images, _ in seen] == [net.EMBED_BATCH, net.EMBED_BATCH, 3]
+    assert seen[2][0] == [f"{i}.jpg" for i in range(2 * net.EMBED_BATCH, count)]
 
 
 def test_no_images_is_no_predictions(monkeypatch: pytest.MonkeyPatch, torch_: Any) -> None:

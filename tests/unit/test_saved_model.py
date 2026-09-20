@@ -139,6 +139,53 @@ def test_another_trys_network_is_never_delivered_as_the_winners(
     assert not wanted.exists()
 
 
+def test_a_volume_that_refuses_chmod_still_delivers_the_latest_best(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refused(self: Path, mode: int, *, follow_symlinks: bool = True) -> None:
+        raise PermissionError(1, "Operation not permitted", str(self))
+
+    monkeypatch.setattr(type(tmp_path), "chmod", refused)
+    kept = tmp_path / "runs" / "r1" / BEST_MODEL
+    settle(_slot(tmp_path, b"first"), kept, is_best=True)
+    staged = _slot(tmp_path, b"second")
+    settle(staged, kept, is_best=True)
+    assert not staged.exists()
+    wanted = tmp_path / "models" / "flowers.pt"
+    assert deliver(kept, wanted, sha256=hashlib.sha256(b"second").hexdigest()) == wanted
+    assert wanted.read_bytes() == b"second"
+    assert not kept.exists()
+
+
+def test_a_read_only_network_is_removed_where_unlink_refuses_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows: unlink fails on a file with no write bit."""
+    unlink = type(tmp_path).unlink
+
+    def windows_unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.exists() and not _writable(self):
+            raise PermissionError(13, "Access is denied", str(self))
+        unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(type(tmp_path), "unlink", windows_unlink)
+    kept = tmp_path / "runs" / "r1" / BEST_MODEL
+    settle(_slot(tmp_path, b"first"), kept, is_best=True)
+    settle(_slot(tmp_path, b"second"), kept, is_best=True)
+    wanted = tmp_path / "models" / "flowers.pt"
+    assert deliver(kept, wanted) == wanted
+    assert wanted.read_bytes() == b"second"
+    assert not kept.exists()
+
+    settle(_slot(tmp_path, b"third"), kept, is_best=True)
+    assert deliver(kept, kept, sha256="not the winner's") is None
+    assert not kept.exists()
+
+    settle(_slot(tmp_path, b"fourth"), kept, is_best=True)
+    settle(_slot(tmp_path, None), kept, is_best=True)
+    assert not kept.exists()
+
+
 def test_the_host_side_loads_no_torch() -> None:
     script = (
         "import sys; import iterate.deliver.saved_model; "

@@ -4,6 +4,7 @@ folder keeps only the best experiment's. No torch here; `iterate.vision` opens t
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import shutil
@@ -25,7 +26,7 @@ def settle(staged: Path, best: Path, *, is_best: bool) -> None:
     elif staged.exists():
         _place(staged, best)
     else:
-        best.unlink(missing_ok=True)
+        _remove(best)
 
 
 def deliver(kept: Path, wanted: Path, *, sha256: str | None = None) -> Path | None:
@@ -36,7 +37,7 @@ def deliver(kept: Path, wanted: Path, *, sha256: str | None = None) -> Path | No
     if not kept.exists():
         return None
     if sha256 is not None and _sha256(kept) != sha256:
-        kept.unlink()
+        _remove(kept)
         return None
     if not (wanted.exists() and wanted.samefile(kept)):
         _place(kept, wanted)
@@ -52,14 +53,26 @@ def _place(src: Path, dst: Path) -> None:
         shutil.copyfile(src, part)
         if dst.exists():
             # Windows will not replace a read-only file.
-            dst.chmod(_READ_ONLY | stat.S_IWUSR)
+            _chmod(dst, _READ_ONLY | stat.S_IWUSR)
         os.replace(part, dst)
     finally:
         part.unlink(missing_ok=True)
     # Read-only: a re-run notebook cell that writes best_model.pt fails loudly instead
     # of replacing the scored file.
-    dst.chmod(_READ_ONLY)
-    src.unlink()
+    _chmod(dst, _READ_ONLY)
+    _remove(src)
+
+
+def _remove(path: Path) -> None:
+    # Windows will not unlink a read-only file.
+    _chmod(path, _READ_ONLY | stat.S_IWUSR)
+    path.unlink(missing_ok=True)
+
+
+def _chmod(path: Path, mode: int) -> None:
+    # Some volumes refuse chmod, and the mode is never worth the network.
+    with contextlib.suppress(OSError):
+        path.chmod(mode)
 
 
 def _sha256(path: Path) -> str:

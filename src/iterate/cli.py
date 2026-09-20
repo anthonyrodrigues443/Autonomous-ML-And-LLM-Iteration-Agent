@@ -20,6 +20,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -1130,8 +1131,6 @@ def run(
 
             controller = _RunController()
             if not use_tui:
-                import threading
-
                 # Replies carry user/LLM text with brackets (code, lists) — print
                 # them literally, never through rich markup (which would eat
                 # "df[cols]" or raise on a stray closing tag).
@@ -1239,6 +1238,10 @@ def run(
             if prepared is not None
             else None
         )
+        # A hard quit in the TUI leaves the loop thread running while this thread deletes
+        # the slot and delivers the winner.
+        slot_lock = threading.Lock()
+        slot_open = [True]
 
         def make_coder() -> CodingAgent:
             kernel: StatefulKernel = (
@@ -1305,7 +1308,9 @@ def run(
             if staged_model is not None:
                 kept = Path(settings.iterate_runs_dir) / run_id / saved_model.BEST_MODEL
                 try:
-                    saved_model.settle(staged_model, kept, is_best=is_best)
+                    with slot_lock:
+                        if slot_open[0]:
+                            saved_model.settle(staged_model, kept, is_best=is_best)
                 except OSError as exc:
                     logging.getLogger(__name__).warning(
                         "the saved network did not reach %s: %s", kept, exc
@@ -1371,7 +1376,9 @@ def run(
                 result = _run_loop()
         finally:
             if staged_model is not None:
-                shutil.rmtree(staged_model.parent, ignore_errors=True)
+                with slot_lock:
+                    slot_open[0] = False
+                    shutil.rmtree(staged_model.parent, ignore_errors=True)
     else:
         # ─── Spec path (allow-listed estimators) + the baseline precedence ─────
         memory: Memory = SqliteMemory(resolved_memory_path)  # main thread creates + uses

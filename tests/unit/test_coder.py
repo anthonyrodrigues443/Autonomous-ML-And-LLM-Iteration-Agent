@@ -1730,6 +1730,7 @@ def test_the_network_recipe_json_names_is_copied_out_before_the_kernel_closes(
     tmp_path: Path,
 ) -> None:
     slot = tmp_path / "slot" / "best_model.pt"
+    slot.parent.mkdir()
     digest = hashlib.sha256(b"weights").hexdigest()
     _network_session(tmp_path, recipe={"model_sha256": digest}, network=b"weights", keep=slot)
     assert slot.read_bytes() == b"weights"
@@ -1749,8 +1750,17 @@ def test_a_network_the_recipe_does_not_vouch_for_is_never_copied(
     tmp_path: Path, recipe: dict[str, Any], network: bytes | None
 ) -> None:
     slot = tmp_path / "slot" / "best_model.pt"
+    slot.parent.mkdir()
     _network_session(tmp_path, recipe=recipe, network=network, keep=slot)
     assert not slot.exists()
+
+
+def test_a_slot_whose_folder_is_gone_is_not_recreated(tmp_path: Path) -> None:
+    """A hard quit deletes the slot folder while the loop thread is still running."""
+    slot = tmp_path / "gone" / "best_model.pt"
+    digest = hashlib.sha256(b"weights").hexdigest()
+    _network_session(tmp_path, recipe={"model_sha256": digest}, network=b"weights", keep=slot)
+    assert not slot.parent.exists()
 
 
 def test_the_slot_is_cleared_when_a_session_starts(tmp_path: Path) -> None:
@@ -1767,6 +1777,7 @@ def test_a_copy_that_fails_costs_the_network_and_not_the_score(
     import pathlib
 
     slot = tmp_path / "slot" / "best_model.pt"
+    slot.parent.mkdir()
     ds = _dataset(tmp_path)
     predictions = b"0\n" * ds.n_test
     recorded = {

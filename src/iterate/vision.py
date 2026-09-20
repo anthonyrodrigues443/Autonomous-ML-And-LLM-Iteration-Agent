@@ -54,18 +54,35 @@ class SavedModel:
 
     def _outputs(self, images: Sequence[Any]) -> np.ndarray:
         import numpy as np
+        from PIL import Image
 
         from iterate.targets import net
 
-        if isinstance(images, str | Path):
-            raise TypeError(f"predict takes a list of images: predict([{str(images)!r}])")
+        if isinstance(images, str | bytes | Path):
+            one = images if isinstance(images, bytes) else str(images)
+            raise TypeError(f"predict takes a list of images: predict([{one!r}])")
+        # An (N, H, W) grey stack cannot be told from one HWC image: pass list(stack).
+        if isinstance(images, np.ndarray) and images.ndim < 4:
+            raise TypeError("predict takes a list of images: predict([array])")
+        if isinstance(images, Image.Image):
+            raise TypeError("predict takes a list of images: predict([image])")
         items = list(images)
         if not items:
             shape = (0,) if self.task == "regression" else (0, int(self.meta["outputs"]))
             return np.zeros(shape, dtype=np.float64)
         torch = net.torch_at_least()
-        pixels = net.pixels_of(items, int(self.meta["image_size"]))
-        return net._predict(torch, self._network, pixels, torch.device(self.device), self.task)
+        size, device = int(self.meta["image_size"]), torch.device(self.device)
+        parts = [
+            net._predict(
+                torch,
+                self._network,
+                net.pixels_of(items[start : start + net.EMBED_BATCH], size, first=start),
+                device,
+                self.task,
+            )
+            for start in range(0, len(items), net.EMBED_BATCH)
+        ]
+        return np.concatenate(parts)
 
     def __repr__(self) -> str:
         what = "a number" if self.task == "regression" else f"{len(self.classes)} classes"

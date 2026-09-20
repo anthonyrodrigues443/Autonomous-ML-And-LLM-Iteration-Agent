@@ -87,6 +87,21 @@ def test_an_unreadable_image_raises_where_decode_leaves_a_blank(tmp_path: Path) 
         net.pixels_of([str(tmp_path / "absent.png")], 32)
 
 
+def test_a_sliver_is_refused_before_it_is_resized(tmp_path: Path) -> None:
+    """The short side goes to image_size first, so a 2 x 5000 image asks for gigabytes."""
+    fine = np.zeros((100, 100 * net.MAX_ASPECT, 3), np.uint8)
+    assert net.pixels_of([fine], 32).shape == (1, 3, 32, 32)
+    sliver = np.zeros((2, 5000, 3), np.uint8)
+    with pytest.raises(ValueError, match=r"image 1 is 5000 x 2"):
+        net.pixels_of([fine, sliver], 32)
+    with pytest.raises(ValueError, match=r"image 257 is 5000 x 2"):
+        net.pixels_of([fine, Image.fromarray(sliver)], 32, first=256)
+    path = tmp_path / "sliver.png"
+    Image.fromarray(sliver).save(path)
+    with pytest.raises(ValueError, match=r"sliver\.png is 5000 x 2"):
+        net.pixels_of([path], 32)
+
+
 # ─── the one builder ─────────────────────────────────────────────────────────
 
 
@@ -229,6 +244,25 @@ def test_numpy_class_names_and_label_statistics_are_saved_as_plain_values() -> N
     assert number["classes"] is None
     assert [type(number[k]) for k in ("label_centre", "label_spread")] == [float, float]
     assert net.checked_meta(_saved(number), "net.pt") is number
+
+
+def test_recipe_values_that_came_from_numpy_are_saved_as_plain_values() -> None:
+    """`np.float64` is a float, so a recipe takes one, and `weights_only=True` will not
+    open a file that holds one."""
+    recipe = asdict(
+        Recipe(
+            backbone="simple_cnn",
+            unfreeze="all",
+            epochs=2,
+            image_size=64,
+            lr=np.logspace(-4, -2, 3)[1],
+            label_smoothing=np.float64(0.1),
+        )
+    )
+    meta = net.saved_meta(_TORCH, recipe, task="classification", classes=["a", "b"], outputs=2)
+    assert [type(meta["recipe"][k]) for k in ("lr", "label_smoothing")] == [float, float]
+    assert meta["recipe"] == recipe
+    assert net.checked_meta(_saved(meta), "net.pt") is meta
 
 
 def test_a_file_a_run_saved_passes_every_check() -> None:

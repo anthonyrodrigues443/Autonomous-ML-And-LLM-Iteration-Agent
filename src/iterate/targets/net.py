@@ -24,6 +24,7 @@ SAVED_KEY = "iterate_model"
 MIN_TORCH = "2.6"
 SIZE_RANGE = (32, 384)
 EMBED_BATCH = 256
+MAX_ASPECT = 64
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
 _RESIZE = "short side to image_size, bilinear, then the centre square"
@@ -179,21 +180,34 @@ def _fitted(rgb: Any, size: int) -> np.ndarray:
     return np.asarray(rgb.crop((left, top, left + size, top + size))).transpose(2, 0, 1)
 
 
-def pixels_of(images: Sequence[Any], size: int) -> np.ndarray:
+def pixels_of(images: Sequence[Any], size: int, *, first: int = 0) -> np.ndarray:
     """`decode` for a caller that must not predict on a blank: a path, a PIL image or an
-    HWC uint8 array, and one that cannot be read raises."""
+    HWC uint8 array, and one that cannot be read raises. `first` is where `images` starts
+    in the caller's own list, for naming one in a refusal."""
     from PIL import Image
 
     out = np.zeros((len(images), 3, size, size), dtype=np.uint8)
     for i, item in enumerate(images):
         if isinstance(item, np.ndarray):
-            out[i] = _fitted(_as_rgb(Image.fromarray(item)), size)
+            im = _not_a_sliver(Image.fromarray(item), f"image {first + i}")
+            out[i] = _fitted(_as_rgb(im), size)
         elif isinstance(item, Image.Image):
-            out[i] = _fitted(_as_rgb(item), size)
+            out[i] = _fitted(_as_rgb(_not_a_sliver(item, f"image {first + i}")), size)
         else:
             with Image.open(item) as im:
-                out[i] = _fitted(_as_rgb(im), size)
+                out[i] = _fitted(_as_rgb(_not_a_sliver(im, str(item))), size)
     return out
+
+
+def _not_a_sliver(im: Any, name: str) -> Any:
+    # The short side is resized to image_size first, so the long side of a sliver
+    # becomes an array far larger than the file that held it.
+    if max(im.size) > MAX_ASPECT * min(im.size):
+        raise ValueError(
+            f"{name} is {im.width} x {im.height}: one side is more than {MAX_ASPECT} times "
+            "the other, which is not a picture a network can read"
+        )
+    return im
 
 
 def saved_meta(
@@ -217,7 +231,7 @@ def saved_meta(
         "task": task,
         "classes": [c.item() if hasattr(c, "item") else c for c in classes] or None,
         "outputs": int(outputs),
-        "recipe": dict(recipe),
+        "recipe": {k: v.item() if hasattr(v, "item") else v for k, v in recipe.items()},
         "image_size": int(recipe["image_size"]),
         "resize": _RESIZE,
         "mean": [float(v) for v in _MEAN.reshape(3)],
