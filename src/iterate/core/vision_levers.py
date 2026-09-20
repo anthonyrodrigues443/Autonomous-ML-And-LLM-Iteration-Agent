@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from importlib import resources
 from typing import TYPE_CHECKING, Any
 
+from iterate.targets import layers as arch
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
@@ -425,10 +427,19 @@ def describe(recipe: dict[str, Any] | None) -> str:
             if k in recipe
         ]
         return ", ".join(bits)
-    depth = {"none": "linear probe", "head": "head only", "all": "all layers"}.get(
-        str(recipe.get("unfreeze")), ""
-    )
+    depth = {
+        "none": "linear probe",
+        "head": "head only",
+        "last_block": "last stage and head",
+        "all": "all layers",
+    }.get(str(recipe.get("unfreeze")), "")
     bits = [f"{recipe.get('backbone')} {recipe.get('image_size')}px {depth}".strip()]
+    if recipe.get("layers"):
+        bits.append(f"layers {arch.text(recipe['layers'])}")
+    if recipe.get("drop_stages"):
+        bits.append(f"{recipe['drop_stages']} stages dropped")
+    if recipe.get("head"):
+        bits.append(f"head {arch.text(recipe['head'])}")
     if recipe.get("unfreeze") != "none":
         bits.append(f"{recipe.get('epochs')} epochs")
     bits.append(f"augment {recipe.get('augment')}")

@@ -28,10 +28,14 @@ from iterate.adapters.data.images import prepare_images
 from iterate.adapters.data.tabular import load_csv
 from iterate.core import codegen
 from iterate.targets import dl, net
+from iterate.targets import layers as arch
 from iterate.targets.dl import DLModelTarget, FitJob, Network, Recipe, RecipeError, TorchRunner
 from tests.unit.image_fixtures import vision_session
 
 _REAL_BUILD = dl._build
+# A stack with one of each layer, small enough to build in a moment.
+STACK: list[Any] = [("conv", 32), ("pool",), ("conv", 64), ("pool",), ("dropout", 0.3)]
+HEAD: list[Any] = [("linear", 64), ("dropout", 0.5)]
 
 # Every shape of recipe `fit()` accepts. A saved network of each one has to open again,
 # and test_net fails when a backbone, an unfreeze value or a recipe field is not here.
@@ -44,6 +48,29 @@ ROUND_TRIP_SHAPES: list[dict[str, Any]] = [
     {"backbone": "simple_cnn", "unfreeze": "all", "epochs": 2, "task": "regression"},
     {"backbone": "resnet18", "unfreeze": "none", "epochs": 0, "task": "regression"},
     {"backbone": "resnet18", "unfreeze": "all", "epochs": 2, "task": "regression"},
+    {
+        "backbone": "layers_net",
+        "layers": STACK,
+        "unfreeze": "all",
+        "epochs": 2,
+        "task": "classification",
+    },
+    {
+        "backbone": "resnet18",
+        "head": HEAD,
+        "unfreeze": "head",
+        "epochs": 2,
+        "task": "classification",
+    },
+    {
+        "backbone": "resnet50",
+        "head": HEAD,
+        "drop_stages": 1,
+        "unfreeze": "head",
+        "epochs": 2,
+        "task": "regression",
+    },
+    {"backbone": "resnet18", "unfreeze": "last_block", "epochs": 2, "task": "classification"},
 ]
 
 
@@ -482,10 +509,194 @@ def every_recipe_shape_round_trips() -> dict[str, Any]:
             TorchRunner("cpu").save(network, path)
             _, opened = _reopened(torch, path)
             again = net._predict(torch, opened, pixels, cpu, task)
-            gaps[f"{recipe.backbone}/{recipe.unfreeze}/{task}"] = float(
+            gaps[f"{dl.recipe_name(recipe)}/{recipe.unfreeze}/{task}"] = float(
                 np.abs(again - expected).max()
             )
         return {"gaps": gaps, "downloaded": sorted(p.name for p in hub.rglob("*"))}
+
+
+def spec_matches_simple_cnn() -> dict[str, Any]:
+    """The stack simple_cnn is: the same modules, the same weights, the same seed. The
+    baseline is not routed through the builder, so this is what says they agree."""
+    torch = dl._torch()
+    torch.manual_seed(11)
+    stock = net._simple_cnn(torch, 7)
+    torch.manual_seed(11)
+    built = arch.build_scratch(torch, arch.SIMPLE_CNN, 7)
+    a, b = stock.state_dict(), built.state_dict()
+    return {
+        "text": arch.text(arch.SIMPLE_CNN),
+        "keys": list(a) == list(b),
+        "same": all(bool(torch.equal(a[k], b[k])) for k in a),
+        "modules": [type(m).__name__ for m in built.modules()]
+        == [type(m).__name__ for m in stock.modules()],
+    }
+
+
+def layers_shapes_and_counts() -> dict[str, Any]:
+    """Real parameters against the pure-Python counter, and the output shape at two
+    image sizes."""
+    torch = dl._torch()
+    out: dict[str, Any] = {}
+    specs = {
+        "simple_cnn": arch.SIMPLE_CNN,
+        "stack": STACK,
+        "strided": [("conv", 16, 5, 2), ("pool", "avg"), ("conv", 32), ("linear", 128)],
+    }
+    for name, raw in specs.items():
+        spec = arch.parse(raw)
+        assert spec is not None
+        for outputs in (1, 10):
+            model = arch.build_scratch(torch, spec, outputs)
+            real = sum(p.numel() for p in model.parameters())
+            out[f"{name}/{outputs}"] = [real, arch.count_weights(spec, outputs)]
+    stack = arch.parse(STACK)
+    assert stack is not None
+    model = arch.build_scratch(torch, stack, 10).eval()
+    with torch.no_grad():
+        out["shapes"] = [list(model(torch.zeros(2, 3, s, s)).shape) for s in (32, 64)]
+    return out
+
+
+def layers_fit() -> dict[str, Any]:
+    """A whole network from a stack, trained on the CPU. Four stride-2 convs take 16px
+    down to a 1px map, and the 25-row set leaves a last batch of one, which batch norm
+    in train mode cannot take at that size: without the skip this fit raises."""
+    dl._build = _REAL_BUILD
+    train, labels = _data(9)
+    holdout, _ = _data(3)
+    recipe = Recipe(
+        backbone="layers_net",
+        layers=[("conv", 16, 3, 2)] * 4,
+        unfreeze="all",
+        epochs=2,
+        batch_size=8,
+        image_size=16,
+    )
+    log: list[str] = []
+    job = FitJob(
+        train[:25], holdout, labels[:25], recipe, 3, None, time.perf_counter() + 240, log.append
+    )
+    report = TorchRunner("cpu").fit(job)
+    return {
+        "rows": len(train[:25]),
+        "shape": list(report.outputs.shape),
+        "sums": bool(np.allclose(report.outputs.sum(axis=1), 1.0)),
+        "epochs": [report.epochs_planned, report.epochs_run],
+        "lines": len(log),
+    }
+
+
+def drop_stage_widths() -> dict[str, Any]:
+    """What the head sees after 0, 1 and 2 stages come off, on every backbone, with no
+    weights downloaded."""
+    torch = dl._torch()
+    dl._build = _REAL_BUILD
+    out: dict[str, Any] = {}
+    for backbone in net.BACKBONES:
+        for dropped in (0, 1, 2):
+            recipe = Recipe(
+                backbone=backbone,
+                unfreeze="head",
+                epochs=2,
+                drop_stages=dropped,
+                head=HEAD,
+                image_size=32,
+            )
+            torch.manual_seed(0)
+            model = net.model_for(torch, asdict(recipe), 5, None, pretrained=False).eval()
+            head = model.get_submodule(net.BACKBONES[backbone][1])
+            with torch.no_grad():
+                shape = list(model(torch.zeros(2, 3, 64, 64)).shape)
+            out[f"{backbone}/{dropped}"] = {
+                "width": int(head[0].in_features),
+                "table": net.STAGES[backbone][len(net.STAGES[backbone]) - dropped - 1][1],
+                "shape": shape,
+            }
+    return out
+
+
+def last_block_trains() -> dict[str, Any]:
+    """Only the last stage that is left, plus the head; and every frozen batch-norm layer
+    keeps its statistics."""
+    torch = dl._torch()
+    dl._build = _REAL_BUILD
+    out: dict[str, Any] = {}
+    for backbone in net.BACKBONES:
+        for dropped in (0, 1):
+            recipe = Recipe(
+                backbone=backbone,
+                unfreeze="last_block",
+                epochs=2,
+                drop_stages=dropped,
+                image_size=32,
+            )
+            torch.manual_seed(0)
+            model = net.model_for(torch, asdict(recipe), 5, None, pretrained=False)
+            dl._optimiser(torch, model, recipe)
+            dl._train_mode(torch, model, recipe)
+            norms = [
+                m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)
+            ]
+            out[f"{backbone}/{dropped}"] = {
+                "prefixes": list(dl._trainable(recipe) or ()),
+                "groups": sorted(
+                    {n.split(".")[0] for n, p in model.named_parameters() if p.requires_grad}
+                ),
+                "training_norms": [sum(m.training for m in norms), len(norms)],
+            }
+    return out
+
+
+def dropout_head_keeps_the_probe() -> dict[str, Any]:
+    """A head that adds no linear layer still ends in the probe's own weights."""
+    torch = dl._torch()
+    dl._build = _REAL_BUILD
+    rng = np.random.default_rng(5)
+    head = (rng.normal(size=(3, 512)).astype(np.float32), rng.normal(size=3).astype(np.float32))
+    recipe = Recipe(
+        backbone="resnet18",
+        unfreeze="head",
+        epochs=2,
+        head=[("dropout", 0.5)],
+        head_init="probe",
+        image_size=32,
+    )
+    torch.manual_seed(0)
+    model = net.model_for(torch, asdict(recipe), 3, head, pretrained=False)
+    final = model.fc[-1]
+    return {
+        "modules": [type(m).__name__ for m in model.fc],
+        "weight": bool(np.array_equal(final.weight.detach().numpy(), head[0])),
+        "bias": bool(np.array_equal(final.bias.detach().numpy(), head[1])),
+    }
+
+
+def golden_state_dict_keys() -> dict[str, Any]:
+    """The names a saved file carries. A builder that moves one cannot open yesterday's
+    file, so this check failing means SAVED_FORMAT has to go up with it."""
+    torch = dl._torch()
+    dl._build = _REAL_BUILD
+    zero = Recipe(
+        backbone="layers_net",
+        layers=[*STACK, ("linear", 128)],
+        unfreeze="all",
+        epochs=2,
+        image_size=32,
+    )
+    topped = Recipe(
+        backbone="resnet18", unfreeze="head", epochs=2, drop_stages=1, head=HEAD, image_size=32
+    )
+    torch.manual_seed(0)
+    keys = list(net.model_for(torch, asdict(zero), 4, None, pretrained=False).state_dict())
+    torch.manual_seed(0)
+    topped_keys = list(net.model_for(torch, asdict(topped), 4, None, pretrained=False).state_dict())
+    return {
+        "format": net.SAVED_FORMAT,
+        "layers": keys,
+        "head": [k for k in topped_keys if k.startswith("fc.")],
+        "dropped": [k for k in topped_keys if k.startswith("layer4.")],
+    }
 
 
 CHECKS = {
@@ -510,6 +721,13 @@ CHECKS = {
         saved_regression_round_trip,
         saved_simple_cnn_round_trip,
         every_recipe_shape_round_trips,
+        spec_matches_simple_cnn,
+        layers_shapes_and_counts,
+        layers_fit,
+        drop_stage_widths,
+        last_block_trains,
+        dropout_head_keeps_the_probe,
+        golden_state_dict_keys,
     )
 }
 

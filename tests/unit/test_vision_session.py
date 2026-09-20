@@ -117,6 +117,80 @@ def test_epochs_and_unfreeze_follow_each_other() -> None:
     assert _merge(tuned, {"epochs": 0}).unfreeze == "none"
 
 
+def test_a_stack_alone_means_a_network_of_its_own() -> None:
+    tuned = Recipe(backbone="resnet18", unfreeze="all", epochs=3, image_size=160)
+    built = _merge(tuned, {"layers": "conv(32) pool conv(64) pool"})
+    assert built.backbone == "layers_net"
+    # A network from zero starts from the run's own baseline, so it gets 20 epochs.
+    assert (built.epochs, built.image_size, built.augment) == (20, 64, "none")
+    assert built.layers == (("conv", 32), ("pool",), ("conv", 64), ("pool",))
+
+
+def test_naming_another_backbone_drops_the_carried_stack() -> None:
+    stack = Recipe(
+        backbone="layers_net", unfreeze="all", epochs=20, layers="conv(32) pool", image_size=64
+    )
+    assert _merge(stack, {"backbone": "resnet18"}).layers is None
+    assert _merge(stack, {"backbone": "simple_cnn"}).layers is None
+    assert _merge(stack, {"epochs": 8}).layers == (("conv", 32), ("pool",))
+    again = _merge(stack, {"backbone": "layers_net", "layers": "conv(64) pool"})
+    assert again.layers == (("conv", 64), ("pool",))
+
+
+def test_a_head_on_a_carried_probe_becomes_a_head_only_fit(capsys: Any) -> None:
+    probe = Recipe(backbone="resnet18", unfreeze="none", epochs=0, head_init="probe")
+    built = _merge(probe, {"head": "linear(64) dropout(0.5)"})
+    assert (built.unfreeze, built.epochs, built.head_init) == ("head", 3, "random")
+    assert built.head == (("linear", 64), ("dropout", 0.5))
+    assert "the carried recipe was a linear probe" in capsys.readouterr().out
+
+
+def test_asking_for_the_probe_back_drops_the_carried_head(capsys: Any) -> None:
+    topped = Recipe(
+        backbone="resnet18", unfreeze="head", epochs=3, head="linear(64)", drop_stages=1
+    )
+    built = _merge(topped, {"unfreeze": "none"})
+    assert (built.head, built.drop_stages, built.epochs) == (None, 0, 0)
+    assert "the carried head was dropped" in capsys.readouterr().out
+
+
+def test_epochs_zero_asks_for_the_probe_back_the_same_way(capsys: Any) -> None:
+    """`fit(epochs=0)` is the other spelling of the probe, so it drops the carried head
+    too, rather than earning a refusal for a head the cell never typed."""
+    topped = Recipe(backbone="resnet18", unfreeze="head", epochs=4, head="linear(512)")
+    built = _merge(topped, {"epochs": 0})
+    assert (built.unfreeze, built.epochs, built.head) == ("none", 0, None)
+    dropped = Recipe(backbone="resnet50", unfreeze="head", epochs=4, drop_stages=1)
+    assert _merge(dropped, {"epochs": 0}).drop_stages == 0
+    assert capsys.readouterr().out.count("the carried head was dropped") == 2
+
+
+def test_a_head_the_run_never_asked_for_leaves_the_probe_head_alone() -> None:
+    """head_init is only reset when this fit is the one that sets a head."""
+    probe_started = Recipe(
+        backbone="resnet18", unfreeze="head", epochs=3, head_init="probe", image_size=64
+    )
+    assert _merge(probe_started, {"epochs": 6}).head_init == "probe"
+    assert _merge(probe_started, {"head": "dropout(0.5)"}).head_init == "random"
+    kept = _merge(probe_started, {"head": "dropout(0.5)", "head_init": "probe"})
+    assert kept.head_init == "probe"
+
+
+def test_dropping_stages_says_what_it_removed(tmp_path: Path, capsys: Any) -> None:
+    """A stage is a large group of pretrained blocks, not a layer, so a fit that drops
+    one says so rather than quietly training on a third of the backbone."""
+    session = _session(tmp_path, per_class=10)
+    session.fit(backbone="resnet50", unfreeze="head", epochs=2, drop_stages=1)
+    out = capsys.readouterr().out
+    assert (
+        "drop_stages=1 removed layer4 from resnet50, with their pretrained weights; "
+        "the head now sees 1024 numbers per image instead of 2048" in out
+    )
+    session.fit(backbone="resnet50", unfreeze="head", epochs=2, drop_stages=0)
+    assert "drop_stages=" not in capsys.readouterr().out
+    assert dl.dropped_line(Recipe(backbone="simple_cnn", unfreeze="all", epochs=3)) == ""
+
+
 def test_a_recipe_the_runner_refuses_is_still_refused() -> None:
     with pytest.raises(RecipeError, match="unknown recipe keys"):
         _merge(BASELINE, {"dropout": 0.5})
@@ -229,7 +303,43 @@ def test_the_fit_line_carries_the_epochs_planned_and_run_and_a_plain_score(
     assert (line["epochs_planned"], line["epochs_run"]) == (4, 3)
     assert 0.0 <= line["val_accuracy"] <= 1.0
     assert line["val"] == pytest.approx(line["val_accuracy"], abs=1e-4)  # accuracy here
-    assert set(asdict(session.best)) <= set(line)
+    assert set(dl.printed(session.best)) <= set(line)
+
+
+def test_a_fit_that_sets_no_layer_field_prints_the_keys_it_always_printed(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """The lever gate matches SUBMITTED to FIT by equality, and a recorded history has
+    to read the same on this version as on the one before it."""
+    import inspect
+
+    session = _session(tmp_path, per_class=10)
+    session.submit(session.fit(backbone="resnet18", epochs=2))
+    out = capsys.readouterr().out
+    fit, submitted = _printed_in(out, "FIT")[-1], _printed_in(out, "SUBMITTED")[-1]
+    assert fit == submitted
+    assert not {"layers", "head", "drop_stages"} & set(fit)
+    assert not {"layers", "head", "drop_stages"} & set(fit["from"])
+    recorded = json.loads((session.workdir / codegen.RECIPE_JSON).read_text())
+    assert not {"layers", "head", "drop_stages"} & set(recorded)
+    # The preamble prints the recipe a third time and imports torch, so it cannot be
+    # called here; the line itself is what the contract holds.
+    opening = inspect.getsource(vision_session.start).split('"recipe now: "')[1]
+    assert "printed(session.best)" in opening.splitlines()[0]
+
+
+def test_a_fit_on_a_stack_names_it_in_the_line_and_in_the_words(
+    tmp_path: Path, capsys: Any
+) -> None:
+    session = _session(tmp_path, per_class=10)
+    session.fit(layers=[("conv", 32), ("pool",), ("conv", 64), ("pool",)], epochs=2)
+    out = capsys.readouterr().out
+    line = _printed_in(out, "FIT")[-1]
+    assert line["backbone"] == "layers_net"
+    assert line["layers"] == "conv(32) pool conv(64) pool"
+    assert "head" not in line
+    assert "drop_stages" not in line
+    assert "(layers conv(32) pool conv(64) pool 32px," in out
 
 
 def test_a_number_run_prints_r2_beside_its_own_metric(tmp_path: Path, capsys: Any) -> None:

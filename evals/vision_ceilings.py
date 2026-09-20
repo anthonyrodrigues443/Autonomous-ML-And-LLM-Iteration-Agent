@@ -30,6 +30,7 @@ from iterate.adapters.data.images import prepare_images
 from iterate.core.scoring import direction as metric_direction
 from iterate.core.scoring import task_for_metric
 from iterate.schemas.experiment import Candidate
+from iterate.targets import layers as arch
 from iterate.targets.dl import BASELINE, BASELINE_SIZE, RECIPE_JSON, SCRATCH, DLModelTarget, Recipe
 
 if TYPE_CHECKING:
@@ -98,12 +99,21 @@ def label(recipe: Recipe) -> str:
     if recipe.unfreeze == "none":
         return f"probe {recipe.backbone} {recipe.image_size}px"
     scratch = recipe.backbone in SCRATCH
-    kind = "from zero" if scratch else "head" if recipe.unfreeze == "head" else "fine-tune"
+    kind = (
+        "from zero"
+        if scratch
+        else {"head": "head", "last_block": "last-block"}.get(recipe.unfreeze, "fine-tune")
+    )
     reference = BASELINE if scratch else _BENCH
     parts = [f"{kind} {recipe.backbone} {recipe.image_size}px {recipe.epochs}ep"]
     for name in ("optimizer", "lr", "schedule", "augment", "label_smoothing", "head_init"):
         if (value := getattr(recipe, name)) != getattr(reference, name):
             parts.append(f"{name}={value}")
+    if recipe.drop_stages:
+        parts.append(f"drop_stages={recipe.drop_stages}")
+    for name in ("layers", "head"):
+        if (spec := getattr(recipe, name)) is not None:
+            parts.append(f"{name}={arch.text(spec)}")
     return " ".join(parts)
 
 

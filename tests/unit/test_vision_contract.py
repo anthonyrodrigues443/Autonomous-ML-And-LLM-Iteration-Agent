@@ -205,3 +205,33 @@ def test_an_explicit_size_on_the_first_fine_tune_reads_as_a_move(
     assert vl.tries(cells)[-1].recipe["image_size"] == 32
     assert vl.tries(cells)[-1].start["image_size"] == 64
     assert vl.moved_levers(cells, carried) == ["backbone", "image-size"]
+
+
+def test_a_repair_line_is_a_fit_the_session_takes_back() -> None:
+    """A repair hands the coder a `fit(...)` to run, so what it writes has to survive the
+    merge that fit does. It writes backbone, image_size and epochs only: a layers net's
+    line loses the stack and is refused, which is why no prompt key offers layers= yet.
+    The day `fit_call` learns the layer settings, this check goes red and says so."""
+    from iterate.core.vision_session import merge
+    from iterate.targets.dl import BASELINE, Recipe, RecipeError
+
+    vl = _levers()
+
+    def refit(line: str, best: Recipe) -> Recipe:
+        changes: dict[str, Any] = {}
+        eval(line, {"fit": lambda **kw: changes.update(kw)})
+        return merge(best, changes, "classification", baseline=BASELINE)[0]
+
+    tuned = Recipe(backbone="resnet18", unfreeze="all", epochs=5, image_size=224)
+    again = refit(vl.fit_call(vars(tuned), batch_size=32), tuned)
+    assert (again.backbone, again.image_size, again.batch_size) == ("resnet18", 224, 32)
+
+    stack = Recipe(
+        backbone="layers_net", unfreeze="all", epochs=20, image_size=64, layers="conv(32) pool"
+    )
+    line = vl.fit_call(vars(stack), batch_size=32)
+    assert "layers=" not in line
+    # The carried best is not the try that failed, so the repair starts from the tuned
+    # network above and the stack is gone for good.
+    with pytest.raises(RecipeError, match="needs layers="):
+        refit(line, tuned)

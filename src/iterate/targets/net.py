@@ -1,9 +1,9 @@
 """The network an image run trains, saves and opens again, and the pixels it reads.
 
-Light on purpose: numpy, PIL and torch are the only imports, so `iterate.vision` opens
-a saved network inside a user's app without pandas, scikit-learn or the agent. torch
-loads on first use. `dl` re-imports every name that moved here, so `dl._build` is
-still the name a test replaces.
+Light on purpose: numpy, PIL, torch and the pure-Python layer grammar are the only
+imports, so `iterate.vision` opens a saved network inside a user's app without pandas,
+scikit-learn or the agent. torch loads on first use. `dl` re-imports every name that
+moved here, so `dl._build` is still the name a test replaces.
 """
 
 from __future__ import annotations
@@ -14,6 +14,9 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, TypeGuard
 
 import numpy as np
+
+from iterate.targets import layers as arch
+from iterate.targets.layers import RecipeError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -36,11 +39,21 @@ BACKBONES: dict[str, tuple[str, str]] = {
     "convnext_tiny": ("ConvNeXt_Tiny_Weights.IMAGENET1K_V1", "classifier.2"),
 }
 # Trained from zero, so no probe and no head-only fit: name to head module.
-SCRATCH: dict[str, str] = {"simple_cnn": "head"}
-
-
-class RecipeError(ValueError):
-    """A recipe the runner will not execute, with a reason the agent can act on."""
+SCRATCH: dict[str, str] = {"simple_cnn": "head", "layers_net": "head"}
+# Each backbone's stages from the stem up, with the feature width each one ends on.
+# `drop_stages=N` turns the last N into Identity. Read from torchvision 0.26, and the
+# names and widths checked again on 0.29.
+STAGES: dict[str, tuple[tuple[tuple[str, ...], int], ...]] = {
+    "resnet18": ((("layer1",), 64), (("layer2",), 128), (("layer3",), 256), (("layer4",), 512)),
+    "resnet50": ((("layer1",), 256), (("layer2",), 512), (("layer3",), 1024), (("layer4",), 2048)),
+    "convnext_tiny": (
+        (("features.1",), 96),
+        (("features.2", "features.3"), 192),
+        (("features.4", "features.5"), 384),
+        (("features.6", "features.7"), 768),
+    ),
+}
+MAX_DROP_STAGES = 2
 
 
 def torch_at_least(wanted: str = MIN_TORCH) -> Any:
@@ -96,6 +109,8 @@ def _build(
             raise RecipeError(
                 f"{backbone} has no pretrained features to embed or probe head to copy"
             )
+        if backbone != "simple_cnn":
+            raise RecipeError(f"{backbone} is the network layers=[...] builds; pass layers= too")
         return _simple_cnn(torch, outputs)
     import torchvision.models as tvm
 
@@ -123,10 +138,65 @@ def model_for(
     build: Callable[..., Any] = _build,
 ) -> Any:
     """The one way a network is made: a fit, a save and a load all come through here
-    with the whole recipe, so a saved file always rebuilds."""
+    with the whole recipe, so a saved file always rebuilds.
+
+    `layers` is a network of its own. `head` and `drop_stages` reshape a pretrained one.
+    With neither, this is the stock build it has always been, module for module and
+    random draw for random draw."""
     # Only passed when off: the tests stand a four-argument fake in for _build.
     extra: dict[str, Any] = {} if pretrained else {"pretrained": False}
-    return build(torch, str(recipe["backbone"]), outputs, probe_head, **extra)
+    layers = arch.parse(recipe.get("layers"), "layers")
+    if layers is not None:
+        return arch.build_scratch(torch, layers, outputs)
+    head = arch.parse(recipe.get("head"), "head")
+    dropped = int(recipe.get("drop_stages") or 0)
+    backbone = str(recipe["backbone"])
+    if not dropped and head is None:
+        return build(torch, backbone, outputs, probe_head, **extra)
+    # Built whole and topped again: the stock head is what says how wide the features are.
+    model = build(torch, backbone, outputs, None, **extra)
+    head_name = BACKBONES[backbone][1]
+    stages = STAGES[backbone]
+    keep = len(stages) - dropped
+    width = stages[keep - 1][1]
+    _same_shape_as_the_table(model, backbone, head_name, None if dropped else width)
+    for names, _ in stages[keep:]:
+        for name in names:
+            model.set_submodule(name, torch.nn.Identity())
+    if dropped and backbone == "convnext_tiny":
+        norm = model.get_submodule("classifier.0")
+        model.set_submodule("classifier.0", type(norm)(width, eps=norm.eps))
+    new = arch.build_head(torch, head or (), width, outputs)
+    if probe_head is not None:
+        final = new[-1] if head else new
+        with torch.no_grad():
+            final.weight.copy_(torch.from_numpy(probe_head[0]))
+            final.bias.copy_(torch.from_numpy(probe_head[1]))
+    model.set_submodule(head_name, new)
+    return model
+
+
+def _same_shape_as_the_table(model: Any, backbone: str, head_name: str, width: int | None) -> None:
+    """STAGES names modules and widths as strings and numbers, so a torchvision that
+    renamed or resized one would be cut in the wrong place and fail far from here.
+    `width` is the stock head's input width to check against, or None when stages were
+    dropped and the head no longer sees it."""
+    missing = [name for names, _ in STAGES[backbone] for name in names if not _there(model, name)]
+    stock = getattr(_there(model, head_name), "in_features", None)
+    if not missing and (width is None or stock == width):
+        return
+    raise RecipeError(
+        f"torchvision {_installed('torchvision')} builds {backbone} in a shape this iterate "
+        "does not know, so head= and drop_stages= cannot change it; fit without them, or "
+        "install torchvision 0.24 or newer, and if you are on one already, report this version"
+    )
+
+
+def _there(model: Any, name: str) -> Any:
+    try:
+        return model.get_submodule(name)
+    except AttributeError:
+        return None
 
 
 def _to_device(torch: Any, batch: np.ndarray, dev: Any) -> Any:
@@ -275,6 +345,22 @@ def checked_meta(saved: Any, path: str | Path) -> dict[str, Any]:
     if not isinstance(recipe, dict) or recipe.get("backbone") not in (*BACKBONES, *SCRATCH):
         known = ", ".join((*BACKBONES, *SCRATCH))
         raise refuse(f"its backbone is not one of {known}")
+    # model_for cuts stages and builds a head straight from these three, so they are
+    # checked here with the rest and not where they would fail as an index error.
+    dropped = recipe.get("drop_stages") or 0
+    if not _is_int(dropped) or not 0 <= dropped <= MAX_DROP_STAGES:
+        raise refuse(
+            f"its drop_stages is {dropped!r}, not a whole number from 0 to {MAX_DROP_STAGES}"
+        )
+    if dropped and recipe["backbone"] not in STAGES:
+        raise refuse(
+            f"{recipe['backbone']} has no stages to drop, and its drop_stages is {dropped}"
+        )
+    try:
+        arch.parse(recipe.get("layers"), "layers")
+        arch.parse(recipe.get("head"), "head")
+    except RecipeError as exc:
+        raise refuse(str(exc)) from None
     if task not in ("classification", "regression"):
         raise refuse(f"its task is {task!r}, not classification or regression")
     size, (low, high) = meta.get("image_size"), SIZE_RANGE
@@ -321,11 +407,13 @@ def _count(classes: Any) -> int | str:
 
 __all__ = [
     "BACKBONES",
+    "MAX_DROP_STAGES",
     "MIN_TORCH",
     "SAVED_FORMAT",
     "SAVED_KEY",
     "SCRATCH",
     "SIZE_RANGE",
+    "STAGES",
     "RecipeError",
     "checked_meta",
     "model_for",

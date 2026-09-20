@@ -186,3 +186,21 @@ def test_a_second_run_all_behaves_like_the_first_and_never_touches_the_delivered
     assert rerun["best_model_unchanged"]
     assert rerun["best_model_unchanged_twice"]
     assert rerun["incumbent"] == "simple_cnn"  # the recipe the session started from
+
+
+def test_a_stack_typed_into_a_cell_builds_trains_and_submits() -> None:
+    result = _check("layers_cell")
+    assert result["preamble_error"] is None
+    assert result["error"] is None
+    (fit,) = result["fit"]
+    assert fit["backbone"] == "layers_net"
+    assert fit["layers"] == "conv(16) pool conv(32) pool"
+    assert fit["epochs_run"] == 1
+    assert result["submitted"] == result["fit"]
+    assert result["said"] == [
+        line for line in result["said"] if "(layers conv(16) pool conv(32) pool 32px," in line
+    ]
+    assert result["said"]
+    assert result["predictions"] == 8
+    assert result["recipe"]["predictions_sha256"]
+    assert result["network"]

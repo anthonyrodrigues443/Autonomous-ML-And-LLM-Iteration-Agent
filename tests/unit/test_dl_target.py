@@ -263,6 +263,59 @@ def test_a_fine_tune_runs_through_the_runner_and_records_its_epochs(tmp_path: Pa
             "label_smoothing=0.5 is outside",
         ),
         ({"unfreeze": "none", "epochs": 3}, "the probe takes 0 epochs"),
+        (
+            {"backbone": "layers_net", "unfreeze": "all", "epochs": 3},
+            "backbone layers_net needs layers=[...]",
+        ),
+        (
+            {"backbone": "resnet18", "unfreeze": "all", "epochs": 3, "layers": "conv(32) pool"},
+            "layers= builds a network of its own and backbone='resnet18' names another",
+        ),
+        (
+            {"backbone": "simple_cnn", "unfreeze": "all", "epochs": 3, "head": "linear(64)"},
+            "head= and drop_stages= change a pretrained backbone and simple_cnn trains from zero",
+        ),
+        (
+            {"unfreeze": "none", "epochs": 0, "head": "linear(64)"},
+            "the probe (unfreeze none) fits one linear layer on the whole backbone",
+        ),
+        (
+            {"unfreeze": "head", "epochs": 3, "head_init": "probe", "head": "linear(64)"},
+            "head_init probe copies one linear layer fitted on the whole backbone",
+        ),
+        (
+            {"unfreeze": "head", "epochs": 3, "head_init": "probe", "drop_stages": 1},
+            "it needs drop_stages=0 and a head with no linear layer",
+        ),
+        ({"unfreeze": "head", "epochs": 3, "drop_stages": 3}, "drop_stages=3 is outside 0 to 2"),
+        (
+            {"unfreeze": "head", "epochs": 3, "head": "conv(32)"},
+            "head[0] names 'conv'; a head takes linear and dropout only",
+        ),
+        (
+            {"backbone": "layers_net", "unfreeze": "all", "epochs": 3, "layers": [("pool",)]},
+            "layers[0] must be a conv layer",
+        ),
+        (
+            {
+                "backbone": "layers_net",
+                "unfreeze": "all",
+                "epochs": 3,
+                "image_size": 384,
+                "layers": "conv(512) conv(512)",
+            },
+            "billion multiply-adds per image at 384 px",
+        ),
+        (
+            {
+                "backbone": "layers_net",
+                "unfreeze": "all",
+                "epochs": 3,
+                "image_size": 224,
+                "layers": "conv(512)",
+            },
+            "GB of activations at 224 px and batch 64",
+        ),
     ],
 )
 def test_a_recipe_is_refused_by_name_as_a_failed_result(
@@ -486,8 +539,15 @@ def test_the_meta_names_the_task_the_spread_the_baseline_and_every_backbone(
         [train.mean(), train.std(), train.min(), train.max()]
     )
     for meta in (classes, numbers):
-        assert meta["baseline"] == asdict(replace(dl.BASELINE, image_size=32))
-        assert meta["backbones"] == ["resnet18", "resnet50", "convnext_tiny", "simple_cnn"]
+        assert meta["baseline"] == dl.printed(replace(dl.BASELINE, image_size=32))
+        assert not {"layers", "head", "drop_stages"} & set(meta["baseline"])
+        assert meta["backbones"] == [
+            "resnet18",
+            "resnet50",
+            "convnext_tiny",
+            "simple_cnn",
+            "layers_net",
+        ]
 
 
 # ─── one ruler ───────────────────────────────────────────────────────────────
@@ -614,6 +674,146 @@ def test_epoch_one_alone_over_the_budget_is_refused_with_advice() -> None:
         dl.plan_epochs(3, 600.0, 540.0)
     with pytest.raises(RecipeError, match=r"are left; halve image_size$"):
         dl.plan_epochs(3, 600.0, 540.0, backbone="simple_cnn")
+    with pytest.raises(RecipeError, match=r"halve image_size, or put a pool after the first conv$"):
+        dl.plan_epochs(3, 600.0, 540.0, backbone="layers_net", layers=(("conv", 32),))
+
+
+# ─── layers, heads and dropped stages ────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("unfreeze", "drop_stages", "backbone", "prefixes"),
+    [
+        ("all", 0, "resnet18", None),
+        ("all", 0, "layers_net", None),
+        ("head", 0, "resnet18", ("fc",)),
+        ("head", 0, "convnext_tiny", ("classifier.2",)),
+        ("head", 1, "resnet50", ("fc",)),
+        # A drop rebuilds convnext's norm before the head, so that norm has to train.
+        ("head", 1, "convnext_tiny", ("classifier",)),
+        ("last_block", 0, "resnet18", ("layer4", "fc")),
+        ("last_block", 1, "resnet18", ("layer3", "fc")),
+        ("last_block", 2, "resnet50", ("layer2", "fc")),
+        ("last_block", 0, "convnext_tiny", ("features.6", "features.7", "classifier")),
+        ("last_block", 2, "convnext_tiny", ("features.2", "features.3", "classifier")),
+    ],
+)
+def test_what_trains_is_the_prefixes_the_table_names(
+    unfreeze: str, drop_stages: int, backbone: str, prefixes: tuple[str, ...] | None
+) -> None:
+    layers = "conv(32) pool" if backbone == "layers_net" else None
+    recipe = Recipe(
+        backbone=backbone, unfreeze=unfreeze, epochs=3, drop_stages=drop_stages, layers=layers
+    )
+    assert dl._trainable(recipe) == prefixes
+
+
+@pytest.mark.parametrize(
+    ("kind", "layers", "told"),
+    [
+        ("oom", False, "out of memory on mps at batch_size=64, image_size=128: halve one of them"),
+        (
+            "oom",
+            True,
+            "out of memory on mps at batch_size=64, image_size=128: halve one of them, or put "
+            "a pool after the first conv",
+        ),
+        (
+            "buffer",
+            False,
+            "one request is larger than mps can ever hold at batch_size=64, image_size=128; "
+            "not retryable",
+        ),
+        (
+            "buffer",
+            True,
+            "one request is larger than mps can ever hold at batch_size=64, image_size=128; "
+            "put a pool after the first conv, or lower the channels",
+        ),
+    ],
+)
+def test_running_out_of_memory_keeps_the_prefix_the_repair_reads(
+    kind: str, layers: bool, told: str
+) -> None:
+    from iterate.core.vision_levers import _WHERE
+
+    text = dl._oom_text(kind, "mps", "batch_size=64, image_size=128", layers)
+    assert text == told
+    found = _WHERE.search(text)
+    assert found is not None
+    assert (found.group(1), found.group(2)) == ("64", "128")
+
+
+def test_a_head_that_ends_in_the_class_count_is_refused_once_the_count_is_known(
+    tmp_path: Path,
+) -> None:
+    """The harness adds the final layer itself, so a copied last linear would make a
+    bottleneck as narrow as the number of classes."""
+    prepared = _prepared(tmp_path, classes=10, per_class=8)
+    runner = FakeRunner()
+    changes = {"unfreeze": "head", "epochs": 3, "head": "linear(10)"}
+    # Nothing outside the target knows how many classes there are, so this passes here.
+    assert Recipe.from_changes(changes).head == (("linear", 10),)
+    result = _target(prepared, runner=runner).run(_cand(changes))
+    assert result.error is not None
+    assert "head ends in linear(10), the number of outputs" in result.error
+    assert runner.jobs == []
+
+
+def test_a_layers_net_names_its_stack_where_a_backbone_names_itself() -> None:
+    plain = Recipe(backbone="resnet50", unfreeze="all", epochs=3)
+    assert dl.recipe_name(plain) == "resnet50"
+    topped = replace(plain, unfreeze="head", drop_stages=1, head="linear(64) dropout(0.5)")
+    assert dl.recipe_name(topped) == "resnet50 -1 stages head linear(64) dropout(0.5)"
+    stack = Recipe(backbone="layers_net", unfreeze="all", epochs=3, layers="conv(32) pool")
+    assert dl.recipe_name(stack) == "layers conv(32) pool"
+
+
+def test_a_stack_is_tuples_however_it_was_written_and_a_recipe_stays_hashable() -> None:
+    """The sweep and replace() build a Recipe straight, so the canonical form cannot be
+    from_changes's alone."""
+    typed = Recipe(
+        backbone="layers_net",
+        unfreeze="all",
+        epochs=3,
+        layers=[["conv", 32], ["pool"], {"dropout": 0.3}],
+    )
+    written = Recipe.from_changes(
+        {
+            "backbone": "layers_net",
+            "unfreeze": "all",
+            "epochs": 3,
+            "layers": "conv(32) pool dropout(0.3)",
+        }
+    )
+    assert typed == written
+    assert typed.layers == (("conv", 32), ("pool",), ("dropout", 0.3))
+    assert len({typed, written}) == 1
+    assert json.loads(json.dumps(asdict(typed)))["layers"] == [
+        ["conv", 32],
+        ["pool"],
+        ["dropout", 0.3],
+    ]
+
+
+def test_an_old_recipe_reads_back_with_the_new_fields_off() -> None:
+    old = {
+        "backbone": "resnet18",
+        "image_size": 160,
+        "unfreeze": "all",
+        "epochs": 3,
+        "batch_size": 64,
+        "lr": 0.001,
+        "optimizer": "adamw",
+        "schedule": "onecycle",
+        "augment": "flip",
+        "label_smoothing": 0.0,
+        "head_init": "random",
+        "seed": 42,
+    }
+    recipe = Recipe.from_changes(old)
+    assert (recipe.layers, recipe.head, recipe.drop_stages) == (None, None, 0)
+    assert asdict(recipe) == {**old, "layers": None, "head": None, "drop_stages": 0}
 
 
 def test_the_plan_is_the_whole_epochs_that_fit() -> None:

@@ -190,7 +190,196 @@ def test_every_recipe_shape_fit_accepts_is_in_the_round_trip_list() -> None:
         "label_smoothing",
         "head_init",
         "seed",
+        "layers",
+        "head",
+        "drop_stages",
     }
+    assert {bool(shape.get("layers")) for shape in ROUND_TRIP_SHAPES} == {False, True}
+    assert {bool(shape.get("head")) for shape in ROUND_TRIP_SHAPES} == {False, True}
+    assert {int(shape.get("drop_stages", 0)) for shape in ROUND_TRIP_SHAPES} == {0, 1}
+
+
+# ─── layers, heads and dropped stages, with no torch ─────────────────────────
+
+
+class _Fake:
+    """A stand-in module: what it is, the numbers it was built with, and its parts."""
+
+    def __init__(self, kind: Any, kids: dict[str, Any] | None = None, **fields: Any) -> None:
+        self.kind, self.kids = kind, kids or {}
+        self.__dict__.update(fields)
+
+    def __getitem__(self, i: int) -> Any:
+        return self.order[i]
+
+    def get_submodule(self, name: str) -> Any:
+        node: Any = self
+        for step in name.split("."):
+            if not isinstance(node, _Fake) or step not in node.kids:
+                raise AttributeError(name)
+            node = node.kids[step]
+        return node
+
+    def set_submodule(self, name: str, new: Any) -> None:
+        stem, _, last = name.rpartition(".")
+        node = self.get_submodule(stem) if stem else self
+        node.kids[last] = new
+
+
+def _sequential(*parts: Any) -> _Fake:
+    if len(parts) == 1 and isinstance(parts[0], dict):
+        return _Fake("sequential", kids=dict(parts[0]), order=list(parts[0].values()))
+    return _Fake("sequential", order=list(parts))
+
+
+_FAKE_NN = SimpleNamespace(
+    Identity=lambda: _Fake("identity"),
+    Linear=lambda a, b: _Fake("linear", in_features=a, out_features=b),
+    ReLU=lambda: _Fake("relu"),
+    Dropout=lambda p: _Fake("dropout", p=p),
+    Dropout2d=lambda p: _Fake("dropout2d", p=p),
+    Conv2d=lambda a, b, k, stride=1, padding=0: _Fake("conv", channels=(a, b), kernel=k),
+    BatchNorm2d=lambda c: _Fake("batchnorm", channels=c),
+    MaxPool2d=lambda k: _Fake("maxpool"),
+    AvgPool2d=lambda k: _Fake("avgpool"),
+    AdaptiveAvgPool2d=lambda k: _Fake("gap"),
+    Flatten=lambda: _Fake("flatten"),
+    Sequential=_sequential,
+)
+_FAKE_TORCH = SimpleNamespace(nn=_FAKE_NN)
+
+
+def _put(root: _Fake, name: str, node: Any) -> None:
+    stem, _, last = name.rpartition(".")
+    parent = root
+    for step in stem.split(".") if stem else []:
+        parent = parent.kids.setdefault(step, _Fake(step))
+    parent.kids[last] = node
+
+
+def _stock(backbone: str, *, features: int | None = None, without: str = "") -> _Fake:
+    """The module tree STAGES names, as a torchvision of this shape would hand it over."""
+    root = _Fake(backbone)
+    for names, width in net.STAGES[backbone]:
+        for name in names:
+            if name != without:
+                _put(root, name, _Fake(f"stage:{name}", width=width))
+    if backbone == "convnext_tiny":
+        _put(root, "classifier.0", _Fake("layernorm2d", eps=1e-6))
+    wide = net.STAGES[backbone][-1][1] if features is None else features
+    _put(root, net.BACKBONES[backbone][1], _Fake("linear", in_features=wide, out_features=1000))
+    return root
+
+
+def _torchvision(monkeypatch: pytest.MonkeyPatch, tree: _Fake) -> list[dict[str, Any]]:
+    """A torchvision that records every call and hands back one prepared tree."""
+    calls: list[dict[str, Any]] = []
+
+    def factory(**kwargs: Any) -> _Fake:
+        calls.append(kwargs)
+        return tree
+
+    models = ModuleType("torchvision.models")
+    setattr(models, str(tree.kind), factory)
+    package = ModuleType("torchvision")
+    package.models = models  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torchvision", package)
+    monkeypatch.setitem(sys.modules, "torchvision.models", models)
+    return calls
+
+
+def _built(recipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tree: _Fake) -> Any:
+    _torchvision(monkeypatch, tree)
+    return net.model_for(_FAKE_TORCH, recipe, 5, None, pretrained=False)
+
+
+def test_a_head_alone_replaces_the_final_layer_and_leaves_every_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = _stock("resnet18")
+    model = _built(
+        {"backbone": "resnet18", "head": [("linear", 64), ("dropout", 0.5)]}, monkeypatch, tree
+    )
+    fc = model.get_submodule("fc")
+    assert [part.kind for part in fc.order] == ["linear", "relu", "dropout", "linear"]
+    assert (fc[0].in_features, fc[0].out_features) == (512, 64)
+    assert (fc[-1].in_features, fc[-1].out_features) == (64, 5)
+    assert [model.get_submodule(f"layer{i}").kind for i in (1, 2, 3, 4)] == [
+        f"stage:layer{i}" for i in (1, 2, 3, 4)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dropped", "width", "gone"), [(1, 1024, ["layer4"]), (2, 512, ["layer3", "layer4"])]
+)
+def test_dropping_stages_turns_them_into_identity_and_narrows_the_head(
+    monkeypatch: pytest.MonkeyPatch, dropped: int, width: int, gone: list[str]
+) -> None:
+    tree = _stock("resnet50")
+    model = _built({"backbone": "resnet50", "drop_stages": dropped}, monkeypatch, tree)
+    assert [
+        name
+        for name in ("layer1", "layer2", "layer3", "layer4")
+        if model.get_submodule(name).kind == "identity"
+    ] == gone
+    fc = model.get_submodule("fc")
+    assert (fc.kind, fc.in_features, fc.out_features) == ("linear", width, 5)
+
+
+def test_a_dropped_convnext_gets_a_norm_of_the_width_that_is_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its head sits behind a norm sized to the stage below it, so the norm is rebuilt."""
+    tree = _stock("convnext_tiny")
+    model = _built({"backbone": "convnext_tiny", "drop_stages": 1}, monkeypatch, tree)
+    norm = model.get_submodule("classifier.0")
+    assert (norm.kind, norm.eps) == (384, 1e-6)
+    assert model.get_submodule("features.6").kind == "identity"
+    assert model.get_submodule("features.7").kind == "identity"
+    assert model.get_submodule("features.5").kind == "stage:features.5"
+
+
+def test_a_torchvision_that_moved_the_stages_is_refused_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = _stock("resnet18", without="layer4")
+    with pytest.raises(net.RecipeError, match=r"builds resnet18 in a shape this iterate"):
+        _built({"backbone": "resnet18", "drop_stages": 1}, monkeypatch, missing)
+    resized = _stock("resnet18", features=99)
+    with pytest.raises(net.RecipeError, match=r"install torchvision 0\.24 or newer"):
+        _built({"backbone": "resnet18", "head": [("linear", 64)]}, monkeypatch, resized)
+
+
+def test_a_stack_builds_its_own_network_and_asks_torchvision_for_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _torchvision(monkeypatch, _stock("resnet18"))
+    recipe = {"backbone": "layers_net", "layers": "conv(32) pool conv(64) pool dropout(0.3)"}
+    model = net.model_for(_FAKE_TORCH, recipe, 5, None, pretrained=False)
+    assert calls == []
+    assert sorted(model.kids) == ["body", "head"]
+    assert [part.kind for part in model.get_submodule("body").order] == [
+        "conv",
+        "batchnorm",
+        "relu",
+        "maxpool",
+        "conv",
+        "batchnorm",
+        "relu",
+        "maxpool",
+        "gap",
+        "flatten",
+    ]
+    head = model.get_submodule("head")
+    assert [part.kind for part in head.order] == ["dropout", "linear"]
+    assert (head[-1].in_features, head[-1].out_features) == (64, 5)
+
+
+def test_a_recipe_with_none_of_the_new_fields_takes_the_build_it_always_took() -> None:
+    calls: list[tuple[Any, ...]] = []
+    recipe = asdict(Recipe(backbone="resnet50", unfreeze="all", epochs=3))
+    net.model_for("torch", recipe, 5, "probe", build=lambda *a, **k: calls.append(a))
+    assert calls == [("torch", "resnet50", 5, "probe")]
 
 
 # ─── what a saved file carries ───────────────────────────────────────────────
@@ -208,6 +397,11 @@ def _meta(**changes: Any) -> dict[str, Any]:
 
 def _saved(meta: dict[str, Any]) -> dict[str, Any]:
     return {net.SAVED_KEY: meta, "state_dict": {"fc.weight": np.zeros((3, 4), np.float32)}}
+
+
+def _tampered(**changes: Any) -> dict[str, Any]:
+    """A saved file whose recipe says something no iterate run would write."""
+    return _saved(_meta(recipe={**_meta()["recipe"], **changes}))
 
 
 def test_the_metadata_is_plain_python_and_names_everything_a_loader_needs() -> None:
@@ -268,6 +462,8 @@ def test_recipe_values_that_came_from_numpy_are_saved_as_plain_values() -> None:
 def test_a_file_a_run_saved_passes_every_check() -> None:
     meta = _meta()
     assert net.checked_meta(_saved(meta), "net.pt") is meta
+    topped = _meta(recipe={**meta["recipe"], "drop_stages": 2, "head": [["linear", 64]]})
+    assert net.checked_meta(_saved(topped), "net.pt") is topped
 
 
 @pytest.mark.parametrize(
@@ -279,6 +475,16 @@ def test_a_file_a_run_saved_passes_every_check() -> None:
         (_saved(_meta(format=2)), "is saved-network format 2 and this iterate reads format 1"),
         (_saved(_meta(recipe={"backbone": "hf_hub:someone/net"})), "its backbone is not one of"),
         (_saved(_meta(recipe="resnet18")), "its backbone is not one of"),
+        (_tampered(drop_stages=99), "its drop_stages is 99, not a whole number from 0 to 2"),
+        (_tampered(drop_stages=-1), "its drop_stages is -1"),
+        (_tampered(drop_stages=1.5), "its drop_stages is 1.5"),
+        (_tampered(drop_stages=True), "its drop_stages is True"),
+        (
+            _tampered(backbone="simple_cnn", drop_stages=1),
+            "simple_cnn has no stages to drop",
+        ),
+        (_tampered(layers=[["conv", 999999]]), "channels=999999 is outside 4 to 512"),
+        (_tampered(head=[["linear", 4096]]), "linear takes one width between 8 and 2048"),
         (_saved(_meta(task="ranking")), "its task is 'ranking'"),
         (_saved(_meta(image_size=100_000)), "its image_size is 100000, outside 32 to 384"),
         (_saved(_meta(image_size=True)), "its image_size is True"),

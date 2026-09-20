@@ -68,10 +68,14 @@ def merge(
 
     Every fit starts from the carried best. A switch between the plain CNN and a
     pretrained network starts from that kind's reference instead, since the plain CNN's
-    20 epochs are not a legal fine-tune.
+    20 epochs are not a legal fine-tune. The layer settings carry the same way, except
+    where carrying one would earn a refusal the agent did not ask for.
     """
-    from iterate.targets.dl import SCRATCH, Recipe
+    from iterate.targets.dl import LAYERS_NET, SCRATCH, Recipe, printed
 
+    changes = dict(changes)
+    if changes.get("layers") is not None and "backbone" not in changes:
+        changes["backbone"] = LAYERS_NET
     start = best
     new = changes.get("backbone", best.backbone)
     if (new in SCRATCH) != (best.backbone in SCRATCH):
@@ -81,6 +85,11 @@ def merge(
             else Recipe(unfreeze="all", epochs=BENCH_EPOCHS, seed=best.seed)
         )
     base = asdict(start)
+    if new != LAYERS_NET and "layers" not in changes:
+        base["layers"] = None
+    if ("head" in changes or "drop_stages" in changes) and "head_init" not in changes:
+        base["head_init"] = "random"
+    _tops(base, changes)
     if "unfreeze" in changes and "epochs" not in changes:
         if changes["unfreeze"] == "none":
             base["epochs"] = 0
@@ -91,7 +100,26 @@ def merge(
             base["unfreeze"] = "none"
         elif base["unfreeze"] == "none":
             base["unfreeze"] = "all"
-    return Recipe.from_changes({**base, **changes}, task=task), asdict(start)
+    return Recipe.from_changes({**base, **changes}, task=task), printed(start)
+
+
+def _tops(base: dict[str, Any], changes: dict[str, Any]) -> None:
+    """A carried probe and a carried head cannot both stand, so the setting the cell just
+    typed wins and the line says which way it went."""
+    asked_head = changes.get("head") is not None or changes.get("drop_stages")
+    # epochs=0 is the other spelling of the probe, and merge turns it into one below.
+    probing = changes.get("unfreeze") == "none" or (
+        "unfreeze" not in changes and changes.get("epochs") == 0
+    )
+    if asked_head and base["unfreeze"] == "none" and "unfreeze" not in changes:
+        base["unfreeze"], base["epochs"] = "head", BENCH_EPOCHS
+        print(
+            f"the carried recipe was a linear probe; your head trains it for "
+            f"{BENCH_EPOCHS} epochs (pass unfreeze= and epochs= to choose)"
+        )
+    elif probing and (base["head"] or base["drop_stages"]):
+        base["head"], base["drop_stages"] = None, 0
+        print("the probe fits one linear layer on the whole backbone; the carried head was dropped")
 
 
 @dataclass(frozen=True)
@@ -304,12 +332,25 @@ class Session:
     # ─── fit ───
 
     def fit(self, **changes: Any) -> Fit:
-        from iterate.targets.dl import FitJob, Network, RecipeError
+        from iterate.targets.dl import (
+            FitJob,
+            Network,
+            RecipeError,
+            dropped_line,
+            printed,
+            recipe_name,
+        )
 
         tick = self._tick()
         recipe, start = merge(self.best, changes, self.task, baseline=self.baseline)
         size = recipe.image_size or self.size
         recipe = replace(recipe, image_size=size)
+        outputs = 1 if self.task == "regression" else len(self.classes)
+        # The size and the class count are known only here, so the caps that scale with
+        # them are checked before any decode at a new size and before any device work.
+        recipe.validate(self.task, outputs=outputs)
+        if dropped := dropped_line(recipe):
+            print(dropped)
         # A start with no size of its own is the session size, not the size this fit
         # arrived at: the lever gate compares the two dicts key by key, and taking the
         # fit's own size would read an explicit `image_size=` as no move.
@@ -318,7 +359,6 @@ class Session:
         stack = np.concatenate([train_px[self.val_idx], holdout_px])
         n_val = len(self.val_idx)
         fit_labels, centre, spread = self._fit_labels()
-        outputs = 1 if self.task == "regression" else len(self.classes)
         saves = hasattr(self.runner, "save")
         staged: Path | None = None
         folded: tuple[np.ndarray, np.ndarray] | None = None
@@ -356,7 +396,7 @@ class Session:
             out = np.asarray(out, dtype=np.float64) * spread + centre
         val_out = out[:n_val]
         line = {
-            **asdict(recipe),
+            **printed(recipe),
             "epochs_planned": planned,
             "epochs_run": ran,
             "seconds": round(time.perf_counter() - tick),
@@ -369,7 +409,7 @@ class Session:
         self._remember(recipe)
         print("FIT " + json.dumps(line, default=str))
         print(
-            f"val {self.metric} = {line['val']:.4f} ({recipe.backbone} {size}px, "
+            f"val {self.metric} = {line['val']:.4f} ({recipe_name(recipe)} {size}px, "
             f"{ran}/{recipe.epochs} epochs, {line['seconds']}s)"
         )
         network: Network | None = None
@@ -808,6 +848,8 @@ def start(workdir: str = ".") -> dict[str, Any]:
     """The preamble's one call: every name the agent's cells see."""
     import pandas as pd
 
+    from iterate.targets.dl import printed
+
     set_device_env()
     import torch
 
@@ -869,7 +911,7 @@ def start(workdir: str = ".") -> dict[str, Any]:
         f"fold: {len(session.fit_idx)} images to fit, {len(session.val_idx)} to validate "
         "(FIT_IDX, VAL_IDX), the same fold every session"
     )
-    print("recipe now: " + json.dumps(asdict(session.best)))
+    print("recipe now: " + json.dumps(printed(session.best)))
     print("\n".join(codegen.vision_worked_example(session.task)))
     gc.collect()
     return names
