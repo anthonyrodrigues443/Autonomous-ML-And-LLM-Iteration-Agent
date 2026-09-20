@@ -464,7 +464,7 @@ def _build(
 
     weights, head_name = BACKBONES[backbone]
     enum, member = weights.split(".")
-    model = getattr(tvm, backbone)(weights=getattr(getattr(tvm, enum), member))
+    model = getattr(tvm, backbone)(weights=getattr(getattr(tvm, enum), member), progress=False)
     features = model.get_submodule(head_name).in_features
     new = torch.nn.Identity() if outputs is None else torch.nn.Linear(features, outputs)
     if head is not None:

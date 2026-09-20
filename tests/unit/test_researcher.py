@@ -10,7 +10,11 @@ No network: the paper sources are fakes, and the LLM is a scripted fake.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import TYPE_CHECKING, Any
+
+import pytest
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -196,6 +200,79 @@ def test_render_is_one_line_per_suggestion() -> None:
     )
     assert len(findings.render().splitlines()) == 2
     assert "<doi:1>" in findings.render()
+
+
+# ─── one suggestion prompt per family ────────────────────────────────────────
+
+
+class _RecordingLLM(_FakeLLM):
+    def __init__(self) -> None:
+        super().__init__(
+            [_queries("q one", "q two"), _suggest({"technique": "t", "rationale": "r", "paper": 1})]
+        )
+        self.sent: list[tuple[list[Any], list[Any]]] = []
+
+    def chat(self, messages, *, tools=None, temperature=None, max_tokens=None) -> ChatResponse:  # type: ignore[no-untyped-def]
+        self.sent.append((list(messages), list(tools or [])))
+        return super().chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens)
+
+
+def _suggestion_call(family: str) -> tuple[str, str]:
+    """(every message, the tool) one suggestion call sends, as text."""
+    llm = _RecordingLLM()
+    Researcher(
+        llm, metric="f1", direction="maximize", family=family, sources=[_FakeSource()]
+    ).research(profile="120 rows, 8 columns", tried=["one-hot encoding"])
+    messages, tools = llm.sent[1]
+    return (
+        json.dumps([[m.role, m.content] for m in messages], ensure_ascii=False),
+        json.dumps([[t.name, t.description, t.parameters] for t in tools], sort_keys=True),
+    )
+
+
+@pytest.mark.parametrize(
+    "table_only", ["tabular-applicable", "columns this dataset does not have", "THIS dataset"]
+)
+def test_a_prompt_run_is_not_asked_for_table_techniques(table_only: str) -> None:
+    messages, _ = _suggestion_call("prompt")
+    assert table_only not in messages
+
+
+@pytest.mark.parametrize(
+    "table_only", ["target-encode", "modelling move", "class balance or row count"]
+)
+def test_a_prompt_runs_suggest_tool_does_not_describe_a_modelling_move(table_only: str) -> None:
+    _, tool = _suggestion_call("prompt")
+    assert table_only not in tool
+
+
+def test_a_prompt_run_is_asked_for_changes_to_the_prompt() -> None:
+    messages, tool = _suggestion_call("prompt")
+    assert "only the PROMPT can change" in messages
+    assert "optimizing 'f1' (maximize)" in messages
+    assert "an edit a prompt writer could" in tool
+    assert '"suggest_techniques"' in tool
+
+
+# Digests of what main 6485be3 sends. Only a deliberate rewording of the table or
+# image pair may change them.
+_TABLE_CALL_ON_MAIN = "7a7976476f0f298724187c0fec556809dd2f53a63e902c1bd901ceebb9b254b2"
+_IMAGE_CALL_ON_MAIN = "4c6f808e1d025ce72dca66c2bc39ec55a59c60d1debce0f88a02c005d7e3d57c"
+
+
+@pytest.mark.parametrize(
+    ("family", "sent_by_main"),
+    [
+        ("tabular", _TABLE_CALL_ON_MAIN),
+        ("vision", _IMAGE_CALL_ON_MAIN),
+        ("a-family-with-no-pair", _TABLE_CALL_ON_MAIN),
+    ],
+)
+def test_table_and_image_runs_send_the_suggestion_call_main_sent(
+    family: str, sent_by_main: str
+) -> None:
+    messages, tool = _suggestion_call(family)
+    assert hashlib.sha256((messages + tool).encode()).hexdigest() == sent_by_main
 
 
 # ─── crediting: under-attribution is the safe failure ────────────────────────

@@ -11,7 +11,7 @@ import subprocess
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -439,6 +439,34 @@ def test_simple_cnn_can_neither_embed_nor_take_a_copied_head() -> None:
     for outputs, given in ((None, None), (3, head)):
         with pytest.raises(RecipeError, match="simple_cnn has no pretrained features"):
             dl._build(None, "simple_cnn", outputs, given)
+
+
+@pytest.mark.parametrize("backbone", sorted(dl.BACKBONES))
+def test_a_pretrained_backbone_loads_its_weights_with_no_progress_bar(
+    backbone: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: dict[str, Any] = {}
+
+    def load(**kwargs: Any) -> Any:
+        asked.update(kwargs)
+        return SimpleNamespace(
+            get_submodule=lambda name: SimpleNamespace(in_features=4),
+            set_submodule=lambda name, new: None,
+        )
+
+    enum, member = dl.BACKBONES[backbone][0].split(".")
+    models = ModuleType("torchvision.models")
+    setattr(models, backbone, load)
+    setattr(models, enum, SimpleNamespace(**{member: "the weights"}))
+    package = ModuleType("torchvision")
+    package.models = models  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torchvision", package)
+    monkeypatch.setitem(sys.modules, "torchvision.models", models)
+
+    dl._build(SimpleNamespace(nn=SimpleNamespace(Identity=object)), backbone, None, None)
+
+    assert asked == {"weights": "the weights", "progress": False}
+    assert "torch" not in sys.modules
 
 
 def test_the_meta_names_the_task_the_spread_the_baseline_and_every_backbone(

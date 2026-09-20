@@ -90,6 +90,8 @@ def fit_prints_epochs() -> dict[str, Any]:
 
 def trimmed_plan() -> dict[str, Any]:
     dl._torch()
+    # A frozen clock: under load the real one moves enough to trim a planned epoch.
+    dl.time = SimpleNamespace(perf_counter=lambda: 100.0)  # type: ignore[assignment]
     dl.time_steps = lambda step, k=10: 1.0  # type: ignore[assignment]
     seen: dict[str, float] = {}
     real_schedule, real_plan = dl._schedule, dl.plan_epochs
@@ -104,7 +106,7 @@ def trimmed_plan() -> dict[str, Any]:
 
     dl._schedule = spy_schedule  # type: ignore[assignment]
     dl.plan_epochs = spy_plan  # type: ignore[assignment]
-    report = TorchRunner("cpu").fit(_job(5, time.perf_counter() + 2.2 + 7.5, []))
+    report = TorchRunner("cpu").fit(_job(5, 100.0 + 2.2 + 7.5, []))
     return {
         "epochs": [report.epochs_planned, report.epochs_run],
         "steps": seen["steps"],

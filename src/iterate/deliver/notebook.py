@@ -167,7 +167,7 @@ def _cell_outputs(cell: Any) -> list[Any]:
     synthesize from the captured stdout/error strings (older cells / fallback)."""
     captured = cell.get("outputs") if isinstance(cell, dict) else getattr(cell, "outputs", None)
     if captured:
-        return [_to_nb_output(o) for o in captured]
+        return [_to_nb_output(o) for o in _settled(captured)]
     error = _cell_get(cell, "error")
     if error:
         return [new_output("error", ename="Error", evalue=_error_oneline(error),
@@ -176,6 +176,51 @@ def _cell_outputs(cell: Any) -> list[Any]:
     if stdout.strip():
         return [new_output("stream", name="stdout", text=stdout)]
     return []
+
+
+def _settled(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Neighbouring stream outputs of one name joined into one, then every line
+    reduced to what a terminal shows once its carriage returns have played out.
+    Returns copies: the captured record is the run's memory and must not change.
+
+    A run's texts are joined once at the end: adding each one to the text so far
+    copies that text every time, which is quadratic in the run's length."""
+    settled: list[dict[str, Any]] = []
+    runs: list[list[str]] = []
+    for output in captured:
+        last = settled[-1] if settled else None
+        if (
+            last is not None
+            and _is_stream(last)
+            and _is_stream(output)
+            and last.get("name", "stdout") == output.get("name", "stdout")
+        ):
+            runs[-1].append(output["text"])
+        else:
+            settled.append(dict(output))
+            runs.append([output["text"]] if _is_stream(output) else [])
+    for output, texts in zip(settled, runs, strict=True):
+        if texts:
+            text = "".join(texts)
+            output["text"] = _after_carriage_returns(text) if "\r" in text else text
+    return settled
+
+
+def _is_stream(output: dict[str, Any]) -> bool:
+    return output.get("type", "stream") == "stream" and isinstance(output.get("text"), str)
+
+
+def _after_carriage_returns(text: str) -> str:
+    """Keep what follows the last carriage return on each line. Carriage returns
+    that end a line (a Windows ``\\r\\n``) are its line ending and stay.
+
+    Line by line, not one regex over the text: a regex retries from every start
+    of a long unbroken line, which is quadratic in that line's length."""
+    lines = []
+    for line in text.split("\n"):
+        body = line.rstrip("\r")
+        lines.append(body.rsplit("\r", 1)[-1] + line[len(body) :])
+    return "\n".join(lines)
 
 
 def _to_nb_output(captured: dict[str, Any]) -> Any:

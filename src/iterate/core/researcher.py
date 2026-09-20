@@ -165,6 +165,11 @@ CHOOSE_SETUP = _setup_tool()
 PLAN_QUERIES = _queries_tool()
 SUGGEST_TECHNIQUES = _suggest_tool()
 VISION_SUGGEST = _suggest_tool("vision_suggest_tool")
+PROMPT_SUGGEST = _suggest_tool("prompt_suggest_tool")
+_SUGGEST_BY_FAMILY = {
+    "vision": ("vision_suggest_system", VISION_SUGGEST),
+    "prompt": ("prompt_suggest_system", PROMPT_SUGGEST),
+}
 
 
 class Researcher:
@@ -287,12 +292,11 @@ class Researcher:
 
     def _suggest(self, profile: str, tried: str, papers: list[Paper]) -> list[Suggestion]:
         listing = "\n".join(f"{i + 1}. {p.brief()}\n   {p.abstract}" for i, p in enumerate(papers))
+        system, tool = _SUGGEST_BY_FAMILY.get(self._family, ("suggest_system", SUGGEST_TECHNIQUES))
         messages = [
             Message(
                 role="system",
-                content=_PROMPTS[
-                    "vision_suggest_system" if self._family == "vision" else "suggest_system"
-                ].format(metric=self._metric, direction=self._direction),
+                content=_PROMPTS[system].format(metric=self._metric, direction=self._direction),
             ),
             Message(
                 role="user",
@@ -301,9 +305,7 @@ class Researcher:
                 ),
             ),
         ]
-        args = self._call(
-            messages, VISION_SUGGEST if self._family == "vision" else SUGGEST_TECHNIQUES
-        )
+        args = self._call(messages, tool)
         raw = args.get("suggestions") if args else None
         if not isinstance(raw, list):
             return []
