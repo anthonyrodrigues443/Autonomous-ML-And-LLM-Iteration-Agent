@@ -129,3 +129,44 @@ def test_a_fixed_job_runs_every_epoch_where_the_plan_would_refuse() -> None:
     assert result["plan_calls"] == [0, 1]
     assert result["refused"].startswith("one epoch needs about 3300s")
     assert result["refused"].endswith("are left; halve image_size")
+
+
+def test_staging_a_fits_weights_moves_none_of_its_outputs() -> None:
+    assert _check("staging_moves_no_output") == {"same": True, "staged": True}
+
+
+@pytest.mark.parametrize(
+    ("check", "kind"),
+    [
+        ("saved_fit_round_trip", ["resnet18", "all", "classification"]),
+        ("saved_probe_round_trip", ["resnet18", "none", "classification"]),
+        ("saved_simple_cnn_round_trip", ["simple_cnn", "all", "classification"]),
+    ],
+)
+def test_a_submitted_network_opens_again_and_predicts_what_was_submitted(
+    check: str, kind: list[str]
+) -> None:
+    """Opened the way `iterate.vision.load` opens it, from the image files and not the
+    session's pixels. A probe's saved head is float32 where the probe was float64."""
+    result = _check(check)
+    assert result["kind"] == kind
+    assert result["same"]
+    assert result["gap"] < (1e-4 if kind[1] == "none" else 1e-6)
+    assert result["digest"]
+    assert result["leftovers"] == []
+
+
+def test_a_saved_number_network_predicts_in_the_labels_own_units() -> None:
+    result = _check("saved_regression_round_trip")
+    assert result["kind"] == ["resnet18", "all", "regression"]
+    assert result["gap"] < 1e-4
+    assert result["digest"]
+
+
+def test_every_recipe_shape_saves_and_opens_again_with_no_download() -> None:
+    from tests.unit._torch_checks import ROUND_TRIP_SHAPES
+
+    result = _check("every_recipe_shape_round_trips")
+    assert len(result["gaps"]) == len(ROUND_TRIP_SHAPES)
+    assert max(result["gaps"].values()) < 1e-6
+    assert result["downloaded"] == []

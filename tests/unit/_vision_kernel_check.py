@@ -8,6 +8,7 @@ PNGs and drives the session the way the coder does. It prints one JSON line.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -173,9 +174,15 @@ def session() -> dict[str, Any]:
                 (kernel.read_output(codegen.PROBABILITIES_CSV) or b"").split()
             )
             out["recipe"] = json.loads(kernel.read_output(codegen.RECIPE_JSON) or b"{}")
+            network = kernel.read_output(codegen.NETWORK_PT) or b""
+            out["network_digest"] = hashlib.sha256(network).hexdigest()
+            out["staged"] = kernel.read_output(".fits/1.pt") is not None
 
             own = kernel.run_cell(prefix + _OWN_MODEL, timeout=600)
             out["own_error"] = own.error
+            out["network_after_own"] = kernel.read_output(codegen.NETWORK_PT) is not None
+            own_recipe = json.loads(kernel.read_output(codegen.RECIPE_JSON) or b"{}")
+            out["own_recipe_names_a_network"] = "model_sha256" in own_recipe
             out["model_lines"] = _tagged(own.stdout, "MODEL")
             out["own_submitted"] = _tagged(own.stdout, "SUBMITTED")
 

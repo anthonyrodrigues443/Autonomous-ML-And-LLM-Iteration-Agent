@@ -73,6 +73,18 @@ def test_a_fit_trains_submits_and_records_the_recipe_it_submitted(
     assert session["recipe"]["predictions_sha256"]
 
 
+def test_a_confined_cell_stages_a_fit_and_leaves_its_network_beside_the_predictions(
+    session: dict[str, Any],
+) -> None:
+    assert session["staged"]
+    assert session["recipe"]["model_sha256"] == session["network_digest"]
+
+
+def test_an_own_model_submission_leaves_no_network_behind(session: dict[str, Any]) -> None:
+    assert not session["network_after_own"]
+    assert not session["own_recipe_names_a_network"]
+
+
 def test_the_own_model_helpers_score_and_submit_under_their_name(
     session: dict[str, Any],
 ) -> None:
