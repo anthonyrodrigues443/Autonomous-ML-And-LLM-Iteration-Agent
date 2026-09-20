@@ -89,8 +89,8 @@ machine under memory pressure): the baseline scored 13.12 knots, as stored, iter
 iteration 2 9.20. Against the 8.87 ceiling that is about 93% of the headroom, in 2
 iterations and 48.5 min. The time budget cut two fits to 9 and 8 of their 10 epochs.
 
-RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
-capture: SLOT_4050
+No run on CUDA yet. An RTX 4050 check over WSL2 follows v0.6.0: epoch time against
+MPS, VRAM peak and the out-of-memory capture.
 
 The ceiling sweep still runs on its own:
 `python -m evals.run ceilings --datasets cyclone_wind`.
