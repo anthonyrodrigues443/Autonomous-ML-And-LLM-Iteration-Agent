@@ -328,7 +328,14 @@ class Session:
     # ─── fit ───
 
     def fit(self, **changes: Any) -> Fit:
-        from iterate.targets.dl import FitJob, Network, RecipeError, printed, recipe_name
+        from iterate.targets.dl import (
+            FitJob,
+            Network,
+            RecipeError,
+            dropped_line,
+            printed,
+            recipe_name,
+        )
 
         tick = self._tick()
         recipe, start = merge(self.best, changes, self.task, baseline=self.baseline)
@@ -338,6 +345,8 @@ class Session:
         # The size and the class count are known only here, so the caps that scale with
         # them are checked before any decode at a new size and before any device work.
         recipe.validate(self.task, outputs=outputs)
+        if dropped := dropped_line(recipe):
+            print(dropped)
         # A start with no size of its own is the session size, not the size this fit
         # arrived at: the lever gate compares the two dicts key by key, and taking the
         # fit's own size would read an explicit `image_size=` as no move.

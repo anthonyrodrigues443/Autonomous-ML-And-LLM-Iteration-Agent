@@ -164,6 +164,21 @@ def test_a_head_the_run_never_asked_for_leaves_the_probe_head_alone() -> None:
     assert kept.head_init == "probe"
 
 
+def test_dropping_stages_says_what_it_removed(tmp_path: Path, capsys: Any) -> None:
+    """A stage is a large group of pretrained blocks, not a layer, so a fit that drops
+    one says so rather than quietly training on a third of the backbone."""
+    session = _session(tmp_path, per_class=10)
+    session.fit(backbone="resnet50", unfreeze="head", epochs=2, drop_stages=1)
+    out = capsys.readouterr().out
+    assert (
+        "drop_stages=1 removed layer4 from resnet50, with their pretrained weights; "
+        "the head now sees 1024 numbers per image instead of 2048" in out
+    )
+    session.fit(backbone="resnet50", unfreeze="head", epochs=2, drop_stages=0)
+    assert "drop_stages=" not in capsys.readouterr().out
+    assert dl.dropped_line(Recipe(backbone="simple_cnn", unfreeze="all", epochs=3)) == ""
+
+
 def test_a_recipe_the_runner_refuses_is_still_refused() -> None:
     with pytest.raises(RecipeError, match="unknown recipe keys"):
         _merge(BASELINE, {"dropout": 0.5})

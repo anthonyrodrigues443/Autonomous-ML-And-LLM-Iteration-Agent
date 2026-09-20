@@ -242,6 +242,21 @@ def printed(recipe: Recipe) -> dict[str, Any]:
     return line
 
 
+def dropped_line(recipe: Recipe) -> str:
+    """What `drop_stages` takes off, in words, or "" when it takes nothing. A stage is a
+    large group of pretrained blocks, so a fit that drops one says so out loud."""
+    if not recipe.drop_stages or recipe.backbone not in STAGES:
+        return ""
+    stages = STAGES[recipe.backbone]
+    keep = len(stages) - recipe.drop_stages
+    gone = ", ".join(name for names, _ in stages[keep:] for name in names)
+    return (
+        f"drop_stages={recipe.drop_stages} removed {gone} from {recipe.backbone}, with their "
+        f"pretrained weights; the head now sees {stages[keep - 1][1]} numbers per image "
+        f"instead of {stages[-1][1]}"
+    )
+
+
 def recipe_name(recipe: Recipe) -> str:
     """The network in one phrase, for the line a person reads. A recipe that sets none of
     the new fields reads exactly as it always did: its backbone's name."""
@@ -951,6 +966,7 @@ __all__ = [
     "RecipeError",
     "Runner",
     "TorchRunner",
+    "dropped_line",
     "oom_kind",
     "plan_epochs",
     "printed",
