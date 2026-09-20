@@ -12,8 +12,8 @@ linear part, and always adds the final layer, one output per class or one number
 takes every form a model types. `found_strict` is the tight one, for a user ask and a
 research finding, where prose must read as nothing at all. `text` is the one canonical
 form shown to a model, `code` the Python it can paste back. Nothing here imports torch,
-so CI checks every refusal, and the builders that turn a spec into modules take `torch`
-as an argument when they land beside it.
+so CI checks every refusal; `build_scratch` and `build_head` take `torch` as an argument
+the way the rest of the runner does.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import OrderedDict
 from itertools import pairwise
 from typing import Any
 
@@ -274,6 +275,49 @@ def activation_bytes(
     return _cost(spec, size, name, features)[1] * _FLOAT_BYTES * batch
 
 
+def build_head(torch: Any, spec: Spec, features: int, outputs: int) -> Any:
+    """The dense tail on `features` numbers per image, with the final layer added. With
+    no tail this is the bare Linear a stock backbone carries, so a head-free recipe
+    builds what it always built."""
+    nn = torch.nn
+    parts: list[Any] = []
+    width = features
+    for layer in spec:
+        if layer[0] == "linear":
+            parts += [nn.Linear(width, int(layer[1])), nn.ReLU()]
+            width = int(layer[1])
+        else:
+            parts.append(nn.Dropout(float(layer[1])))
+    final = nn.Linear(width, outputs)
+    return nn.Sequential(*parts, final) if parts else final
+
+
+def build_scratch(torch: Any, spec: Spec, outputs: int) -> Any:
+    """A whole network from a stack, trained from zero. The two modules are named `body`
+    and `head`, as simple_cnn's are, so one freezing rule and one set of saved weight
+    names cover both."""
+    nn = torch.nn
+    end = _body_end(spec)
+    body: list[Any] = []
+    width = 3
+    for layer in spec[:end]:
+        if layer[0] == "conv":
+            channels, kernel, stride = _conv(layer)
+            body += [
+                nn.Conv2d(width, channels, kernel, stride=stride, padding=kernel // 2),
+                nn.BatchNorm2d(channels),
+                nn.ReLU(),
+            ]
+            width = channels
+        elif layer[0] == "pool":
+            body.append(nn.AvgPool2d(2) if len(layer) > 1 else nn.MaxPool2d(2))
+        else:
+            body.append(nn.Dropout2d(float(layer[1])))
+    trunk = nn.Sequential(*body, nn.AdaptiveAvgPool2d(1), nn.Flatten())
+    head = build_head(torch, spec[end:], width, outputs)
+    return nn.Sequential(OrderedDict(body=trunk, head=head))
+
+
 def _not_layers(value: Any, name: str) -> RecipeError:
     example, shown = (
         (HEAD_EXAMPLE, '[("linear", 512), ("dropout", 0.5)]')
@@ -512,6 +556,8 @@ __all__ = [
     "RecipeError",
     "Spec",
     "activation_bytes",
+    "build_head",
+    "build_scratch",
     "check",
     "code",
     "count_macs",

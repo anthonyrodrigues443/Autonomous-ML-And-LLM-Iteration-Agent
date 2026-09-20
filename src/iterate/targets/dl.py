@@ -32,13 +32,16 @@ from iterate.adapters.compute.base import CodeJob
 from iterate.core import codegen
 from iterate.core.scoring import direction, requires_proba, score, task_for_metric
 from iterate.schemas.experiment import ExperimentResult, Metrics
+from iterate.targets import layers as arch
+from iterate.targets.layers import RecipeError, Spec
 from iterate.targets.net import (
     BACKBONES,
     EMBED_BATCH,
+    MAX_DROP_STAGES,
     SAVED_KEY,
     SCRATCH,
     SIZE_RANGE,
-    RecipeError,
+    STAGES,
     _as_rgb,
     _build,
     _fitted,
@@ -75,9 +78,11 @@ _OUTPUT_TAIL_CHARS = 2000
 _T = TypeVar("_T")
 _COPY_NAME = re.compile(r"(missing-)?[0-9a-f]{16}")
 
+LAYERS_NET = "layers_net"
+_POOL_HINT = "put a pool after the first conv"
 _CHOICES: dict[str, tuple[str, ...]] = {
     "backbone": (*BACKBONES, *SCRATCH),
-    "unfreeze": ("none", "head", "all"),
+    "unfreeze": ("none", "head", "last_block", "all"),
     "optimizer": ("adamw", "sgd"),
     "schedule": ("onecycle", "cosine", "constant"),
     "augment": ("none", "flip", "flip_crop"),
@@ -90,6 +95,7 @@ _RANGES: dict[str, tuple[float, float]] = {
     "lr": (1e-5, 1.0),
     "label_smoothing": (0.0, 0.3),
     "seed": (0, 2**32 - 1),
+    "drop_stages": (0, MAX_DROP_STAGES),
 }
 
 
@@ -109,6 +115,15 @@ class Recipe:
     label_smoothing: float = 0.0
     head_init: str = "random"
     seed: int = 42
+    layers: Spec | None = None
+    head: Spec | None = None
+    drop_stages: int = 0
+
+    def __post_init__(self) -> None:
+        # A Recipe built straight, by replace() or by the sweep, is canonical and
+        # hashable too: only from_changes would otherwise have parsed the lists.
+        for name in ("layers", "head"):
+            object.__setattr__(self, name, arch.parse(getattr(self, name), name))
 
     @classmethod
     def from_changes(cls, changes: dict[str, Any], *, task: str = "classification") -> Recipe:
@@ -116,6 +131,10 @@ class Recipe:
         unknown = sorted(set(changes) - set(kinds) - {"note"})
         if unknown:
             raise RecipeError(f"unknown recipe keys {unknown}; the keys are {sorted(kinds)}")
+        changes = dict(changes)
+        for name in ("layers", "head"):
+            if name in changes:
+                changes[name] = arch.parse(changes[name], name)
         for name, value in changes.items():
             if name in kinds and not _is_kind(value, kinds[name]):
                 raise RecipeError(f"{name} must be {kinds[name]}, got {value!r}")
@@ -123,7 +142,7 @@ class Recipe:
         recipe.validate(task)
         return recipe
 
-    def validate(self, task: str = "classification") -> None:
+    def validate(self, task: str = "classification", *, outputs: int | None = None) -> None:
         for name, allowed in _CHOICES.items():
             if (value := getattr(self, name)) not in allowed:
                 raise RecipeError(f"{name} must be one of {list(allowed)}, got {value!r}")
@@ -136,6 +155,18 @@ class Recipe:
                 raise RecipeError(
                     f"{name}={value!r} is outside {low} to {top}{hint if too_long else ''}"
                 )
+        if self.layers is not None and self.backbone != LAYERS_NET:
+            raise RecipeError(
+                f"layers= builds a network of its own and backbone={self.backbone!r} names "
+                "another; drop backbone= to train the layers from zero, or pass head=[...] to "
+                "put layers on a pretrained backbone"
+            )
+        if self.layers is None and self.backbone == LAYERS_NET:
+            raise RecipeError(f"backbone {LAYERS_NET} needs layers=[...], like {arch.EXAMPLE!r}")
+        if self.head is not None or self.drop_stages:
+            self._pretrained_top()
+            if self.head is not None:
+                arch.check(self.head, "head", outputs=outputs)
         if self.backbone in SCRATCH:
             if self.unfreeze != "all" or self.epochs == 0:
                 raise RecipeError(
@@ -147,9 +178,40 @@ class Recipe:
                     f"{self.backbone} has no probe to start its head from; set head_init to random"
                 )
         elif (self.unfreeze == "none") != (self.epochs == 0):
-            raise RecipeError("the probe takes 0 epochs; unfreeze head or all takes 1 to 12")
+            raise RecipeError(
+                "the probe takes 0 epochs; unfreeze head, last_block or all takes 1 to 12"
+            )
         if task == "regression" and self.label_smoothing > 0:
             raise RecipeError("label_smoothing is for classes; set it to 0 to predict a number")
+        if self.layers is not None:
+            arch.check(
+                self.layers,
+                "layers",
+                size=self.image_size,
+                batch=self.batch_size,
+                outputs=outputs,
+            )
+
+    def _pretrained_top(self) -> None:
+        """What `head=` and `drop_stages=` need of the rest of the recipe. Both change a
+        pretrained backbone above its last stage, which a from-zero net does not have."""
+        if self.backbone in SCRATCH:
+            raise RecipeError(
+                f"head= and drop_stages= change a pretrained backbone and {self.backbone} "
+                "trains from zero; put linear and dropout at the end of layers=[...], or pass "
+                "backbone='resnet18'"
+            )
+        if self.unfreeze == "none":
+            raise RecipeError(
+                "the probe (unfreeze none) fits one linear layer on the whole backbone; with "
+                "head= or drop_stages= set unfreeze to head, last_block or all"
+            )
+        widened = any(layer[0] == "linear" for layer in self.head or ())
+        if self.head_init == "probe" and (self.drop_stages or widened):
+            raise RecipeError(
+                "head_init probe copies one linear layer fitted on the whole backbone, so it "
+                "needs drop_stages=0 and a head with no linear layer; set head_init to random"
+            )
 
 
 def _is_kind(value: Any, kind: str) -> bool:
@@ -159,7 +221,35 @@ def _is_kind(value: Any, kind: str) -> bool:
         return isinstance(value, int | float)
     if kind == "int | None":
         return value is None or isinstance(value, int)
+    # from_changes parses a layer list before this runs, so by here a spec is tuples.
+    if kind == "Spec | None":
+        return value is None or isinstance(value, tuple)
     return type(value).__name__ == kind
+
+
+def printed(recipe: Recipe) -> dict[str, Any]:
+    """The recipe as a line writes it. A stack goes out as the one canonical text, which
+    parses back and can sit in a set; a field this recipe does not use is left out, so a
+    run that touches none of them prints the bytes it always printed."""
+    line = asdict(recipe)
+    for name in ("layers", "head"):
+        if line[name] is None:
+            del line[name]
+        else:
+            line[name] = arch.text(line[name], name)
+    if not line["drop_stages"]:
+        del line["drop_stages"]
+    return line
+
+
+def recipe_name(recipe: Recipe) -> str:
+    """The network in one phrase, for the line a person reads. A recipe that sets none of
+    the new fields reads exactly as it always did: its backbone's name."""
+    if recipe.layers is not None:
+        return f"layers {arch.text(recipe.layers)}"
+    dropped = f" -{recipe.drop_stages} stages" if recipe.drop_stages else ""
+    head = f" head {arch.text(recipe.head)}" if recipe.head else ""
+    return f"{recipe.backbone}{dropped}{head}"
 
 
 BASELINE = Recipe(
@@ -245,7 +335,7 @@ def release(device: str) -> None:
         getattr(_torch(), device).empty_cache()
 
 
-def _guarded(device: str, work: Callable[[], _T], where: str) -> _T:
+def _guarded(device: str, work: Callable[[], _T], where: str, *, layers: bool = False) -> _T:
     # Raised after the except block: raised inside it, the new error would chain the
     # old one, whose traceback keeps every tensor of the failed step alive.
     failure = ""
@@ -254,7 +344,7 @@ def _guarded(device: str, work: Callable[[], _T], where: str) -> _T:
     except RuntimeError as exc:
         if (kind := oom_kind(exc)) is None:
             raise
-        failure = f"{_oom_text(kind, device, where)} ({str(exc).splitlines()[0][:160]})"
+        failure = f"{_oom_text(kind, device, where, layers)} ({str(exc).splitlines()[0][:160]})"
     finally:
         release(device)
     raise DeviceOutOfMemoryError(failure)
@@ -270,12 +360,22 @@ def time_steps(step: Callable[[], object], k: int = TIMED_STEPS) -> float:
 
 
 def plan_epochs(
-    wanted: int, epoch_seconds: float, seconds_left: float, *, backbone: str = "resnet18"
+    wanted: int,
+    epoch_seconds: float,
+    seconds_left: float,
+    *,
+    backbone: str = "resnet18",
+    layers: Spec | None = None,
 ) -> int:
     """The whole epochs that fit, so the schedule is built over what will run."""
     fits = int(seconds_left // epoch_seconds) if epoch_seconds > 0 else wanted
     if fits < 1:
-        advice = "halve image_size" if backbone in SCRATCH else "halve image_size or use resnet18"
+        if layers is not None:
+            advice = f"halve image_size, or {_POOL_HINT}"
+        elif backbone in SCRATCH:
+            advice = "halve image_size"
+        else:
+            advice = "halve image_size or use resnet18"
         raise RecipeError(
             f"one epoch needs about {epoch_seconds:.0f}s and {max(seconds_left, 0):.0f}s of "
             f"the fit budget are left; {advice}"
@@ -327,13 +427,17 @@ def _time_train_step(
 
 
 def _train_mode(torch: Any, model: Any, recipe: Recipe) -> None:
-    """Train mode; a head-only fit keeps the frozen backbone's batch-norm statistics,
-    so the backbone stays the one the probe head was fitted on."""
+    """Train mode, except for a batch-norm layer with no trainable weight of its own: a
+    frozen part of the network keeps the statistics its head was fitted on. For head and
+    all that is the rule this always had; last_block leaves the last stage free."""
     model.train()
-    if recipe.unfreeze == "head":
-        for module in model.modules():
-            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
-                module.eval()
+    if recipe.unfreeze == "all":
+        return
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm) and not any(
+            p.requires_grad for p in module.parameters(recurse=False)
+        ):
+            module.eval()
 
 
 class TorchRunner:
@@ -350,7 +454,8 @@ class TorchRunner:
 
     def fit(self, job: FitJob) -> FitReport:
         where = f"batch_size={job.recipe.batch_size}, image_size={job.recipe.image_size}"
-        return _guarded(self.device, lambda: self._fit(job), where)
+        layers = job.recipe.layers is not None
+        return _guarded(self.device, lambda: self._fit(job), where, layers=layers)
 
     def _fit(self, job: FitJob) -> FitReport:
         torch, recipe, n = _torch(), job.recipe, len(job.train)
@@ -396,15 +501,23 @@ class TorchRunner:
             recipe.epochs
             if job.fixed
             else plan_epochs(
-                recipe.epochs, step_seconds * per_epoch, left, backbone=recipe.backbone
+                recipe.epochs,
+                step_seconds * per_epoch,
+                left,
+                backbone=recipe.backbone,
+                layers=recipe.layers,
             )
         )
         sched = _schedule(torch, opt, recipe, planned * per_epoch)
+        # Batch norm in train mode raises on a one-row batch. Only a layers net drops
+        # that last row, so every stored recipe keeps the batch order it was measured on.
+        lonely = recipe.layers is not None and n > 1 and n % recipe.batch_size == 1
+        rows = n - int(lonely)
 
         def one_epoch(_: int) -> str | None:
             _train_mode(torch, model, recipe)
             order, total, tallied = rng.permutation(n), 0.0, 0.0
-            for start in range(0, n, recipe.batch_size):
+            for start in range(0, rows, recipe.batch_size):
                 if time.perf_counter() > stop_at:
                     return None
                 idx = order[start : start + recipe.batch_size]
@@ -416,8 +529,8 @@ class TorchRunner:
                 total += loss.item() * len(idx)
                 tallied += tally(out, yb)
             if regression:
-                return f"loss={total / n:.4f} train_r2={1 - tallied / n:.4f}"
-            return f"loss={total / n:.4f} train_acc={tallied / n:.4f}"
+                return f"loss={total / rows:.4f} train_r2={1 - tallied / rows:.4f}"
+            return f"loss={total / rows:.4f} train_acc={tallied / rows:.4f}"
 
         ran = run_epochs(one_epoch, planned, job.log)
         outputs = _predict(torch, model, job.holdout, dev, job.task)
@@ -470,10 +583,14 @@ def _stage(torch: Any, model: Any, path: Path, log: Callable[[str], None]) -> No
         log(f"this fit has no weights file: {exc}")
 
 
-def _oom_text(kind: str, device: str, where: str) -> str:
+def _oom_text(kind: str, device: str, where: str, layers: bool = False) -> str:
+    # The "batch_size=.., image_size=.." prefix is what the repair lever reads by regex.
     if kind == "oom":
-        return f"out of memory on {device} at {where}: halve one of them"
-    return f"one request is larger than {device} can ever hold at {where}; not retryable"
+        return f"out of memory on {device} at {where}: halve one of them" + (
+            f", or {_POOL_HINT}" if layers else ""
+        )
+    tail = f"{_POOL_HINT}, or lower the channels" if layers else "not retryable"
+    return f"one request is larger than {device} can ever hold at {where}; {tail}"
 
 
 def _torch() -> Any:
@@ -492,10 +609,23 @@ def _head_name(backbone: str) -> str:
     return SCRATCH[backbone] if backbone in SCRATCH else BACKBONES[backbone][1]
 
 
+def _trainable(recipe: Recipe) -> tuple[str, ...] | None:
+    """The parameter-name prefixes that train, or None when every parameter does."""
+    if recipe.unfreeze == "all":
+        return None
+    head = _head_name(recipe.backbone)
+    top = head.split(".")[0]
+    if recipe.unfreeze != "last_block":
+        # A drop rebuilds convnext's norm before the head, so that norm trains with it.
+        return (top,) if recipe.drop_stages else (head,)
+    stages = STAGES[recipe.backbone]
+    return (*stages[len(stages) - recipe.drop_stages - 1][0], top)
+
+
 def _optimiser(torch: Any, model: Any, recipe: Recipe) -> Any:
-    head_name = _head_name(recipe.backbone)
+    prefixes = _trainable(recipe)
     for name, param in model.named_parameters():
-        param.requires_grad_(recipe.unfreeze == "all" or name.startswith(head_name))
+        param.requires_grad_(prefixes is None or name.startswith(prefixes))
     params = [p for p in model.parameters() if p.requires_grad]
     if recipe.optimizer == "adamw":
         return torch.optim.AdamW(params, lr=recipe.lr, weight_decay=1e-4)
@@ -644,6 +774,9 @@ class DLModelTarget:
         recipe, m = replace(recipe, image_size=size), self._metric
         log: list[str] = []
         try:
+            # The size caps are checkable only now that the size is filled in, and a
+            # refusal here costs no decode and no device work.
+            recipe.validate(self._task, outputs=self._outputs)
             if recipe.unfreeze == "none":
                 report = FitReport(self._probe(recipe.backbone, size)[2], 0, 0)
             else:
@@ -676,7 +809,7 @@ class DLModelTarget:
             values=values, primary=m, direction=direction(m), n_samples=self._dataset.n_test
         )
         ran = {"epochs_planned": report.epochs_planned, "epochs_run": report.epochs_run}
-        artifacts = {RECIPE_JSON: json.dumps({**asdict(recipe), **ran})}
+        artifacts = {RECIPE_JSON: json.dumps({**printed(recipe), **ran})}
         return ExperimentResult(
             experiment_id=experiment_id, metrics=metrics, logs=_tail(log), artifacts=artifacts
         )
@@ -805,8 +938,10 @@ __all__ = [
     "BASELINE_SIZE",
     "DEFAULT_SIZE",
     "FIT_BUDGET_SECONDS",
+    "LAYERS_NET",
     "RECIPE_JSON",
     "SCRATCH",
+    "STAGES",
     "DLModelTarget",
     "DeviceOutOfMemoryError",
     "FitJob",
@@ -818,6 +953,8 @@ __all__ = [
     "TorchRunner",
     "oom_kind",
     "plan_epochs",
+    "printed",
+    "recipe_name",
     "run_epochs",
     "time_steps",
 ]

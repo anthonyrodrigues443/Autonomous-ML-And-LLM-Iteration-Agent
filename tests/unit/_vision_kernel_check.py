@@ -347,7 +347,48 @@ def experiment() -> dict[str, Any]:
     return out
 
 
-CHECKS = {f.__name__: f for f in (session, experiment)}
+def layers_cell() -> dict[str, Any]:
+    """`fit(layers=[...])` typed into a confined cell: it builds, it trains, it submits,
+    and the line names the stack in the text a cell can paste back."""
+    out: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="vision-layers-") as tmp:
+        root = Path(tmp)
+        images, work = root / "images", root / "work"
+        images.mkdir(parents=True)
+        work.mkdir(parents=True)
+        _inputs(images, work)
+        kernel = LocalKernel(
+            confinement=confine.Confinement(reads=(images,), weights=root / "weights")
+        )
+        kernel.start(
+            {
+                name: (work / name).read_bytes()
+                for name in (codegen.TRAIN_CSV, codegen.HOLDOUT_CSV, codegen.META_JSON)
+            }
+        )
+        try:
+            out["preamble_error"] = kernel.run_cell(
+                codegen.vision_session_preamble(), timeout=300
+            ).error
+            ran = kernel.run_cell(
+                codegen.VISION_CELL_PREFIX
+                + "f = fit(layers=[('conv', 16), ('pool',), ('conv', 32), ('pool',)], epochs=1)\n"
+                "submit(f)\n",
+                timeout=600,
+            )
+            out["error"] = ran.error
+            out["fit"] = _tagged(ran.stdout, "FIT")
+            out["submitted"] = _tagged(ran.stdout, "SUBMITTED")
+            out["said"] = [line for line in ran.stdout.splitlines() if line.startswith("val ")]
+            out["predictions"] = len((kernel.read_output(codegen.PREDICTIONS_CSV) or b"").split())
+            out["recipe"] = json.loads(kernel.read_output(codegen.RECIPE_JSON) or b"{}")
+            out["network"] = bool(kernel.read_output(codegen.NETWORK_PT))
+        finally:
+            kernel.close()
+    return out
+
+
+CHECKS = {f.__name__: f for f in (session, experiment, layers_cell)}
 
 
 if __name__ == "__main__":

@@ -151,3 +151,21 @@ def test_the_network_outlives_the_kernel_and_predicts_what_the_session_submitted
     assert len(experiment["written"]) == 8
     assert experiment["predicted"] == experiment["written"]
     assert experiment["probability_gap"] < 1e-4
+
+
+def test_a_stack_typed_into_a_cell_builds_trains_and_submits() -> None:
+    result = _check("layers_cell")
+    assert result["preamble_error"] is None
+    assert result["error"] is None
+    (fit,) = result["fit"]
+    assert fit["backbone"] == "layers_net"
+    assert fit["layers"] == "conv(16) pool conv(32) pool"
+    assert fit["epochs_run"] == 1
+    assert result["submitted"] == result["fit"]
+    assert result["said"] == [
+        line for line in result["said"] if "(layers conv(16) pool conv(32) pool 32px," in line
+    ]
+    assert result["said"]
+    assert result["predictions"] == 8
+    assert result["recipe"]["predictions_sha256"]
+    assert result["network"]
