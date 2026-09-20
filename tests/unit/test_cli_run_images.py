@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -683,3 +684,125 @@ def test_an_image_run_host_never_loads_lightgbm(tmp_path: Path) -> None:
         timeout=180,
     )
     assert out.stdout.strip().splitlines()[-1:] == ["False"], out.stderr[-2000:]
+
+
+def test_the_notebook_inputs_are_the_bytes_the_session_was_started_with(
+    tmp_path: Path, calls: list[dict[str, Any]]
+) -> None:
+    """One build, from the dataset the loop hands the coder: a second build from a
+    second read of the data could deliver a notebook that loads different rows."""
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    (kw,) = calls
+    hook = kw["on_experiment"]
+    closed = dict(
+        zip(
+            hook.__code__.co_freevars,
+            (c.cell_contents for c in hook.__closure__),
+            strict=True,
+        )
+    )
+    inputs = closed["session_inputs"]
+    coder = kw["make_coder"]()
+    started = codegen.build_inputs(kw["dataset"])
+    started.update(coder._extra_inputs or {})
+    assert inputs == started
+    assert inputs[codegen.META_JSON] == kw["target"].meta_json()
+    held = pd.read_csv(io.BytesIO(inputs[codegen.HOLDOUT_CSV]))
+    assert "label" not in held.columns
+    assert list(held.columns) == ["image"]
+
+
+def test_the_run_folder_is_kept_out_of_the_users_git_history(
+    tmp_path: Path, calls: list[dict[str, Any]]
+) -> None:
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    marker = tmp_path / "dot" / ".gitignore"
+    assert marker.read_text() == "*\n"
+    marker.write_text("# mine\n")
+    assert runner.invoke(app, ["run", "--data", str(csv), "--target", "label"]).exit_code == 0
+    assert marker.read_text() == "# mine\n"  # written once, never rewritten
+
+
+def test_a_folder_that_is_not_iterates_own_is_never_marked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]
+) -> None:
+    """`--runs-dir` inside a project would otherwise put a `*` in the project's root."""
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(project / "runs"))
+    cli_module.get_settings.cache_clear()
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert not (project / ".gitignore").exists()
+    # The second run is the one that matters: by then a run folder is there, and a
+    # guard that reads "the runs dir exists" would call the project iterate's own.
+    (project / "runs" / "20260921_000000_abc").mkdir(parents=True)
+    second = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert second.exit_code == 0, second.output
+    assert not (project / ".gitignore").exists()
+
+
+def test_a_dot_iterate_an_earlier_version_left_is_marked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]
+) -> None:
+    """The upgrade case: v0.5 wrote no marker, so the folder is already there."""
+    dot = tmp_path / "project" / ".iterate"
+    dot.mkdir(parents=True)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(dot / "runs"))
+    cli_module.get_settings.cache_clear()
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert (dot / ".gitignore").read_text() == "*\n"
+    assert not (tmp_path / "project" / ".gitignore").exists()
+
+
+def _image_experiment() -> Any:
+    from iterate.schemas.experiment import Candidate, Experiment
+
+    cells = [
+        {
+            "code": "print(1)",
+            "stdout": "1\n",
+            "error": None,
+            "source": "agent",
+            "outputs": [],
+            "thinking": "",
+        }
+    ]
+    candidate = Candidate(
+        description="a depth sweep",
+        rationale="deeper backbones on this set",
+        changes={"cells": cells, "started_from": {"backbone": "resnet18", "epochs": 3}},
+    )
+    return Experiment(iteration=2, hypothesis="h", candidate=candidate, target="label")
+
+
+def _sources(notebook: Any) -> list[str]:
+    return [cell.source for cell in notebook.cells]
+
+
+def test_only_the_notebook_that_gets_the_input_files_carries_the_setup_cell() -> None:
+    """The setup cell clears the folder it is run in. A journey notebook under
+    `notebooks/` is run from the run folder, so it would clear the run folder."""
+    exp = _image_experiment()
+    common = {
+        "baseline_score": 0.5,
+        "metric": "accuracy",
+        "data_path": "/tmp/d.csv",
+        "target": "label",
+    }
+    delivered = _sources(
+        cli_module._render_experiment(exp, is_best=True, with_setup=True, **common)
+    )
+    assert any("Setup (added by iterate" in source for source in delivered)
+    assert any(codegen.INCUMBENT_JSON in source for source in delivered)
+    for is_best in (True, False):
+        journey = _sources(cli_module._render_experiment(exp, is_best=is_best, **common))
+        assert not any("Setup (added by iterate" in source for source in journey), is_best
+        assert not any(codegen.INCUMBENT_JSON in source for source in journey), is_best

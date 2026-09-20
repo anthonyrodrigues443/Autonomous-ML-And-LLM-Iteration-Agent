@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any
 
@@ -1159,3 +1160,34 @@ def test_a_fit_returns_its_holdout_predictions_only_through_submit(tmp_path: Pat
     assert isinstance(fit, Fit)
     assert "_holdout_out" not in repr(fit)
     assert len(fit._holdout_out) == 6
+
+
+# ─── images that are not there any more ──────────────────────────────────────
+
+
+def test_images_all_present_say_nothing(tmp_path: Path, capsys: Any) -> None:
+    session = _session(tmp_path)
+    vision_session._say_what_cannot_be_opened(session)
+    assert capsys.readouterr().out == ""
+
+
+def test_a_session_whose_images_are_all_gone_refuses_to_start(tmp_path: Path) -> None:
+    """`decode` turns a path it cannot open into a blank frame, so without this a Run
+    All after the image cache was deleted trains on black and prints a score."""
+    session = _session(tmp_path)
+    for path in (*session.train_paths, *session.holdout_paths):
+        os.remove(path)
+    with pytest.raises(FileNotFoundError, match="could not be opened, starting with"):
+        vision_session._say_what_cannot_be_opened(session)
+
+
+def test_a_session_missing_some_images_says_how_many_and_which(tmp_path: Path, capsys: Any) -> None:
+    session = _session(tmp_path)
+    gone = session.train_paths[0]
+    os.remove(gone)
+    vision_session._say_what_cannot_be_opened(session)
+    out = capsys.readouterr().out
+    total = len(session.train_paths) + len(session.holdout_paths)
+    assert f"1 of {total} images could not be opened" in out
+    assert gone in out
+    assert "blank frames" in out
