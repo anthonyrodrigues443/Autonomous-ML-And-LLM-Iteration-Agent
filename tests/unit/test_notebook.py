@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import nbformat
 
@@ -253,6 +253,111 @@ def test_save_round_trips(tmp_path: Path) -> None:
     path = save_notebook(nb, tmp_path / "sub" / "best.ipynb")
     assert path.exists()
     nbformat.read(path, as_version=4)  # reads back clean
+
+
+# ─── progress bars in captured outputs ────────────────────────────────────
+
+_DOWNLOADING = 'Downloading: "https://download.pytorch.org/models/resnet18-f37072fd.pth" to x.pth'
+_TRAINING_LINES = [
+    "epoch 1/3 loss=0.5033 train_acc=0.8443 22s",
+    "epoch 2/3 loss=0.2073 train_acc=0.9329 19s",
+    "epoch 3/3 loss=0.0829 train_acc=0.9734 20s",
+    'FIT {"backbone": "resnet18", "image_size": 64, "epochs_run": 3, "val": 0.9737}',
+    'MODEL {"model": "efficientnet_b0", "image_size": 224, "epochs": 2, "val": 0.9478}',
+    'SUBMITTED {"backbone": "resnet18", "image_size": 64, "val": 0.9737}',
+    "KEPT the earlier submission: its val f1_macro 0.9804 is not beaten by 0.9737",
+]
+
+
+def _stream(name: str, text: str) -> dict[str, Any]:
+    return {"type": "stream", "name": name, "text": text}
+
+
+def _session(captured: list[dict[str, Any]]) -> nbformat.NotebookNode:
+    from iterate.deliver.notebook import build_session_notebook
+
+    cell = {"code": "fit()", "stdout": "", "error": None, "source": "agent", "outputs": captured}
+    nb = build_session_notebook([cell], title="t", metric="f1")
+    nbformat.validate(nb)
+    return nb
+
+
+def _outputs(captured: list[dict[str, Any]]) -> list[Any]:
+    return list(next(c for c in _session(captured).cells if c.cell_type == "code").outputs)
+
+
+def test_training_lines_survive_in_the_written_notebook_and_tick_lines_do_not(
+    tmp_path: Path,
+) -> None:
+    download = [_stream("stderr", f"\r{i / 10:.1f}%") for i in range(1, 1001)]
+    batches = [_stream("stderr", f"\r{i * 10:3d}%|{'#' * i:<10}| {i}/10") for i in range(1, 11)]
+    first, *rest = _TRAINING_LINES
+    captured = [
+        _stream("stdout", _DOWNLOADING + "\n"),
+        *download,
+        _stream("stderr", "\n"),
+        _stream("stdout", first + "\n"),
+        *batches,
+        _stream("stderr", "\n"),
+        *[_stream("stdout", line + "\n") for line in rest],
+    ]
+    path = save_notebook(_session(captured), tmp_path / "best.ipynb")
+    written = nbformat.read(path, as_version=4)
+    nbformat.validate(written)
+    outputs = next(c for c in written.cells if c.cell_type == "code").outputs
+
+    assert [o.name for o in outputs] == ["stdout", "stderr", "stdout", "stderr", "stdout"]
+    printed = "".join(o.text for o in outputs if o.name == "stdout")
+    assert printed.splitlines() == [_DOWNLOADING, *_TRAINING_LINES]
+    bars = "".join(o.text for o in outputs if o.name == "stderr")
+    assert bars.splitlines() == ["100.0%", "100%|##########| 10/10"]
+    assert not any("\r" in o.text for o in outputs)
+
+
+def test_a_progress_bar_that_ends_each_tick_with_a_carriage_return_settles_too() -> None:
+    ticks = [_stream("stdout", f"{i}%\r") for i in (10, 20, 30)]
+    (only,) = _outputs([*ticks, _stream("stdout", "done\nepoch 1/1 loss=0.5\n")])
+    assert only.text == "done\nepoch 1/1 loss=0.5\n"
+
+
+def test_a_windows_line_ending_is_left_alone() -> None:
+    text = "epoch 1/2 loss=0.5\r\nepoch 2/2 loss=0.4\r\r\nFIT {}\r\n"
+    (only,) = _outputs([_stream("stdout", text)])
+    assert only.text == text
+
+
+def test_streams_join_only_with_a_neighbour_of_the_same_name() -> None:
+    result = {"type": "execute_result", "data": {"text/plain": "1"}, "execution_count": 1}
+    outputs = _outputs(
+        [
+            _stream("stdout", "one\n"),
+            _stream("stderr", "warn\n"),
+            _stream("stdout", "two\n"),
+            _stream("stdout", "three\n"),
+            result,
+            _stream("stdout", "four\n"),
+        ]
+    )
+    assert [(o.output_type, o.get("name"), o.get("text")) for o in outputs] == [
+        ("stream", "stdout", "one\n"),
+        ("stream", "stderr", "warn\n"),
+        ("stream", "stdout", "two\nthree\n"),
+        ("execute_result", None, None),
+        ("stream", "stdout", "four\n"),
+    ]
+
+
+def test_settling_a_cell_leaves_its_captured_record_alone() -> None:
+    captured = [_stream("stderr", "\r1%"), _stream("stderr", "\r2%\n")]
+    (only,) = _outputs(captured)
+    assert only.text == "2%\n"
+    assert captured == [_stream("stderr", "\r1%"), _stream("stderr", "\r2%\n")]
+
+
+def test_one_long_unbroken_line_after_a_progress_bar_is_kept_whole() -> None:
+    blob = "A" * 400_000
+    (only,) = _outputs([_stream("stdout", "\r50%\r100%\n"), _stream("stdout", blob + "\n")])
+    assert only.text == "100%\n" + blob + "\n"
 
 
 # ─── CLI wiring: best / all / none ────────────────────────────────────────
