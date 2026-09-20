@@ -48,6 +48,13 @@ def experiment() -> dict[str, Any]:
     return _check("experiment")
 
 
+@pytest.fixture(scope="module")
+def rerun() -> dict[str, Any]:
+    if importlib.util.find_spec("nbclient") is None:
+        pytest.skip("needs a Jupyter kernel (dev extra: nbclient/ipykernel)")
+    return _check("rerun")
+
+
 def test_torch_never_loads_in_the_test_process() -> None:
     assert "torch" not in sys.modules
 
@@ -151,3 +158,31 @@ def test_the_network_outlives_the_kernel_and_predicts_what_the_session_submitted
     assert len(experiment["written"]) == 8
     assert experiment["predicted"] == experiment["written"]
     assert experiment["probability_gap"] < 1e-4
+
+
+def test_run_all_on_a_delivered_session_carries_past_its_dead_ends(
+    rerun: dict[str, Any],
+) -> None:
+    """Run All has failed at cell 1 since v0.2, and most 12B sessions have a dead end in
+    them. The inputs are beside the notebook now and an errored cell is tagged, so the
+    whole session replays."""
+    assert rerun["errored_cells"] == 1
+    assert rerun["tagged_cells"] == 1
+    assert rerun["first_reached_the_end"]
+    assert rerun["first_submitted"] == 1
+    assert rerun["network_written"]
+    assert rerun["untagged_stops"]  # the same notebook without the tag stops at it
+
+
+def test_a_second_run_all_behaves_like_the_first_and_never_touches_the_delivered_model(
+    rerun: dict[str, Any],
+) -> None:
+    """The setup cell puts the folder back: without it the keep-best guard would read
+    the first pass's submission and hold the second pass's fit against it."""
+    assert rerun["delivered_is_read_only"]
+    assert rerun["second_reached_the_end"]
+    assert (rerun["second_submitted"], rerun["second_kept"]) == (1, 0)
+    assert (rerun["first_submitted"], rerun["first_kept"]) == (1, 0)
+    assert rerun["best_model_unchanged"]
+    assert rerun["best_model_unchanged_twice"]
+    assert rerun["incumbent"] == "simple_cnn"  # the recipe the session started from

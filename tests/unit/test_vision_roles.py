@@ -1147,6 +1147,10 @@ def test_the_loop_carries_the_recipe_stamps_what_moved_and_marks_what_did_not() 
     assert two.candidate.changes["levers_moved"] == ["backbone"]
     assert two.candidate.changes["lever_unmeasured"] is True
     assert supervisor.seen[1]["this_run"] == out.history[:1]
+    # The same recipe again, kept on the experiment: the delivered notebook hands it to
+    # its own Run All, and by then the kernel's copy is gone with the kernel's folder.
+    assert one.candidate.changes["started_from"]["backbone"] == "simple_cnn"
+    assert two.candidate.changes["started_from"]["backbone"] == "resnet18"
 
 
 def test_an_own_model_win_writes_a_fit_recipe_into_the_file_the_kernel_opens() -> None:
