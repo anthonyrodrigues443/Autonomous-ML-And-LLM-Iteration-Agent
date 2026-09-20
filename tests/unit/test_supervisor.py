@@ -870,6 +870,48 @@ def test_technique_scoreboard_skips_stamped_experiments() -> None:
     assert "RandomForest" not in sent.split("Technique scoreboard")[1].splitlines()[0]
 
 
+def _digested(score: float, techniques: list[str], *, rmse: bool = False) -> Experiment:
+    from iterate.schemas.experiment import ExperimentDigest
+
+    exp = _rmse_experiment("e", score) if rmse else _scored_experiment("e", score, "x = 1")
+    return exp.model_copy(update={"digest": ExperimentDigest(techniques=techniques, score=score)})
+
+
+def test_on_a_lower_is_better_metric_the_scoreboard_keeps_each_techniques_lowest_score() -> None:
+    from iterate.core.supervisor import _technique_table
+
+    table = _technique_table(
+        [_digested(5.30, ["HGB"], rmse=True), _digested(4.10, ["HGB"], rmse=True)], "rmse"
+    )
+    assert "HGB 4.1000 (x2)" in table
+    assert "5.3000" not in table
+
+
+def test_on_a_lower_is_better_metric_the_scoreboard_ranks_the_lowest_score_first() -> None:
+    from iterate.core.supervisor import _technique_table
+
+    table = _technique_table(
+        [
+            _digested(4.10, ["HGB"], rmse=True),
+            _digested(3.80, ["RandomForest"], rmse=True),
+            _digested(4.90, ["Ridge"], rmse=True),
+        ],
+        "rmse",
+    )
+    assert table.index("RandomForest") < table.index("HGB") < table.index("Ridge")
+
+
+def test_on_a_higher_is_better_metric_the_scoreboard_keeps_and_ranks_the_highest() -> None:
+    from iterate.core.supervisor import _technique_table
+
+    table = _technique_table(
+        [_digested(0.55, ["HGB"]), _digested(0.61, ["HGB"]), _digested(0.64, ["RandomForest"])],
+        "f1",
+    )
+    assert "HGB 0.6100 (x2)" in table
+    assert table.index("RandomForest") < table.index("HGB")
+
+
 def test_rebriefing_an_engineered_feature_the_best_already_builds_is_rejected() -> None:
     # run 11 i6: the config compression dropped the feature set, so the supervisor
     # re-commissioned the incumbent's own Tenure_Monthly win.

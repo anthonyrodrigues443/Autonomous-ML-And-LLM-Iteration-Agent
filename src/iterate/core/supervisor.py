@@ -1649,6 +1649,7 @@ def _technique_table(history: list[Experiment], metric: str) -> str:
     """Best score reached whenever each technique appeared, aggregated across all
     digests, so the pattern 'this technique tends to score well' is explicit rather
     than left for the model to infer from scattered lines."""
+    minimize = direction(metric) == "minimize"
     best: dict[str, float] = {}
     seen: dict[str, int] = {}
     for exp in history:
@@ -1668,11 +1669,11 @@ def _technique_table(history: list[Experiment], metric: str) -> str:
         score = exp.digest.score
         for tech in exp.digest.techniques:
             seen[tech] = seen.get(tech, 0) + 1
-            if tech not in best or score > best[tech]:
+            if tech not in best or (score < best[tech] if minimize else score > best[tech]):
                 best[tech] = score
     if not best:
         return ""
-    ranked = sorted(best.items(), key=lambda kv: -kv[1])
+    ranked = sorted(best.items(), key=lambda kv: kv[1] if minimize else -kv[1])
     cells = [f"{t} {best[t]:.4f} (x{seen[t]})" for t, _ in ranked]
     return f"Technique scoreboard (best {metric} when each appeared): " + " | ".join(cells)
 
