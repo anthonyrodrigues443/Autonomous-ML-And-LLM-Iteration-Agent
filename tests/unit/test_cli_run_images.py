@@ -739,3 +739,70 @@ def test_a_folder_that_is_not_iterates_own_is_never_marked(
     result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
     assert result.exit_code == 0, result.output
     assert not (project / ".gitignore").exists()
+    # The second run is the one that matters: by then a run folder is there, and a
+    # guard that reads "the runs dir exists" would call the project iterate's own.
+    (project / "runs" / "20260921_000000_abc").mkdir(parents=True)
+    second = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert second.exit_code == 0, second.output
+    assert not (project / ".gitignore").exists()
+
+
+def test_a_dot_iterate_an_earlier_version_left_is_marked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]
+) -> None:
+    """The upgrade case: v0.5 wrote no marker, so the folder is already there."""
+    dot = tmp_path / "project" / ".iterate"
+    dot.mkdir(parents=True)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(dot / "runs"))
+    cli_module.get_settings.cache_clear()
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert (dot / ".gitignore").read_text() == "*\n"
+    assert not (tmp_path / "project" / ".gitignore").exists()
+
+
+def _image_experiment() -> Any:
+    from iterate.schemas.experiment import Candidate, Experiment
+
+    cells = [
+        {
+            "code": "print(1)",
+            "stdout": "1\n",
+            "error": None,
+            "source": "agent",
+            "outputs": [],
+            "thinking": "",
+        }
+    ]
+    candidate = Candidate(
+        description="a depth sweep",
+        rationale="deeper backbones on this set",
+        changes={"cells": cells, "started_from": {"backbone": "resnet18", "epochs": 3}},
+    )
+    return Experiment(iteration=2, hypothesis="h", candidate=candidate, target="label")
+
+
+def _sources(notebook: Any) -> list[str]:
+    return [cell.source for cell in notebook.cells]
+
+
+def test_only_the_notebook_that_gets_the_input_files_carries_the_setup_cell() -> None:
+    """The setup cell clears the folder it is run in. A journey notebook under
+    `notebooks/` is run from the run folder, so it would clear the run folder."""
+    exp = _image_experiment()
+    common = {
+        "baseline_score": 0.5,
+        "metric": "accuracy",
+        "data_path": "/tmp/d.csv",
+        "target": "label",
+    }
+    delivered = _sources(
+        cli_module._render_experiment(exp, is_best=True, with_setup=True, **common)
+    )
+    assert any("Setup (added by iterate" in source for source in delivered)
+    assert any(codegen.INCUMBENT_JSON in source for source in delivered)
+    for is_best in (True, False):
+        journey = _sources(cli_module._render_experiment(exp, is_best=is_best, **common))
+        assert not any("Setup (added by iterate" in source for source in journey), is_best
+        assert not any(codegen.INCUMBENT_JSON in source for source in journey), is_best

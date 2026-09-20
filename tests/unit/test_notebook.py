@@ -610,8 +610,9 @@ def test_save_inputs_writes_the_bytes_the_kernel_got_and_repeats_cleanly(
 
 
 def test_the_holdout_written_beside_the_notebook_carries_no_labels(tmp_path: Path) -> None:
-    """Every family: the kernel never got the holdout labels, so neither does the
-    notebook that replays it."""
+    """The kernel never got the holdout labels, so neither does the notebook that
+    replays it. `build_inputs` is the one door all three families go through; each
+    family's own CLI test checks what the run actually delivers."""
     import pandas as pd
 
     from iterate.adapters.data.tabular import load_csv
@@ -624,13 +625,12 @@ def test_the_holdout_written_beside_the_notebook_carries_no_labels(tmp_path: Pat
     csv = tmp_path / "d.csv"
     frame.to_csv(csv, index=False)
     dataset = load_csv(csv, target="churn")
-    for family in ("tabular", "prompt", "vision"):
-        folder = tmp_path / family
-        save_inputs(folder, codegen.build_inputs(dataset))
-        held = pd.read_csv(folder / codegen.HOLDOUT_CSV)
-        assert "churn" not in held.columns, family
-        assert len(held) == dataset.n_test
-        assert "churn" in pd.read_csv(folder / codegen.TRAIN_CSV).columns
+    folder = tmp_path / "runs" / "r1"
+    save_inputs(folder, codegen.build_inputs(dataset))
+    held = pd.read_csv(folder / codegen.HOLDOUT_CSV)
+    assert "churn" not in held.columns
+    assert len(held) == dataset.n_test
+    assert "churn" in pd.read_csv(folder / codegen.TRAIN_CSV).columns
 
 
 def test_the_recorded_preamble_loads_when_it_is_run_from_the_run_folder(

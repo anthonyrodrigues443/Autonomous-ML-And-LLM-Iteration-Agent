@@ -785,6 +785,25 @@ def current() -> Session | None:
     return _CURRENT[0] if _CURRENT is not None else None
 
 
+def _say_what_cannot_be_opened(session: Session) -> None:
+    """`decode` turns an image it cannot open into a blank frame and says nothing, so a
+    notebook re-run after the image cache was deleted would train on black frames and
+    print a score that means nothing. During a run no path is missing, so nothing here
+    prints."""
+    paths = [*session.train_paths, *session.holdout_paths]
+    missing = [p for p in paths if not os.path.exists(p)]
+    if not missing:
+        return
+    where = (
+        f"{len(missing)} of {len(paths)} images could not be opened, starting with "
+        f"{missing[0]}. Restore ~/.cache/iterate/images, or re-run `iterate run` on the "
+        "original data"
+    )
+    if len(missing) == len(paths):
+        raise FileNotFoundError(where)
+    print(f"{where}; the ones that are gone are blank frames")
+
+
 def start(workdir: str = ".") -> dict[str, Any]:
     """The preamble's one call: every name the agent's cells see."""
     import pandas as pd
@@ -801,6 +820,7 @@ def start(workdir: str = ".") -> dict[str, Any]:
     holdout = pd.read_csv(folder / codegen.HOLDOUT_CSV)
     torch.manual_seed(int(meta.get("seed") or 42))
     session = Session(meta, train, holdout, workdir=folder)
+    _say_what_cannot_be_opened(session)
     wanted = session.size
     session.size = session.largest_size_that_fits(wanted)
     tick = time.perf_counter()

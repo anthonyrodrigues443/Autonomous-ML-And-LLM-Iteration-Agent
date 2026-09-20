@@ -955,10 +955,6 @@ def run(
     if prepared is not None:
         dataset = prepared.dataset
 
-    # ─── The run folder, from here on ──────────────────────────────────────
-    # Below every refusal, like the archive: a run that cannot start makes no folder.
-    _ignore_run_folder(Path(settings.iterate_runs_dir))
-
     # ─── New chapter? Archive the existing db. ─────────────────────────────
     # Any of --fresh, --source, --baseline+--source means "new chapter." Below every
     # refusal, so a run that cannot start leaves the memory it had.
@@ -978,6 +974,10 @@ def run(
             "--compute e2b needs an E2B API key — run 'iterate setup' or set E2B_API_KEY "
             "(get a free key at e2b.dev)."
         )
+
+    # ─── The run folder, from here on ──────────────────────────────────────
+    # Below every refusal, like the archive: a run that cannot start makes no folder.
+    _ignore_run_folder(Path(settings.iterate_runs_dir))
 
     data_summary = prepared.profile.render() if prepared is not None else summarize_dataset(dataset)
 
@@ -2070,15 +2070,19 @@ def _ignore_run_folder(runs_dir: Path) -> None:
     train.csv, and the notebook needs it there; committing it is the user's call, not
     a side effect of running the agent.
 
-    Written when iterate makes the folder, or into one that already holds the runs: a
-    folder that is someone else's is never marked, and a `.gitignore` already there is
-    never rewritten, because a user who edits it means it."""
+    Written when iterate makes the folder, or into a `.iterate/` an earlier version
+    left: a folder that is someone else's is never marked however many runs have
+    happened, and a `.gitignore` already there is never rewritten, because a user who
+    edits it means it."""
     folder = runs_dir.parent
     with contextlib.suppress(OSError):
-        ours = not folder.exists()
+        # Ownership is decided before the mkdir, so it cannot be read off a folder
+        # this call just made; the name check is the upgrade case, a `.iterate/` from
+        # a version that did not write the marker.
+        ours = not folder.exists() or folder.name == ".iterate"
         folder.mkdir(parents=True, exist_ok=True)
         marker = folder / ".gitignore"
-        if (ours or runs_dir.exists()) and not marker.exists():
+        if ours and not marker.exists():
             marker.write_text("*\n", encoding="utf-8")
 
 
@@ -2092,6 +2096,7 @@ def _render_experiment(
     exp: Experiment,
     *,
     is_best: bool,
+    with_setup: bool = False,
     baseline_score: float | None,
     metric: str,
     data_path: str,
@@ -2102,7 +2107,12 @@ def _render_experiment(
     """Render ONE experiment to a notebook node — shared by the incremental
     per-iteration save and the end-of-run write, so both produce identical files.
     Cell-by-cell experiments carry their session ("cells"); render the real
-    session. Spec / one-shot experiments render through the contract."""
+    session. Spec / one-shot experiments render through the contract.
+
+    `with_setup` is the notebook that gets the input files beside it, which is the
+    only one meant to be run: the setup cell clears the folder it is run in, and a
+    journey notebook under `notebooks/` would clear the run folder instead. It is
+    not `is_best`, because the winner also gets a journey copy under `notebooks/`."""
     from iterate.core import codegen
     from iterate.deliver.notebook import build_notebook, build_session_notebook
 
@@ -2136,7 +2146,7 @@ def _render_experiment(
             # between cells and between Run Alls.
             setup=(
                 codegen.vision_notebook_setup(started_from)
-                if isinstance(started_from, dict)
+                if with_setup and isinstance(started_from, dict)
                 else None
             ),
         )
@@ -2191,6 +2201,7 @@ def _write_experiment_notebook(
             _render_experiment(
                 exp,
                 is_best=True,
+                with_setup=True,
                 baseline_score=baseline_score,
                 metric=metric,
                 data_path=data_path,
@@ -2252,6 +2263,7 @@ def _write_notebooks(
                 _render_experiment(
                     result.best,
                     is_best=True,
+                    with_setup=True,
                     baseline_score=baseline_score,
                     metric=metric,
                     data_path=data_path,
