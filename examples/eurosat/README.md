@@ -64,8 +64,8 @@ its own torch code, a timm efficientnet_b0, and scored 0.9478.
 
 Certification run: SLOT_CERT
 
-RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
-capture: SLOT_4050
+GPU compatible: it trains on an Apple GPU (MPS) or an NVIDIA GPU (CUDA), and falls back
+to CPU.
 
 The ceiling sweep still runs on its own:
 `python -m evals.run ceilings --datasets eurosat`.
