@@ -59,7 +59,7 @@ def test_a_trimmed_plan_builds_its_schedule_over_the_epochs_it_runs() -> None:
     assert result["epochs"] == [2, 2]
     assert result["steps"] == 2 * 3
     assert result["epoch_seconds"] == 3.3
-    assert 7.0 < result["left"] <= 7.5
+    assert result["left"] == 7.5
 
 
 def test_an_epoch_the_deadline_cuts_still_predicts() -> None:
