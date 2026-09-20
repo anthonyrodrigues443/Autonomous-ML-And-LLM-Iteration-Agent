@@ -8,7 +8,8 @@ touches the device, with the pool cap and the fallback flag already set.
 Every helper prints one tagged line the host reads afterwards: ``FIT`` when `fit()`
 returns, ``MODEL`` when `evaluate()` scores the agent's own model, and ``SUBMITTED``
 when a submit helper writes predictions. Those lines, not the text of a cell, are how
-the run knows which lever moved.
+the run knows which lever moved. A fit submitted after a better-validated fit prints
+``KEPT`` and writes nothing, so the last ``SUBMITTED`` line still names the file on disk.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -524,9 +526,44 @@ class Session:
             return _numbers(out, rows, order)
         return _probabilities(out, rows, len(self.classes), order)
 
+    def _kept_val(self) -> float | None:
+        """The validation score of the fit this folder already holds. It is read from
+        disk, so a restarted kernel still has it, and only while recipe.json describes
+        predictions.csv: a file written over since is not a submission to keep. A class
+        run's probabilities.csv must pass the check the host's finish runs, because a
+        submit that writes is the only repair for one that does not. An own-model
+        submission carries no score a fit is held against."""
+        try:
+            saved = json.loads((self.workdir / codegen.RECIPE_JSON).read_text())
+            on_disk = (self.workdir / codegen.PREDICTIONS_CSV).read_bytes()
+            if self.task != "regression":
+                probs = (self.workdir / codegen.PROBABILITIES_CSV).read_bytes()
+                codegen.parse_probabilities(probs, expected=len(self.holdout_paths))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(saved, dict) or "model" in saved:
+            return None
+        if saved.get("predictions_sha256") != hashlib.sha256(on_disk).hexdigest():
+            return None
+        val = saved.get("val")
+        return float(val) if isinstance(val, int | float) and math.isfinite(val) else None
+
     def _write(self, out: np.ndarray, line: dict[str, Any]) -> None:
         import pandas as pd
 
+        from iterate.core.scoring import direction
+
+        # Only a fit is held against a fit, and a tie keeps the earlier one. Nothing is
+        # written and no SUBMITTED line is printed, so the host carries the kept recipe.
+        kept, new = self._kept_val(), line.get("val")
+        if kept is not None and "model" not in line and isinstance(new, int | float):
+            beats = new < kept if direction(self.metric) == "minimize" else new > kept
+            if not beats:
+                print(
+                    f"KEPT the earlier submission: its val {self.metric} {kept:.4f} "
+                    f"is not beaten by {float(new):.4f}"
+                )
+                return
         if self.task == "regression":
             predictions = pd.Series(np.asarray(out, dtype=np.float64))
             (self.workdir / codegen.PROBABILITIES_CSV).unlink(missing_ok=True)

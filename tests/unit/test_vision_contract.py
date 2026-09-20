@@ -155,6 +155,39 @@ def test_an_own_model_payload_carried_back_still_opens_a_session(
     assert json.loads(capsys.readouterr().out.splitlines()[-2][4:])["backbone"] == "resnet18"
 
 
+def test_a_fit_the_session_kept_out_never_becomes_the_recipe_the_host_carries(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """The host carries the last SUBMITTED payload, and keeps recipe.json only while it
+    describes predictions.csv. A worse fit submitted second must leave both on the first."""
+    from iterate.core.coder import _recipe_describes
+    from iterate.core.vision_session import Fit
+
+    vl = _levers()
+    session = vision_session(tmp_path, holdout=6, size=32)
+
+    def scored(val: float, lr: float, column: int) -> Fit:
+        out = np.full((6, 3), 0.1)
+        out[:, column] = 0.8
+        return Fit({"backbone": "resnet18", "lr": lr, "val": val}, out)
+
+    names = {**session_names(session), "a": scored(0.9573, 0.001, 1), "b": scored(0.9313, 0.002, 2)}
+    cells = []
+    for code in ("submit(a)", "submit(b)"):
+        _run(code, names)
+        cells += _cell(code, capsys)
+
+    assert cells[0]["stdout"].startswith("SUBMITTED ")
+    assert cells[1]["stdout"].startswith("KEPT ")
+    assert "SUBMITTED" not in cells[1]["stdout"]
+    assert vl.submitted(cells) == names["a"].line
+    work = session.workdir
+    recorded = (work / codegen.RECIPE_JSON).read_bytes()
+    assert _recipe_describes(recorded, (work / codegen.PREDICTIONS_CSV).read_bytes())
+    assert json.loads(recorded)["lr"] == 0.001
+    assert set((work / codegen.PREDICTIONS_CSV).read_text().split()) == {"c1"}
+
+
 def test_an_explicit_size_on_the_first_fine_tune_reads_as_a_move(
     tmp_path: Path, capsys: Any
 ) -> None:
