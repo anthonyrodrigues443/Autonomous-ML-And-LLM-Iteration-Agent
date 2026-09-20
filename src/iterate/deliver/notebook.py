@@ -181,8 +181,12 @@ def _cell_outputs(cell: Any) -> list[Any]:
 def _settled(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Neighbouring stream outputs of one name joined into one, then every line
     reduced to what a terminal shows once its carriage returns have played out.
-    Returns copies: the captured record is the run's memory and must not change."""
+    Returns copies: the captured record is the run's memory and must not change.
+
+    A run's texts are joined once at the end: adding each one to the text so far
+    copies that text every time, which is quadratic in the run's length."""
     settled: list[dict[str, Any]] = []
+    runs: list[list[str]] = []
     for output in captured:
         last = settled[-1] if settled else None
         if (
@@ -191,12 +195,14 @@ def _settled(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
             and _is_stream(output)
             and last.get("name", "stdout") == output.get("name", "stdout")
         ):
-            last["text"] += output["text"]
+            runs[-1].append(output["text"])
         else:
             settled.append(dict(output))
-    for output in settled:
-        if _is_stream(output) and "\r" in output["text"]:
-            output["text"] = _after_carriage_returns(output["text"])
+            runs.append([output["text"]] if _is_stream(output) else [])
+    for output, texts in zip(settled, runs, strict=True):
+        if texts:
+            text = "".join(texts)
+            output["text"] = _after_carriage_returns(text) if "\r" in text else text
     return settled
 
 

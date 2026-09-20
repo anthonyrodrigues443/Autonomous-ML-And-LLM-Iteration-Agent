@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import nbformat
@@ -358,6 +359,23 @@ def test_one_long_unbroken_line_after_a_progress_bar_is_kept_whole() -> None:
     blob = "A" * 400_000
     (only,) = _outputs([_stream("stdout", "\r50%\r100%\n"), _stream("stdout", blob + "\n")])
     assert only.text == "100%\n" + blob + "\n"
+
+
+def test_a_hundred_thousand_stream_outputs_in_one_cell_join_in_under_a_second() -> None:
+    from iterate.deliver.notebook import build_session_notebook
+
+    lines = [f"{i:>8} " + "x" * 50 + "\n" for i in range(100_000)]
+    captured = [_stream("stdout", line) for line in lines]
+    cell = {"code": "fit()", "stdout": "", "error": None, "source": "agent", "outputs": captured}
+
+    # CPU time, not wall time: other work on the machine must not move this number.
+    started = time.process_time()
+    nb = build_session_notebook([cell], title="t", metric="f1")
+    spent = time.process_time() - started
+
+    (only,) = next(c for c in nb.cells if c.cell_type == "code").outputs
+    assert only.text == "".join(lines)
+    assert spent < 1.0
 
 
 # ─── CLI wiring: best / all / none ────────────────────────────────────────
