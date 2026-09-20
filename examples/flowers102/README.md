@@ -39,10 +39,26 @@ headroom. One standard error on this holdout is 0.4 points, so resnet18 fine-tun
 224 px, 0.972, ties it. The resnet18 probe on frozen features scores 0.892, so most of
 the headroom is pretrained features, and the rest is fine-tuning them.
 
-**Status:** data ready, and `DLModelTarget` measures its ceiling here in the eval
-sweep (`python -m evals.run ceilings --datasets flowers102`). The `iterate run`
-switch for images lands later in v0.6; until then a run on this folder stops once it
-is linked.
+**Status:** working. Since v0.6 an image run goes end to end on this dataset: the plain
+CNN baseline, briefed experiments that fine-tune through `fit()` or the agent's own
+torch code, a sealed holdout, and `best.ipynb`.
+
+```bash
+iterate run --data data.csv --target label --metric accuracy
+```
+
+`--target label` is required on the CSV form. Pass `--metric accuracy` so the run's
+numbers line up with the stored baseline and ceiling: left to pick for itself, the
+metric step chose `f1_macro` here 3 times of 3. The run needs torch, which the harness
+installs at the start with your consent, or `pip install 'iterate-ai[vision]'`.
+
+Live on gemma4:12b, Apple M5 with MPS: SLOT_FLOWERS_RUN
+
+RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
+capture: SLOT_4050
+
+The ceiling sweep still runs on its own:
+`python -m evals.run ceilings --datasets flowers102`.
 
 **License:** Oxford states no license for the images. The script downloads them for
 local use and this repo redistributes nothing. Cite: Nilsback, M-E. and Zisserman,

@@ -70,9 +70,30 @@ winner: convnext_tiny fine-tuned at 160 px scored 8.87, and resnet18 and resnet5
 scores. A frozen backbone takes about a third of the headroom at best, 13.17 for the
 resnet18 probe and 11.62 for convnext_tiny's; fine-tuning takes the rest.
 
-**Status:** data ready, and the eval sweep measures its ceiling
-(`python -m evals.run ceilings --datasets cyclone_wind`). The `iterate run` switch for
-images lands later in v0.6; until then a run on these files stops before training.
+**Status:** working, the number-label image example. Since v0.6 an image run goes end
+to end here: the plain CNN baseline as a regressor, briefed experiments that fine-tune
+through `fit()` or the agent's own torch code, a sealed holdout, and `best.ipynb`.
+
+```bash
+iterate run --train train.csv --holdout holdout.csv --target label --metric rmse
+```
+
+The split by storm is yours, so the holdout is sealed exactly as `prepare.py` wrote it.
+`--target label` is required on the CSV form. The live run below passed no `--metric`
+and the metric step picked rmse by itself; naming it makes the run repeatable. The run
+needs torch, which the harness installs at the start with your consent, or
+`pip install 'iterate-ai[vision]'`.
+
+Live on gemma4:12b, Apple M5 with MPS (main 6485be3, SLOT_KEEP_BEST, machine under
+memory pressure): the baseline scored 13.12 knots, as stored, iteration 1 9.16 and
+iteration 2 9.20. Against the 8.87 ceiling that is about 93% of the headroom, in 2
+iterations and 48.5 min. The time budget cut two fits to 9 and 8 of their 10 epochs.
+
+RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
+capture: SLOT_4050
+
+The ceiling sweep still runs on its own:
+`python -m evals.run ceilings --datasets cyclone_wind`.
 
 **License:** CC-BY-4.0. Cite: M. Maskey, R. Ramachandran, I. Gurung, B. Freitag,
 M. Ramasubramanian, J. Miller. "Tropical Cyclone Wind Estimation Competition Dataset",

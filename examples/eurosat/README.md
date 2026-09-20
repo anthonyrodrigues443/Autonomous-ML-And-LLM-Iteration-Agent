@@ -42,9 +42,33 @@ backbone here, 0.899 for the resnet18 probe and 0.944 for convnext_tiny's: on ti
 no ImageNet photograph resembles, features learned from the tiles themselves carry
 most of the way, and a pretrained model has to be fine-tuned to pass them.
 
-**Status:** data ready, and `DLModelTarget` measures its ceiling here in the eval
-sweep (`python -m evals.run ceilings --datasets eurosat`). The `iterate run` switch
-for images lands later in v0.6.
+**Status:** working, and the dataset the v0.6 certification run uses. Since v0.6 an
+image run goes end to end here: the plain CNN baseline, briefed experiments that
+fine-tune through `fit()` or the agent's own torch code, a sealed holdout, and
+`best.ipynb`.
+
+```bash
+iterate run --data data.csv --target label --metric accuracy
+```
+
+`--target label` is required on the CSV form. Pass `--metric accuracy` so the run's
+numbers line up with the stored baseline and ceiling: left to pick for itself, the
+metric step chose `f1_macro` here 2 times of 3. The run needs torch, which the harness
+installs at the start with your consent, or `pip install 'iterate-ai[vision]'`.
+
+First live run, 2026-09-18, gemma4:12b on an Apple M5 with MPS, 3 iterations, 43 min,
+no `--metric`, so the metric step picked `f1_macro`: the baseline reproduced the stored
+accuracy exactly, 0.9496, and `f1_macro` went from 0.9477 to 0.9848 (accuracy 0.9854)
+on the first iteration, a convnext_tiny fine-tune at 128 px. The third iteration wrote
+its own torch code, a timm efficientnet_b0, and scored 0.9478.
+
+Certification run, from the 0.6.0 wheel in a clean venv: SLOT_CERT
+
+RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
+capture: SLOT_4050
+
+The ceiling sweep still runs on its own:
+`python -m evals.run ceilings --datasets eurosat`.
 
 **License:** MIT, per the Zenodo record. Cite: Helber, Bischke, Dengel, Borth. "EuroSAT: A Novel Dataset and
 Deep Learning Benchmark for Land Use and Land Cover Classification." IEEE JSTARS

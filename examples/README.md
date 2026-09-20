@@ -9,9 +9,9 @@ Public-dataset demos that ship with `iterate`.
 | `intent_clinc150/` | `PromptTarget` | CLINC150 intent classification (public) | **working** — but measured at f1_macro 0.989 for a minimal prompt, so it has almost no headroom |
 | `hate_speech_davidson/` | `PromptTarget` | Davidson hate / offensive / neither (public) | **working, the prompt example worth running** |
 | `sts_benchmark/` | `PromptTarget` | STS-B sentence similarity, scored 0-5 (public) | **working** — the REGRESSION example |
-| `flowers102/` | `DLModelTarget` | Oxford Flowers102, 102 species (public) | data ready; the eval sweep measures its ceiling; the run switch lands later in v0.6 |
-| `eurosat/` | `DLModelTarget` | EuroSAT satellite land use, 10 classes (public, MIT) | data ready; the eval sweep measures its ceiling; the vision certification dataset |
-| `cyclone_wind/` | `DLModelTarget` | NASA storm wind speed from satellite frames (public, CC-BY-4.0) | data ready; the eval sweep measures its ceiling; the NUMBER-label vision example, split by storm |
+| `flowers102/` | `DLModelTarget` | Oxford Flowers102, 102 species (public) | **working, the image example worth running**: the plain CNN baseline scores 0.554 against a measured ceiling of 0.974 |
+| `eurosat/` | `DLModelTarget` | EuroSAT satellite land use, 10 classes (public, MIT) | **working**, the image certification dataset: no ImageNet overlap, 0.950 against a 0.986 ceiling |
+| `cyclone_wind/` | `DLModelTarget` | NASA storm wind speed from satellite frames (public, CC-BY-4.0) | **working**, the NUMBER-label image example, split by storm: 13.12 knots against an 8.87 ceiling |
 
 ### Which prompt example to run
 
@@ -44,6 +44,31 @@ iterate run --data data.clean.csv --target Churn --metric f1
 
 See `churn_tabular/README.md` for what the run produces and what to expect.
 
+## Running an image example
+
+Since v0.6 an image run works end to end: a plain CNN baseline, briefed experiments
+that fine-tune a pretrained backbone through `fit()` or write their own torch code, a
+sealed holdout, and `best.ipynb`.
+
+```bash
+cd examples/flowers102
+python prepare.py                 # one-time: downloads, verifies, writes images/ and data.csv
+iterate run --data data.csv --target label --metric accuracy
+
+cd ../cyclone_wind
+python prepare.py                 # about 250 MB: writes train.csv and holdout.csv, split by storm
+iterate run --train train.csv --holdout holdout.csv --target label --metric rmse
+```
+
+`--target label` is required on the CSV form. Name the metric: left to pick for
+itself the agent usually chooses `f1_macro` on the two class datasets, and the number
+then does not line up with the accuracy these READMEs and the stored ceilings quote.
+An image run needs torch: the harness installs it at the start of the run with your
+consent, or install it yourself with `pip install 'iterate-ai[vision]'`. It trains on
+your machine, and `--compute e2b` is refused. Expect tens of minutes: the three live
+runs so far took 29 to 49 minutes for 2 or 3 iterations on an Apple M5 with a local
+gemma4:12b. RTX 4050 (CUDA, over WSL2): SLOT_4050
+
 ## Bringing your own tabular problem
 
 No code needed: any prepared CSV works directly.
@@ -57,6 +82,17 @@ and the usual cleaning done (the agent iterates models, it does not clean data f
 you). Classification metrics: `f1`, `accuracy`, `precision`, `recall`. Regression:
 `rmse`, `mae`, `mse`, `r2`.
 
+## Bringing your own images
+
+```bash
+iterate run --data path/to/image_folder                 # the labels are found by rules and shown to you before anything trains
+iterate run --data your_images.csv --target <label_column> --metric accuracy
+```
+
+A folder can be laid out however it came: class folders, a label table beside the
+images, a train and test pair. A CSV needs one column of image paths, relative to the
+CSV's own folder, and one label column holding a class or a number.
+
 Custom `BenchmarkTarget` implementations in your own package (for problems that are
-not a flat CSV) are supported at the protocol level (`iterate.targets.base`), but the
-CSV path is the supported public interface until the target families grow at v0.5/v0.6.
+not a CSV or a folder of images) are supported at the protocol level
+(`iterate.targets.base`), but the CLI forms above are the supported public interface.
