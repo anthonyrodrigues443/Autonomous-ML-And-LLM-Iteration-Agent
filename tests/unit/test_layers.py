@@ -105,6 +105,109 @@ def test_a_head_reads_the_same_way() -> None:
     assert layers.parse("linear(512) dropout(0.5)", "head") == (("linear", 512), ("dropout", 0.5))
 
 
+@pytest.mark.parametrize(
+    "clause",
+    [
+        "use conv(32) pool conv(64)",
+        "layers: conv(32) pool conv(64)",
+        "layers=conv(32) pool conv(64)",
+        "change the layers to conv(32) pool conv(64)",
+        "switch to conv(32) -> pool -> conv(64)",
+    ],
+)
+def test_a_change_clause_reads_as_the_stack_it_names(clause: str) -> None:
+    assert layers.parse(clause) == (("conv", 32), ("pool",), ("conv", 64))
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "try a custom CNN, 20 epochs",
+        "simple_cnn 64px",
+        "a CNN (2015)",
+        "swap to convnext_tiny",
+        "20 epochs",
+    ],
+)
+def test_prose_behind_a_leading_word_is_still_not_layers(prose: str) -> None:
+    with pytest.raises(RecipeError, match="must be layers like"):
+        layers.parse(prose)
+
+
+@pytest.mark.parametrize(
+    ("typed", "spec"),
+    [
+        ("conv-32, pool, conv-64", (("conv", 32), ("pool",), ("conv", 64))),
+        ("conv-32-pool-conv-64", (("conv", 32), ("pool",), ("conv", 64))),
+        ("linear-256", (("linear", 256),)),
+        ("dropout-0.3", (("dropout", 0.3),)),
+        (
+            "conv32-conv64-pool-drop0.3-fc256",
+            (("conv", 32), ("conv", 64), ("pool",), ("dropout", 0.3), ("linear", 256)),
+        ),
+    ],
+)
+def test_a_hyphen_before_a_number_separates_it_and_is_not_a_minus(typed: str, spec: Spec) -> None:
+    assert layers.parse(typed) == spec
+
+
+@pytest.mark.parametrize(
+    "typed",
+    [
+        [("conv", "32"), ("pool",), ("linear", "256")],
+        [["conv", "32"], ["pool"], ["linear", "256"]],
+        [{"conv": "32"}, {"pool": []}, {"linear": "256"}],
+        '[["conv", "32"], ["pool"], ["linear", "256"]]',
+    ],
+)
+def test_a_number_quoted_as_a_string_reads_as_the_number(typed: Any) -> None:
+    assert layers.parse(typed) == (("conv", 32), ("pool",), ("linear", 256))
+
+
+def test_a_flat_layer_holding_a_quoted_number_is_one_layer() -> None:
+    assert layers.parse(["conv", "32"]) == (("conv", 32),)
+    assert layers.parse([("dropout", "0.3")]) == (("dropout", 0.3),)
+    with pytest.raises(RecipeError, match="conv takes channels from 4 to 512"):
+        layers.parse([("conv", "wide")])
+
+
+def test_a_layer_that_takes_nothing_reads_as_null_or_as_an_empty_list() -> None:
+    stack = (("conv", 32), ("pool",), ("linear", 256))
+    assert layers.parse(json.loads('[{"conv": 32}, {"pool": null}, {"linear": 256}]')) == stack
+    assert layers.parse('[["conv", 32], ["pool", null], ["linear", 256]]') == stack
+    assert layers.parse([{"conv": 32}, {"pool": []}, {"linear": 256}]) == stack
+    with pytest.raises(RecipeError, match="dropout takes one share"):
+        layers.parse([("dropout", None)])
+
+
+def test_a_json_string_reads_as_the_value_it_decodes_to() -> None:
+    stack = (("conv", 32), ("pool",), ("conv", 64))
+    assert layers.parse('[{"conv": 32}, {"pool": []}, {"conv": 64}]') == stack
+    assert layers.parse('[["conv", 32], ["pool"], ["conv", 64]]') == stack
+    assert layers.parse('{"conv": 32}') == (("conv", 32),)
+    assert layers.parse("[conv(32) pool conv(64)]") == stack
+
+
+def test_a_refusal_names_what_the_reader_has_to_change() -> None:
+    with pytest.raises(RecipeError, match="remove '%'"):
+        layers.parse(["conv(32)", "dropout 30%"])
+    with pytest.raises(RecipeError, match=r"30 looks like a percentage, so write 0\.3"):
+        layers.parse([("conv", 32), ("dropout", 30)])
+
+
+@pytest.mark.parametrize(
+    ("typed", "word"),
+    [
+        ("conv(32) then pool then conv(64)", "then"),
+        ("conv(32) and pool and conv(64)", "and"),
+        ("conv(32) followed by pool", "followed"),
+    ],
+)
+def test_a_word_between_two_layers_is_named_in_the_refusal(typed: str, word: str) -> None:
+    with pytest.raises(RecipeError, match=f"'{word}' is not a layer name"):
+        layers.parse(typed)
+
+
 # ─── the strict reader ───────────────────────────────────────────────────────
 
 
@@ -143,6 +246,34 @@ def test_an_ask_of_prose_opens_nothing(prose: str) -> None:
 )
 def test_an_ask_that_writes_the_stack_out_is_read(ask: str, spec: Spec) -> None:
     assert layers.found_strict(ask) == spec
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "each stage doubles the width: conv(64), conv(128), conv(256), conv(512)",
+        "the two branches use conv(64), conv(128) filters respectively",
+    ],
+)
+def test_widths_counted_off_in_prose_open_nothing(prose: str) -> None:
+    assert layers.found_strict(prose) is None
+
+
+def test_a_stack_that_shrinks_the_map_is_still_read() -> None:
+    assert layers.found_strict("conv(32,3,2) conv(64,3,2)") == (
+        ("conv", 32, 3, 2),
+        ("conv", 64, 3, 2),
+    )
+
+
+def test_a_written_stack_reads_however_the_sentence_judges_it() -> None:
+    """A known boundary: the caller that owns research findings filters the comparative
+    ones, because the layer grammar reads the stack either way."""
+    assert layers.found_strict("resnet50 gets 0.94; a scratch conv(32) pool conv(64) net") == (
+        ("conv", 32),
+        ("pool",),
+        ("conv", 64),
+    )
 
 
 def test_what_the_prompts_show_is_what_an_ask_can_copy_back() -> None:
@@ -265,8 +396,8 @@ def test_a_layer_the_builder_cannot_make_is_refused_by_name(typed: Any, reason: 
             [("conv", 512), ("conv", 512)],
             "layers",
             {"size": 224, "batch": 64},
-            "layers does about 7621 billion multiply-adds for a batch of 64 at 224 px and the "
-            "limit is 512 (resnet50 at 224 px does 262)",
+            "layers does about 119 billion multiply-adds per image at 224 px and the limit "
+            "is 8 (resnet50 at 224 px does 4)",
         ),
         (
             [("conv", 512)],
@@ -323,6 +454,14 @@ def test_the_caps_that_scale_with_the_batch_wait_for_the_batch() -> None:
         layers.check(spec, size=224, batch=64)
 
 
+def test_a_smaller_batch_does_not_buy_a_more_expensive_network() -> None:
+    spec = layers.parse([("conv", 256), ("conv", 256)])
+    assert spec is not None
+    for batch in (None, 8, 16, 64):
+        with pytest.raises(RecipeError, match="multiply-adds per image"):
+            layers.check(spec, size=224, batch=batch)
+
+
 def test_the_baseline_stack_passes_every_check() -> None:
     layers.check(layers.SIMPLE_CNN, size=64, batch=64, outputs=10)
     layers.check(layers.parse(layers.EXAMPLE) or (), size=160, batch=64, outputs=102)
@@ -341,6 +480,15 @@ def test_the_weight_count_reads_a_head_from_the_backbone_width() -> None:
     head = layers.parse(layers.HEAD_EXAMPLE, "head")
     assert head is not None
     assert layers.count_weights(head, 10, features=512) == (512 + 1) * 512 + (512 + 1) * 10
+
+
+def test_the_cost_of_a_head_reads_the_backbone_width_too() -> None:
+    head = layers.parse(layers.HEAD_EXAMPLE, "head")
+    assert head is not None
+    assert layers.count_macs(head, 224, "head", features=2048) == 2048 * 512
+    lead = layers.parse("dropout(0.5) linear(512)", "head")
+    assert lead is not None
+    assert layers.activation_bytes(lead, 224, 1, "head", features=2048) == 4 * (2048 + 2 * 512)
 
 
 def test_the_multiply_add_count_is_the_measured_one_for_simple_cnn() -> None:

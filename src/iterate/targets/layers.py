@@ -18,6 +18,7 @@ as an argument when they land beside it.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from itertools import pairwise
@@ -31,7 +32,10 @@ HEAD_KINDS = ("linear", "dropout")
 MAX_LAYERS = 12
 MAX_HEAD = 4
 MAX_PARAMS = 30_000_000
-MAX_BATCH_MACS = 8_000_000_000 * 64
+# The compute cap is per image: an epoch costs the same multiply-adds whatever the batch
+# size is, so a smaller batch must not buy a more expensive network.
+MAX_MACS = 8_000_000_000
+MAX_BATCH_MACS = MAX_MACS * 64
 MAX_ACTIVATION_BYTES = 6 * 2**30
 CHANNELS = (4, 512)
 WIDTHS = (8, 2048)
@@ -97,7 +101,8 @@ _WORDS = "|".join(_NAME_WORDS)
 # The lookbehind keeps `cnn` out of `simple_cnn`; the lookahead still allows `conv32`.
 _NAME_AT = re.compile(rf"(?<![a-z0-9_])(?:{_WORDS})(?![a-z_])")
 _STRICT_AT = re.compile(rf"(?<![a-z0-9_])({_WORDS})(?![a-z_])\s*(\([^()]*\))?")
-_TOKEN = re.compile(r"[a-z_]+(?:2d)?|-?\d*\.\d+|-?\d+")
+# No layer takes a negative number, so a leading "-" is a separator, never a sign.
+_TOKEN = re.compile(r"[a-z_]+(?:2d)?|\d*\.\d+|\d+")
 _FILLER = re.compile(r"[\s:=,()\[\]'\"|;+>-]+")
 # What may sit between two layers of one ask: separators only, never a word.
 _GAP = re.compile(r"[\s,;+|>\-\[\]'\"]*")
@@ -117,18 +122,26 @@ def parse(value: Any, name: str = "layers") -> Spec | None:
     if isinstance(value, str):
         if not value.strip():
             return None
+        if value.lstrip()[:1] in ("[", "{"):
+            try:
+                return parse(json.loads(value), name)
+            except json.JSONDecodeError:
+                pass
         value = _chunks(value, name)
     if not isinstance(value, list | tuple):
         raise _not_layers(value, name)
-    if value and isinstance(value[0], str) and any(_is_number(v) for v in value[1:]):
+    if value and isinstance(value[0], str) and any(_is_number(_number(v)) for v in value[1:]):
         value = [value]
     return tuple(_layer(item, f"{name}[{i}]") for i, item in enumerate(value)) or None
 
 
 def found_strict(value: Any, name: str = "layers") -> Spec | None:
     """The stack a user ask or a research finding states outright, or None. Only
-    name(number) counts, a bare name other than pool ends the run, and a run of fewer
-    than two valued layers is prose."""
+    name(number) counts, a bare name other than pool ends the run, a run of fewer than
+    two valued layers is prose, and so is a run of convs that never shrinks the map. A
+    written-out stack reads whatever the sentence says about it, so a finding that
+    measures one and calls it the loser still opens the lever; the caller that owns
+    findings filters comparative sentences."""
     if not isinstance(value, str):
         return None
     low = value.lower()
@@ -216,15 +229,14 @@ def check(
     if size is None:
         return
     macs, elements = _cost(spec, size, name)
+    if macs > MAX_MACS:
+        raise RecipeError(
+            f"{name} does about {macs / 1e9:.0f} billion multiply-adds per image at {size} px "
+            f"and the limit is {MAX_MACS / 1e9:.0f} (resnet50 at 224 px does 4); put a pool "
+            "after the first conv, lower the channels, or lower image_size"
+        )
     if batch is None:
         return
-    if macs * batch > MAX_BATCH_MACS:
-        raise RecipeError(
-            f"{name} does about {macs * batch / 1e9:.0f} billion multiply-adds for a batch of "
-            f"{batch} at {size} px and the limit is {MAX_BATCH_MACS / 1e9:.0f} (resnet50 at "
-            "224 px does 262); put a pool after the first conv, lower the channels, or lower "
-            "image_size"
-        )
     if (used := elements * _FLOAT_BYTES * batch) > MAX_ACTIVATION_BYTES:
         raise RecipeError(
             f"{name} keeps about {used / 2**30:.1f} GB of activations at {size} px and batch "
@@ -248,15 +260,18 @@ def count_weights(spec: Spec, outputs: int = 0, *, features: int = 3) -> int:
     return total + ((width + 1) * outputs if outputs else 0)
 
 
-def count_macs(spec: Spec, size: int, name: str = "layers") -> int:
-    """Multiply-adds for one image."""
-    return _cost(spec, size, name)[0]
+def count_macs(spec: Spec, size: int, name: str = "layers", *, features: int = 3) -> int:
+    """Multiply-adds for one image. A head starts from the backbone's `features` wide
+    vector, not from the image."""
+    return _cost(spec, size, name, features)[0]
 
 
-def activation_bytes(spec: Spec, size: int, batch: int, name: str = "layers") -> int:
+def activation_bytes(
+    spec: Spec, size: int, batch: int, name: str = "layers", *, features: int = 3
+) -> int:
     """What the forward pass keeps for the backward pass: every layer's output, in
     float32, for the whole batch."""
-    return _cost(spec, size, name)[1] * _FLOAT_BYTES * batch
+    return _cost(spec, size, name, features)[1] * _FLOAT_BYTES * batch
 
 
 def _not_layers(value: Any, name: str) -> RecipeError:
@@ -272,7 +287,12 @@ def _chunks(value: str, name: str) -> list[str]:
     """One text, one chunk per layer name in it."""
     low = value.strip().lower()
     marks = [m.start() for m in _NAME_AT.finditer(low)]
-    if not marks or _FILLER.sub("", low[: marks[0]]):
+    if not marks:
+        raise _not_layers(value, name)
+    if _FILLER.sub("", low[: marks[0]]):
+        # A change clause leads with a word, so loose mode must read what strict does.
+        if (found := found_strict(low, name)) is not None:
+            return [_written(layer) for layer in found]
         raise _not_layers(value, name)
     return [low[a:b] for a, b in pairwise([*marks, len(low)])]
 
@@ -285,11 +305,24 @@ def _run(run: list[str], name: str) -> Spec | None:
     except RecipeError:
         return None
     valued = [layer for layer in spec or () if layer[0] != "pool"]
-    return spec if len(valued) >= 2 else None
+    if len(valued) < 2:
+        return None
+    kinds = {layer[0] for layer in spec or ()}
+    # Widths enumerated in prose read as convs with nothing between them to shrink the map.
+    if kinds == {"conv"} and not any(_conv(layer)[2] == 2 for layer in spec or ()):
+        return None
+    return spec
 
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _number(value: Any) -> Any:
+    """A number a model quoted as a string, as the number; anything else untouched."""
+    if isinstance(value, str) and re.fullmatch(r"\d*\.\d+|\d+", value.strip()):
+        return float(value) if "." in value else int(value)
+    return value
 
 
 def _absurd(value: int | float) -> bool:
@@ -304,26 +337,40 @@ def _whole(value: Any) -> bool:
 
 def _words(chunk: str, at: str) -> list[Any]:
     low = chunk.strip().lower()
-    if not low or _FILLER.sub("", _TOKEN.sub("", low)):
+    if not low:
         raise RecipeError(
             f'{at} is {chunk!r}; write the name first, like ("conv", 32) or "conv:32"'
         )
-    return [
-        (float(t) if "." in t else int(t)) if t[0].isdigit() or t[0] in ".-" else t
+    if left := _FILLER.sub("", _TOKEN.sub("", low)):
+        raise RecipeError(
+            f"{at} is {chunk!r}: remove {left!r}; write only the layers, like {EXAMPLE!r}"
+        )
+    words: list[Any] = [
+        (float(t) if "." in t else int(t)) if t[0].isdigit() or t[0] == "." else t
         for t in _TOKEN.findall(low)
     ]
+    for word in words[1:]:
+        # pool is the only layer whose argument is a word.
+        if isinstance(word, str) and word not in ("max", "avg"):
+            raise RecipeError(
+                f"{at} is {chunk!r}: {word!r} is not a layer name; write only the layers, "
+                f"like {EXAMPLE!r}"
+            )
+    return words
 
 
 def _layer(item: Any, at: str) -> Layer:
     if isinstance(item, dict) and len(item) == 1:
         ((key, args),) = item.items()
-        item = [key, *(args if isinstance(args, list | tuple) else [args])]
+        item = [key, *(args if isinstance(args, list | tuple) else [] if args is None else [args])]
     if isinstance(item, list | tuple) and len(item) == 1 and isinstance(item[0], str):
         item = item[0]
     if isinstance(item, str):
         item = _words(item, at)
     if not isinstance(item, list | tuple) or not item or not isinstance(item[0], str):
         raise RecipeError(f'{at} is {item!r}; write the name first, like ("conv", 32) or "conv:32"')
+    # JSON writes a layer that takes nothing as null and its numbers as strings.
+    item = [item[0], *(_number(a) for a in item[1:] if a is not None)]
     raw = re.sub(r"[\s-]+", "_", item[0].strip().lower())
     kind = _ALIASES.get(raw, raw)
     args, shown = list(item[1:]), tuple(item)
@@ -340,7 +387,12 @@ def _layer(item: Any, at: str) -> Layer:
         return ("pool", "avg") if how == ["avg"] or raw in _AVG else ("pool",)
     if kind == "dropout":
         if not (len(args) == 1 and _is_number(args[0]) and DROPOUT[0] <= args[0] <= DROPOUT[1]):
-            raise RecipeError(f"{at} is {shown}: {_takes('dropout')}")
+            percent = (
+                f"; {args[0]} looks like a percentage, so write {args[0] / 100:g}"
+                if len(args) == 1 and _whole(args[0]) and 1 <= args[0] <= 100
+                else ""
+            )
+            raise RecipeError(f"{at} is {shown}: {_takes('dropout')}{percent}")
         return ("dropout", float(args[0]))
     if kind == "linear":
         if len(args) != 1 or not _whole(args[0]) or not WIDTHS[0] <= args[0] <= WIDTHS[1]:
@@ -390,12 +442,12 @@ def _body_end(spec: Spec) -> int:
     return conv[-1] + 1 if conv else 0
 
 
-def _cost(spec: Spec, size: int, name: str) -> tuple[int, int]:
+def _cost(spec: Spec, size: int, name: str, features: int = 3) -> tuple[int, int]:
     """Multiply-adds and kept activation elements for one image, and the refusal when a
     conv or a pool meets a 1 px map. The final layer is the builder's, so neither number
     counts it."""
     macs = elements = 0
-    side, width, halved = size, 3, 0
+    side, width, halved = size, features, 0
     body = _body_end(spec)
     for i, layer in enumerate(spec):
         kind = str(layer[0])
@@ -453,6 +505,7 @@ __all__ = [
     "MAX_BATCH_MACS",
     "MAX_HEAD",
     "MAX_LAYERS",
+    "MAX_MACS",
     "MAX_PARAMS",
     "SIMPLE_CNN",
     "Layer",
