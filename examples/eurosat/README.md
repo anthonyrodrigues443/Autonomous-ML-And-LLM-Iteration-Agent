@@ -62,7 +62,7 @@ accuracy exactly, 0.9496, and `f1_macro` went from 0.9477 to 0.9848 (accuracy 0.
 on the first iteration, a convnext_tiny fine-tune at 128 px. The third iteration wrote
 its own torch code, a timm efficientnet_b0, and scored 0.9478.
 
-Certification run, from the 0.6.0 wheel in a clean venv: SLOT_CERT
+Certification run: SLOT_CERT
 
 RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
 capture: SLOT_4050
