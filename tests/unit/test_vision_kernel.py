@@ -138,3 +138,16 @@ def test_one_image_experiment_runs_the_way_a_run_runs_it(experiment: dict[str, A
     assert experiment["artifacts"] == ["recipe.json"]
     assert experiment["recipe"]["backbone"] == "simple_cnn"
     assert experiment["recipe"]["predictions_sha256"]
+
+
+def test_the_network_outlives_the_kernel_and_predicts_what_the_session_submitted(
+    experiment: dict[str, Any],
+) -> None:
+    """The three hops end to end: the confined cell writes the file, the coder copies it
+    out before `close()` deletes the folder, and `iterate.vision.load` opens it."""
+    assert experiment["kernel_folder_gone"]
+    assert experiment["network_kept"]
+    assert experiment["network_digest_matches"]
+    assert len(experiment["written"]) == 8
+    assert experiment["predicted"] == experiment["written"]
+    assert experiment["probability_gap"] < 1e-4
