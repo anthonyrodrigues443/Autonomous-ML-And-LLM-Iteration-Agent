@@ -1703,6 +1703,108 @@ def test_the_recipe_is_kept_only_while_it_describes_the_predictions(tmp_path: Pa
         assert (codegen.RECIPE_JSON in out.result.artifacts) is kept
 
 
+def _network_session(
+    tmp_path: Path, *, recipe: dict[str, Any], network: bytes | None, keep: Path | None
+) -> _WatchKernel:
+    ds = _dataset(tmp_path)
+    predictions = b"0\n" * ds.n_test
+    recorded = {"predictions_sha256": hashlib.sha256(predictions).hexdigest(), **recipe}
+    files = {codegen.PREDICTIONS_CSV: predictions, codegen.RECIPE_JSON: json.dumps(recorded)}
+    if network is not None:
+        files[codegen.NETWORK_PT] = network
+    kernel = _WatchKernel(
+        [CellResult("loaded", "")], files={k: _bytes(v) for k, v in files.items()}
+    )
+    fake = _FakeLLM([_finish(), _finish()])
+    CodingAgent(fake, kernel, metric="f1", max_cells=2, keep_model=keep).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="keep"
+    )
+    return kernel
+
+
+def _bytes(value: str | bytes) -> bytes:
+    return value if isinstance(value, bytes) else value.encode()
+
+
+def test_the_network_recipe_json_names_is_copied_out_before_the_kernel_closes(
+    tmp_path: Path,
+) -> None:
+    slot = tmp_path / "slot" / "best_model.pt"
+    digest = hashlib.sha256(b"weights").hexdigest()
+    _network_session(tmp_path, recipe={"model_sha256": digest}, network=b"weights", keep=slot)
+    assert slot.read_bytes() == b"weights"
+
+
+@pytest.mark.parametrize(
+    ("recipe", "network"),
+    [
+        ({"model_sha256": "beef"}, b"weights"),
+        ({"model_sha256": hashlib.sha256(b"weights").hexdigest()}, None),
+        ({}, b"weights"),
+        ({"model_sha256": hashlib.sha256(b"weights").hexdigest(), "predictions_sha256": "x"}, b"w"),
+    ],
+    ids=["another file's digest", "no file", "a recipe that names no network", "a floor submit"],
+)
+def test_a_network_the_recipe_does_not_vouch_for_is_never_copied(
+    tmp_path: Path, recipe: dict[str, Any], network: bytes | None
+) -> None:
+    slot = tmp_path / "slot" / "best_model.pt"
+    _network_session(tmp_path, recipe=recipe, network=network, keep=slot)
+    assert not slot.exists()
+
+
+def test_the_slot_is_cleared_when_a_session_starts(tmp_path: Path) -> None:
+    """A session that crashed must not leave its network for the next one to win with."""
+    slot = tmp_path / "best_model.pt"
+    slot.write_bytes(b"the last session's")
+    _network_session(tmp_path, recipe={}, network=None, keep=slot)
+    assert not slot.exists()
+
+
+def test_a_copy_that_fails_costs_the_network_and_not_the_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pathlib
+
+    slot = tmp_path / "slot" / "best_model.pt"
+    ds = _dataset(tmp_path)
+    predictions = b"0\n" * ds.n_test
+    recorded = {
+        "predictions_sha256": hashlib.sha256(predictions).hexdigest(),
+        "model_sha256": hashlib.sha256(b"weights").hexdigest(),
+    }
+    kernel = _WatchKernel(
+        [CellResult("loaded", "")],
+        files={
+            codegen.PREDICTIONS_CSV: predictions,
+            codegen.RECIPE_JSON: json.dumps(recorded).encode(),
+            codegen.NETWORK_PT: b"weights",
+        },
+    )
+
+    def full(self: pathlib.Path, data: bytes) -> int:
+        self.touch()
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", full)
+    fake = _FakeLLM([_finish(), _finish()])
+    out = CodingAgent(fake, kernel, metric="f1", max_cells=2, keep_model=slot).run(  # type: ignore[arg-type]
+        dataset=ds, brief="b", experiment_id="keep"
+    )
+    assert out.result.succeeded
+    assert codegen.RECIPE_JSON in out.result.artifacts
+    assert not slot.exists()
+
+
+def test_a_run_with_no_slot_never_asks_the_kernel_for_a_network(tmp_path: Path) -> None:
+    """Every table and prompt run: `keep_model` is None and the session is today's."""
+    digest = hashlib.sha256(b"weights").hexdigest()
+    kernel = _network_session(
+        tmp_path, recipe={"model_sha256": digest}, network=b"weights", keep=None
+    )
+    assert codegen.NETWORK_PT not in kernel.reads
+
+
 # ─── a cell that would not stop ───────────────────────────────────────────────
 
 
