@@ -67,7 +67,7 @@ An image run needs torch: the harness installs it at the start of the run with y
 consent, or install it yourself with `pip install 'iterate-ai[vision]'`. It trains on
 your machine, and `--compute e2b` is refused. Expect tens of minutes: the four live
 runs so far took 29 to 49 minutes for 2 or 3 iterations on an Apple M5 with a local
-gemma4:12b. No run on CUDA yet: an RTX 4050 check over WSL2 follows v0.6.0.
+gemma4:12b. RTX 4050 (CUDA, over WSL2): SLOT_4050
 
 ## Bringing your own tabular problem
 

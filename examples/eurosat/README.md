@@ -64,8 +64,8 @@ its own torch code, a timm efficientnet_b0, and scored 0.9478.
 
 Certification run: SLOT_CERT
 
-No run on CUDA yet. An RTX 4050 check over WSL2 follows v0.6.0: epoch time against
-MPS, VRAM peak and the out-of-memory capture.
+RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
+capture: SLOT_4050
 
 The ceiling sweep still runs on its own:
 `python -m evals.run ceilings --datasets eurosat`.

@@ -61,8 +61,8 @@ same 2 each time, and tied it. 3 iterations, 39 min, no traceback. 0.9811 is pas
 sweep never ran, so the stored ceiling is the best of thirteen recipes and not a true
 upper bound. An earlier run on main 6485be3 reached 0.9670 in 29 min.
 
-No run on CUDA yet. An RTX 4050 check over WSL2 follows v0.6.0: epoch time against
-MPS, VRAM peak and the out-of-memory capture.
+RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
+capture: SLOT_4050
 
 The ceiling sweep still runs on its own:
 `python -m evals.run ceilings --datasets flowers102`.
