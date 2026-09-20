@@ -5,6 +5,7 @@ stubbed; nothing trains."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -472,7 +473,9 @@ def _run_with_a_winner(
         assert slot.parent.is_dir()
         if network is not None:
             slot.write_bytes(network)
-        kw["on_experiment"](experiment=None, baseline=None, is_best=wins, run_id="r1")
+        # The real loop logs a hook's error and goes on.
+        with contextlib.suppress(Exception):
+            kw["on_experiment"](experiment=None, baseline=None, is_best=wins, run_id="r1")
         changes = {"code": "fit()", "cells": [], "recipe": recipe or _FIT}
         tried = Experiment(
             candidate=Candidate(description="a fine-tune", changes=changes, rationale="r"),
@@ -607,6 +610,28 @@ def test_a_network_that_cannot_be_moved_is_a_warning_with_the_path_and_the_hook_
     kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
     assert any(str(kept) in r.getMessage() and "No space" in r.getMessage() for r in caplog.records)
     assert (kept.parent / "monitor.json").is_file()
+
+
+def test_the_network_is_settled_before_anything_else_in_the_hook_can_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next session clears the slot, so a hook that died ahead of the settle would
+    lose the winner's network for good."""
+
+    real, calls = cli_module._copy_report, []
+
+    def broken_in_the_hook(*a: Any, **kw: Any) -> None:
+        calls.append(a)
+        if len(calls) == 1:
+            raise RuntimeError("the report could not be copied")
+        real(*a, **kw)
+
+    monkeypatch.setattr(cli_module, "_copy_report", broken_in_the_hook)
+    result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=b"weights")
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 2
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    assert kept.read_bytes() == b"weights"
 
 
 def test_the_staging_folder_goes_even_when_the_loop_dies(
