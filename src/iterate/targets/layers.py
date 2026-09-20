@@ -91,7 +91,8 @@ _REFUSED = {
     "logsoftmax": _ADDED_FINAL,
     "sigmoid": _ADDED_FINAL,
 }
-_NAME_WORDS = sorted({*KINDS, *_ALIASES, *_REFUSED}, key=len, reverse=True)
+# Longest first, so `maxpool2d` wins over `pool`; the second key only pins the order.
+_NAME_WORDS = sorted({*KINDS, *_ALIASES, *_REFUSED}, key=lambda word: (-len(word), word))
 _WORDS = "|".join(_NAME_WORDS)
 # The lookbehind keeps `cnn` out of `simple_cnn`; the lookahead still allows `conv32`.
 _NAME_AT = re.compile(rf"(?<![a-z0-9_])(?:{_WORDS})(?![a-z_])")

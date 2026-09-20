@@ -4,6 +4,7 @@ the real `_simple_cnn` pins."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from typing import Any
@@ -84,6 +85,20 @@ def test_the_canonical_text_and_code_are_the_one_form_the_prompts_show() -> None
 )
 def test_the_canonical_form_drops_what_the_builder_defaults(typed: Any, spec: Spec | None) -> None:
     assert layers.parse(typed) == spec
+
+
+def test_a_parsed_stack_is_hashable_and_json_safe() -> None:
+    spec = layers.parse(json.loads(json.dumps([["conv", 32], ["pool"], ["dropout", 0.3]])))
+    assert spec == (("conv", 32), ("pool",), ("dropout", 0.3))
+    assert len({spec, layers.parse("conv(32) pool dropout(0.3)")}) == 1
+    assert json.loads(json.dumps(spec)) == [["conv", 32], ["pool"], ["dropout", 0.3]]
+
+
+def test_no_spec_reads_and_writes_as_nothing() -> None:
+    assert layers.text(None) == ""
+    assert layers.code(None) == "None"
+    assert layers.found_strict(None) is None
+    layers.check((), size=64, batch=64, outputs=10)
 
 
 def test_a_head_reads_the_same_way() -> None:
