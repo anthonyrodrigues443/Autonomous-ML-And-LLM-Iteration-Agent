@@ -52,7 +52,14 @@ numbers line up with the stored baseline and ceiling: left to pick for itself, t
 metric step chose `f1_macro` here 3 times of 3. The run needs torch, which the harness
 installs at the start with your consent, or `pip install 'iterate-ai[vision]'`.
 
-Live on gemma4:12b, Apple M5 with MPS: SLOT_FLOWERS_RUN
+Live on gemma4:12b, Apple M5 with MPS, 2026-09-20, on the keep-best code: the baseline
+scored 0.5544, as stored. Iteration 1, resnet18 fine-tuned at 160 px, 0.9523.
+Iteration 2, convnext_tiny fine-tuned at 224 px, 0.9811, the best: at about 150 s an
+epoch the time budget gave it 2 epochs. Iteration 3 asked for 2, 4 and 3 epochs, got the
+same 2 each time, and tied it. 3 iterations, 39 min, no traceback. 0.9811 is past the sweep's
+0.974 by 0.7 points, under two standard errors: convnext_tiny at 224 px is a pairing the
+sweep never ran, so the stored ceiling is the best of thirteen recipes and not a true
+upper bound. An earlier run on main 6485be3 reached 0.9670 in 29 min.
 
 RTX 4050 (CUDA, over WSL2), epoch time against MPS, VRAM peak and the out-of-memory
 capture: SLOT_4050

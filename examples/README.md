@@ -65,7 +65,7 @@ itself the agent usually chooses `f1_macro` on the two class datasets, and the n
 then does not line up with the accuracy these READMEs and the stored ceilings quote.
 An image run needs torch: the harness installs it at the start of the run with your
 consent, or install it yourself with `pip install 'iterate-ai[vision]'`. It trains on
-your machine, and `--compute e2b` is refused. Expect tens of minutes: the three live
+your machine, and `--compute e2b` is refused. Expect tens of minutes: the four live
 runs so far took 29 to 49 minutes for 2 or 3 iterations on an Apple M5 with a local
 gemma4:12b. RTX 4050 (CUDA, over WSL2): SLOT_4050
 

@@ -84,8 +84,8 @@ and the metric step picked rmse by itself; naming it makes the run repeatable. T
 needs torch, which the harness installs at the start with your consent, or
 `pip install 'iterate-ai[vision]'`.
 
-Live on gemma4:12b, Apple M5 with MPS (main 6485be3, SLOT_KEEP_BEST, machine under
-memory pressure): the baseline scored 13.12 knots, as stored, iteration 1 9.16 and
+Live on gemma4:12b, Apple M5 with MPS (main 6485be3, before the keep-best guard,
+machine under memory pressure): the baseline scored 13.12 knots, as stored, iteration 1 9.16 and
 iteration 2 9.20. Against the 8.87 ceiling that is about 93% of the headroom, in 2
 iterations and 48.5 min. The time budget cut two fits to 9 and 8 of their 10 epochs.
 
