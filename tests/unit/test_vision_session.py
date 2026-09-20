@@ -389,6 +389,195 @@ def test_a_wrong_number_of_numbers_is_refused(tmp_path: Path) -> None:
     session.submit_numbers(np.zeros((6, 1)), model="own")  # a column is accepted
 
 
+# ─── a submit keeps the better fit ───────────────────────────────────────────
+
+
+def _scored(session: Session, val: float | None, *, lr: float) -> Fit:
+    """What `fit()` returns, at a validation score the test picks. The holdout
+    predictions follow `lr`, so no two tries write the same bytes."""
+    n = len(session.holdout_paths)
+    if session.task == "regression":
+        out = np.full(n, lr)
+    else:
+        out = np.full((n, len(session.classes)), 0.1)
+        out[:, round(lr * 1000) % len(session.classes)] = 0.8
+    line = {"backbone": "resnet18", "lr": lr} | ({} if val is None else {"val": val})
+    return Fit(line, out)
+
+
+def _recorded(session: Session) -> dict[str, Any]:
+    recorded: dict[str, Any] = json.loads((session.workdir / codegen.RECIPE_JSON).read_text())
+    return recorded
+
+
+def _files(session: Session) -> list[bytes]:
+    names = (codegen.PREDICTIONS_CSV, codegen.PROBABILITIES_CSV, codegen.RECIPE_JSON)
+    return [(session.workdir / name).read_bytes() for name in names]
+
+
+def test_a_worse_fit_submitted_after_a_better_one_writes_nothing(
+    tmp_path: Path, capsys: Any
+) -> None:
+    session = _session(tmp_path)
+    session.submit(_scored(session, 0.9573, lr=0.001))
+    first = _files(session)
+    session.submit(_scored(session, 0.9313, lr=0.002))
+    assert _files(session) == first
+    out = capsys.readouterr().out
+    assert out.count("SUBMITTED ") == 1
+    assert "KEPT the earlier submission: its val accuracy 0.9573 is not beaten by 0.9313" in out
+    assert out.count("predictions for the holdout") == 1
+
+
+def test_a_better_fit_still_replaces_the_one_submitted_before_it(
+    tmp_path: Path, capsys: Any
+) -> None:
+    session = _session(tmp_path)
+    session.submit(_scored(session, 0.9313, lr=0.001))
+    session.submit(_scored(session, 0.9573, lr=0.002))
+    assert _recorded(session)["lr"] == 0.002
+    digest = hashlib.sha256((session.workdir / codegen.PREDICTIONS_CSV).read_bytes()).hexdigest()
+    assert _recorded(session)["predictions_sha256"] == digest
+    assert [s["lr"] for s in _printed(capsys, "SUBMITTED")] == [0.001, 0.002]
+
+
+def test_a_number_run_keeps_the_lower_validation_score(tmp_path: Path, capsys: Any) -> None:
+    session = _session(tmp_path, task="regression", metric="rmse")
+    session.submit(_scored(session, 8.3266, lr=0.001))
+    session.submit(_scored(session, 8.6088, lr=0.0005))
+    assert _recorded(session)["lr"] == 0.001
+    assert "its val rmse 8.3266 is not beaten by 8.6088" in capsys.readouterr().out
+    session.submit(_scored(session, 8.2, lr=0.0007))
+    assert _recorded(session)["lr"] == 0.0007
+    written = (session.workdir / codegen.PREDICTIONS_CSV).read_text().splitlines()
+    assert {float(v) for v in written} == {0.0007}
+
+
+@pytest.mark.parametrize(
+    ("task", "metric", "better", "worse"),
+    [("classification", "log_loss", 0.30, 0.40), ("regression", "r2", 0.90, 0.80)],
+)
+def test_the_metric_and_not_the_task_says_which_score_is_better(
+    tmp_path: Path, task: str, metric: str, better: float, worse: float
+) -> None:
+    """A class run can score on a loss and a number run on a fit: both orders, so a
+    guard that always keeps passes neither."""
+    first = _session(tmp_path / "better_first", task=task, metric=metric)
+    first.submit(_scored(first, better, lr=0.001))
+    first.submit(_scored(first, worse, lr=0.002))
+    assert _recorded(first)["lr"] == 0.001
+    second = _session(tmp_path / "worse_first", task=task, metric=metric)
+    second.submit(_scored(second, worse, lr=0.001))
+    second.submit(_scored(second, better, lr=0.002))
+    assert _recorded(second)["lr"] == 0.002
+
+
+def test_a_tie_keeps_the_earlier_fit(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    session.submit(_scored(session, 0.95, lr=0.001))
+    session.submit(_scored(session, 0.95, lr=0.002))
+    assert _recorded(session)["lr"] == 0.001
+
+
+def test_an_own_model_submitted_after_a_better_fit_still_writes(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """Only a fit is held against a fit: the brief may have asked for this model, and
+    its score says nothing about a recipe `fit()` can rebuild."""
+    session = _session(tmp_path, per_class=10, holdout=6)
+    session.submit(_scored(session, 0.95, lr=0.001))
+    n_val = len(session.val_idx)
+    own = session.evaluate(np.full((n_val, 3), 1 / 3), model="vit")
+    assert own < 0.95
+    session.submit_probabilities(np.full((6, 3), 1 / 3), model="vit")
+    assert _recorded(session)["model"] == "vit"
+    assert _printed(capsys, "SUBMITTED")[-1]["model"] == "vit"
+
+
+def test_a_fit_submitted_after_a_better_own_model_still_writes(tmp_path: Path) -> None:
+    session = _session(tmp_path, per_class=10, holdout=6)
+    truth = np.asarray(session.labels)[session.val_idx]
+    perfect = np.zeros((len(truth), 3))
+    perfect[np.arange(len(truth)), truth] = 1.0
+    assert session.evaluate(perfect, model="vit") == pytest.approx(1.0)
+    session.submit_probabilities(np.full((6, 3), 1 / 3), model="vit")
+    session.submit(_scored(session, 0.9, lr=0.002))
+    assert "model" not in _recorded(session)
+    assert _recorded(session)["lr"] == 0.002
+
+
+def test_a_submission_with_no_validation_score_always_writes(tmp_path: Path) -> None:
+    session = _session(tmp_path, holdout=6)
+    session.submit(_scored(session, 0.95, lr=0.001))
+    session.submit(_scored(session, None, lr=0.002))
+    assert _recorded(session)["lr"] == 0.002
+    session.submit(_scored(session, 0.95, lr=0.003))
+    session.submit_probabilities(np.full((6, 3), 1 / 3), model="never_evaluated")
+    assert _recorded(session)["model"] == "never_evaluated"
+    assert "val" not in _recorded(session)
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        pytest.param(codegen.PREDICTIONS_CSV, None, id="gone"),
+        pytest.param(codegen.PREDICTIONS_CSV, "c0\n" * 6, id="written over"),
+        pytest.param(codegen.RECIPE_JSON, '{"backbone": "resnet18", "va', id="recipe cut short"),
+        pytest.param(codegen.RECIPE_JSON, "[1, 2]", id="recipe not a payload"),
+        pytest.param(codegen.PROBABILITIES_CSV, None, id="probabilities gone"),
+        pytest.param(codegen.PROBABILITIES_CSV, "0.8,0.1,0.1\n" * 5, id="probabilities cut short"),
+        pytest.param(codegen.PROBABILITIES_CSV, "c0\n" * 6, id="probabilities not numbers"),
+    ],
+)
+def test_a_submission_no_longer_whole_on_disk_never_blocks_a_submit(
+    tmp_path: Path, name: str, content: str | None
+) -> None:
+    """The floor writes predictions.csv without a recipe, a cell can delete a file, and a
+    cell stopped inside a write leaves one cut short. Submitting again is how the folder
+    is repaired, so the score beside a submission that is not whole keeps nothing."""
+    session = _session(tmp_path, holdout=6)
+    session.submit(_scored(session, 0.95, lr=0.001))
+    damaged = session.workdir / name
+    if content is None:
+        damaged.unlink()
+    else:
+        damaged.write_text(content)
+    session.submit(_scored(session, 0.9, lr=0.002))
+    assert _recorded(session)["lr"] == 0.002
+    probabilities = (session.workdir / codegen.PROBABILITIES_CSV).read_bytes()
+    assert len(codegen.parse_probabilities(probabilities, expected=6)) == 6
+
+
+def test_a_saved_score_that_is_not_a_number_never_blocks_a_submit(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    session.submit(_scored(session, float("nan"), lr=0.001))
+    session.submit(_scored(session, 0.5, lr=0.002))
+    assert _recorded(session)["lr"] == 0.002
+
+
+@pytest.mark.parametrize(
+    ("task", "metric"), [("classification", "accuracy"), ("regression", "rmse")]
+)
+def test_a_fit_whose_score_is_not_a_number_never_replaces_a_scored_one(
+    tmp_path: Path, capsys: Any, task: str, metric: str
+) -> None:
+    session = _session(tmp_path, task=task, metric=metric)
+    session.submit(_scored(session, 0.9, lr=0.001))
+    session.submit(_scored(session, float("nan"), lr=0.002))
+    assert _recorded(session)["lr"] == 0.001
+    assert capsys.readouterr().out.count("SUBMITTED ") == 1
+
+
+def test_a_restarted_kernel_still_keeps_the_better_fit(tmp_path: Path) -> None:
+    session = _session(tmp_path)
+    session.submit(_scored(session, 0.95, lr=0.001))
+    restarted = _session(tmp_path)  # the same workdir, a new kernel
+    restarted.submit(_scored(restarted, 0.9, lr=0.002))
+    assert _recorded(restarted)["lr"] == 0.001
+    restarted.submit(_scored(restarted, 0.96, lr=0.003))
+    assert _recorded(restarted)["lr"] == 0.003
+
+
 # ─── evaluate ────────────────────────────────────────────────────────────────
 
 
