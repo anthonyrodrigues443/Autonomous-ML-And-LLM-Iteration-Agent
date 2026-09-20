@@ -31,6 +31,8 @@ LEVERS: tuple[str, ...] = (
     "augmentation",
     "regularisation",
     "fine-tune-depth",
+    "layer-stack",
+    "custom-head",
 )
 FIT_FIELDS: dict[str, tuple[str, ...]] = {
     "backbone": ("backbone",),
@@ -39,7 +41,10 @@ FIT_FIELDS: dict[str, tuple[str, ...]] = {
     "augmentation": ("augment",),
     "regularisation": ("label_smoothing",),
     "fine-tune-depth": ("unfreeze", "lr", "head_init", "optimizer", "schedule"),
+    "layer-stack": ("layers",),
+    "custom-head": ("head", "drop_stages"),
 }
+LAYER_LEVERS = frozenset({"layer-stack", "custom-head"})
 MODEL_FIELDS: dict[str, tuple[str, ...]] = {
     "image-size": ("image_size",),
     "epochs": ("epochs",),
@@ -89,6 +94,10 @@ _ALIASES: dict[str, str] = {
     "finetune-depth": "fine-tune-depth",
     "unfreeze": "fine-tune-depth",
     "learning-rate": "fine-tune-depth",
+    # Multi-word only: bare "head", "layers" and "architecture" are words the 12B
+    # already writes into fine-tune and backbone tags.
+    "from-scratch": "layer-stack",
+    "new-head": "custom-head",
 }
 _NAMES = sorted({*LEVERS, *_ALIASES}, key=len, reverse=True)
 _NEXT = re.compile(r"\bnext\s*:", re.IGNORECASE)
@@ -853,9 +862,12 @@ def ready_line(items: Sequence[Ready]) -> str:
 
 
 def ledger_line(history: Sequence[Experiment]) -> str:
+    """A layer class is listed only once a try has spent an experiment on it, so a run
+    that never opens one sends the bytes it sent before the classes existed."""
     done = tried(history)
-    yes = ", ".join(lv for lv in LEVERS if lv in done) or "none"
-    no = ", ".join(lv for lv in LEVERS if lv not in done) or "none"
+    shown = [lv for lv in LEVERS if lv not in LAYER_LEVERS or lv in done]
+    yes = ", ".join(lv for lv in shown if lv in done) or "none"
+    no = ", ".join(lv for lv in shown if lv not in done) or "none"
     return f"Levers tried: {yes} | Levers NOT yet tried: {no}"
 
 
