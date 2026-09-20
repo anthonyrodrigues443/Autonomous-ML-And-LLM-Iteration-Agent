@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -683,3 +684,58 @@ def test_an_image_run_host_never_loads_lightgbm(tmp_path: Path) -> None:
         timeout=180,
     )
     assert out.stdout.strip().splitlines()[-1:] == ["False"], out.stderr[-2000:]
+
+
+def test_the_notebook_inputs_are_the_bytes_the_session_was_started_with(
+    tmp_path: Path, calls: list[dict[str, Any]]
+) -> None:
+    """One build, from the dataset the loop hands the coder: a second build from a
+    second read of the data could deliver a notebook that loads different rows."""
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    (kw,) = calls
+    hook = kw["on_experiment"]
+    closed = dict(
+        zip(
+            hook.__code__.co_freevars,
+            (c.cell_contents for c in hook.__closure__),
+            strict=True,
+        )
+    )
+    inputs = closed["session_inputs"]
+    coder = kw["make_coder"]()
+    started = codegen.build_inputs(kw["dataset"])
+    started.update(coder._extra_inputs or {})
+    assert inputs == started
+    assert inputs[codegen.META_JSON] == kw["target"].meta_json()
+    held = pd.read_csv(io.BytesIO(inputs[codegen.HOLDOUT_CSV]))
+    assert "label" not in held.columns
+    assert list(held.columns) == ["image"]
+
+
+def test_the_run_folder_is_kept_out_of_the_users_git_history(
+    tmp_path: Path, calls: list[dict[str, Any]]
+) -> None:
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    marker = tmp_path / "dot" / ".gitignore"
+    assert marker.read_text() == "*\n"
+    marker.write_text("# mine\n")
+    assert runner.invoke(app, ["run", "--data", str(csv), "--target", "label"]).exit_code == 0
+    assert marker.read_text() == "# mine\n"  # written once, never rewritten
+
+
+def test_a_folder_that_is_not_iterates_own_is_never_marked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]
+) -> None:
+    """`--runs-dir` inside a project would otherwise put a `*` in the project's root."""
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(project / "runs"))
+    cli_module.get_settings.cache_clear()
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert not (project / ".gitignore").exists()

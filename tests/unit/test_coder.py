@@ -1683,6 +1683,38 @@ def test_starting_files_reach_the_kernels_working_directory(tmp_path: Path) -> N
     assert codegen.TRAIN_CSV in kernel.started
 
 
+def test_the_notebook_copies_are_the_files_the_kernel_was_started_with(tmp_path: Path) -> None:
+    """The delivered notebook re-reads these three by name from its own folder, and the
+    host builds them from the same dataset object the session was run on."""
+    from iterate.deliver.notebook import save_inputs
+
+    ds = _dataset(tmp_path)
+    meta = b'{"target": "y", "task": "classification", "features": ["f1"], "family": "vision"}'
+    kernel = _WatchKernel(
+        [CellResult("loaded", "")], files={codegen.PREDICTIONS_CSV: b"0\n" * ds.n_test}
+    )
+    CodingAgent(
+        _FakeLLM([_finish(), _finish()]),
+        kernel,  # type: ignore[arg-type]
+        metric="f1",
+        max_cells=2,
+        extra_inputs={codegen.META_JSON: meta},
+    ).run(
+        dataset=ds,
+        brief="b",
+        experiment_id="copies",
+        starting_files={codegen.INCUMBENT_JSON: b"{}"},
+    )
+    delivered = tmp_path / "runs" / "r1"
+    inputs = codegen.build_inputs(ds)
+    inputs[codegen.META_JSON] = meta
+    save_inputs(delivered, inputs)
+    for name in (codegen.TRAIN_CSV, codegen.HOLDOUT_CSV, codegen.META_JSON):
+        assert (delivered / name).read_bytes() == kernel.started[name], name
+    # incumbent.json is the one file the notebook writes for itself, in its setup cell.
+    assert not (delivered / codegen.INCUMBENT_JSON).exists()
+
+
 def test_the_recipe_is_kept_only_while_it_describes_the_predictions(tmp_path: Path) -> None:
     ds = _dataset(tmp_path)
     predictions = b"0\n" * ds.n_test

@@ -645,6 +645,48 @@ def test_each_iteration_notebook_is_saved_the_moment_it_finishes(
     assert (run_dir / "best.ipynb").exists()  # best.ipynb tracks the best-so-far
 
 
+def test_the_winner_notebook_gets_the_files_its_first_cell_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run All has failed at cell 1 since v0.2: the session read its three files from
+    the kernel's folder, which is deleted when the run ends. They land beside the
+    notebook now, as the same bytes the kernel was started with."""
+    from iterate.config import get_settings
+    from iterate.core import codegen
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "runs"))
+    get_settings.cache_clear()
+    captured = _stub_run_supervised(monkeypatch, invoke_hook=True)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--data",
+                str(data),
+                "--target",
+                "churn",
+                "--metric",
+                "f1",
+                "--code",
+                "--memory",
+                str(tmp_path / "m.db"),
+            ],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code == 0, result.stdout
+    run_dir = tmp_path / "runs" / "t"
+    started = codegen.build_inputs(captured["dataset"])
+    started.update(captured["coder"]._extra_inputs or {})
+    assert started  # a table run adds none of its own, so this is build_inputs alone
+    for name, sent in started.items():
+        assert (run_dir / name).read_bytes() == sent, name
+    assert "churn" not in (run_dir / codegen.HOLDOUT_CSV).read_text().splitlines()[0]
+
+
 def test_research_is_on_by_default_and_can_be_turned_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

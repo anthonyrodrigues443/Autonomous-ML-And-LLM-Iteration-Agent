@@ -585,6 +585,7 @@ def _run_experiment(
     markers = () if vision is not None else lever_markers_for_brief(decision.brief)
     extra: dict[str, Any] = {}
     gate: Callable[[list[Any]], bool] | None = None
+    started_from: dict[str, Any] | None = None
     if vision is not None:
         # What the run carried in, for the gate and the prompt, and separately the
         # recipe the kernel's fit() may depart from: an own-model win is the carried
@@ -592,6 +593,7 @@ def _run_experiment(
         # last fit instead.
         carried = vl.recipe_of(best) or vision["baseline"]
         incumbent = vl.fit_recipe_of(best) or vision["baseline"]
+        started_from = incumbent
         lever = vl.lever_class(decision.brief) or ""
 
         def gate(cells: list[Any]) -> bool:
@@ -636,6 +638,9 @@ def _run_experiment(
     )
     changes: dict[str, object] = {"code": code, "cells": cells}
     if vision is not None and gate is not None:
+        # The recipe the kernel was handed, kept so the delivered notebook can hand the
+        # same one to its own Run All: the kernel's folder is gone by then.
+        changes["started_from"] = started_from
         agent_cells = [c for c in cells if c["source"] == "agent"]
         carried = vl.recipe_of(best) or vision["baseline"]
         if (recipe := vl.submitted(agent_cells)) is not None:

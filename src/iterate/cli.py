@@ -955,6 +955,10 @@ def run(
     if prepared is not None:
         dataset = prepared.dataset
 
+    # ─── The run folder, from here on ──────────────────────────────────────
+    # Below every refusal, like the archive: a run that cannot start makes no folder.
+    _ignore_run_folder(Path(settings.iterate_runs_dir))
+
     # ─── New chapter? Archive the existing db. ─────────────────────────────
     # Any of --fresh, --source, --baseline+--source means "new chapter." Below every
     # refusal, so a run that cannot start leaves the memory it had.
@@ -1036,6 +1040,13 @@ def run(
         model_target = _image_target(prepared, metric=metric, average=average)
     else:
         model_target = ModelTarget(dataset, metric=metric, average=average)
+    # The prompt and image families hand the session their own meta.json. Read once, so
+    # the copy delivered beside the notebook is the same object the kernel was started
+    # with and cannot drift from it.
+    family_meta = model_target.meta_json() if is_prompt_run or prepared is not None else None
+    # The bytes a delivered session re-reads on Run All. Built from the dataset the loop
+    # hands the coder, which for a prompt run is the smaller-holdout one it scored on.
+    session_inputs: dict[str, bytes] | None = None
     if line := run_setup.render():
         console.print(f"[dim]{line}[/dim]")
         # An image run's first model is fixed: the plain CNN baseline, never a proposal.
@@ -1067,6 +1078,9 @@ def run(
         )
 
     if code:
+        session_inputs = codegen.build_inputs(dataset)
+        if family_meta is not None:
+            session_inputs[codegen.META_JSON] = family_meta
         # --until bounds the WHOLE run via the terminator; a session's budget is
         # kernel-execution seconds. Tool-only roles use the no-think client even
         # under --think, because thinking crowds out the call.
@@ -1257,7 +1271,7 @@ def run(
                 # you can submit — is unchanged.
                 family = {
                     "preamble": model_target.session_preamble(),
-                    "extra_inputs": {codegen.META_JSON: model_target.meta_json()},
+                    "extra_inputs": {codegen.META_JSON: family_meta},
                     "floor_cell": codegen.prompt_fallback_baseline(),
                     "family": "prompt",
                     # A tabular cell is a fit: seconds. A prompt cell is one model
@@ -1272,7 +1286,7 @@ def run(
             elif prepared is not None:
                 family = {
                     "preamble": codegen.vision_session_preamble(),
-                    "extra_inputs": {codegen.META_JSON: model_target.meta_json()},
+                    "extra_inputs": {codegen.META_JSON: family_meta},
                     "floor_cell": codegen.vision_fallback_baseline(),
                     "family": "vision",
                     # Frees the last cell's device memory and starts this cell's fit clock.
@@ -1328,10 +1342,11 @@ def run(
                 is_best=is_best,
                 run_dir=Path(settings.iterate_runs_dir) / run_id,
                 mode=notebooks,
-                data_path=str(data or train),
-                holdout_path=str(holdout) if holdout is not None else None,
+                data_path=_absolute(data or train),
+                holdout_path=_absolute(holdout) or None,
                 target=target,
                 metric=metric,
+                inputs=session_inputs,
             )
 
         def _run_loop() -> RunResult:
@@ -1473,10 +1488,11 @@ def run(
             result,
             mode=notebooks,
             run_dir=run_dir,
-            data_path=str(data or train),
-            holdout_path=str(holdout) if holdout is not None else None,
+            data_path=_absolute(data or train),
+            holdout_path=_absolute(holdout) or None,
             target=target,
             metric=metric,
+            inputs=session_inputs,
         )
 
     # ─── Summary ───────────────────────────────────────────────────────────
@@ -2049,6 +2065,29 @@ def _recorded_network(result: ExperimentResult) -> str | None:
         return ""
 
 
+def _ignore_run_folder(runs_dir: Path) -> None:
+    """Keep a run out of the user's git history. A run folder holds a copy of their
+    train.csv, and the notebook needs it there; committing it is the user's call, not
+    a side effect of running the agent.
+
+    Written when iterate makes the folder, or into one that already holds the runs: a
+    folder that is someone else's is never marked, and a `.gitignore` already there is
+    never rewritten, because a user who edits it means it."""
+    folder = runs_dir.parent
+    with contextlib.suppress(OSError):
+        ours = not folder.exists()
+        folder.mkdir(parents=True, exist_ok=True)
+        marker = folder / ".gitignore"
+        if (ours or runs_dir.exists()) and not marker.exists():
+            marker.write_text("*\n", encoding="utf-8")
+
+
+def _absolute(path: Path | None) -> str:
+    """A delivered notebook is opened from the run folder, not from the folder the run
+    was started in, so the data path written into it has to read the same anywhere."""
+    return str(path.resolve()) if path is not None else ""
+
+
 def _render_experiment(
     exp: Experiment,
     *,
@@ -2064,6 +2103,7 @@ def _render_experiment(
     per-iteration save and the end-of-run write, so both produce identical files.
     Cell-by-cell experiments carry their session ("cells"); render the real
     session. Spec / one-shot experiments render through the contract."""
+    from iterate.core import codegen
     from iterate.deliver.notebook import build_notebook, build_session_notebook
 
     cells = exp.candidate.changes.get("cells")
@@ -2082,6 +2122,7 @@ def _render_experiment(
             )
         else:
             note = None
+        started_from = exp.candidate.changes.get("started_from")
         return build_session_notebook(
             cells,
             title=title,
@@ -2091,6 +2132,13 @@ def _render_experiment(
             hypothesis=exp.hypothesis,
             findings=exp.digest,
             honesty_note=note,
+            # Image sessions only: the one family whose kernel keeps state of its own
+            # between cells and between Run Alls.
+            setup=(
+                codegen.vision_notebook_setup(started_from)
+                if isinstance(started_from, dict)
+                else None
+            ),
         )
     return build_notebook(
         exp,
@@ -2115,12 +2163,13 @@ def _write_experiment_notebook(
     holdout_path: str | None = None,
     target: str,
     metric: str,
+    inputs: dict[str, bytes] | None = None,
 ) -> None:
     """Save one finished iteration's notebook the moment it completes (and keep
     best.ipynb pointing at the best-so-far), so a crash or Ctrl-C mid-run still
     leaves every finished deliverable on disk. The end-of-run `_write_notebooks`
     rewrite is idempotent on top of these."""
-    from iterate.deliver.notebook import save_notebook, slug
+    from iterate.deliver.notebook import save_inputs, save_notebook, slug
 
     baseline_score = baseline.metrics.primary_value if baseline.metrics is not None else None
     if mode == "all":
@@ -2150,6 +2199,8 @@ def _write_experiment_notebook(
             ),
             run_dir / "best.ipynb",
         )
+        if inputs is not None:
+            save_inputs(run_dir, inputs)
 
 
 def _write_notebooks(
@@ -2161,10 +2212,15 @@ def _write_notebooks(
     holdout_path: str | None = None,
     target: str,
     metric: str,
+    inputs: dict[str, bytes] | None = None,
 ) -> None:
     """Render the run as runnable notebooks: the winner (`best`) or one per
-    experiment (`all`). The full record is already in Memory; this just renders it."""
-    from iterate.deliver.notebook import save_notebook, slug
+    experiment (`all`). The full record is already in Memory; this just renders it.
+
+    A session notebook reads its inputs from its own folder, so the bytes the kernel
+    was given are written beside the winner. The per-iteration notebooks under
+    `notebooks/` stay a record of the run and are not re-runnable."""
+    from iterate.deliver.notebook import save_inputs, save_notebook, slug
 
     baseline_score = (
         result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
@@ -2206,6 +2262,8 @@ def _write_notebooks(
                 run_dir / "best.ipynb",
             )
         )
+        if inputs is not None:
+            save_inputs(run_dir, inputs)
 
     if not written:
         return

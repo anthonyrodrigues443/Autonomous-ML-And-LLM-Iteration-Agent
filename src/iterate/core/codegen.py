@@ -18,6 +18,8 @@ from iterate.core.scoring import direction, requires_proba, score, task_for_metr
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from iterate.adapters.data.tabular import TabularDataset
 
 # File names exchanged with the runner's working directory.
@@ -429,6 +431,38 @@ def vision_session_preamble() -> str:
         "def finish(*args, **kwargs):\n"
         "    print('finish is a tool call, not a Python function. This cell still ran; "
         "now invoke the finish tool to end the session.')\n" + IMPORT_WATCH
+    )
+
+
+def vision_notebook_setup(started_from: Mapping[str, Any] | None) -> str:
+    """The one cell the host adds ahead of a delivered image session, so Run All starts
+    where the session did.
+
+    It writes the recipe the session departed from and clears what an earlier Run All
+    left in the folder: the session's own state file, which would otherwise carry the
+    last re-run's fit, and the submission files, which the keep-best guard reads and
+    would hold a second Run All's fit against a first one's. `best_model.pt`, the
+    delivered network, is not among them and is never touched.
+    """
+    from iterate.core.vision_session import SESSION_JSON
+
+    stale = (SESSION_JSON, PREDICTIONS_CSV, PROBABILITIES_CSV, RECIPE_JSON, NETWORK_PT)
+    recipe = (
+        f"with open({INCUMBENT_JSON!r}, 'w') as _f:\n"
+        f"    _f.write({json.dumps(dict(started_from), default=str)!r})\n"
+        if started_from
+        else ""
+    )
+    return (
+        "# Written by iterate, not by the session: the recipe it started from, and a\n"
+        "# clean slate so this Run All behaves like the first one.\n"
+        "import os\n"
+        + recipe
+        + "for _stale in (\n"
+        + "".join(f"    {name!r},\n" for name in stale)
+        + "):\n"
+        "    if os.path.exists(_stale):\n"
+        "        os.remove(_stale)\n"
     )
 
 
@@ -1014,6 +1048,7 @@ __all__ = [
     "session_preamble",
     "validate_train_and_predict",
     "vision_fallback_baseline",
+    "vision_notebook_setup",
     "vision_session_preamble",
     "vision_worked_example",
 ]

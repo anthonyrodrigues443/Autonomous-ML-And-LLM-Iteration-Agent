@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import tempfile
 from dataclasses import asdict, replace
@@ -347,7 +348,160 @@ def experiment() -> dict[str, Any]:
     return out
 
 
-CHECKS = {f.__name__: f for f in (session, experiment)}
+_DEAD_END = "raise RuntimeError('this cell is a dead end')\n"
+_FIT_AND_SUBMIT = "f = fit(epochs=1)\nsubmit(f)\n"
+
+
+def _kernelspec(root: Path) -> str:
+    """A kernel that is THIS interpreter. The installed `python3` kernelspec belongs to
+    whichever python owns the Jupyter data dir, which on a Mac is the system one."""
+    name = "iterate-rerun"
+    spec = root / "jupyter" / "kernels" / name
+    spec.mkdir(parents=True)
+    (spec / "kernel.json").write_text(
+        json.dumps(
+            {
+                "argv": [sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"],
+                "display_name": name,
+                "language": "python",
+            }
+        )
+    )
+    os.environ["JUPYTER_PATH"] = str(root / "jupyter")
+    return name
+
+
+def _executed(path: Path, folder: Path, kernel: str) -> tuple[str, bool]:
+    """Run All on the delivered notebook, from its own folder. Returns everything the
+    cells printed and whether the last one ran: an untagged dead end stops nbclient
+    exactly as it stops Jupyter."""
+    import nbformat
+    from nbclient import NotebookClient
+
+    node = nbformat.read(path, as_version=4)
+    NotebookClient(
+        node, timeout=900, kernel_name=kernel, resources={"metadata": {"path": str(folder)}}
+    ).execute()
+    printed = [
+        output.get("text", "")
+        for cell in node.cells
+        for output in cell.get("outputs", [])
+        if output.get("output_type") == "stream"
+    ]
+    ran = node.cells[-1].get("execution_count") is not None
+    return "".join(printed), ran
+
+
+def rerun() -> dict[str, Any]:
+    """A recorded session, delivered and run again. The session has a dead end in it,
+    the folder already holds a read-only best_model.pt, and Run All happens twice."""
+    from iterate.adapters.data.tabular import load_split
+    from iterate.core.coder import CodingAgent
+    from iterate.deliver import notebook, saved_model
+
+    out: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="vision-rerun-") as tmp:
+        root = Path(tmp)
+        images, work = root / "images", root / "work"
+        images.mkdir(parents=True)
+        work.mkdir(parents=True)
+        _inputs(images, work)
+        held = pd.read_csv(work / codegen.HOLDOUT_CSV)
+        held["label"] = [CLASSES[i % len(CLASSES)] for i in range(len(held))]
+        held.to_csv(work / "sealed.csv", index=False)
+        dataset = load_split(
+            work / codegen.TRAIN_CSV, work / "sealed.csv", "label", task="classification"
+        )
+        meta = json.loads((work / codegen.META_JSON).read_text())
+        agent = CodingAgent(
+            _FakeLLM([_DEAD_END, _FIT_AND_SUBMIT]),
+            LocalKernel(confinement=confine.Confinement(reads=(images,), weights=root / "weights")),
+            metric="accuracy",
+            max_cells=4,
+            install=False,
+            preamble=codegen.vision_session_preamble(),
+            extra_inputs={codegen.META_JSON: json.dumps(meta).encode()},
+            floor_cell=codegen.vision_fallback_baseline(),
+            family="vision",
+            cell_prefix=codegen.VISION_CELL_PREFIX,
+            floor_carries_code=False,
+            data_summary="Images: 32 train / 8 holdout.",
+            cell_timeout=750.0,
+            deadline_seconds=2700.0,
+            wall_ceiling_seconds=5400.0,
+        )
+        coded = agent.run(
+            dataset=dataset,
+            brief="next: epochs: fit the plain CNN for one epoch",
+            experiment_id="iter-01",
+            starting_files={codegen.INCUMBENT_JSON: json.dumps(meta["baseline"]).encode()},
+        )
+        cells = [
+            {
+                "code": c.code,
+                "stdout": c.stdout,
+                "error": c.error,
+                "source": c.source,
+                "outputs": c.outputs,
+                "thinking": c.thinking,
+            }
+            for c in coded.cells
+        ]
+        out["errored_cells"] = sum(1 for c in cells if c["error"])
+
+        run_dir = root / "runs" / "r1"
+        inputs = codegen.build_inputs(dataset)
+        inputs[codegen.META_JSON] = json.dumps(meta).encode()
+        notebook.save_inputs(run_dir, inputs)
+        node = notebook.build_session_notebook(
+            cells,
+            title="best: one epoch",
+            metric="accuracy",
+            score=1.0,
+            setup=codegen.vision_notebook_setup(meta["baseline"]),
+        )
+        path = notebook.save_notebook(node, run_dir / "best.ipynb")
+        out["tagged_cells"] = sum(
+            1 for cell in node.cells if cell.get("metadata", {}).get("tags") == ["raises-exception"]
+        )
+
+        delivered = run_dir / saved_model.BEST_MODEL
+        staged = root / "slot.pt"
+        staged.write_bytes(b"the delivered network, from the run that won")
+        saved_model.settle(staged, delivered, is_best=True)
+        before = hashlib.sha256(delivered.read_bytes()).hexdigest()
+        out["delivered_is_read_only"] = not (delivered.stat().st_mode & 0o222)
+
+        kernel = _kernelspec(root)
+        printed, ran = _executed(path, run_dir, kernel)
+        out["first_reached_the_end"] = ran
+        out["first_submitted"] = printed.count("SUBMITTED ")
+        out["first_kept"] = printed.count("KEPT the earlier")
+        out["network_written"] = (run_dir / codegen.NETWORK_PT).is_file()
+        out["best_model_unchanged"] = hashlib.sha256(delivered.read_bytes()).hexdigest() == before
+
+        printed, ran = _executed(path, run_dir, kernel)
+        out["second_reached_the_end"] = ran
+        out["second_submitted"] = printed.count("SUBMITTED ")
+        out["second_kept"] = printed.count("KEPT the earlier")
+        out["best_model_unchanged_twice"] = (
+            hashlib.sha256(delivered.read_bytes()).hexdigest() == before
+        )
+
+        # The same notebook without the tag: what every Run All did before this PR.
+        for cell in node.cells:
+            cell.get("metadata", {}).pop("tags", None)
+        untagged = notebook.save_notebook(node, run_dir / "untagged.ipynb")
+        try:
+            _executed(untagged, run_dir, kernel)
+            out["untagged_stops"] = False
+        except Exception as exc:
+            out["untagged_stops"] = "dead end" in str(exc)
+        out["incumbent"] = json.loads((run_dir / codegen.INCUMBENT_JSON).read_text())["backbone"]
+    return out
+
+
+CHECKS = {f.__name__: f for f in (session, experiment, rerun)}
 
 
 if __name__ == "__main__":

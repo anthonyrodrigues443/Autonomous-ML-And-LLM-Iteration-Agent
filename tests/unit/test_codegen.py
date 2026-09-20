@@ -612,3 +612,47 @@ def test_runs_installer_passes_every_image_harness_cell() -> None:
         codegen.IMPORT_WATCH,
     ]
     assert [codegen.runs_installer(c) for c in harness] == [None] * len(harness)
+
+
+def test_the_notebook_setup_cell_writes_the_recipe_and_clears_the_last_run_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run All twice must behave the same both times: the session's own state file and
+    the three submission files would otherwise carry the first pass into the second,
+    where the keep-best guard reads them. The delivered model is not one of them."""
+    import json
+
+    from iterate.core.vision_session import SESSION_JSON
+
+    stale = (
+        SESSION_JSON,
+        codegen.PREDICTIONS_CSV,
+        codegen.PROBABILITIES_CSV,
+        codegen.RECIPE_JSON,
+        codegen.NETWORK_PT,
+    )
+    for name in stale:
+        (tmp_path / name).write_text("left by an earlier Run All")
+    (tmp_path / "best_model.pt").write_bytes(b"the delivered network")
+    monkeypatch.chdir(tmp_path)
+
+    cell = codegen.vision_notebook_setup({"backbone": "resnet18", "epochs": 3})
+    assert codegen.runs_installer(cell) is None
+    exec(compile(cell, "<setup>", "exec"), {})  # the cell a user runs
+
+    assert [name for name in stale if (tmp_path / name).exists()] == []
+    assert (tmp_path / "best_model.pt").read_bytes() == b"the delivered network"
+    carried = json.loads((tmp_path / codegen.INCUMBENT_JSON).read_text())
+    assert carried == {"backbone": "resnet18", "epochs": 3}
+    # a second pass over a folder it already cleaned is a no-op, not an error
+    exec(compile(cell, "<setup>", "exec"), {})
+
+
+def test_the_notebook_setup_cell_without_a_recipe_still_clears_the_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / codegen.PREDICTIONS_CSV).write_text("a\n")
+    monkeypatch.chdir(tmp_path)
+    exec(compile(codegen.vision_notebook_setup(None), "<setup>", "exec"), {})
+    assert not (tmp_path / codegen.PREDICTIONS_CSV).exists()
+    assert not (tmp_path / codegen.INCUMBENT_JSON).exists()

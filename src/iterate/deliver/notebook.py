@@ -21,11 +21,26 @@ from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook, new_outp
 from iterate.core.codegen import is_code_candidate
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from nbformat import NotebookNode
 
     from iterate.schemas.experiment import Candidate, Experiment
+
+# nbclient and Jupyter's Run All read this tag: a cell carrying it may raise without
+# stopping the cells after it. A session's dead ends are the reason Run All stopped.
+RAISES = "raises-exception"
+
+_SETUP_MD = (
+    "## Setup (added by iterate, not part of the session)\n\n"
+    "_Writes the recipe this session started from and clears what an earlier Run All"
+    " left here, so every Run All starts where the session did. Your delivered"
+    " `best_model.pt` is never touched: a re-run trains again and writes its own"
+    " network file. Cells that errored in the session are tagged so Jupyter and"
+    " `jupyter nbconvert --execute` carry on past them; VS Code stops at an errored"
+    " cell whatever the tag says, so there you continue from the cell below it._"
+)
 
 
 def build_notebook(
@@ -71,12 +86,17 @@ def build_session_notebook(
     hypothesis: str | None = None,
     findings: Any = None,
     honesty_note: str | None = None,
+    setup: str | None = None,
 ) -> NotebookNode:
     """Render a cell-by-cell coding session as a runnable notebook.
 
     Each `Cell` becomes a code cell with a markdown note of what it printed, and a
     cell's `thinking` renders as a reasoning block above its code. ``hypothesis``
     opens the notebook and ``findings`` closes it.
+
+    ``setup`` is one host-written cell placed ahead of the session, for a family that
+    needs the folder put back the way the session found it. Without it the notebook is
+    the session and nothing else.
     """
     nb = new_notebook()
     head = [f"# {title}", ""]
@@ -99,6 +119,9 @@ def build_session_notebook(
                 + hypothesis.strip().replace("\n", "\n> ")
             )
         )
+    if setup is not None:
+        nb.cells.append(new_markdown_cell(_SETUP_MD))
+        nb.cells.append(new_code_cell(setup.strip()))
     for count, cell in enumerate(cells, start=1):
         thinking = _cell_get(cell, "thinking").strip()
         if thinking:
@@ -119,6 +142,8 @@ def build_session_notebook(
                 new_markdown_cell("_(dead end — this cell errored; kept for the record)_")
             )
         node = new_code_cell(_cell_get(cell, "code").strip())
+        if _cell_get(cell, "error"):
+            node.metadata["tags"] = [RAISES]
         node.execution_count = count
         node.outputs = _cell_outputs(cell)
         nb.cells.append(node)
@@ -241,6 +266,22 @@ def _cell_get(cell: Any, key: str) -> str:
     return value or ""
 
 
+def save_inputs(folder: Path, inputs: Mapping[str, bytes]) -> list[Path]:
+    """Write the bytes the kernel was given beside the notebook that replays it.
+
+    The session's first cell reads these names from its own folder, and the folder it
+    read them from was the kernel's, deleted when the session ended. Same bytes, so a
+    Run All loads the same rows in the same order: the holdout among them carries no
+    labels, because the kernel never got them either."""
+    folder.mkdir(parents=True, exist_ok=True)
+    written = []
+    for name, data in sorted(inputs.items()):
+        path = folder / name
+        path.write_bytes(data)
+        written.append(path)
+    return written
+
+
 def save_notebook(node: NotebookNode, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -358,4 +399,4 @@ def _rationale_md(candidate: Candidate) -> str:
     return f"### Rationale\n\n{candidate.rationale.strip() or '(none given)'}"
 
 
-__all__ = ["build_notebook", "build_session_notebook", "save_notebook", "slug"]
+__all__ = ["build_notebook", "build_session_notebook", "save_inputs", "save_notebook", "slug"]
