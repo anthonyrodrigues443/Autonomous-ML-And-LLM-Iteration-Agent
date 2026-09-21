@@ -19,15 +19,21 @@ iterate run --data examples/churn_tabular/data.clean.csv --target Churn
 # (python examples/toxicity_jigsaw/prepare.py builds that eval set first, no account needed)
 iterate run --data examples/toxicity_jigsaw/data.csv --target label \
             --task "decide whether this Wikipedia comment is toxic"
+
+# the same loop on images: a CSV of image paths and labels, or a folder laid out however it came
+# (python examples/flowers102/prepare.py builds that CSV first, no account needed)
+iterate run --data examples/flowers102/data.csv --target label --metric accuracy
+iterate run --data path/to/your_image_folder      # no --target: the labels are found for you
 ```
 
-`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. In v0.5 the same loop iterates an **LLM prompt**: give it a labelled eval set and one line saying what the job is, and the agent writes a prompt, measures it, reads what it got wrong, and rewrites it. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook, or as `prompts.yaml` on a prompt run. 807 unit tests across 51 files run in CI on every push.
+`iterate` runs an autonomous experiment loop on your ML problem. The agent **writes and runs its own training code**, cell by cell, in a live Jupyter kernel: a Supervisor reads the run history and briefs one experiment, a coding agent executes it against real cell outputs and real tracebacks, a Summarizer distills every finished notebook so the next one inherits what worked and what failed. In v0.3 you **talk to it while it runs**: a terminal UI streams the session as a live transcript (syntax-highlighted cells, scores, briefs) over a pinned input box, and anything you type in plain English becomes a question answered from the run's notebooks, a steer for the current experiment, or a standing rule every later experiment respects. In v0.5 the same loop iterates an **LLM prompt**: give it a labelled eval set and one line saying what the job is, and the agent writes a prompt, measures it, reads what it got wrong, and rewrites it. In v0.6 it trains an **image model**: give it a folder of images or a CSV of image paths, and the run starts from a plain CNN trained from zero, then the agent fine-tunes pretrained backbones or writes its own torch code, for classes or for numbers. Every submission is scored on a sealed holdout, every attempt persists in memory, and the winner ships as a runnable notebook, or as `prompts.yaml` on a prompt run. 2,163 unit tests across 75 files; CI runs 2,115 of them on every push, and the other 48 need torch or a Mac.
 
-| v0.5 today | On the roadmap |
+| v0.6 today | On the roadmap |
 |---|---|
-| **It iterates LLM prompts, not only models.** Pass `--task` with a labelled eval set and the agent writes a prompt, measures it on training rows, reads the misses, and rewrites it. Classification and regression, scored on the same sealed holdout a model gets, delivered as `prompts.yaml` | Vision transfer learning (v0.6) |
-| **You no longer pick the metric.** Omit `--metric` and the agent reads your data, searches the literature, and chooses one, then tells you why. An explicit choice always wins | Cost-to-serve recommendations (v0.7) |
-| **A Critic reviews every experiment for leakage**, so a pipeline that fits on the holdout does not get to bank its score; **a Researcher grounds proposals in real papers** (OpenAlex + arXiv, no API key), citing work it actually retrieved | Inferred inputs + MCP auto-discovery (v0.9), one-sentence input (v1.0) |
+| **It trains image models, on the same loop.** Point `--data` at a folder of images laid out however it came, or at a CSV of image paths, and the run starts from a plain CNN trained from zero; the agent then fine-tunes pretrained backbones or writes its own torch code. Classes and numbers, scored on the same sealed holdout a table gets, delivered as a runnable notebook | Cost-to-serve recommendations (v0.7) |
+| **It iterates LLM prompts, not only models.** Pass `--task` with a labelled eval set and the agent writes a prompt, measures it on training rows, reads the misses, and rewrites it. Classification and regression, scored on the same sealed holdout a model gets, delivered as `prompts.yaml` | Inferred inputs + MCP auto-discovery (v0.9) |
+| **You no longer pick the metric.** Omit `--metric` and the agent reads your data, searches the literature, and chooses one, then tells you why. An explicit choice always wins | One-sentence input (v1.0) |
+| **A Critic reviews every experiment for leakage**, so a pipeline that fits on the holdout does not get to bank its score; **a Researcher grounds proposals in real papers** (OpenAlex + arXiv, no API key), citing work it actually retrieved | |
 | A deterministic guard stack converts weak-model waste and outranks everything else: a user steer can shape a brief but never bypass a gate, and no agent can overturn a guard; talk to the run while it runs; winner ships as a runnable notebook | |
 
 ## Why I built this
@@ -48,7 +54,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 
 ## Status
 
-**v0.5 released: the same loop now iterates LLM prompts.** v0.1 proved the autonomous loop, v0.2 made the agent write and run its own code, v0.3 put you in the loop without stopping it, v0.4 made `--metric` optional and added a Researcher and a Critic, and v0.5 adds the second problem type. Pass `--task` and a labelled eval set, and the agent writes a prompt, reads what it got wrong, and rewrites it, for classification and for regression, scored on the same sealed holdout a model is. Behind every release there is now an eval suite with a measured ceiling per dataset, so a flat result reads as a miss or as an exhausted problem instead of a guess.
+**v0.6 released: the same loop now trains image models.** v0.1 proved the autonomous loop, v0.2 made the agent write and run its own code, v0.3 put you in the loop without stopping it, v0.4 made `--metric` optional and added a Researcher and a Critic, v0.5 added LLM prompts as the second problem type, and v0.6 adds the third: images. Pass a folder of images or a CSV of image paths, and the run starts from a plain CNN trained from zero, then the agent fine-tunes pretrained backbones through a `fit()` helper or writes its own torch code, for classes and for numbers, scored on the same sealed holdout a table is. The honest floor: on a local 12B the agent mostly steers `fit()` (backbone, image size, learning rate, epochs, augmentation) and rarely writes torch of its own, and an image run is tens of minutes on a laptop GPU, not seconds. Behind every release there is an eval suite with a measured ceiling per dataset, so a flat result reads as a miss or as an exhausted problem instead of a guess.
 
 **Agent-first:** the autonomous loop landed at v0.1, not as a late-stage add-on. Two dials turn release to release: the inputs you must give *shrink* (toward one-sentence input) and the problem types *grow* (tabular, then prompts, then DL/vision).
 
@@ -59,7 +65,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 | v0.3 | **Interactive runs**: terminal UI (live transcript + input box), plain-English chat with queued delivery, pause / resume / stop, notebook Q&A, standing rules | shipped |
 | v0.4 | **Researcher + Critic specialists**: literature-grounded proposals with real citations, leak review before a score banks; agent picks the metric + starting model; probability metrics | shipped |
 | v0.5 | **`PromptTarget`: agentic prompt iteration** — you give a labelled eval set and a one-line task, the agent writes a prompt, reads what it got wrong, and rewrites it. Classification **and** regression, scored on a sealed holdout | shipped |
-| v0.6 | **`DLModelTarget`: an image folder or a CSV of image paths runs the same loop a table does.** A plain CNN baseline, then briefed experiments that fine-tune pretrained backbones or write their own torch code, for classes and numbers, scored on a sealed holdout. Validated on a local RTX 4050 | in progress |
+| v0.6 | **`DLModelTarget`: an image folder or a CSV of image paths runs the same loop a table does.** A plain CNN baseline, then briefed experiments that fine-tune pretrained backbones or write their own torch code, for classes and numbers, scored on a sealed holdout. **The winner is saved: `best_model.pt` plus a three-line loader**, and `best.ipynb` really runs again. **You can say what the network should be**: `layers=`, `head=` and `drop_stages=` on `fit()`, from a research finding or typed into a running run. GPU compatible: Apple (MPS) and NVIDIA (CUDA), with CPU as the fallback. Run live with a local 12B. | shipped |
 | v0.7 | **Cost-constrained recommendation** + serving profile + `iterate cost` | planned |
 | v0.9 | Infer features/target from the data + a description; **MCP discovery** of the data/code itself (absorbs the v0.8 milestone) | planned |
 | v1.0 | One-sentence input + multi-backend benchmark + read-only dashboard + docs + launch (absorbs the v0.10 milestone) | planned |
@@ -68,7 +74,7 @@ I kept seeing the same failure mode on small AI teams. A model or a prompt ships
 
 ## What it does
 
-You give it a prepared CSV, the target column, and a metric. The agent does the rest: builds its own baseline, then runs one briefed experiment per iteration, cell by cell, against a sealed holdout it never sees. The split is yours if you want it to be: pass `--train` and `--holdout` instead of `--data` and the holdout is sealed exactly as you gave it, its rows shuffled once so their order cannot carry a label. For a folder of images laid out however it came, `iterate run --data <folder>` works out how the images link to their labels by rules, shows what it found, refuses what it cannot prove with the reason, and writes a canonical folder with `raw_files/`, `train/`, `holdout/` and their CSVs before the run; no `--target` needed. Where the rules can only say "one of these", the Linker, the sixth specialist, reads a listing of the folder and proposes which table, key and label column; the proposal is rebuilt and measured before you see it, and the pause takes yes, no, or a correction in plain English. A plan the Linker proposed and you accepted is remembered, so the same folder never goes through the model twice. Before it asks for a yes, seven deterministic checks run on the rows it will write: coverage both ways, duplicate and conflicting labels, byte copies across the split, lookalikes, a second label source, class balance, and id-like columns that span the split; the report prints under the link block and lands as `monitor.json` beside the plan. A copy of a training image never stays in a holdout it makes, and you can answer `drop` to take one out of a holdout you gave. The vision target, `DLModelTarget`, predicts classes and numbers, and measures its own ceiling in the eval suite. Like a table run, an image run starts from a fixed plain baseline, a small CNN trained from zero with basic prep, and every pretrained model is a try the agent makes. Since v0.6 an image run is a run, not a stop: a folder, a CSV of image paths, or a `--train` and `--holdout` pair goes through the same loop a table does, and the agent's cells train against a sealed holdout it never sees. A cell trains one of the four backbones `fit()` knows, or writes its own torch code for any model the research names, and the harness keeps the images, the holdout, the time limit and the submission either way.
+You give it a prepared CSV, the target column, and a metric. The agent does the rest: builds its own baseline, then runs one briefed experiment per iteration, cell by cell, against a sealed holdout it never sees. The split is yours if you want it to be: pass `--train` and `--holdout` instead of `--data` and the holdout is sealed exactly as you gave it, its rows shuffled once so their order cannot carry a label. Since v0.6 the data can be images too: a folder laid out however it came, a CSV of image paths, or your own `--train` and `--holdout` pair goes through the same loop, from a plain CNN baseline to fine-tuned pretrained backbones and the agent's own torch code ([What v0.6 adds](#what-v06-adds-images-same-loop)).
 
 What a live run looks like:
 
@@ -136,6 +142,30 @@ The last form tunes a prompt for one model while a stronger model drives the run
 
 ---
 
+## What v0.6 adds: images, same loop
+
+An image dataset is a table like any other: one column of image paths, one column holding the label. Nothing about the loop changes. The Supervisor still briefs one change per experiment, the coding agent still measures like for like, the Critic still reviews, the Summarizer still hands on what was learned, and the winner still ships as a runnable `best.ipynb`. What changes is what a cell does: it trains a network on your GPU instead of fitting a table model.
+
+- **Three ways in.** A CSV of image paths with `--target`, your own split with `--train` and `--holdout`, or a folder laid out however it came with `--data <folder>` and no `--target`. For a folder, the run works out how the images link to their labels by rules (class folders, a table joined to the images on an exact key, one-hot columns, a split column, wrapper folders), shows what it found, and refuses what it cannot prove with the reason and the flags that would settle it. Where the rules can only say "one of these", the Linker, the sixth specialist, reads a listing of the folder and proposes which table, key and label column; the proposal is rebuilt and measured before you see it, and the pause takes yes, no, or a correction in plain English. A plan you accepted is remembered, so the same folder never goes through the model twice.
+- **Seven checks before you say yes.** On a folder run, seven deterministic checks run on the rows it will write: coverage both ways, duplicate and conflicting labels, byte copies across the split, lookalikes, a second label source, class balance, and id-like columns that span the split. The report prints under the link block and lands as `monitor.json`. It reports and never relabels: a copy of a training image never stays in a holdout the run makes, and you can answer `drop` to take one out of a holdout you gave. The linked data lands in `.iterate/data/<name>/` with `raw_files/`, `train/`, `holdout/` and their CSVs.
+- **The baseline is a plain CNN trained from zero**, the image twin of a table run's baseline: three conv blocks at 64 px, 20 epochs, no augmentation, the same model on every machine. Every pretrained model is a try the agent makes, so the gain over the baseline is the agent's.
+- **`fit()` is the easy path, the agent's own torch code is the open one.** `fit()` trains one of three pinned pretrained backbones (resnet18, resnet50, convnext_tiny) or the plain CNN, plans its epochs against the cell's time budget, prints a line per epoch, and reports an out-of-memory error as a result instead of a crash. The agent moves the levers: backbone, image size, how much to unfreeze, learning rate and schedule, augmentation, epochs, label smoothing. When the research names a model `fit()` does not have, the agent writes its own torch code and the harness scores and submits it under that model's name. Either way the harness keeps the images, the holdout, the time limit and the submission.
+- **Classes and numbers.** A label can be a class (a flower species, a land-use type) or a number (a storm's wind speed in knots). The run prints how it read the labels, and `--metric` settles it when whole-number labels could be either.
+- **torch is installed for you, or up front.** An image run needs torch and torchvision. With install consent the harness installs them at the start of the run, before anything else trains; or install them yourself with `pip install 'iterate-ai[vision]'`. They never change mid-run.
+- **It trains on this machine.** `--compute e2b` is refused for an image run: the sandbox has no GPU and none of your images. On a Mac every cell still runs inside the macOS sandbox.
+
+```bash
+iterate run --data examples/flowers102/data.csv --target label --metric accuracy     # a CSV of image paths, classes
+iterate run --train examples/cyclone_wind/train.csv --holdout examples/cyclone_wind/holdout.csv \
+            --target label --metric rmse                                             # your own split, a number label
+iterate run --data path/to/image_folder                                              # a folder: the labels are found for you
+iterate run --data path/to/image_folder --labels labels.csv --key image_id --target breed   # or name the label table yourself
+```
+
+The cost line is honest: an image run is tens of minutes, not seconds. Four live runs on a local gemma4:12b and an Apple M5 took 29 to 49 minutes for 2 or 3 iterations. EuroSAT, 27,000 satellite tiles, went from `f1_macro` 0.948 to 0.985 in a 3-iteration run of 43 minutes. Storm wind speed went from rmse 13.12 knots to 9.16 against a measured ceiling of 8.87, in 2 iterations and 48.5 minutes (main 6485be3, before the keep-best guard, machine under memory pressure). Flowers102, 102 flower species, went from accuracy 0.554 to 0.981 in 3 iterations and 39 minutes. That is past the 0.974 our own ceiling sweep had found, by 0.7 points where one standard error is 0.4: the agent fine-tuned convnext_tiny at 224 px, a pairing the sweep never ran. It is GPU compatible: Apple GPUs (MPS) and NVIDIA GPUs (CUDA), and it falls back to CPU. On a 12B the agent mostly steers `fit()`: across eleven live image sessions it wrote its own torch code in one, and that model scored below the `fit()` best, 0.9478 against 0.9848. Most of the gain is pretrained features, which is what transfer learning is. Labels are classes or numbers only: no detection, no segmentation.
+
+---
+
 ## Quick start
 
 **Local-first. $0. No API keys required.**
@@ -143,7 +173,7 @@ The last form tunes a prompt for one model while a stronger model drives the run
 ```bash
 # 1. Install Ollama + a local model (one-time)
 brew install ollama
-ollama pull gemma4:12b         # the model v0.2 was validated on
+ollama pull gemma4:12b         # the local model every release since v0.2 is validated on
 ollama serve                   # background server at localhost:11434
 
 # 2. Install iterate (pulls scikit-learn / XGBoost / LightGBM)
@@ -156,6 +186,11 @@ iterate run --data train.clean.csv --target churn --metric f1
 python examples/toxicity_jigsaw/prepare.py     # builds examples/toxicity_jigsaw/data.csv, no account needed
 iterate run --data examples/toxicity_jigsaw/data.csv --target label \
             --task "decide whether this Wikipedia comment is toxic" --metric f1
+
+# 3c. Or train an image model: a CSV of image paths (or a folder of images, no --target)
+python examples/flowers102/prepare.py          # downloads Oxford Flowers102 (329 MiB), no account needed
+iterate run --data examples/flowers102/data.csv --target label --metric accuracy
+#     needs torch: the run installs it at the start with your consent, or: pip install 'iterate-ai[vision]'
 ```
 
 The first run offers a one-time setup wizard (backend, model, compute, install consent); after that, flags override saved defaults per run.
@@ -177,7 +212,7 @@ iterate run --data train.clean.csv --target churn --metric f1 \
             --until 30m --notebooks all
 ```
 
-Useful flags: `--train` + `--holdout` instead of `--data` (bring your own split: the holdout is sealed exactly as given; code path only, the `--spec` lane keeps `--data`), `--max-iterations`, `--patience`, `--until` (wall-clock bound), `--notebooks best|all|none`, `--compute local|e2b`, `--install/--no-install` (package-install consent), `--think` (reasoning mode for the coder, Ollama only), `--fresh` (archive memory, start a new chapter), `--plain` (classic output instead of the interactive UI), `--spec` (the v0.1 allow-list path, kept as the fast lane). Prompt runs: `--task` (switches to prompt iteration), `--prompt-file` (your current prompt as the baseline), `--target-model` / `--target-backend` (the model whose prompt is tuned, separate from the one driving the run), `--loop-holdout` (records per candidate during the search). Full reference: `iterate run --help`
+Useful flags: `--train` + `--holdout` instead of `--data` (bring your own split: the holdout is sealed exactly as given; code path only, the `--spec` lane keeps `--data`), `--max-iterations`, `--patience`, `--until` (wall-clock bound), `--notebooks best|all|none`, `--compute local|e2b`, `--install/--no-install` (package-install consent), `--think` (reasoning mode for the coder, Ollama only), `--fresh` (archive memory, start a new chapter), `--plain` (classic output instead of the interactive UI), `--spec` (the v0.1 allow-list path, kept as the fast lane). Prompt runs: `--task` (switches to prompt iteration), `--prompt-file` (your current prompt as the baseline), `--target-model` / `--target-backend` (the model whose prompt is tuned, separate from the one driving the run), `--loop-holdout` (records per candidate during the search). Image folders: `--labels` (the table that holds the labels, when the rules should not pick one), `--key` (the column in `--labels` that names each image), `--yes` (accept a link the rules could not fully prove, or one the Linker proposed, without the pause). Full reference: `iterate run --help`
 
 **Where things land:** `.iterate/runs/<run_id>/best.ipynb` (the runnable winner), `meta.json` + `train.csv` + `holdout.csv` beside it (the bytes the session read; the holdout has no labels in it), `notebooks/` (with `--notebooks all`), `best.json` (config + score sidecar), `prompts.yaml` on a prompt run (every version with its score, the best marked), `best_model.pt` on an image run (the winning network, read-only). `.iterate/` is git-ignored by a `.gitignore` written when the folder is first made, since a run folder holds a copy of your training rows. Code-path winners ship as notebooks by design; `--spec` winners also save `best_model.joblib`. `--output` moves the model file, and `best.json` goes beside it.
 
@@ -201,9 +236,9 @@ You can ask for one mid-run. Type `try conv(32) pool conv(64) pool linear(256)` 
 
 > **Note on the one-line form.** The `iterate "improve our churn baseline"` experience,
 > where the agent discovers the data, baseline, and metric itself, is the **v1.0 vision**,
-> not v0.5. Today you pass `--data`/`--target` explicitly (and `--task` for a prompt run);
-> the inputs shrink release by release (see the roadmap). Auto-discovery, vision targets,
-> and cost-constrained serving are on the roadmap, not shipped yet.
+> not v0.6. Today you pass `--data`/`--target` explicitly (`--task` for a prompt run, and no
+> `--target` for a folder of images); the inputs shrink release by release (see the roadmap).
+> Auto-discovery and cost-constrained serving are on the roadmap, not shipped yet.
 
 ---
 
@@ -212,7 +247,7 @@ You can ask for one mid-run. Type `try conv(32) pool conv(64) pool linear(256)` 
 | Target | What it iterates on | Status |
 |---|---|---|
 | `ModelTarget` | Trains a tabular model, scores it on a sealed holdout | **shipped (v0.1, code-gen in v0.2)** |
-| `DLModelTarget` | Trains a vision model for classes or numbers, from a plain CNN baseline to fine-tuned pretrained backbones and the agent's own torch code, and scores it | built (v0.6); `iterate run` starts it from a folder, a CSV of image paths, or a `--train` and `--holdout` pair |
+| `DLModelTarget` | Trains an image model for classes or numbers, from a plain CNN baseline to fine-tuned pretrained backbones and the agent's own torch code, and scores it on a sealed holdout. `iterate run` starts it from a folder, a CSV of image paths, or a `--train` and `--holdout` pair | **shipped (v0.6)** |
 | `PromptTarget` | Runs an LLM prompt against a labelled eval set, one model call per record, scored on a sealed holdout | **shipped (v0.5)** |
 
 All inherit from `BenchmarkTarget`. Same iteration loop, different execution path. (LLMs are **prompt-iteration only**; we don't fine-tune foundation models.)
@@ -234,6 +269,11 @@ src/iterate/
 │   ├── supervisor        # strategist: grounded briefs + deterministic no-op guards
 │   ├── coder             # cell-by-cell coding agent on a live stateful kernel
 │   ├── summarizer        # per-experiment digest (cross-notebook knowledge transfer)
+│   ├── researcher        # literature grounding with real citations (OpenAlex + arXiv)
+│   ├── critic            # leak review before a score banks
+│   ├── linker            # works out how a folder's images link to their labels
+│   ├── prompt_runtime    # a prompt session's ask / evaluate / submit
+│   ├── vision_session    # an image session's fit / evaluate / submit
 │   ├── codegen           # code-gen contract, session preamble, floor submission
 │   ├── orchestrator      # v0.1 spec-path loop (--spec)
 │   ├── proposer          # spec-path proposer + dataset profiling
@@ -241,11 +281,11 @@ src/iterate/
 │   ├── memory            # persistent experiment store (sqlite)
 │   ├── scoring           # sealed-holdout scoring, shared by both paths
 │   └── terminator        # deadline / patience / max-iterations gates
-├── targets/              # BenchmarkTarget protocol + tabular ModelTarget
+├── targets/              # BenchmarkTarget protocol + ModelTarget (tables), PromptTarget, DLModelTarget (images)
 ├── adapters/
-│   ├── data/             # csv loading + profiling
+│   ├── data/             # csv loading + profiling, image loading, the folder linker, the monitor, the workspace
 │   ├── models/           # estimator registry (spec path)
-│   └── compute/          # LocalKernel + E2BKernel (Jupyter), runners, sandbox
+│   └── compute/          # LocalKernel + E2BKernel (Jupyter), runners, the macOS cell sandbox, harness-side installs
 ├── deliver/              # runnable .ipynb rendering (sessions, leaderboards)
 ├── llm/                  # pluggable backends: native Ollama client + one
 │                         #   OpenAI-compatible client (Groq/Together/Deepseek/OpenAI/vLLM)
@@ -267,7 +307,7 @@ src/iterate/
 | Bounded autonomy (deadline / patience) | ✗ | ✗ | ✗ | partial | **✓ shipped** |
 | Auditable reasoning trail (runnable notebooks) | ✗ | ✗ | ✗ | basic | **✓ shipped** |
 | Iterates LLM prompts | ✗ | ✗ | eval only | ✗ | **✓ shipped** |
-| Iterates DL / vision models | partial | ✗ | ✗ | partial | planned v0.6 |
+| Iterates DL / vision models | partial | ✗ | ✗ | partial | **✓ shipped** |
 | Literature-aware proposals | ✗ | ✗ | ✗ | partial | ✓ |
 | Cost-to-serve-aware optimization | ✗ | ✗ | ✗ | ✗ | planned v0.7 |
 | Auto-discovers data + context (MCP) | ✗ | ✗ | ✗ | partial | planned v0.9 |
