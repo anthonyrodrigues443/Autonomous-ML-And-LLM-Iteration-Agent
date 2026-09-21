@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 from iterate.adapters.research import Paper
 from iterate.core.researcher import Findings, Researcher, Suggestion, credited
 from iterate.schemas.llm import ChatResponse, ToolCall
+from iterate.targets import layers as arch
 
 _PAPERS = [
     Paper("TabNet", "doi:10.1609/aaai.v35i8.16826", "attentive tabular learning", 2021, 1586, "openalex"),
@@ -255,9 +256,11 @@ def test_a_prompt_run_is_asked_for_changes_to_the_prompt() -> None:
 
 
 # Digests of what main 6485be3 sends. Only a deliberate rewording of the table or
-# image pair may change them.
+# image pair may change them. The image digest was recomputed once, for the v0.6 hold's
+# PR E, which teaches the image pair to suggest a layer stack; the table digest is
+# untouched since 6485be3 and is the proof that rewording did not reach the table pair.
 _TABLE_CALL_ON_MAIN = "7a7976476f0f298724187c0fec556809dd2f53a63e902c1bd901ceebb9b254b2"
-_IMAGE_CALL_ON_MAIN = "4c6f808e1d025ce72dca66c2bc39ec55a59c60d1debce0f88a02c005d7e3d57c"
+_IMAGE_CALL_ON_MAIN = "a300345dc2b798eccb706d6f039a60718d3acb54258ee34a92366efd4dfa985b"
 
 
 @pytest.mark.parametrize(
@@ -342,3 +345,114 @@ def test_a_pre_v05_cache_file_is_still_readable(tmp_path: Path) -> None:
     )
 
     assert _Cache(tmp_path).get("arxiv", "legacy", 5) is not None
+
+
+# ─── an image suggestion may not invent a network (v0.6 hold, PR E) ──────────
+
+
+_STACK_PAPERS = [
+    Paper(
+        "A small CNN for land cover",
+        "doi:10.1000/stack",
+        "Our network stacks a convolution of 32 filters and one of 64 filters, each "
+        "followed by pooling, then dropout of 0.3 and a fully connected layer of 256 "
+        "units, trained from scratch on 27000 tiles.",
+        2022,
+        40,
+        "openalex",
+    )
+]
+# The same claim with no width anywhere, which is how an abstract normally reads. The
+# numbers it does carry are the ones a 12B invents, so membership alone would pass them.
+_NO_WIDTH_PAPERS = [
+    Paper(
+        "A small CNN for land cover",
+        "doi:10.1000/nowidth",
+        "Our network stacks several convolutional blocks with pooling and dropout, "
+        "followed by a fully connected layer, on 64x64 tiles across 10 land cover "
+        "classes, with a dropout rate of 0.3, batches of 32 and 256 epochs.",
+        2022,
+        40,
+        "openalex",
+    )
+]
+
+
+def _vision_suggestion(technique: str, papers: list[Paper] | None = None) -> list[Suggestion]:
+    llm = _FakeLLM([
+        _queries("q"),
+        _suggest({"technique": technique, "rationale": "r", "paper": 1}),
+    ])
+    researcher = Researcher(
+        llm,
+        metric="accuracy",
+        direction="maximize",
+        family="vision",
+        sources=[_FakeSource(list(papers if papers is not None else _STACK_PAPERS))],
+    )
+    return researcher.research(profile="27000 images, 10 classes").suggestions
+
+
+@pytest.mark.parametrize(
+    ("technique", "kept"),
+    [
+        ("train conv(32) pool conv(64) pool dropout(0.3) linear(256) from zero", True),
+        # One width the abstract never states: the stack is all this said, so it goes.
+        ("train conv(32) pool conv(128) pool dropout(0.3) linear(256) from zero", False),
+        # No stack written out at all: this check does not touch it.
+        ("fine-tune timm efficientnet_b0 on all layers at 128 px", True),
+    ],
+)
+def test_an_image_stack_survives_only_when_the_abstract_states_every_number(
+    technique: str, kept: bool
+) -> None:
+    """The lever ladder opens a layer class on a finding, and a 12B copies the example it
+    is shown. A network it made up, with a real paper against it, is the failure to stop."""
+    assert [s.technique for s in _vision_suggestion(technique)] == ([technique] if kept else [])
+
+
+@pytest.mark.parametrize(
+    ("technique", "left"),
+    [
+        (
+            "use timm vit_small_patch16_224 with a linear(768) dropout(0.2) classifier",
+            "use timm vit_small_patch16_224 with a linear dropout classifier",
+        ),
+        (
+            "fine-tune timm resnet50 on all layers, with a head of linear(512) dropout(0.5)",
+            "fine-tune timm resnet50 on all layers, with a head of linear dropout",
+        ),
+    ],
+)
+def test_an_unstated_head_costs_the_stack_and_not_the_model_the_paper_names(
+    technique: str, left: str
+) -> None:
+    """What the abstract check guards is the STACK. A paper that names a real model and
+    sketches a head is a backbone or own-model finding, and dropping it whole would throw
+    the model name and its citation away for the sake of two numbers nobody can use."""
+    kept = _vision_suggestion(technique)
+    assert [s.technique for s in kept] == [left]
+    assert arch.found_strict(kept[0].technique) is None
+
+
+def test_an_abstract_that_states_no_width_at_all_states_no_stack() -> None:
+    """Measured on gemma4:12b: given an abstract with no width in it, the model invents a
+    stack anyway, out of the example the prompt shows it, and the numbers it invents are
+    the ones an image abstract carries for other reasons. Set membership alone kept that
+    invented stack 5 times out of 5, so the abstract has to state widths at all."""
+    invented = "conv(32) pool conv(64) dropout(0.3) linear(256) from zero"
+    assert _vision_suggestion(invented, list(_NO_WIDTH_PAPERS)) == []
+    assert [s.technique for s in _vision_suggestion(invented)] == [invented]
+
+
+def test_a_table_run_is_never_checked_against_the_abstract() -> None:
+    """Image family only: "conv(32)" in a tabular technique is not a network this harness
+    would ever build, and the check must not quietly drop a table suggestion."""
+    llm = _FakeLLM([
+        _queries("q"),
+        _suggest({"technique": "conv(32) pool conv(999) linear(7)", "rationale": "r", "paper": 1}),
+    ])
+    findings = Researcher(
+        llm, metric="f1", direction="maximize", sources=[_FakeSource(list(_STACK_PAPERS))]
+    ).research(profile="p")
+    assert len(findings.suggestions) == 1

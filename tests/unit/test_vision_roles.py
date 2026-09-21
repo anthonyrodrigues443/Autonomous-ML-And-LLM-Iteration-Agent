@@ -1706,9 +1706,12 @@ def test_two_iterations_through_the_real_supervisor_read_each_other() -> None:
 # ─── the ask, through the supervisor ─────────────────────────────────────────
 
 
-# The sha256 of every message main 621987d sends for this image call. An ask is the only
-# new thing on the wire, so a run with no guidance must send exactly these bytes.
-_IMAGE_CALL_ON_MAIN = "81da841bb08767d2e5f69f9699138f84bcef9aff4f7e020ce04a7c7e582ee312"
+# The sha256 of every message this image call sends. PR D added the ask, which is the only
+# new thing on the wire there, so it kept main 621987d's digest; PR E reworded the image
+# system prompt on purpose (two class definitions and one clause, then four words in the
+# clause after a probe read "head (the same...)" as a head that may hold a conv), so the
+# digest was recomputed, against a run with no guidance and no layer class on the line.
+_IMAGE_CALL_ON_MAIN = "331072ef9abd5ec6d09780cc8a3aab7c42a9e7b526476b8ec81e9e0585fd3726"
 _SWAP_BRIEF = (
     "next: backbone: keep the recipe and swap the backbone to convnext_tiny (because resnet18 "
     "took 12s an epoch, so convnext_tiny fits the budget at about 126s)"
@@ -1909,3 +1912,155 @@ def test_an_image_run_reads_a_typed_ask_and_a_table_run_leaves_the_note_alone() 
             assert ctrl.note_reader(f"try {STACK}")[0] == f"[ask: layers {STACK}]"
         else:
             assert ctrl.note_reader is None
+
+
+# ─── the prompts the two classes need (PR E) ─────────────────────────────────
+
+
+def _coder_pair(brief: str) -> tuple[str, str]:
+    """(system, task) the image coder is sent for one brief."""
+    messages = coder_mod._build_messages(
+        data_summary="Images: 10",
+        metric="accuracy",
+        direction="maximize",
+        brief=brief,
+        preamble_output="loaded",
+        family="vision",
+        starting_code="",
+        starting_score=0.9785,
+        starting_recipe=RECIPE,
+    )
+    return messages[0].content or "", messages[1].content or ""
+
+
+@pytest.mark.parametrize(
+    ("brief", "call"),
+    [
+        (
+            f"next: layer-stack: train a network from zero through fit(), with layers {STACK}",
+            'fit(layers=[("conv", 32), ("pool",), ("conv", 64), ("pool",), '
+            '("dropout", 0.3), ("linear", 256)], epochs=20)',
+        ),
+        (
+            f"next: custom-head: fine-tune resnet50 through fit(), all layers, with head {HEAD}",
+            'fit(backbone=\'resnet50\', head=[("linear", 512), ("dropout", 0.5)])',
+        ),
+    ],
+)
+def test_a_layer_brief_hands_the_coder_the_call_that_makes_it(brief: str, call: str) -> None:
+    """A stack reaches the coder as prose. The call is the one thing it must not retype."""
+    system, user = _coder_pair(brief)
+    assert call in user
+    assert "copied character for character" in user
+    assert call not in system
+
+
+def test_a_from_zero_call_carries_its_own_epochs_and_a_head_call_keeps_the_best_s() -> None:
+    """The coder fills in what the call leaves out, from the pretrained best in front of
+    it, and merge() reads a re-stated epochs=3 as the choice: the from-zero network then
+    trains 3 epochs instead of 20 and loses on the schedule, not on its architecture.
+    A head keeps the carried best's epochs on purpose, so its call must not name them."""
+    layers = f"next: layer-stack: train a network from zero through fit(), with layers {STACK}"
+    head = f"next: custom-head: fine-tune resnet50 through fit(), all layers, with head {HEAD}"
+    assert str(vl.brief_call(layers)).endswith(f"epochs={vl.SCRATCH_EPOCHS})")
+    assert "epochs" not in str(vl.brief_call(head))
+
+
+def test_every_other_class_leaves_the_coder_pair_exactly_as_it_was() -> None:
+    """The call line is the only thing PR E adds to a brief, and it is added for two
+    classes. An epochs brief must reach the same system prompt and the same task text."""
+    epochs = "next: epochs: keep the recipe and train 6 epochs"
+    layers = f"next: layer-stack: train a network from zero through fit(), with layers {STACK}"
+    epochs_system, epochs_user = _coder_pair(epochs)
+    layer_system, layer_user = _coder_pair(layers)
+    call = vl.brief_call(layers)
+    assert epochs_system == layer_system
+    assert "The brief's change, written as the call" not in epochs_user
+    assert layer_user == epochs_user.replace(epochs, layers) + "\n\n" + (
+        coder_mod._PROMPTS["vision_brief_call"].replace("{call}", str(call))
+    )
+
+
+def test_the_easy_path_names_the_two_settings_so_a_12b_does_not_write_its_own_net() -> None:
+    system, _ = _coder_pair("next: epochs: keep the recipe and train 6 epochs")
+    assert "layers=[('conv', 32), ('pool',), ('linear', 256)]" in system
+    assert "head=[('linear', 512), ('dropout', 0.5)]" in system
+    assert "never your own nn.Sequential" in system
+
+
+def test_the_supervisor_prompt_defines_both_classes_and_the_tool_lists_them() -> None:
+    system = sup._PROMPTS["vision_system"]
+    assert "layer-stack: a network from zero." in system
+    assert "custom-head: your layers in place of a backbone's final layer." in system
+    assert "It also takes layers (conv(32) pool linear(256), trained from zero)" in system
+    # Never "head (the same...)": the only stack that sentence can point back at opens
+    # with a conv, and a head takes linear and dropout only.
+    assert "head (linear and dropout, on a pretrained backbone)" in system
+    brief_field = sup._PROMPTS["vision_tool"]["fields"]["brief"]
+    assert "fine-tune-depth, layer-stack, custom-head" in brief_field
+
+
+def test_the_ready_line_says_to_copy_a_stack_only_when_one_is_on_it() -> None:
+    plain = ready_for([first_try()], first_try(), findings=FINDINGS, median_width=64)
+    assert "Copy a layer stack" not in vl.ready_line(plain)
+    asked = ready_for([first_try()], first_try(), asks=f"please try {STACK}")
+    assert vl.ready_line(asked).endswith(
+        "Copy a layer stack into the brief exactly as it is written here."
+    )
+    assert "Copy a layer stack" not in vl.ready_line([])
+
+
+# ─── a finding opens a stack only when the abstract states its numbers ────────
+
+
+_STACK_PAPER = (
+    "We train a small network of conv(32) pool conv(64) pool dropout(0.3) linear(256) on "
+    "Sentinel-2 tiles."
+)
+
+
+@pytest.mark.parametrize(
+    ("finding", "opens"),
+    [
+        (f"- a network of {STACK} <doi:1>", "layer-stack"),
+        (f"- a classifier head of {HEAD} <doi:1>", "custom-head"),
+        ("- fine-tune a deep convolutional network end to end <doi:1>", ""),
+        ("- a CNN with 20 epochs at 64 px <doi:1>", ""),
+        # The researcher checks the technique against the abstract; the rationale is
+        # never checked, so a stack that sits there alone carries nothing behind it.
+        (
+            f"- fine-tune timm resnet50 on all layers — the paper's own network is "
+            f"{STACK}, which suits 64 px tiles <doi:1>",
+            "",
+        ),
+        # A written stack reads whatever the sentence says about it, so a paper that
+        # measures one and calls it the loser must not brief the loser.
+        (f"- a network of {STACK} — resnet50 beats it, at 0.97 against 0.81 <doi:1>", ""),
+    ],
+)
+def test_a_finding_that_writes_a_stack_out_opens_its_class(finding: str, opens: str) -> None:
+    items = ready_for([first_try()], first_try(), findings=finding)
+    layer = [r for r in items if r.lever in vl.LAYER_LEVERS]
+    assert [r.lever for r in layer] == ([opens] if opens else [])
+    for entry in layer:
+        brief = f"next: {entry.lever}: {entry.move} (because {entry.reason})."
+        assert vl.classes_named(brief)[:1] == [entry.lever]
+        assert vl.missing_value(brief) is None
+        assert vl.proposed_value(entry.lever, vl.change_clause(brief)) == entry.stack
+
+
+def test_a_stack_the_run_already_tried_stays_shut_however_the_paper_writes_it() -> None:
+    tried = stack_try()
+    items = ready_for([tried], tried, findings=f"- a network of {STACK} <doi:1>")
+    assert [r for r in items if r.lever in vl.LAYER_LEVERS] == []
+
+
+def test_a_paper_stack_that_ends_in_the_class_count_never_reaches_a_brief() -> None:
+    """fit() adds the final layer itself, so this stack earns a RecipeError and spends the
+    experiment the finding opened on a repair round. It is the shape a 12B writes: it
+    copies the paper's last layer, and the paper's last layer is the class count."""
+    finding = "- a network of conv(32) pool conv(64) dropout(0.2) linear(10) <doi:1>"
+    opened = ready_for([first_try()], first_try(), findings=finding)
+    assert [r.lever for r in opened if r.lever in vl.LAYER_LEVERS] == ["layer-stack"]
+    known = ready_for([first_try()], first_try(), findings=finding, outputs=10)
+    assert [r for r in known if r.lever in vl.LAYER_LEVERS] == []

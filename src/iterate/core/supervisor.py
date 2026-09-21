@@ -127,6 +127,10 @@ class Supervisor:
         task: str = "classification",
         image_size: int | None = None,
         image_width: int | None = None,
+        # The class count, None for a number. A layer stack that ends in a final layer
+        # as wide as this one is refused before it is briefed: fit() adds the final
+        # layer itself, so the experiment would die on a RecipeError.
+        outputs: int | None = None,
     ) -> None:
         self._client = client
         self._metric = metric
@@ -138,6 +142,7 @@ class Supervisor:
         self._task = task
         self._image_size = image_size
         self._image_width = image_width
+        self._outputs = outputs
         self._tool = _build_tool(family)
 
     def decide(
@@ -186,6 +191,7 @@ class Supervisor:
                 asks=user_guidance or "",
                 median_width=self._image_width,
                 default_size=self._image_size,
+                outputs=self._outputs,
             )
             if vision
             else []

@@ -567,7 +567,7 @@ coder:
 
     WHAT IS ALREADY LOADED (the load cell's output is below). TASK is 'classification' or 'regression'. CLASSES lists the class names in the order every probability column follows, and is None for a number. DEVICE and IMAGE_SIZE. train_px and holdout_px hold every image decoded at IMAGE_SIZE, uint8 arrays shaped (n, 3, IMAGE_SIZE, IMAGE_SIZE); pixels(size) returns both at another size. labels holds the training labels: indices into CLASSES, or numbers in the label's own units. FIT_IDX and VAL_IDX split the training rows the same way in every session: train on FIT_IDX, score on VAL_IDX, so tries compare like for like. holdout_px has no labels here.
 
-    THE EASY PATH: fit(). f = fit(backbone=..., image_size=..., epochs=..., unfreeze=..., augment=..., label_smoothing=..., lr=...) trains resnet18, resnet50, convnext_tiny or simple_cnn on FIT_IDX. Every setting you do not pass keeps the best recipe's value, so pass only what the brief changes. It prints one line per epoch, a FIT line and the validation score, and returns the fit; f.val is its score. submit(f) writes that fit's holdout predictions. Run ONE fit per cell: its 540 second budget counts from the top of the cell.
+    THE EASY PATH: fit(). f = fit(backbone=..., image_size=..., epochs=..., unfreeze=..., augment=..., label_smoothing=..., lr=...) trains resnet18, resnet50, convnext_tiny or simple_cnn on FIT_IDX. Every setting you do not pass keeps the best recipe's value, so pass only what the brief changes. fit() also builds the network the brief describes: layers=[('conv', 32), ('pool',), ('linear', 256)] trains a whole network from zero, and head=[('linear', 512), ('dropout', 0.5)] puts your own layers where a pretrained backbone's final layer was, so a brief that says from zero, or a new head, is still fit() and never your own nn.Sequential. The four layer names are conv (convolution, batch norm and ReLU together), pool, dropout and linear; fit() works out every size and adds the final layer itself. It prints one line per epoch, a FIT line and the validation score, and returns the fit; f.val is its score. submit(f) writes that fit's holdout predictions. Run ONE fit per cell: its 540 second budget counts from the top of the cell.
 
     YOUR OWN CODE, for any model fit() does not train. The load cell printed a worked example of the shape that works here, for THIS run's task: follow it. What matters in it: build the model with the exact name the brief gives; read the input size from the model's pretrained_cfg and call pixels(size) when the model fixes one, because a network built for 224 px refuses a 64 px image; train on FIT_IDX only; time an epoch and stop while seconds_left() still covers predicting; predict through predict(model, ...), which sets eval mode and no_grad for you; score with evaluate(outputs, model=NAME, ...) and submit with submit_probabilities(probs, model=NAME) or submit_numbers(values, model=NAME). The model= name is REQUIRED on all three: without it the run cannot record what was tried, and the call fails. evaluate() only scores outputs; it never trains. Holdout images never enter a training step, a mean or a standard deviation, or a batch-norm update.
 
@@ -592,6 +592,12 @@ coder:
     {preamble_output}
 
     Do this now, ONE action per cell. Run the brief's try first: fit() when fit() can express it, or your own torch code scored with evaluate() for anything else. Read its validation score against the best so far and submit it. Then use the budget left for one more measured change to the same lever, and call the finish tool.
+  # Only for the two layer classes, appended to the task message: a stack reaches the
+  # coder as prose, and a 12B handed prose rewrites the widths. Placeholder: {call}
+  vision_brief_call: >-
+    The brief's change, written as the call that makes it: {call}. Run exactly that in
+    your first cell, with the layers copied character for character, and read the FIT
+    line it prints. Do not build the network yourself.
   # The best is a recipe to start from, not code to rebuild. Placeholders: {metric}, {score}, {recipe}
   vision_starting_point: |-
 
@@ -882,9 +888,9 @@ supervisor:
 
     THE BASELINE is a small CNN trained from zero on these images. It is the bar to beat, not a model to refine.
 
-    WHAT A TRY CAN BE. The session's fit() trains resnet18, resnet50 or convnext_tiny (an epoch of either of the last two takes three to four times as long as resnet18), or simple_cnn, and takes image_size (32 to 384), epochs (1 to 12 for a pretrained network), unfreeze (all fine-tunes every layer, head trains the new head only, none is a linear probe), augment (none, flip, flip_crop), label_smoothing (classes only) and lr. Any other pretrained model, a timm or Hugging Face model named exactly as it loads, the coding agent writes in its own torch code. Each try has a 540 second fit budget.
+    WHAT A TRY CAN BE. The session's fit() trains resnet18, resnet50 or convnext_tiny (an epoch of either of the last two takes three to four times as long as resnet18), or simple_cnn, and takes image_size (32 to 384), epochs (1 to 12 for a pretrained network), unfreeze (all fine-tunes every layer, head trains the new head only, none is a linear probe), augment (none, flip, flip_crop), label_smoothing (classes only) and lr. It also takes layers (conv(32) pool linear(256), trained from zero) and head (linear and dropout, on a pretrained backbone). Any other pretrained model, a timm or Hugging Face model named exactly as it loads, the coding agent writes in its own torch code. Each try has a 540 second fit budget.
 
-    THE LEVER CLASSES. backbone: another network fit() trains. own-model: a model fit() does not have, in the agent's own torch code. image-size. epochs. augmentation. regularisation: label_smoothing, or dropout and weight decay in own code. fine-tune-depth: which layers train, and the learning rate.
+    THE LEVER CLASSES. backbone: another network fit() trains. own-model: a model fit() does not have, in the agent's own torch code. image-size. epochs. augmentation. regularisation: label_smoothing, or dropout and weight decay in own code. fine-tune-depth: which layers train, and the learning rate. layer-stack: a network from zero. custom-head: your layers in place of a backbone's final layer.
 
     WHAT YOU SEE. The data summary is ESTABLISHED FACT. Under each experiment a "fit:" line, written by the harness from what the session printed, gives the recipe that was submitted, the epochs that ran of those planned and the seconds each took, the training score at the first and last epoch ("still rising" when the last epoch still gained), the validation score, and "train above val by" when training pulls ahead. The history ends with two harness lines. "Levers tried" lists the classes sessions actually changed. "Levers ready now" lists the classes THIS RUN'S numbers open, each with the fact that opened it: a failed, out-of-memory or budget-cut try opens only its repair; a stronger backbone or a larger image size opens when the seconds per epoch leave room in the budget; epochs open when training was still rising, or when your own code trained only a few; augmentation and regularisation open when training sits above validation; fine-tune-depth opens when the best try does not train every layer; own-model opens when a literature finding names a model no try has spent an experiment on; a class two experiments in a row spent without beating the best closes.
 
@@ -937,7 +943,7 @@ supervisor:
         briefed: no lever is ready, or several tries have not beaten the best. false when
         you already know the change worth making.
       brief: |-
-        The "next:" move handed to the coding agent: 1-2 lines opening "next: <class>:" with ONE class from Levers ready now (backbone, own-model, image-size, epochs, augmentation, regularisation, fine-tune-depth), the ONE change with its exact value, and one reason quoting a profile fact or a number from a fit line; never a predicted score. Do NOT write a "so far:" summary. Example: next: epochs: the resnet18 try ran 3 of 3 epochs at 41s each and train_acc was still rising (0.958 -> 0.981), so keep the recipe and train 6 epochs. On experiment 1 brief ONE pretrained model fine-tuned on all layers. Required unless stopping.
+        The "next:" move handed to the coding agent: 1-2 lines opening "next: <class>:" with ONE class from Levers ready now (backbone, own-model, image-size, epochs, augmentation, regularisation, fine-tune-depth, layer-stack, custom-head), the ONE change with its exact value, and one reason quoting a profile fact or a number from a fit line; never a predicted score. Do NOT write a "so far:" summary. Example: next: epochs: the resnet18 try ran 3 of 3 epochs at 41s each and train_acc was still rising (0.958 -> 0.981), so keep the recipe and train 6 epochs. On experiment 1 brief ONE pretrained model fine-tuned on all layers. Required unless stopping.
 
 
 critic:
@@ -1332,14 +1338,17 @@ researcher:
 
     A suggestion must be something one notebook session builds on one GPU in minutes: a pretrained model named exactly as a library loads it (a torchvision name such as resnet50, a timm name such as efficientnet_b0, or a Hugging Face org/name id), or ONE training change to such a model: the image size, the number of epochs, an augmentation, a regulariser, how many layers to fine-tune, or the learning rate. Name the model or the change in the technique ("fine-tune <library> <exact model name> on all layers"). Useless here, however good the paper: extra unlabeled or outside data, an ensemble or a second model at prediction time, detection or segmentation labels, many GPUs or days of training, or an architecture the paper built that no library ships with weights.
 
+    A paper that writes its own network out layer by layer, with the width of every layer in the abstract you are shown, may instead be suggested as that stack, written as conv(32) pool conv(64) dropout(0.3) linear(256). Only those four names, and only widths the abstract itself states: a width you supply is dropped with the whole suggestion, because a made-up network with a real paper against it is worse than no suggestion at all. Abstracts seldom list widths, so expect this to be rare.
+
     Suggest at most 3, ordered best first, and suggest fewer (or none) rather than padding. Call suggest_techniques; respond with nothing else.
   vision_suggest_tool:
     name: suggest_techniques
     description: "Record which published techniques are worth trying on these images."
     fields:
       technique: >-
-        The model or the one training change to try, named as a notebook cell would build
-        it (e.g. "fine-tune <library> <exact model name> on all layers at 128 px").
+        The model, the one training change, or the layer stack the abstract writes out, as
+        a notebook cell would build it (e.g. "fine-tune <library> <exact model name> on all
+        layers at 128 px", or "conv(32) pool conv(64) pool linear(256) from zero").
       rationale: >-
         ONE sentence tying the paper's finding to THESE images: what they show, their
         size, how many there are, or whether the label is a class or a number.

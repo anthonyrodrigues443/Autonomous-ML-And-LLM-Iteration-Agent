@@ -529,6 +529,62 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-09-21 | Sprint 4 Day 14 | The image prompts learn the two layer classes, and the coder is handed the call
+
+**Task:** PR E of the v0.6.0 hold, on the branch that already holds PR A (the saved model), PR B (the re-runnable notebook), PR C (the layer params in `fit()`) and PR D (the two lever classes and the user ask). PR C gave `fit()` the params and PR D gave the supervisor the classes, but no prompt key had moved, so the 12B did not know the words existed. This is the prompts, and three Ollama-only probes that decide what ships.
+
+**Image keys only.** `supervisor.vision_system` gains two class definitions and one clause in WHAT A TRY CAN BE; its tool's brief field lists the two names. `coder.vision_system`'s EASY PATH names `layers=` and `head=`. A new `coder.vision_brief_call` carries the finished call, appended to the task message for the two layer classes and nothing else. `researcher.vision_suggest_system` and its tool's technique field allow a layer stack. `_TABLE_CALL_ON_MAIN` in test_researcher.py did not move, which is the proof the table pair was not touched, and the table and prompt digest tests passed untouched.
+
+**What each key costs, counted by gemma4:12b itself (`prompt_eval_count`, the same text before and after):**
+
+| Key | Before | After | Added |
+|---|---|---|---|
+| `supervisor.vision_system` (always on) | 990 | 1048 | **+58** |
+| `supervisor.vision_tool` brief field (always on) | 169 | 177 | **+8** |
+| `coder.vision_system` | 1085 | 1215 | +130 |
+| `coder.vision_brief_call` (two briefs a run) | 0 | 47 | +47 |
+| `researcher.vision_suggest_system` | 279 | 394 | +115 |
+| `researcher.vision_suggest_tool` technique field | 44 | 73 | +29 |
+
+The always-on planning prompt grew by **66 tokens**, against the read-out's estimate of about 45. The first draft cost 78 and was cut twice against the counter: "a network from zero, out of the layers you name" became "a network from zero", and the clause lost six words. What is left is the floor for two definitions and one clause that still shows an example stack, and the example is the part the probe shows the model copies. One token of that 66 was bought back later: "head (the same, on a pretrained backbone)" pointed at the only stack on the line, which opens with a conv, and a head takes linear and dropout only, so it now reads "head (linear and dropout, on a pretrained backbone)".
+
+**Probe R3.1, the supervisor: 10 of 10 and 10 of 10.** A typed ask at iteration 2, through the real `decide()` so the ask reaches both the ladder and the guidance message, gemma4:12b at the run's own 0.4, ten calls a case, first answer only with no nudge allowed to correct it. Every first brief opened with the right class, passed `missing_value`, and its stack equalled the entry's character for character, for `layer-stack` and for `custom-head`.
+
+One thing the probe found on the way. A first draft sent the ask only through the ready line, with no guidance message, and the model briefed `image-size` 10 of 10 and ignored the leading entry. The control says that is not this PR: on the same fixture with no ask at all it picks `image-size` 10 of 10 on the OLD image prompt too, so this 12B prefers an entry with a number from a fit line behind it over the first entry on the line. It does not reach the live path, which always sends both, but it is what R4b has to watch: if a live ask is ever passed over, this is why.
+
+**Probe R3.2, the coder: 10 of 10 and 10 of 10, and the counterfactual is what pays for the sentence.** Ten calls a case at the coder's own 0.7, judged on the FIRST cell only.
+
+| Coder prompt | Brief | First cell is the right `fit()` call | Wrote its own torch net |
+|---|---|---|---|
+| Old (pre PR E) | `layer-stack`, no call line | **0 of 10** | 10 of 10 |
+| Old (pre PR E) | `custom-head`, no call line | **0 of 10** | 7 of 10 |
+| New, call line cut off | `layer-stack` | 10 of 10 | 0 |
+| New, call line cut off | `custom-head` | 10 of 10 | 0 |
+| New, as it ships | `layer-stack` | 10 of 10 | 0 |
+| New, as it ships | `custom-head` | 10 of 10 | 0 |
+
+The old prompt fails exactly the way the read-out predicted: "Since fit() is for standard architectures, I must implement this myself", then `class LayerStack(nn.Module)`. The EASY PATH sentence is what fixes it. The call line rescued nothing on this fixture, and the honest reading is that it is insurance for a stack longer than the example, at 47 tokens on the two briefs a run that use it.
+
+**Probe R3.3, the researcher: the rewording ships.** Five calls each at the Researcher's own 0.3, on a recorded land-cover paper shortlist taken from this machine's own search cache (7 papers, deduped across two real queries). Old prompt and new both named a real architecture in 5 of 5 answers, so the rewording costs nothing it was earning before. Read instead through `vl.models_named`, which is the function that actually opens own-model, both score 0 of 5: the model writes `timm.resnet50`, and the dotted form does not tokenise, and resnet50 is a network `fit()` already trains anyway. That 0 is the same on both arms, so it is not PR E's doing, but neither prompt produced a usable own-model finding on this shortlist and R4a should watch it. Neither wrote a layer stack at all, because none of those abstracts states a width.
+
+So the abstract check was proved on planted papers instead, and this is the strongest result of the run. Given an abstract that really writes `conv(32) pool conv(64) pool dropout(0.3) linear(256)` out, the model suggested exactly that stack 5 of 5 and the check kept it 5 of 5. Given a paper making the same claim with **no width anywhere** in the abstract, the model invented a stack anyway, 5 of 5, out of the example the prompt itself shows it, with a real DOI pinned to it, and the check dropped all 5. That is hole 21 reproduced live rather than argued, and it means the check is load-bearing and not belt-and-braces. An earlier draft of this entry said the model wrote no stack there, which the probe log (`p3_planted.json`) contradicts; the numbers above are what was recorded.
+
+**And one probe failed. The research-finding opener is 0 of 20 on this model.** `_found_in` builds the same two entries from a finding as an ask does, and on the finding route the supervisor never briefed either one: 10 of 10 it briefed `backbone` or `own-model` instead of the `layer-stack` entry, and 10 of 10 it briefed `image-size` instead of the `custom-head` entry, with the entry on the ready line and the copy-the-stack sentence next to it. Every one of the 20 cleared the guard for the class it did name, so this is the entry losing on the line, not a guard fault, and it matches what the ask probe showed from the other side: the ask route passes because the ask reaches the model twice, on the ready line AND as the guidance message, and the ready line alone carries little weight with this 12B. The read-out's cut order names this opener first, so **it is Tony's call whether `_found_in` and its two ready entries ship at all**; nothing in the read-out's stated fallbacks pulls it, and the researcher rewording and the abstract check pass on their own evidence either way.
+
+**What the review round then changed.** Six findings, every one reproduced against the real code before it was taken.
+
+The abstract check was passing invented stacks by coincidence. `_stack_is_stated` collected every number in the abstract and asked for set membership, and the numbers a 12B invents are the prompt's own example widths plus the class count, which are exactly the numbers an image abstract carries for other reasons: input size, batch size, epoch count, dropout rate, classes. Planted live: an abstract with no width at all, carrying 64 px inputs, batches of 32, dropout 0.2 and 10 classes, KEPT an invented `conv(32) pool conv(64) dropout(0.2) linear(10)` 5 of 5. The check now needs the abstract to state widths at all (filters, channels, units, neurons, feature maps, kernels, hidden) before membership is asked, and the ready line no longer claims "the paper's abstract states every number in it", which the code cannot prove; it says every number in it appears in the abstract, which it can.
+
+The check also guarded the wrong string. It read the `technique` field, but what reaches the ladder is the rendered line, technique and rationale together, and `_found_in` parsed the whole line. A technique that passed the check ("fine-tune timm resnet50 on all layers") with a stack sitting in its rationale opened `layer-stack` on a network nothing had verified. `_found_in` now parses the technique segment alone, so the checked text and the parsed text are the same text. It also skips a line holding a comparison word: `found_strict` reads the loser of a sentence as readily as the winner and returns no span to tell them apart, which its own docstring says the caller owning findings has to handle, and this is that caller.
+
+Dropping the whole suggestion was too blunt. An unverified head in a technique that also names a real model threw the model name, the rationale and the citation away with it, and `models_named` then never saw the model, so own-model opened on nothing. What must not survive is the stack, which is what the read-out says too. A suggestion that names a network keeps its line with the widths taken out of the layers; a suggestion that was nothing but a stack is still dropped whole.
+
+A finding stack ending in `linear(<class count>)` reached the brief and died at `fit()`, which adds the final layer itself. That is the shape the 12B writes, because it copies the paper's last layer: the planted control wrote it live. The class count now reaches the ladder (`Supervisor(outputs=...)` from the cli's own `n_classes`, into `ready()` and `_stack_kind`), so the entry never opens and the experiment the finding bought is not spent on a repair round.
+
+The handed call was incomplete, which cost the from-zero net its schedule. `fit(layers=[...])` alone gets `BASELINE.epochs` = 20 from `merge()`, but the coder fills the rest in from the pretrained best in front of it, and 17 of 18 recorded first cells re-stated `epochs=3`. `merge()` reads that as the choice, so the stack would have trained 3 epochs and lost on an epoch count rather than on its architecture, with two such losses closing the class. A layers call now carries `epochs=20`, which is identical to what `merge()` picks when nothing is passed. A head call does not: a head keeps the carried best's epochs on purpose.
+
+**Not in this PR:** anything a table or prompt run reads, `last_block` in the supervisor's `unfreeze` list (the ready entry carries the exact value, so the word is not needed and the tokens are), and the live runs. R4a to R4d are the next thing, and today's image certification does not carry over. Pre-existing and flagged for R4c rather than fixed here: 6 of 10 layer cells passed `unfreeze=True` and `augment=True`, which `dl.py` refuses by value, so each costs one repair round; the coder's EASY PATH parameter list is byte-identical before and after PR E, so it is not this PR's, but R4c's pass condition is "no RecipeError loop" and it will be seen there.
+
 ### 2026-09-21 | Sprint 4 Day 12 | The builders: a network from a list of layers, a head on a pretrained one
 
 **Task:** PR C part 2 of the v0.6.0 hold, on the branch that already holds part 1 (the pure-Python grammar, `targets/layers.py`). Part 1 could read a stack and refuse a bad one; nothing could build one. This part makes it real in torch and closes PR A's blocker for good: `net.model_for` learns the new shapes, so a file saved from one opens again. Part 1's dl.py and vision_session.py work was not in the branch, so it is here too: the three `Recipe` fields, the merge rules and the recipe-level refusals.
