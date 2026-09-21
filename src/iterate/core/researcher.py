@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from iterate.adapters.research import ArxivClient, OpenAlexClient, search_all
+from iterate.core import vision_levers as vl
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
 from iterate.targets import layers as arch
@@ -325,8 +326,15 @@ class Researcher:
             if not technique or paper is None:
                 continue
             if self._family == "vision" and not _stack_is_stated(technique, paper.abstract):
-                log.info("researcher: dropped a stack the abstract does not state (%s)", technique)
-                continue
+                kept = _without_the_stack(technique)
+                log.info(
+                    "researcher: dropped a stack the abstract does not state (%s)%s",
+                    technique,
+                    "" if kept is None else f", kept the model it names as {kept!r}",
+                )
+                if kept is None:
+                    continue
+                technique = kept
             out.append(
                 Suggestion(technique=technique, rationale=rationale, citation=paper.identifier)
             )
@@ -383,11 +391,20 @@ class Researcher:
 
 
 _NUMBER = re.compile(r"\d*\.\d+|\d+")
+# A width an abstract really states sits next to the word for what it is. Without one of
+# these anywhere, every number in the abstract is an input size, a batch, an epoch count
+# or a class count, and matching an invented width against those passes by coincidence:
+# measured on gemma4:12b, a width-free abstract carrying 64 px, batches of 32 and 10
+# classes kept an invented conv(32) pool conv(64) linear(10) five times out of five.
+_WIDTH_WORD = re.compile(r"filters|channels|units|neurons|feature maps|kernels|hidden", re.I)
+# The bracketed part of a layer, for taking a stack out of a suggestion that says more.
+_LAYER_CALL = re.compile(r"\b(conv|pool|dropout|linear)\s*\(\s*[\d.,\s]*\)", re.I)
 
 
 def _stack_is_stated(technique: str, abstract: str) -> bool:
-    """Whether an image suggestion that writes a layer stack may become a finding: every
-    number in the stack has to appear in the abstract the suggestion cites.
+    """Whether an image suggestion that writes a layer stack may become a finding: the
+    abstract the suggestion cites has to state widths at all, and every number in the
+    stack has to appear in it.
 
     A 12B copies the example it is shown, so a stack it invented would arrive with a real
     paper pinned to it, and the lever ladder opens on findings. A suggestion that writes
@@ -396,8 +413,24 @@ def _stack_is_stated(technique: str, abstract: str) -> bool:
     spec = arch.found_strict(technique)
     if spec is None:
         return True
+    if not _WIDTH_WORD.search(abstract):
+        return False
     stated = {float(m.group()) for m in _NUMBER.finditer(abstract)}
     return all(float(value) in stated for layer in spec for value in layer[1:])
+
+
+def _without_the_stack(technique: str) -> str | None:
+    """The suggestion with the widths taken out of its layers, when it names a network as
+    well, or None when the stack is all it said.
+
+    What may not survive an unstated stack is the STACK: a paper that names a real model
+    and sketches a head is a legitimate own-model or backbone finding, and dropping it
+    whole for the head's sake loses the model name and the citation with it."""
+    lower = technique.lower().replace("-", "_")
+    if not vl.models_named(technique) and not any(b in lower for b in vl.FIT_BACKBONES):
+        return None
+    stripped = _LAYER_CALL.sub(lambda m: m.group(1), technique)
+    return None if arch.found_strict(stripped) is not None else stripped
 
 
 def _resolve(index: Any, papers: list[Paper]) -> Paper | None:

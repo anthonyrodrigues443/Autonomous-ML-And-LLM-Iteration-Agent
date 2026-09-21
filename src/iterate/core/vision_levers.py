@@ -71,6 +71,9 @@ STRENGTH: dict[str, int] = {"simple_cnn": 0, "resnet18": 1, "resnet50": 2, "conv
 # Seconds per epoch against resnet18 at one size, from the Day 4 sweep's rows.
 COST: dict[str, float] = {"simple_cnn": 0.5, "resnet18": 1.0, "resnet50": 3.5, "convnext_tiny": 3.5}
 BENCH_EPOCHS = 3
+# Mirrors dl.BASELINE.epochs, which cannot be imported here because it pulls in torch:
+# the schedule merge() gives a from-zero network when nothing else is passed.
+SCRATCH_EPOCHS = 20
 MAX_EPOCHS = 12
 BUDGET = 540.0
 # Below this the last epoch's gain does not pay for doubling: measured on EuroSAT
@@ -720,13 +723,18 @@ def ready(
     asks: str = "",
     median_width: int | None = None,
     default_size: int | None = None,
+    outputs: int | None = None,
 ) -> list[Ready]:
     """The lever classes this run's evidence opens, each with the fact that opened it.
     A failure closes everything but its repair and whatever the human asked for on this
     turn, which is a recorded fact of its own.
 
     ``asks`` is what the human typed into THIS iteration, a recorded fact like any other:
-    it adds an entry, and every guard the supervisor runs still runs on the brief."""
+    it adds an entry, and every guard the supervisor runs still runs on the brief.
+
+    ``outputs`` is the class count, so a stack a paper ends in a final layer as wide as
+    the class count is refused here rather than at the fit, which fit() would add a
+    second final layer after."""
     last = history[-1] if history else None
     best = best_try(carried)
     recipe = recipe_of(carried)
@@ -869,15 +877,15 @@ def ready(
                 "input size its pretrained_cfg names",
             )
         )
-    for key, stack in _found_in(findings):
+    for key, stack in _found_in(findings, outputs):
         if stack in _tried_values(history, key):
             continue
         what = "network" if key == "layers" else "head"
         out.append(
             Ready(
                 _ASK_LEVER[key],
-                f"a literature finding writes this {what} out, and the paper's abstract "
-                "states every number in it",
+                f"a literature finding writes this {what} out, and every number in it "
+                "appears in the abstract",
                 _stack_move(stack) if key == "layers" else _head_move(stack, recipe, "", False),
                 stack=stack,
             )
@@ -886,27 +894,42 @@ def ready(
     return [*led, *(r for r in out if r.lever not in closed and r.lever not in opened), *trailing]
 
 
-def _stack_kind(spec: arch.Spec) -> tuple[str | None, str]:
+def _stack_kind(spec: arch.Spec, outputs: int | None = None) -> tuple[str | None, str]:
     """Which recipe key a written stack belongs to, or why it is neither. A stack that
     opens with a conv is a whole network; anything else can only be a head."""
     looks = "layers" if spec and spec[0][0] == "conv" else "head"
     try:
-        arch.check(spec, looks)
+        arch.check(spec, looks, outputs=outputs)
     except arch.RecipeError as exc:
         return None, str(exc)
     return looks, ""
 
 
-def _found_in(findings: str) -> list[tuple[str, str]]:
+# A finding renders as "- <technique> — <rationale> <citation>", and the researcher's
+# abstract check reads the technique alone, so only the technique may be parsed here:
+# a stack in the rationale carries the paper's authority with nothing behind it.
+_TECHNIQUE_ENDS = " — "
+# found_strict reads the loser of a comparison as readily as the winner and returns no
+# span to tell them apart, so a line that compares two networks opens nothing at all.
+_LOSER = re.compile(
+    r"\b(?:beats|beat|outperform\w*|worse|only reach\w*|compared to|versus|vs|baseline)\b",
+    re.IGNORECASE,
+)
+
+
+def _found_in(findings: str, outputs: int | None = None) -> list[tuple[str, str]]:
     """The stacks the research findings write out, as (recipe key, canonical text).
 
-    Strict form only, one line at a time, so a sentence about a network opens nothing and
-    two lines cannot be read as one stack. What reaches here has already passed the
-    researcher's check that the cited abstract states every number in it."""
+    Strict form only, the technique segment of one line at a time, so a sentence about a
+    network opens nothing and two lines cannot be read as one stack. What reaches here as
+    a technique has passed the researcher's check that the cited abstract states every
+    number in it."""
     out: list[tuple[str, str]] = []
     for line in findings.splitlines():
-        spec = arch.found_strict(line)
-        key = _stack_kind(spec)[0] if spec is not None else None
+        if _LOSER.search(line):
+            continue
+        spec = arch.found_strict(line.split(_TECHNIQUE_ENDS, 1)[0])
+        key = _stack_kind(spec, outputs)[0] if spec is not None else None
         if key is None:
             continue
         pair = (key, arch.text(spec, key))
@@ -1363,7 +1386,13 @@ def missing_value(brief: str) -> str | None:
 def brief_call(brief: str) -> str | None:
     """The brief's layer change as the `fit()` call that makes it, or None for any other
     class. The head call carries the backbone and the depth the move named, so the whole
-    ask runs as one experiment."""
+    ask runs as one experiment.
+
+    A layers call also carries the from-zero schedule. The coder copies this call
+    character for character but fills the rest in from the recipe it was handed, and
+    re-stating the pretrained best's 3 epochs is what merge() reads as the choice: it
+    takes the 20 a from-zero network would otherwise get, and the stack then loses on an
+    epoch count instead of on its architecture. Measured 17 of 18 first cells."""
     lever = lever_class(brief)
     if lever not in LAYER_LEVERS:
         return None
@@ -1376,6 +1405,8 @@ def brief_call(brief: str) -> str | None:
     if key == "head" and (name := _backbone_named(clause)):
         call["backbone"] = name
     call[key] = value
+    if key == "layers":
+        call["epochs"] = SCRATCH_EPOCHS
     if key == "head" and _ASK_BLOCK.search(clause):
         call["unfreeze"] = "last_block"
     inside = ", ".join(

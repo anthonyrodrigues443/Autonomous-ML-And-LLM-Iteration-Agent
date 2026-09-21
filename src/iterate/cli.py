@@ -1106,6 +1106,7 @@ def run(
             task=dataset.task,
             image_size=prepared.image_size if prepared is not None else None,
             image_width=prepared.profile.widths[1] if prepared is not None else None,
+            outputs=n_classes or None,
         )
         summarizer = Summarizer(client, metric=metric)
         # Same no-think client as the other strict roles: the Researcher must emit
