@@ -19,6 +19,8 @@ import re
 import shutil
 import signal
 import sys
+import tempfile
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -31,6 +33,7 @@ from rich.table import Table
 
 from iterate import __version__, userconfig
 from iterate.config import get_settings
+from iterate.deliver import saved_model
 
 # NOTE: the heavy stack (pandas, scikit-learn, joblib, the orchestrator/model
 # chain) is imported lazily inside `run()` — not at module load — so `iterate
@@ -738,7 +741,10 @@ def run(
     output: Path | None = typer.Option(
         None,
         "--output",
-        help="Where to save the best model. Default: .iterate/runs/<run_id>/best_model.joblib",
+        help=(
+            "Where to save the best model. Default: .iterate/runs/<run_id>/best_model.joblib "
+            "for a table run, .iterate/runs/<run_id>/best_model.pt for an image run"
+        ),
     ),
     notebooks: str = typer.Option(
         "best",
@@ -969,6 +975,10 @@ def run(
             "(get a free key at e2b.dev)."
         )
 
+    # ─── The run folder, from here on ──────────────────────────────────────
+    # Below every refusal, like the archive: a run that cannot start makes no folder.
+    _ignore_run_folder(Path(settings.iterate_runs_dir))
+
     data_summary = prepared.profile.render() if prepared is not None else summarize_dataset(dataset)
 
     # ─── LLM clients + memory ──────────────────────────────────────────────
@@ -1030,6 +1040,13 @@ def run(
         model_target = _image_target(prepared, metric=metric, average=average)
     else:
         model_target = ModelTarget(dataset, metric=metric, average=average)
+    # The prompt and image families hand the session their own meta.json. Read once, so
+    # the copy delivered beside the notebook is the same object the kernel was started
+    # with and cannot drift from it.
+    family_meta = model_target.meta_json() if is_prompt_run or prepared is not None else None
+    # The bytes a delivered session re-reads on Run All. Built from the dataset the loop
+    # hands the coder, which for a prompt run is the smaller-holdout one it scored on.
+    session_inputs: dict[str, bytes] | None = None
     if line := run_setup.render():
         console.print(f"[dim]{line}[/dim]")
         # An image run's first model is fixed: the plain CNN baseline, never a proposal.
@@ -1061,6 +1078,9 @@ def run(
         )
 
     if code:
+        session_inputs = codegen.build_inputs(dataset)
+        if family_meta is not None:
+            session_inputs[codegen.META_JSON] = family_meta
         # --until bounds the WHOLE run via the terminator; a session's budget is
         # kernel-execution seconds. Tool-only roles use the no-think client even
         # under --think, because thinking crowds out the call.
@@ -1086,6 +1106,7 @@ def run(
             task=dataset.task,
             image_size=prepared.image_size if prepared is not None else None,
             image_width=prepared.profile.widths[1] if prepared is not None else None,
+            outputs=n_classes or None,
         )
         summarizer = Summarizer(client, metric=metric)
         # Same no-think client as the other strict roles: the Researcher must emit
@@ -1125,8 +1146,6 @@ def run(
 
             controller = _RunController()
             if not use_tui:
-                import threading
-
                 # Replies carry user/LLM text with brackets (code, lists) — print
                 # them literally, never through rich markup (which would eat
                 # "df[cols]" or raise on a stray closing tag).
@@ -1227,6 +1246,18 @@ def run(
             deps.Installer(pending=deps.pending_path()) if compute == "local" and install else None
         )
 
+        # The kernel's folder is deleted before the loop knows which try won, so a
+        # session's network waits here until `on_experiment` says.
+        staged_model = (
+            Path(tempfile.mkdtemp(prefix="iterate-model-")) / saved_model.BEST_MODEL
+            if prepared is not None
+            else None
+        )
+        # A hard quit in the TUI leaves the loop thread running while this thread deletes
+        # the slot and delivers the winner.
+        slot_lock = threading.Lock()
+        slot_open = [True]
+
         def make_coder() -> CodingAgent:
             kernel: StatefulKernel = (
                 E2BKernel(api_key=e2b_api_key)
@@ -1241,7 +1272,7 @@ def run(
                 # you can submit — is unchanged.
                 family = {
                     "preamble": model_target.session_preamble(),
-                    "extra_inputs": {codegen.META_JSON: model_target.meta_json()},
+                    "extra_inputs": {codegen.META_JSON: family_meta},
                     "floor_cell": codegen.prompt_fallback_baseline(),
                     "family": "prompt",
                     # A tabular cell is a fit: seconds. A prompt cell is one model
@@ -1256,7 +1287,7 @@ def run(
             elif prepared is not None:
                 family = {
                     "preamble": codegen.vision_session_preamble(),
-                    "extra_inputs": {codegen.META_JSON: model_target.meta_json()},
+                    "extra_inputs": {codegen.META_JSON: family_meta},
                     "floor_cell": codegen.vision_fallback_baseline(),
                     "family": "vision",
                     # Frees the last cell's device memory and starts this cell's fit clock.
@@ -1270,6 +1301,7 @@ def run(
                     "cell_timeout": 750.0,
                     "deadline_seconds": 2700.0,
                     "wall_ceiling_seconds": 5400.0,
+                    "keep_model": staged_model,
                 }
             return CodingAgent(
                 coder_client,
@@ -1286,6 +1318,18 @@ def run(
         def on_experiment(
             *, experiment: Experiment, baseline: ExperimentResult, is_best: bool, run_id: str
         ) -> None:
+            # First and on its own: the loop swallows a hook's error, and the next
+            # session clears the slot, so anything failing ahead of this loses the winner.
+            if staged_model is not None:
+                kept = Path(settings.iterate_runs_dir) / run_id / saved_model.BEST_MODEL
+                try:
+                    with slot_lock:
+                        if slot_open[0]:
+                            saved_model.settle(staged_model, kept, is_best=is_best)
+                except OSError as exc:
+                    logging.getLogger(__name__).warning(
+                        "the saved network did not reach %s: %s", kept, exc
+                    )
             if prepared is not None:
                 _copy_report(dataset, Path(settings.iterate_runs_dir) / run_id)
             # Incremental deliverable: each finished iteration's notebook is saved
@@ -1299,10 +1343,11 @@ def run(
                 is_best=is_best,
                 run_dir=Path(settings.iterate_runs_dir) / run_id,
                 mode=notebooks,
-                data_path=str(data or train),
-                holdout_path=str(holdout) if holdout is not None else None,
+                data_path=_absolute(data or train),
+                holdout_path=_absolute(holdout) or None,
                 target=target,
                 metric=metric,
+                inputs=session_inputs,
             )
 
         def _run_loop() -> RunResult:
@@ -1326,24 +1371,30 @@ def run(
                 family=role_family,
             )
 
-        if use_tui and controller is not None:
-            from iterate.ui.tui import run_in_tui
+        try:
+            if use_tui and controller is not None:
+                from iterate.ui.tui import run_in_tui
 
-            result = run_in_tui(
-                _run_loop,
-                controller,
-                title=(
-                    f"iterate · {model_target.name} · target={target} · {metric} · "
-                    f"{mode} · {compute} — type below; / for commands"
-                ),
-                configure_logging=_configure_logging,
-            )
-            if result is None:
-                # Hard stop before the loop recorded anything: nothing to show.
-                console.print("stopped — the run ended before anything finished.")
-                raise typer.Exit(0)
-        else:
-            result = _run_loop()
+                result = run_in_tui(
+                    _run_loop,
+                    controller,
+                    title=(
+                        f"iterate · {model_target.name} · target={target} · {metric} · "
+                        f"{mode} · {compute} — type below; / for commands"
+                    ),
+                    configure_logging=_configure_logging,
+                )
+                if result is None:
+                    # Hard stop before the loop recorded anything: nothing to show.
+                    console.print("stopped — the run ended before anything finished.")
+                    raise typer.Exit(0)
+            else:
+                result = _run_loop()
+        finally:
+            if staged_model is not None:
+                with slot_lock:
+                    slot_open[0] = False
+                    shutil.rmtree(staged_model.parent, ignore_errors=True)
     else:
         # ─── Spec path (allow-listed estimators) + the baseline precedence ─────
         memory: Memory = SqliteMemory(resolved_memory_path)  # main thread creates + uses
@@ -1423,8 +1474,14 @@ def run(
         )
         console.print(f"[dim]prompts written to {record}[/dim]")
     elif result.best is not None and result.best.result is not None:
-        out_path = output or (run_dir / "best_model.joblib")
-        _save_best_model(model_target, result, metric, out_path)
+        if prepared is not None:
+            kept = run_dir / saved_model.BEST_MODEL
+            _save_best_model(model_target, result, metric, output or kept, network=kept)
+        else:
+            out_path = output or (run_dir / "best_model.joblib")
+            _save_best_model(model_target, result, metric, out_path)
+    elif prepared is not None and result.baseline.metrics is not None:
+        console.print("\n[dim]no network was saved: no try beat the baseline[/dim]")
 
     # ─── Notebook deliverable (full record is already in Memory) ───────────
     if notebooks != "none":
@@ -1432,10 +1489,11 @@ def run(
             result,
             mode=notebooks,
             run_dir=run_dir,
-            data_path=str(data or train),
-            holdout_path=str(holdout) if holdout is not None else None,
+            data_path=_absolute(data or train),
+            holdout_path=_absolute(holdout) or None,
             target=target,
             metric=metric,
+            inputs=session_inputs,
         )
 
     # ─── Summary ───────────────────────────────────────────────────────────
@@ -1916,13 +1974,21 @@ def _check_baseline_divergence(
         )
 
 
-def _save_best_model(target: ModelTarget, result: RunResult, metric: str, path: Path) -> None:
+def _save_best_model(
+    target: ModelTarget,
+    result: RunResult,
+    metric: str,
+    path: Path,
+    *,
+    network: Path | None = None,
+) -> None:
     """Persist the winning approach + a sidecar best.json.
 
     Spec winner → refit and pickle the fitted pipeline (joblib). Code winner →
     save the `train_and_predict` source (a code-gen winner returns predictions, not
     a pickled model — by design; see LIMITATIONS.md). The notebook deliverable
-    (Day 6) turns that source into a runnable artifact.
+    (Day 6) turns that source into a runnable artifact. An image run passes `network`,
+    where the loop left the winner's file, and it is moved to `path`.
     """
     best = result.best
     assert best is not None
@@ -1932,7 +1998,26 @@ def _save_best_model(target: ModelTarget, result: RunResult, metric: str, path: 
     score = best_result.metrics.primary_value if best_result.metrics else None
     path.parent.mkdir(parents=True, exist_ok=True)  # the run dir (the code path skips save_model)
 
-    if spec.get("code"):
+    recipe: dict[str, Any] = {}
+    if network is not None:
+        recipe = {"recipe": spec.get("recipe")}
+        artifact = saved_model.deliver(network, path, sha256=_recorded_network(best_result))
+        if artifact is not None:
+            load_hint = (
+                f"load it: from iterate.vision import load; "
+                f"load({str(path)!r}).predict([...image paths...])"
+            )
+        elif isinstance(spec.get("recipe"), dict) and spec["recipe"].get("model"):
+            load_hint = (
+                "no network was saved: the winner is the agent's own network, which this "
+                "version does not save; best.ipynb holds the code that built it"
+            )
+        else:
+            load_hint = (
+                "no network was saved: the winning try left no network file; "
+                "best.ipynb holds the code that built it"
+            )
+    elif spec.get("code"):
         # Code winner: the runnable artifact is best.ipynb (written by _write_notebooks);
         # a code-gen winner returns predictions, not a pickle — by design.
         artifact = None
@@ -1949,6 +2034,7 @@ def _save_best_model(target: ModelTarget, result: RunResult, metric: str, path: 
                 "run_id": result.run_id,
                 "model": spec.get("model"),
                 "params": spec.get("params", {}),
+                **recipe,
                 "code": spec.get("code"),
                 "description": best.candidate.description,
                 "rationale": best.candidate.rationale,
@@ -1966,10 +2052,52 @@ def _save_best_model(target: ModelTarget, result: RunResult, metric: str, path: 
         console.print(f"\n[dim]{load_hint}[/dim]")
 
 
+def _recorded_network(result: ExperimentResult) -> str | None:
+    """The network digest in the try's recipe.json, `""` when it names none, and None
+    when the try carries no recipe.json to check a file against."""
+    from iterate.core import codegen
+
+    recorded = result.artifacts.get(codegen.RECIPE_JSON)
+    if recorded is None:
+        return None
+    try:
+        return str(json.loads(recorded).get("model_sha256") or "")
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _ignore_run_folder(runs_dir: Path) -> None:
+    """Keep a run out of the user's git history. A run folder holds a copy of their
+    train.csv, and the notebook needs it there; committing it is the user's call, not
+    a side effect of running the agent.
+
+    Written when iterate makes the folder, or into a `.iterate/` an earlier version
+    left: a folder that is someone else's is never marked however many runs have
+    happened, and a `.gitignore` already there is never rewritten, because a user who
+    edits it means it."""
+    folder = runs_dir.parent
+    with contextlib.suppress(OSError):
+        # Ownership is decided before the mkdir, so it cannot be read off a folder
+        # this call just made; the name check is the upgrade case, a `.iterate/` from
+        # a version that did not write the marker.
+        ours = not folder.exists() or folder.name == ".iterate"
+        folder.mkdir(parents=True, exist_ok=True)
+        marker = folder / ".gitignore"
+        if ours and not marker.exists():
+            marker.write_text("*\n", encoding="utf-8")
+
+
+def _absolute(path: Path | None) -> str:
+    """A delivered notebook is opened from the run folder, not from the folder the run
+    was started in, so the data path written into it has to read the same anywhere."""
+    return str(path.resolve()) if path is not None else ""
+
+
 def _render_experiment(
     exp: Experiment,
     *,
     is_best: bool,
+    with_setup: bool = False,
     baseline_score: float | None,
     metric: str,
     data_path: str,
@@ -1980,7 +2108,13 @@ def _render_experiment(
     """Render ONE experiment to a notebook node — shared by the incremental
     per-iteration save and the end-of-run write, so both produce identical files.
     Cell-by-cell experiments carry their session ("cells"); render the real
-    session. Spec / one-shot experiments render through the contract."""
+    session. Spec / one-shot experiments render through the contract.
+
+    `with_setup` is the notebook that gets the input files beside it, which is the
+    only one meant to be run: the setup cell clears the folder it is run in, and a
+    journey notebook under `notebooks/` would clear the run folder instead. It is
+    not `is_best`, because the winner also gets a journey copy under `notebooks/`."""
+    from iterate.core import codegen
     from iterate.deliver.notebook import build_notebook, build_session_notebook
 
     cells = exp.candidate.changes.get("cells")
@@ -1999,6 +2133,7 @@ def _render_experiment(
             )
         else:
             note = None
+        started_from = exp.candidate.changes.get("started_from")
         return build_session_notebook(
             cells,
             title=title,
@@ -2008,6 +2143,13 @@ def _render_experiment(
             hypothesis=exp.hypothesis,
             findings=exp.digest,
             honesty_note=note,
+            # Image sessions only: the one family whose kernel keeps state of its own
+            # between cells and between Run Alls.
+            setup=(
+                codegen.vision_notebook_setup(started_from)
+                if with_setup and isinstance(started_from, dict)
+                else None
+            ),
         )
     return build_notebook(
         exp,
@@ -2032,12 +2174,13 @@ def _write_experiment_notebook(
     holdout_path: str | None = None,
     target: str,
     metric: str,
+    inputs: dict[str, bytes] | None = None,
 ) -> None:
     """Save one finished iteration's notebook the moment it completes (and keep
     best.ipynb pointing at the best-so-far), so a crash or Ctrl-C mid-run still
     leaves every finished deliverable on disk. The end-of-run `_write_notebooks`
     rewrite is idempotent on top of these."""
-    from iterate.deliver.notebook import save_notebook, slug
+    from iterate.deliver.notebook import save_inputs, save_notebook, slug
 
     baseline_score = baseline.metrics.primary_value if baseline.metrics is not None else None
     if mode == "all":
@@ -2059,6 +2202,7 @@ def _write_experiment_notebook(
             _render_experiment(
                 exp,
                 is_best=True,
+                with_setup=True,
                 baseline_score=baseline_score,
                 metric=metric,
                 data_path=data_path,
@@ -2067,6 +2211,8 @@ def _write_experiment_notebook(
             ),
             run_dir / "best.ipynb",
         )
+        if inputs is not None:
+            save_inputs(run_dir, inputs)
 
 
 def _write_notebooks(
@@ -2078,10 +2224,15 @@ def _write_notebooks(
     holdout_path: str | None = None,
     target: str,
     metric: str,
+    inputs: dict[str, bytes] | None = None,
 ) -> None:
     """Render the run as runnable notebooks: the winner (`best`) or one per
-    experiment (`all`). The full record is already in Memory; this just renders it."""
-    from iterate.deliver.notebook import save_notebook, slug
+    experiment (`all`). The full record is already in Memory; this just renders it.
+
+    A session notebook reads its inputs from its own folder, so the bytes the kernel
+    was given are written beside the winner. The per-iteration notebooks under
+    `notebooks/` stay a record of the run and are not re-runnable."""
+    from iterate.deliver.notebook import save_inputs, save_notebook, slug
 
     baseline_score = (
         result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
@@ -2113,6 +2264,7 @@ def _write_notebooks(
                 _render_experiment(
                     result.best,
                     is_best=True,
+                    with_setup=True,
                     baseline_score=baseline_score,
                     metric=metric,
                     data_path=data_path,
@@ -2123,6 +2275,8 @@ def _write_notebooks(
                 run_dir / "best.ipynb",
             )
         )
+        if inputs is not None:
+            save_inputs(run_dir, inputs)
 
     if not written:
         return

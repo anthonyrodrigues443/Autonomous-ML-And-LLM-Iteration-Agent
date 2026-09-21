@@ -5,6 +5,9 @@ stubbed; nothing trains."""
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
 import json
 import os
 import subprocess
@@ -22,6 +25,7 @@ from iterate.adapters.compute import deps
 from iterate.cli import app
 from iterate.core import codegen
 from iterate.core import researcher as researcher_module
+from iterate.deliver import saved_model
 from iterate.schemas.llm import ChatResponse, ToolCall
 from tests.unit.image_fixtures import class_tree, png, stub_image_run
 
@@ -430,6 +434,228 @@ def test_make_coder_carries_every_image_setting(
     assert kw["data_summary"] == calls[0]["data_summary"]
     assert kw["floor_carries_code"] is False
     assert codegen.META_JSON in kw["extra_inputs"]
+    assert kw["keep_model"].name == saved_model.BEST_MODEL
+
+
+# ─── the winner's network: staged by the coder, settled by the hook, delivered at the end ───
+
+_FIT = {"backbone": "resnet18", "image_size": 64, "epochs": 3, "val": 0.9}
+
+
+def _run_with_a_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    network: bytes | None,
+    recipe: dict[str, Any] | None = None,
+    wins: bool = True,
+    recorded: dict[str, Any] | None = None,
+    extra: tuple[str, ...] = (),
+) -> tuple[Any, Path]:
+    """The real `iterate run` around a loop that stages `network` the way a session's
+    coder does, calls the hook, and returns one finished try."""
+    from iterate.core import agent_loop
+    from iterate.core import coder as coder_module
+    from iterate.core.orchestrator import RunResult
+    from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult, Metrics
+
+    def scored(name: str, value: float) -> ExperimentResult:
+        metrics = Metrics(
+            values={"accuracy": value}, primary="accuracy", direction="maximize", n_samples=24
+        )
+        return ExperimentResult(experiment_id=name, metrics=metrics)
+
+    artifacts = {} if recorded is None else {codegen.RECIPE_JSON: json.dumps(recorded)}
+    staging: list[Path] = []
+
+    def loop(**kw: Any) -> RunResult:
+        slot = kw["make_coder"]()["keep_model"]
+        staging.append(slot.parent)
+        assert slot.parent.is_dir()
+        if network is not None:
+            slot.write_bytes(network)
+        # The real loop logs a hook's error and goes on.
+        with contextlib.suppress(Exception):
+            kw["on_experiment"](experiment=None, baseline=None, is_best=wins, run_id="r1")
+        changes = {"code": "fit()", "cells": [], "recipe": recipe or _FIT}
+        tried = Experiment(
+            candidate=Candidate(description="a fine-tune", changes=changes, rationale="r"),
+            target="dl-model",
+            hypothesis="h",
+            status="completed",
+            iteration=1,
+            result=scored("e1", 0.9).model_copy(update={"artifacts": artifacts}),
+        )
+        return RunResult(
+            baseline=scored("baseline", 0.5),
+            history=[tried],
+            best=tried if wins else None,
+            stopped_because="supervisor",
+            run_id="r1",
+        )
+
+    monkeypatch.setattr(agent_loop, "run_supervised", loop)
+    monkeypatch.setattr(coder_module, "CodingAgent", lambda *a, **kw: kw)
+    folder = class_tree(tmp_path / "pets", per_class=8)
+    argv = ["run", "--data", str(folder), "--metric", "accuracy", "--notebooks", "none", "--plain"]
+    result = runner.invoke(app, [*argv, *extra])
+    (made,) = staging
+    return result, made
+
+
+def test_the_winners_network_lands_in_the_run_folder_with_its_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, staging = _run_with_a_winner(tmp_path, monkeypatch, network=b"weights")
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    assert kept.read_bytes() == b"weights"
+    assert not os.access(kept, os.W_OK) or os.geteuid() == 0
+    best = json.loads(kept.with_name("best.json").read_text())
+    assert best["recipe"] == _FIT
+    assert best["artifact_path"] == str(kept)
+    assert best["score"] == 0.9
+    assert "from iterate.vision import load" in _plain(result.output)
+    assert "no network was saved" not in _plain(result.output)
+    assert not staging.exists()
+
+
+def test_output_moves_the_network_and_best_json_goes_beside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "models" / "pets.pt"
+    result, _ = _run_with_a_winner(
+        tmp_path, monkeypatch, network=b"weights", extra=("--output", str(out))
+    )
+    assert result.exit_code == 0, result.output
+    assert out.read_bytes() == b"weights"
+    assert json.loads(out.with_name("best.json").read_text())["artifact_path"] == str(out)
+    run_dir = tmp_path / "dot" / "runs" / "r1"
+    assert not (run_dir / saved_model.BEST_MODEL).exists()
+    assert not (run_dir / "best.json").exists()
+
+
+def test_a_winner_that_is_the_agents_own_network_says_nothing_was_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    own = {"model": "timm-vit", "epochs": 4, "val": 0.9}
+    result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=None, recipe=own)
+    assert result.exit_code == 0, result.output
+    run_dir = tmp_path / "dot" / "runs" / "r1"
+    assert not (run_dir / saved_model.BEST_MODEL).exists()
+    best = json.loads((run_dir / "best.json").read_text())
+    assert (best["artifact_path"], best["recipe"]) == (None, own)
+    said = _plain(result.output)
+    assert "no network was saved: the winner is the agent's own network" in said
+    assert "saved best model" not in said
+
+
+def test_a_fit_winner_whose_file_never_arrived_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=None)
+    assert result.exit_code == 0, result.output
+    assert "no network was saved: the winning try left no network file" in _plain(result.output)
+
+
+def test_a_network_the_winners_recipe_json_vouches_for_is_delivered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded = {**_FIT, "model_sha256": hashlib.sha256(b"weights").hexdigest()}
+    result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=b"weights", recorded=recorded)
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    assert kept.read_bytes() == b"weights"
+    assert json.loads(kept.with_name("best.json").read_text())["artifact_path"] == str(kept)
+
+
+@pytest.mark.parametrize(
+    "recorded", [{**_FIT, "model_sha256": hashlib.sha256(b"the winner's").hexdigest()}, _FIT]
+)
+def test_another_trys_network_in_the_run_folder_is_never_delivered_as_the_winners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded: dict[str, Any]
+) -> None:
+    """What a failed settle leaves behind: the run folder still holds the earlier best."""
+    result, _ = _run_with_a_winner(
+        tmp_path, monkeypatch, network=b"an earlier best's", recorded=recorded
+    )
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    assert not kept.exists()
+    assert json.loads(kept.with_name("best.json").read_text())["artifact_path"] is None
+    said = _plain(result.output)
+    assert "no network was saved: the winning try left no network file" in said
+    assert "saved best model" not in said
+
+
+def test_a_run_no_try_won_says_why_there_is_no_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, staging = _run_with_a_winner(tmp_path, monkeypatch, network=b"a loser", wins=False)
+    assert result.exit_code == 0, result.output
+    assert "no network was saved: no try beat the baseline" in _plain(result.output)
+    assert not (tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL).exists()
+    assert not staging.exists()
+
+
+def test_a_network_that_cannot_be_moved_is_a_warning_with_the_path_and_the_hook_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def full(*a: Any, **kw: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(saved_model, "settle", full)
+    with caplog.at_level("WARNING"):
+        result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=b"weights")
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    assert any(str(kept) in r.getMessage() and "No space" in r.getMessage() for r in caplog.records)
+    assert (kept.parent / "monitor.json").is_file()
+
+
+def test_the_network_is_settled_before_anything_else_in_the_hook_can_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next session clears the slot, so a hook that died ahead of the settle would
+    lose the winner's network for good."""
+
+    real, calls = cli_module._copy_report, []
+
+    def broken_in_the_hook(*a: Any, **kw: Any) -> None:
+        calls.append(a)
+        if len(calls) == 1:
+            raise RuntimeError("the report could not be copied")
+        real(*a, **kw)
+
+    monkeypatch.setattr(cli_module, "_copy_report", broken_in_the_hook)
+    result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=b"weights")
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 2
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    assert kept.read_bytes() == b"weights"
+
+
+def test_the_staging_folder_goes_even_when_the_loop_dies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.core import agent_loop
+    from iterate.core import coder as coder_module
+
+    staging: list[Path] = []
+
+    def loop(**kw: Any) -> Any:
+        slot = kw["make_coder"]()["keep_model"]
+        slot.write_bytes(b"weights")
+        staging.append(slot.parent)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent_loop, "run_supervised", loop)
+    monkeypatch.setattr(coder_module, "CodingAgent", lambda *a, **kw: kw)
+    folder = class_tree(tmp_path / "pets", per_class=8)
+    result = runner.invoke(app, ["run", "--data", str(folder), "--metric", "accuracy", "--plain"])
+    assert result.exit_code != 0
+    (made,) = staging
+    assert not made.exists()
 
 
 def test_an_image_run_host_never_loads_lightgbm(tmp_path: Path) -> None:
@@ -458,3 +684,125 @@ def test_an_image_run_host_never_loads_lightgbm(tmp_path: Path) -> None:
         timeout=180,
     )
     assert out.stdout.strip().splitlines()[-1:] == ["False"], out.stderr[-2000:]
+
+
+def test_the_notebook_inputs_are_the_bytes_the_session_was_started_with(
+    tmp_path: Path, calls: list[dict[str, Any]]
+) -> None:
+    """One build, from the dataset the loop hands the coder: a second build from a
+    second read of the data could deliver a notebook that loads different rows."""
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    (kw,) = calls
+    hook = kw["on_experiment"]
+    closed = dict(
+        zip(
+            hook.__code__.co_freevars,
+            (c.cell_contents for c in hook.__closure__),
+            strict=True,
+        )
+    )
+    inputs = closed["session_inputs"]
+    coder = kw["make_coder"]()
+    started = codegen.build_inputs(kw["dataset"])
+    started.update(coder._extra_inputs or {})
+    assert inputs == started
+    assert inputs[codegen.META_JSON] == kw["target"].meta_json()
+    held = pd.read_csv(io.BytesIO(inputs[codegen.HOLDOUT_CSV]))
+    assert "label" not in held.columns
+    assert list(held.columns) == ["image"]
+
+
+def test_the_run_folder_is_kept_out_of_the_users_git_history(
+    tmp_path: Path, calls: list[dict[str, Any]]
+) -> None:
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    marker = tmp_path / "dot" / ".gitignore"
+    assert marker.read_text() == "*\n"
+    marker.write_text("# mine\n")
+    assert runner.invoke(app, ["run", "--data", str(csv), "--target", "label"]).exit_code == 0
+    assert marker.read_text() == "# mine\n"  # written once, never rewritten
+
+
+def test_a_folder_that_is_not_iterates_own_is_never_marked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]
+) -> None:
+    """`--runs-dir` inside a project would otherwise put a `*` in the project's root."""
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(project / "runs"))
+    cli_module.get_settings.cache_clear()
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert not (project / ".gitignore").exists()
+    # The second run is the one that matters: by then a run folder is there, and a
+    # guard that reads "the runs dir exists" would call the project iterate's own.
+    (project / "runs" / "20260921_000000_abc").mkdir(parents=True)
+    second = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert second.exit_code == 0, second.output
+    assert not (project / ".gitignore").exists()
+
+
+def test_a_dot_iterate_an_earlier_version_left_is_marked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, calls: list[dict[str, Any]]
+) -> None:
+    """The upgrade case: v0.5 wrote no marker, so the folder is already there."""
+    dot = tmp_path / "project" / ".iterate"
+    dot.mkdir(parents=True)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(dot / "runs"))
+    cli_module.get_settings.cache_clear()
+    csv = _csv(tmp_path / "flat", ["a", "b", "c"] * 8)
+    result = runner.invoke(app, ["run", "--data", str(csv), "--target", "label", "--plain"])
+    assert result.exit_code == 0, result.output
+    assert (dot / ".gitignore").read_text() == "*\n"
+    assert not (tmp_path / "project" / ".gitignore").exists()
+
+
+def _image_experiment() -> Any:
+    from iterate.schemas.experiment import Candidate, Experiment
+
+    cells = [
+        {
+            "code": "print(1)",
+            "stdout": "1\n",
+            "error": None,
+            "source": "agent",
+            "outputs": [],
+            "thinking": "",
+        }
+    ]
+    candidate = Candidate(
+        description="a depth sweep",
+        rationale="deeper backbones on this set",
+        changes={"cells": cells, "started_from": {"backbone": "resnet18", "epochs": 3}},
+    )
+    return Experiment(iteration=2, hypothesis="h", candidate=candidate, target="label")
+
+
+def _sources(notebook: Any) -> list[str]:
+    return [cell.source for cell in notebook.cells]
+
+
+def test_only_the_notebook_that_gets_the_input_files_carries_the_setup_cell() -> None:
+    """The setup cell clears the folder it is run in. A journey notebook under
+    `notebooks/` is run from the run folder, so it would clear the run folder."""
+    exp = _image_experiment()
+    common = {
+        "baseline_score": 0.5,
+        "metric": "accuracy",
+        "data_path": "/tmp/d.csv",
+        "target": "label",
+    }
+    delivered = _sources(
+        cli_module._render_experiment(exp, is_best=True, with_setup=True, **common)
+    )
+    assert any("Setup (added by iterate" in source for source in delivered)
+    assert any(codegen.INCUMBENT_JSON in source for source in delivered)
+    for is_best in (True, False):
+        journey = _sources(cli_module._render_experiment(exp, is_best=is_best, **common))
+        assert not any("Setup (added by iterate" in source for source in journey), is_best
+        assert not any(codegen.INCUMBENT_JSON in source for source in journey), is_best

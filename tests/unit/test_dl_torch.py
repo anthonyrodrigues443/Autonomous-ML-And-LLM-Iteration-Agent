@@ -129,3 +129,132 @@ def test_a_fixed_job_runs_every_epoch_where_the_plan_would_refuse() -> None:
     assert result["plan_calls"] == [0, 1]
     assert result["refused"].startswith("one epoch needs about 3300s")
     assert result["refused"].endswith("are left; halve image_size")
+
+
+def test_staging_a_fits_weights_moves_none_of_its_outputs() -> None:
+    assert _check("staging_moves_no_output") == {"same": True, "staged": True}
+
+
+@pytest.mark.parametrize(
+    ("check", "kind"),
+    [
+        ("saved_fit_round_trip", ["resnet18", "all", "classification"]),
+        ("saved_probe_round_trip", ["resnet18", "none", "classification"]),
+        ("saved_simple_cnn_round_trip", ["simple_cnn", "all", "classification"]),
+    ],
+)
+def test_a_submitted_network_opens_again_and_predicts_what_was_submitted(
+    check: str, kind: list[str]
+) -> None:
+    """Opened the way `iterate.vision.load` opens it, from the image files and not the
+    session's pixels. A probe's saved head is float32 where the probe was float64."""
+    result = _check(check)
+    assert result["kind"] == kind
+    assert result["same"]
+    assert result["gap"] < (1e-4 if kind[1] == "none" else 1e-6)
+    assert result["digest"]
+    assert result["leftovers"] == []
+
+
+def test_a_saved_number_network_predicts_in_the_labels_own_units() -> None:
+    result = _check("saved_regression_round_trip")
+    assert result["kind"] == ["resnet18", "all", "regression"]
+    assert result["gap"] < 1e-4
+    assert result["digest"]
+
+
+def test_every_recipe_shape_saves_and_opens_again_with_no_download() -> None:
+    from tests.unit._torch_checks import ROUND_TRIP_SHAPES
+
+    result = _check("every_recipe_shape_round_trips")
+    assert len(result["gaps"]) == len(ROUND_TRIP_SHAPES)
+    assert max(result["gaps"].values()) < 1e-6
+    assert result["downloaded"] == []
+
+
+# ─── layers, heads and dropped stages ────────────────────────────────────────
+
+
+def test_the_stack_simple_cnn_is_builds_simple_cnn_weight_for_weight() -> None:
+    """simple_cnn keeps its own builder, so nothing stored can move; this is the proof
+    that the grammar says the same thing."""
+    result = _check("spec_matches_simple_cnn")
+    assert result["text"] == "conv(32) pool conv(64) pool conv(128) pool"
+    assert result == {"text": result["text"], "keys": True, "same": True, "modules": True}
+
+
+def test_a_stacks_real_parameters_are_the_ones_the_counter_promised() -> None:
+    result = _check("layers_shapes_and_counts")
+    for key, (real, counted) in result.items():
+        if key != "shapes":
+            assert real == counted, key
+    assert result["simple_cnn/10"][0] == 93_696 + 1290
+    assert result["shapes"] == [[2, 10], [2, 10]]
+
+
+def test_a_network_from_a_stack_fits_on_cpu_and_skips_a_last_batch_of_one() -> None:
+    result = _check("layers_fit")
+    assert result["rows"] == 25
+    assert result["shape"] == [9, 3]
+    assert result["sums"]
+    assert result["epochs"] == [2, 2]
+    assert result["lines"] == 2
+
+
+def test_dropping_stages_leaves_the_width_the_table_records() -> None:
+    result = _check("drop_stage_widths")
+    assert len(result) == 9
+    for key, found in result.items():
+        assert found["width"] == found["table"], key
+        assert found["shape"] == [2, 5], key
+    assert [result[f"resnet50/{n}"]["width"] for n in (0, 1, 2)] == [2048, 1024, 512]
+    assert [result[f"convnext_tiny/{n}"]["width"] for n in (0, 1, 2)] == [768, 384, 192]
+
+
+def test_last_block_trains_the_last_stage_that_is_left_and_the_head() -> None:
+    result = _check("last_block_trains")
+    assert result["resnet18/0"]["prefixes"] == ["layer4", "fc"]
+    assert result["resnet18/0"]["groups"] == ["fc", "layer4"]
+    assert result["resnet18/1"]["prefixes"] == ["layer3", "fc"]
+    assert result["resnet18/1"]["groups"] == ["fc", "layer3"]
+    assert result["convnext_tiny/0"]["prefixes"] == ["features.6", "features.7", "classifier"]
+    assert result["convnext_tiny/0"]["groups"] == ["classifier", "features"]
+    # Every batch norm outside the stage that trains keeps its ImageNet statistics.
+    training, total = result["resnet18/0"]["training_norms"]
+    assert 0 < training < total
+
+
+def test_a_head_of_dropout_alone_still_starts_from_the_probe() -> None:
+    result = _check("dropout_head_keeps_the_probe")
+    assert result["modules"] == ["Dropout", "Linear"]
+    assert result["weight"]
+    assert result["bias"]
+
+
+def test_the_saved_weight_names_are_the_ones_last_versions_files_carry() -> None:
+    """A builder change renames these, and then a file saved by the version before it
+    cannot be opened. Moving this list means SAVED_FORMAT goes up with it."""
+    result = _check("golden_state_dict_keys")
+    assert result["format"] == 1
+    assert result["layers"] == [
+        "body.0.weight",
+        "body.0.bias",
+        "body.1.weight",
+        "body.1.bias",
+        "body.1.running_mean",
+        "body.1.running_var",
+        "body.1.num_batches_tracked",
+        "body.4.weight",
+        "body.4.bias",
+        "body.5.weight",
+        "body.5.bias",
+        "body.5.running_mean",
+        "body.5.running_var",
+        "body.5.num_batches_tracked",
+        "head.1.weight",
+        "head.1.bias",
+        "head.3.weight",
+        "head.3.bias",
+    ]
+    assert result["head"] == ["fc.0.weight", "fc.0.bias", "fc.3.weight", "fc.3.bias"]
+    assert result["dropped"] == []

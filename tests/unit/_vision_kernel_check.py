@@ -8,7 +8,9 @@ PNGs and drives the session the way the coder does. It prints one JSON line.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sys
 import tempfile
 from dataclasses import asdict, replace
@@ -173,9 +175,15 @@ def session() -> dict[str, Any]:
                 (kernel.read_output(codegen.PROBABILITIES_CSV) or b"").split()
             )
             out["recipe"] = json.loads(kernel.read_output(codegen.RECIPE_JSON) or b"{}")
+            network = kernel.read_output(codegen.NETWORK_PT) or b""
+            out["network_digest"] = hashlib.sha256(network).hexdigest()
+            out["staged"] = kernel.read_output(".fits/1.pt") is not None
 
             own = kernel.run_cell(prefix + _OWN_MODEL, timeout=600)
             out["own_error"] = own.error
+            out["network_after_own"] = kernel.read_output(codegen.NETWORK_PT) is not None
+            own_recipe = json.loads(kernel.read_output(codegen.RECIPE_JSON) or b"{}")
+            out["own_recipe_names_a_network"] = "model_sha256" in own_recipe
             out["model_lines"] = _tagged(own.stdout, "MODEL")
             out["own_submitted"] = _tagged(own.stdout, "SUBMITTED")
 
@@ -237,12 +245,43 @@ class _FakeLLM:
         return ChatResponse(model="fake-model", tool_calls=[call])
 
 
+class _Remembering(LocalKernel):
+    """Keeps what the host read, since the kernel's folder is gone once `run` returns."""
+
+    def __init__(self, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.read: dict[str, bytes | None] = {}
+
+    def read_output(self, name: str) -> bytes | None:
+        self.read[name] = super().read_output(name)
+        return self.read[name]
+
+
+def _opened_again(kept: Path, images: list[str], read: dict[str, bytes | None]) -> dict[str, Any]:
+    """The delivered file through the public loader, against what the session submitted."""
+    import numpy as np
+
+    from iterate.vision import load
+
+    model = load(kept)
+    written = (read[codegen.PREDICTIONS_CSV] or b"").decode().splitlines()
+    rows = (read[codegen.PROBABILITIES_CSV] or b"").decode().splitlines()
+    probs = np.array([[float(v) for v in row.split(",")] for row in rows])
+    return {
+        "loaded_on": model.device,
+        "predicted": [str(name) for name in model.predict(images)],
+        "written": written,
+        "probability_gap": float(np.abs(model.predict_proba(images) - probs).max()),
+    }
+
+
 def experiment() -> dict[str, Any]:
     """One image experiment the way `iterate run` runs it: the real CodingAgent, the
     vision family the CLI passes, a confined kernel, and the host scoring what the
-    session submitted."""
+    session submitted. Then the network it left, opened the way a user's app opens it."""
     from iterate.adapters.data.tabular import load_split
     from iterate.core.coder import CodingAgent
+    from iterate.deliver import saved_model
 
     out: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="vision-coder-") as tmp:
@@ -258,8 +297,124 @@ def experiment() -> dict[str, Any]:
             work / codegen.TRAIN_CSV, work / "sealed.csv", "label", task="classification"
         )
         meta = json.loads((work / codegen.META_JSON).read_text())
+        kernel = _Remembering(
+            confinement=confine.Confinement(reads=(images,), weights=root / "weights")
+        )
+        slot = root / "slot" / saved_model.BEST_MODEL
+        slot.parent.mkdir()
+        slot.write_bytes(b"an earlier session's network")
         agent = CodingAgent(
             _FakeLLM(["f = fit(epochs=1)\nsubmit(f)\n"]),
+            kernel,
+            metric="accuracy",
+            max_cells=4,
+            install=False,
+            preamble=codegen.vision_session_preamble(),
+            extra_inputs={codegen.META_JSON: json.dumps(meta).encode()},
+            floor_cell=codegen.vision_fallback_baseline(),
+            family="vision",
+            cell_prefix=codegen.VISION_CELL_PREFIX,
+            floor_carries_code=False,
+            data_summary="Images: 32 train / 8 holdout.",
+            cell_timeout=750.0,
+            deadline_seconds=2700.0,
+            wall_ceiling_seconds=5400.0,
+            keep_model=slot,
+        )
+        coded = agent.run(
+            dataset=dataset,
+            brief="next: backbone: fit the plain CNN",
+            experiment_id="iter-01",
+            starting_files={codegen.INCUMBENT_JSON: json.dumps(meta["baseline"]).encode()},
+        )
+        read = dict(kernel.read)
+        out["error"] = coded.result.error
+        out["score"] = None if coded.result.metrics is None else coded.result.metrics.primary_value
+        out["artifacts"] = sorted(coded.result.artifacts)
+        recipe = coded.result.artifacts.get(codegen.RECIPE_JSON)
+        out["recipe"] = json.loads(recipe) if recipe else None
+        out["sources"] = [c.source for c in coded.cells]
+        out["stdout_has_fit"] = any("FIT {" in (c.stdout or "") for c in coded.cells)
+        out["kernel_folder_gone"] = kernel.read_output(codegen.PREDICTIONS_CSV) is None
+        out["network_kept"] = slot.is_file()
+        if slot.is_file() and out["recipe"]:
+            digest = hashlib.sha256(slot.read_bytes()).hexdigest()
+            out["network_digest_matches"] = digest == out["recipe"].get("model_sha256")
+            kept = root / "runs" / "r1" / saved_model.BEST_MODEL
+            saved_model.settle(slot, kept, is_best=True)
+            # The rows the kernel predicted, in its order: load_split shuffles the holdout.
+            asked = [str(p) for p in dataset.test_features["image"]]
+            out.update(_opened_again(kept, asked, read))
+    return out
+
+
+_DEAD_END = "raise RuntimeError('this cell is a dead end')\n"
+_FIT_AND_SUBMIT = "f = fit(epochs=1)\nsubmit(f)\n"
+
+
+def _kernelspec(root: Path) -> str:
+    """A kernel that is THIS interpreter. The installed `python3` kernelspec belongs to
+    whichever python owns the Jupyter data dir, which on a Mac is the system one."""
+    name = "iterate-rerun"
+    spec = root / "jupyter" / "kernels" / name
+    spec.mkdir(parents=True)
+    (spec / "kernel.json").write_text(
+        json.dumps(
+            {
+                "argv": [sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"],
+                "display_name": name,
+                "language": "python",
+            }
+        )
+    )
+    os.environ["JUPYTER_PATH"] = str(root / "jupyter")
+    return name
+
+
+def _executed(path: Path, folder: Path, kernel: str) -> tuple[str, bool]:
+    """Run All on the delivered notebook, from its own folder. Returns everything the
+    cells printed and whether the last one ran: an untagged dead end stops nbclient
+    exactly as it stops Jupyter."""
+    import nbformat
+    from nbclient import NotebookClient
+
+    node = nbformat.read(path, as_version=4)
+    NotebookClient(
+        node, timeout=900, kernel_name=kernel, resources={"metadata": {"path": str(folder)}}
+    ).execute()
+    printed = [
+        output.get("text", "")
+        for cell in node.cells
+        for output in cell.get("outputs", [])
+        if output.get("output_type") == "stream"
+    ]
+    ran = node.cells[-1].get("execution_count") is not None
+    return "".join(printed), ran
+
+
+def rerun() -> dict[str, Any]:
+    """A recorded session, delivered and run again. The session has a dead end in it,
+    the folder already holds a read-only best_model.pt, and Run All happens twice."""
+    from iterate.adapters.data.tabular import load_split
+    from iterate.core.coder import CodingAgent
+    from iterate.deliver import notebook, saved_model
+
+    out: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="vision-rerun-") as tmp:
+        root = Path(tmp)
+        images, work = root / "images", root / "work"
+        images.mkdir(parents=True)
+        work.mkdir(parents=True)
+        _inputs(images, work)
+        held = pd.read_csv(work / codegen.HOLDOUT_CSV)
+        held["label"] = [CLASSES[i % len(CLASSES)] for i in range(len(held))]
+        held.to_csv(work / "sealed.csv", index=False)
+        dataset = load_split(
+            work / codegen.TRAIN_CSV, work / "sealed.csv", "label", task="classification"
+        )
+        meta = json.loads((work / codegen.META_JSON).read_text())
+        agent = CodingAgent(
+            _FakeLLM([_DEAD_END, _FIT_AND_SUBMIT]),
             LocalKernel(confinement=confine.Confinement(reads=(images,), weights=root / "weights")),
             metric="accuracy",
             max_cells=4,
@@ -277,21 +432,117 @@ def experiment() -> dict[str, Any]:
         )
         coded = agent.run(
             dataset=dataset,
-            brief="next: backbone: fit the plain CNN",
+            brief="next: epochs: fit the plain CNN for one epoch",
             experiment_id="iter-01",
             starting_files={codegen.INCUMBENT_JSON: json.dumps(meta["baseline"]).encode()},
         )
-        out["error"] = coded.result.error
-        out["score"] = None if coded.result.metrics is None else coded.result.metrics.primary_value
-        out["artifacts"] = sorted(coded.result.artifacts)
-        recipe = coded.result.artifacts.get(codegen.RECIPE_JSON)
-        out["recipe"] = json.loads(recipe) if recipe else None
-        out["sources"] = [c.source for c in coded.cells]
-        out["stdout_has_fit"] = any("FIT {" in (c.stdout or "") for c in coded.cells)
+        cells = [
+            {
+                "code": c.code,
+                "stdout": c.stdout,
+                "error": c.error,
+                "source": c.source,
+                "outputs": c.outputs,
+                "thinking": c.thinking,
+            }
+            for c in coded.cells
+        ]
+        out["errored_cells"] = sum(1 for c in cells if c["error"])
+
+        run_dir = root / "runs" / "r1"
+        inputs = codegen.build_inputs(dataset)
+        inputs[codegen.META_JSON] = json.dumps(meta).encode()
+        notebook.save_inputs(run_dir, inputs)
+        node = notebook.build_session_notebook(
+            cells,
+            title="best: one epoch",
+            metric="accuracy",
+            score=1.0,
+            setup=codegen.vision_notebook_setup(meta["baseline"]),
+        )
+        path = notebook.save_notebook(node, run_dir / "best.ipynb")
+        out["tagged_cells"] = sum(
+            1 for cell in node.cells if cell.get("metadata", {}).get("tags") == ["raises-exception"]
+        )
+
+        delivered = run_dir / saved_model.BEST_MODEL
+        staged = root / "slot.pt"
+        staged.write_bytes(b"the delivered network, from the run that won")
+        saved_model.settle(staged, delivered, is_best=True)
+        before = hashlib.sha256(delivered.read_bytes()).hexdigest()
+        out["delivered_is_read_only"] = not (delivered.stat().st_mode & 0o222)
+
+        kernel = _kernelspec(root)
+        printed, ran = _executed(path, run_dir, kernel)
+        out["first_reached_the_end"] = ran
+        out["first_submitted"] = printed.count("SUBMITTED ")
+        out["first_kept"] = printed.count("KEPT the earlier")
+        out["network_written"] = (run_dir / codegen.NETWORK_PT).is_file()
+        out["best_model_unchanged"] = hashlib.sha256(delivered.read_bytes()).hexdigest() == before
+
+        printed, ran = _executed(path, run_dir, kernel)
+        out["second_reached_the_end"] = ran
+        out["second_submitted"] = printed.count("SUBMITTED ")
+        out["second_kept"] = printed.count("KEPT the earlier")
+        out["best_model_unchanged_twice"] = (
+            hashlib.sha256(delivered.read_bytes()).hexdigest() == before
+        )
+
+        # The same notebook without the tag: what every Run All did before this PR.
+        for cell in node.cells:
+            cell.get("metadata", {}).pop("tags", None)
+        untagged = notebook.save_notebook(node, run_dir / "untagged.ipynb")
+        try:
+            _executed(untagged, run_dir, kernel)
+            out["untagged_stops"] = False
+        except Exception as exc:
+            out["untagged_stops"] = "dead end" in str(exc)
+        out["incumbent"] = json.loads((run_dir / codegen.INCUMBENT_JSON).read_text())["backbone"]
     return out
 
 
-CHECKS = {f.__name__: f for f in (session, experiment)}
+def layers_cell() -> dict[str, Any]:
+    """`fit(layers=[...])` typed into a confined cell: it builds, it trains, it submits,
+    and the line names the stack in the text a cell can paste back."""
+    out: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="vision-layers-") as tmp:
+        root = Path(tmp)
+        images, work = root / "images", root / "work"
+        images.mkdir(parents=True)
+        work.mkdir(parents=True)
+        _inputs(images, work)
+        kernel = LocalKernel(
+            confinement=confine.Confinement(reads=(images,), weights=root / "weights")
+        )
+        kernel.start(
+            {
+                name: (work / name).read_bytes()
+                for name in (codegen.TRAIN_CSV, codegen.HOLDOUT_CSV, codegen.META_JSON)
+            }
+        )
+        try:
+            out["preamble_error"] = kernel.run_cell(
+                codegen.vision_session_preamble(), timeout=300
+            ).error
+            ran = kernel.run_cell(
+                codegen.VISION_CELL_PREFIX
+                + "f = fit(layers=[('conv', 16), ('pool',), ('conv', 32), ('pool',)], epochs=1)\n"
+                "submit(f)\n",
+                timeout=600,
+            )
+            out["error"] = ran.error
+            out["fit"] = _tagged(ran.stdout, "FIT")
+            out["submitted"] = _tagged(ran.stdout, "SUBMITTED")
+            out["said"] = [line for line in ran.stdout.splitlines() if line.startswith("val ")]
+            out["predictions"] = len((kernel.read_output(codegen.PREDICTIONS_CSV) or b"").split())
+            out["recipe"] = json.loads(kernel.read_output(codegen.RECIPE_JSON) or b"{}")
+            out["network"] = bool(kernel.read_output(codegen.NETWORK_PT))
+        finally:
+            kernel.close()
+    return out
+
+
+CHECKS = {f.__name__: f for f in (session, experiment, rerun, layers_cell)}
 
 
 if __name__ == "__main__":

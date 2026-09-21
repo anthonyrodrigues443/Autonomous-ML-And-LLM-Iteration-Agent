@@ -13,6 +13,8 @@ from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult, 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 _FN = (
     "def train_and_predict(X_train, y_train, X_holdout):\n"
     "    from sklearn.linear_model import LogisticRegression\n"
@@ -455,3 +457,201 @@ def test_the_load_cell_of_a_users_split_names_both_files() -> None:
     plain = _load_cell("data.csv", "y")
     assert "load_csv('data.csv', target='y')" in plain
     assert "load_split" not in plain
+
+
+# ─── the notebook runs again: its inputs, its setup cell, its dead ends ───
+
+# A trimmed copy of a real recorded session: the preamble, a cell with captured
+# outputs, a dead end, and the harness floor.
+_RECORDED: list[dict[str, Any]] = [
+    {
+        "code": "import json, random, pandas as pd, numpy as np\nrandom.seed(42)",
+        "stdout": "loaded: (96, 5) train / (24, 5) holdout; target: churn\n",
+        "error": None,
+        "source": "preamble",
+        "outputs": [
+            {
+                "type": "stream",
+                "name": "stdout",
+                "text": "loaded: (96, 5) train / (24, 5) holdout; target: churn\n",
+            }
+        ],
+        "thinking": "",
+    },
+    {
+        "code": "model = HistGradientBoostingClassifier(max_depth=4)\nmodel.fit(X_train, y_train)",
+        "stdout": "f1 = 0.6134\n",
+        "error": None,
+        "source": "agent",
+        "outputs": [
+            {"type": "stream", "name": "stdout", "text": "f1 = 0.6134\n"},
+            {"type": "execute_result", "data": {"text/plain": "0.6134"}, "metadata": {}},
+        ],
+        "thinking": "The brief asks for a depth sweep.\n\nStart at 4.",
+    },
+    {
+        "code": "scores = cross_val_score(model, X_train, y_train, scoring='f1')",
+        "stdout": "",
+        "error": "NameError: name 'cross_val_score' is not defined",
+        "source": "agent",
+        "outputs": [
+            {
+                "type": "error",
+                "ename": "NameError",
+                "evalue": "name 'cross_val_score' is not defined",
+                "traceback": [
+                    "Traceback (most recent call last)",
+                    "NameError: name 'cross_val_score' is not defined",
+                ],
+            }
+        ],
+        "thinking": "",
+    },
+    {
+        "code": "pd.Series(preds).to_csv('predictions.csv', index=False, header=False)",
+        "stdout": "fallback banked 24 rows\n",
+        "error": None,
+        "source": "fallback",
+        "outputs": [],
+        "thinking": "",
+    },
+]
+
+_RECORDED_KWARGS: dict[str, Any] = {
+    "title": "best: depth sweep",
+    "metric": "f1",
+    "score": 0.6134,
+    "baseline_score": 0.5871,
+    "hypothesis": "findings so far: nothing tried yet\n\nnext: max_depth",
+    "findings": {
+        "what_helped": ["max_depth=4 over the default"],
+        "what_hurt": ["one-hot on the id column"],
+        "data_insights": [],
+        "val_trail": "0.5871 -> 0.6134",
+        "takeaway": "depth is the lever here",
+    },
+    "honesty_note": "this submission is byte-identical to an earlier experiment's",
+}
+
+# sha256 of what main 25bd892 writes for _RECORDED, with the cell ids taken out:
+# nbformat gives every cell a fresh random id on every render, so two renders of one
+# session already differ there today. Everything else is pinned.
+_SESSION_ON_MAIN = "ed552abd791971813814072983fb58ac40e4611d0d1a4903695d5426243e7647"
+
+
+def _as_main_wrote_it(node: nbformat.NotebookNode) -> str:
+    import copy
+    import re
+
+    stripped = copy.deepcopy(node)
+    for cell in stripped.cells:
+        cell.get("metadata", {}).pop("tags", None)
+    text = nbformat.writes(stripped)
+    return "\n".join(
+        line for line in text.splitlines() if not re.match(r'^\s*"id": "[^"]+",?$', line)
+    )
+
+
+def _digest(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_a_session_notebook_is_byte_for_byte_what_main_wrote_apart_from_the_tag() -> None:
+    from iterate.deliver.notebook import build_session_notebook
+
+    nb = build_session_notebook(_RECORDED, **_RECORDED_KWARGS)
+    nbformat.validate(nb)
+    assert _digest(_as_main_wrote_it(nb)) == _SESSION_ON_MAIN
+
+
+def test_only_the_cells_that_errored_carry_the_carry_on_tag() -> None:
+    from iterate.deliver.notebook import RAISES, build_session_notebook
+
+    nb = build_session_notebook(_RECORDED, **_RECORDED_KWARGS)
+    code = [c for c in nb.cells if c.cell_type == "code"]
+    assert [bool(c.metadata.get("tags")) for c in code] == [False, False, True, False]
+    assert code[2].metadata["tags"] == [RAISES]
+    # ...and the one that errored is the one the session recorded as a dead end.
+    assert "cross_val_score" in code[2].source
+
+
+def test_a_setup_cell_goes_ahead_of_the_session_and_changes_nothing_else() -> None:
+    from iterate.deliver.notebook import build_session_notebook
+
+    nb = build_session_notebook(_RECORDED, **_RECORDED_KWARGS, setup="import os  # setup")
+    nbformat.validate(nb)
+    kinds = [c.cell_type for c in nb.cells]
+    code = [c for c in nb.cells if c.cell_type == "code"]
+    assert code[0].source == "import os  # setup"
+    assert code[0].execution_count is None  # the host wrote it; the session never ran it
+    assert kinds.index("code") == 3  # header, hypothesis, the setup note, then the cell
+    assert "VS Code stops at an errored cell" in nb.cells[2].source
+    # Everything after it is the session, unchanged.
+    rest = nbformat.v4.new_notebook()
+    rest.cells = nb.cells[:2] + nb.cells[4:]
+    assert _digest(_as_main_wrote_it(rest)) == _SESSION_ON_MAIN
+
+
+def test_save_inputs_writes_the_bytes_the_kernel_got_and_repeats_cleanly(
+    tmp_path: Path,
+) -> None:
+    from iterate.deliver.notebook import save_inputs
+
+    inputs = {"meta.json": b'{"target": "churn"}', "train.csv": b"a,b\n1,2\n"}
+    folder = tmp_path / "runs" / "r1"
+    written = save_inputs(folder, inputs)
+    assert [p.name for p in written] == ["meta.json", "train.csv"]
+    assert (folder / "train.csv").read_bytes() == b"a,b\n1,2\n"
+    before = {p.name: p.read_bytes() for p in folder.iterdir()}
+    save_inputs(folder, inputs)
+    assert {p.name: p.read_bytes() for p in folder.iterdir()} == before
+
+
+def test_the_holdout_written_beside_the_notebook_carries_no_labels(tmp_path: Path) -> None:
+    """The kernel never got the holdout labels, so neither does the notebook that
+    replays it. `build_inputs` is the one door all three families go through; each
+    family's own CLI test checks what the run actually delivers."""
+    import pandas as pd
+
+    from iterate.adapters.data.tabular import load_csv
+    from iterate.core import codegen
+    from iterate.deliver.notebook import save_inputs
+
+    frame = pd.DataFrame(
+        {"f1": range(40), "f2": [i % 3 for i in range(40)], "churn": [i % 2 for i in range(40)]}
+    )
+    csv = tmp_path / "d.csv"
+    frame.to_csv(csv, index=False)
+    dataset = load_csv(csv, target="churn")
+    folder = tmp_path / "runs" / "r1"
+    save_inputs(folder, codegen.build_inputs(dataset))
+    held = pd.read_csv(folder / codegen.HOLDOUT_CSV)
+    assert "churn" not in held.columns
+    assert len(held) == dataset.n_test
+    assert "churn" in pd.read_csv(folder / codegen.TRAIN_CSV).columns
+
+
+def test_the_recorded_preamble_loads_when_it_is_run_from_the_run_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug this PR exists for: the session's first cell reads its three files from
+    its own folder, and that folder was the kernel's, deleted at the end of the run."""
+    import pandas as pd
+
+    from iterate.adapters.data.tabular import load_csv
+    from iterate.core import codegen
+    from iterate.deliver.notebook import save_inputs
+
+    frame = pd.DataFrame({"f1": range(40), "churn": [i % 2 for i in range(40)]})
+    csv = tmp_path / "d.csv"
+    frame.to_csv(csv, index=False)
+    run_dir = tmp_path / "runs" / "r1"
+    save_inputs(run_dir, codegen.build_inputs(load_csv(csv, target="churn")))
+
+    monkeypatch.chdir(run_dir)
+    namespace: dict[str, Any] = {}
+    exec(codegen.session_preamble(), namespace)  # the cell a user runs
+    assert list(namespace["X_train"].columns) == ["f1"]
+    assert "churn" not in namespace["X_holdout"].columns

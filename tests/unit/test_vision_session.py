@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any
 
@@ -18,7 +19,7 @@ import pytest
 from iterate.core import codegen, vision_session
 from iterate.core.vision_session import Fit, Session, merge
 from iterate.targets import dl
-from iterate.targets.dl import BASELINE, Recipe, RecipeError
+from iterate.targets.dl import BASELINE, Network, Recipe, RecipeError
 from tests.unit.image_fixtures import FakeVisionRunner
 from tests.unit.image_fixtures import vision_session as _session
 
@@ -29,7 +30,10 @@ pytestmark = pytest.mark.unit
 
 
 def _printed(capsys: pytest.CaptureFixture[str], tag: str) -> list[dict[str, Any]]:
-    out = capsys.readouterr().out
+    return _printed_in(capsys.readouterr().out, tag)
+
+
+def _printed_in(out: str, tag: str) -> list[dict[str, Any]]:
     return [
         json.loads(line[len(tag) + 1 :]) for line in out.splitlines() if line.startswith(tag + " ")
     ]
@@ -111,6 +115,80 @@ def test_epochs_and_unfreeze_follow_each_other() -> None:
     tuned = Recipe(backbone="resnet18", unfreeze="all", epochs=3)
     assert _merge(tuned, {"unfreeze": "none"}).epochs == 0
     assert _merge(tuned, {"epochs": 0}).unfreeze == "none"
+
+
+def test_a_stack_alone_means_a_network_of_its_own() -> None:
+    tuned = Recipe(backbone="resnet18", unfreeze="all", epochs=3, image_size=160)
+    built = _merge(tuned, {"layers": "conv(32) pool conv(64) pool"})
+    assert built.backbone == "layers_net"
+    # A network from zero starts from the run's own baseline, so it gets 20 epochs.
+    assert (built.epochs, built.image_size, built.augment) == (20, 64, "none")
+    assert built.layers == (("conv", 32), ("pool",), ("conv", 64), ("pool",))
+
+
+def test_naming_another_backbone_drops_the_carried_stack() -> None:
+    stack = Recipe(
+        backbone="layers_net", unfreeze="all", epochs=20, layers="conv(32) pool", image_size=64
+    )
+    assert _merge(stack, {"backbone": "resnet18"}).layers is None
+    assert _merge(stack, {"backbone": "simple_cnn"}).layers is None
+    assert _merge(stack, {"epochs": 8}).layers == (("conv", 32), ("pool",))
+    again = _merge(stack, {"backbone": "layers_net", "layers": "conv(64) pool"})
+    assert again.layers == (("conv", 64), ("pool",))
+
+
+def test_a_head_on_a_carried_probe_becomes_a_head_only_fit(capsys: Any) -> None:
+    probe = Recipe(backbone="resnet18", unfreeze="none", epochs=0, head_init="probe")
+    built = _merge(probe, {"head": "linear(64) dropout(0.5)"})
+    assert (built.unfreeze, built.epochs, built.head_init) == ("head", 3, "random")
+    assert built.head == (("linear", 64), ("dropout", 0.5))
+    assert "the carried recipe was a linear probe" in capsys.readouterr().out
+
+
+def test_asking_for_the_probe_back_drops_the_carried_head(capsys: Any) -> None:
+    topped = Recipe(
+        backbone="resnet18", unfreeze="head", epochs=3, head="linear(64)", drop_stages=1
+    )
+    built = _merge(topped, {"unfreeze": "none"})
+    assert (built.head, built.drop_stages, built.epochs) == (None, 0, 0)
+    assert "the carried head was dropped" in capsys.readouterr().out
+
+
+def test_epochs_zero_asks_for_the_probe_back_the_same_way(capsys: Any) -> None:
+    """`fit(epochs=0)` is the other spelling of the probe, so it drops the carried head
+    too, rather than earning a refusal for a head the cell never typed."""
+    topped = Recipe(backbone="resnet18", unfreeze="head", epochs=4, head="linear(512)")
+    built = _merge(topped, {"epochs": 0})
+    assert (built.unfreeze, built.epochs, built.head) == ("none", 0, None)
+    dropped = Recipe(backbone="resnet50", unfreeze="head", epochs=4, drop_stages=1)
+    assert _merge(dropped, {"epochs": 0}).drop_stages == 0
+    assert capsys.readouterr().out.count("the carried head was dropped") == 2
+
+
+def test_a_head_the_run_never_asked_for_leaves_the_probe_head_alone() -> None:
+    """head_init is only reset when this fit is the one that sets a head."""
+    probe_started = Recipe(
+        backbone="resnet18", unfreeze="head", epochs=3, head_init="probe", image_size=64
+    )
+    assert _merge(probe_started, {"epochs": 6}).head_init == "probe"
+    assert _merge(probe_started, {"head": "dropout(0.5)"}).head_init == "random"
+    kept = _merge(probe_started, {"head": "dropout(0.5)", "head_init": "probe"})
+    assert kept.head_init == "probe"
+
+
+def test_dropping_stages_says_what_it_removed(tmp_path: Path, capsys: Any) -> None:
+    """A stage is a large group of pretrained blocks, not a layer, so a fit that drops
+    one says so rather than quietly training on a third of the backbone."""
+    session = _session(tmp_path, per_class=10)
+    session.fit(backbone="resnet50", unfreeze="head", epochs=2, drop_stages=1)
+    out = capsys.readouterr().out
+    assert (
+        "drop_stages=1 removed layer4 from resnet50, with their pretrained weights; "
+        "the head now sees 1024 numbers per image instead of 2048" in out
+    )
+    session.fit(backbone="resnet50", unfreeze="head", epochs=2, drop_stages=0)
+    assert "drop_stages=" not in capsys.readouterr().out
+    assert dl.dropped_line(Recipe(backbone="simple_cnn", unfreeze="all", epochs=3)) == ""
 
 
 def test_a_recipe_the_runner_refuses_is_still_refused() -> None:
@@ -225,7 +303,43 @@ def test_the_fit_line_carries_the_epochs_planned_and_run_and_a_plain_score(
     assert (line["epochs_planned"], line["epochs_run"]) == (4, 3)
     assert 0.0 <= line["val_accuracy"] <= 1.0
     assert line["val"] == pytest.approx(line["val_accuracy"], abs=1e-4)  # accuracy here
-    assert set(asdict(session.best)) <= set(line)
+    assert set(dl.printed(session.best)) <= set(line)
+
+
+def test_a_fit_that_sets_no_layer_field_prints_the_keys_it_always_printed(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """The lever gate matches SUBMITTED to FIT by equality, and a recorded history has
+    to read the same on this version as on the one before it."""
+    import inspect
+
+    session = _session(tmp_path, per_class=10)
+    session.submit(session.fit(backbone="resnet18", epochs=2))
+    out = capsys.readouterr().out
+    fit, submitted = _printed_in(out, "FIT")[-1], _printed_in(out, "SUBMITTED")[-1]
+    assert fit == submitted
+    assert not {"layers", "head", "drop_stages"} & set(fit)
+    assert not {"layers", "head", "drop_stages"} & set(fit["from"])
+    recorded = json.loads((session.workdir / codegen.RECIPE_JSON).read_text())
+    assert not {"layers", "head", "drop_stages"} & set(recorded)
+    # The preamble prints the recipe a third time and imports torch, so it cannot be
+    # called here; the line itself is what the contract holds.
+    opening = inspect.getsource(vision_session.start).split('"recipe now: "')[1]
+    assert "printed(session.best)" in opening.splitlines()[0]
+
+
+def test_a_fit_on_a_stack_names_it_in_the_line_and_in_the_words(
+    tmp_path: Path, capsys: Any
+) -> None:
+    session = _session(tmp_path, per_class=10)
+    session.fit(layers=[("conv", 32), ("pool",), ("conv", 64), ("pool",)], epochs=2)
+    out = capsys.readouterr().out
+    line = _printed_in(out, "FIT")[-1]
+    assert line["backbone"] == "layers_net"
+    assert line["layers"] == "conv(32) pool conv(64) pool"
+    assert "head" not in line
+    assert "drop_stages" not in line
+    assert "(layers conv(32) pool conv(64) pool 32px," in out
 
 
 def test_a_number_run_prints_r2_beside_its_own_metric(tmp_path: Path, capsys: Any) -> None:
@@ -578,6 +692,289 @@ def test_a_restarted_kernel_still_keeps_the_better_fit(tmp_path: Path) -> None:
     assert _recorded(restarted)["lr"] == 0.003
 
 
+# ─── a submit keeps the network ───────────────────────────────────────────────
+
+
+class SavingRunner(FakeVisionRunner):
+    """A runner that can save. A fit stages marker bytes where it is told to, and a
+    saved network is the text that names it, so a test reads whose network a file is."""
+
+    def __init__(self, *, save_fails: BaseException | None = None, staged_bytes: int = 8) -> None:
+        super().__init__()
+        self.save_fails = save_fails
+        self.staged_bytes = staged_bytes
+        self.saved: list[Network] = []
+
+    def fit(self, job: Any) -> Any:
+        report = super().fit(job)
+        if job.save_to is not None:
+            job.save_to.write_bytes(b"w" * self.staged_bytes)
+        return report
+
+    def save(self, network: Network, path: Path) -> None:
+        self.saved.append(network)
+        if self.save_fails is not None:
+            path.write_bytes(b"half a file")
+            raise self.save_fails
+        kind = "probe" if network.head is not None else "fit"
+        path.write_text(f"{kind} lr={network.recipe.lr}")
+
+
+def _networked(session: Session, val: float, *, lr: float) -> Fit:
+    fit = _scored(session, val, lr=lr)
+    staged = session.workdir / vision_session.FITS_DIR / f"lr-{lr}.pt"
+    staged.parent.mkdir(exist_ok=True)
+    staged.write_bytes(b"weights")
+    recipe = Recipe(backbone="resnet18", unfreeze="all", epochs=3, lr=lr)
+    outputs = 1 if session.task == "regression" else len(session.classes)
+    network = Network(recipe, session.task, session.classes, outputs, weights=staged)
+    return Fit(fit.line, fit._holdout_out, network)
+
+
+def _network_files(session: Session) -> list[bytes]:
+    return [*_files(session), (session.workdir / codegen.NETWORK_PT).read_bytes()]
+
+
+def _network_digest(session: Session) -> str:
+    return hashlib.sha256((session.workdir / codegen.NETWORK_PT).read_bytes()).hexdigest()
+
+
+def test_a_submitted_fit_leaves_its_network_and_the_recipe_names_its_digest(
+    tmp_path: Path, capsys: Any
+) -> None:
+    session = _session(tmp_path, per_class=10, runner=SavingRunner())
+    fit = session.fit(backbone="resnet18", epochs=2)
+    session.submit(fit)
+    assert (session.workdir / codegen.NETWORK_PT).read_text() == "fit lr=0.001"
+    assert _recorded(session)["model_sha256"] == _network_digest(session)
+    assert not (session.workdir / (codegen.NETWORK_PT + ".part")).exists()
+    out = capsys.readouterr().out
+    (printed_fit,) = [json.loads(x[4:]) for x in out.splitlines() if x.startswith("FIT ")]
+    (submitted,) = [json.loads(x[10:]) for x in out.splitlines() if x.startswith("SUBMITTED ")]
+    assert submitted == printed_fit
+    assert "model_sha256" not in submitted
+    assert out.splitlines()[-1] == "submitted 6 predictions for the holdout"
+
+
+def test_a_trained_fit_is_told_where_to_stage_and_a_probe_carries_its_head(
+    tmp_path: Path,
+) -> None:
+    runner = SavingRunner()
+    session = _session(tmp_path, per_class=10, runner=runner)
+    trained = session.fit(backbone="resnet18", epochs=2)
+    (job,) = runner.jobs
+    assert job.save_to == session.workdir / vision_session.FITS_DIR / "1.pt"
+    assert trained._network is not None
+    assert (trained._network.weights, trained._network.head) == (job.save_to, None)
+    assert trained._network.recipe == session.best
+
+    probe = session.fit(unfreeze="none")
+    assert len(runner.jobs) == 1
+    assert probe._network is not None
+    assert probe._network.head is not None
+    weight, bias = probe._network.head
+    assert probe._network.weights is None
+    assert (weight.shape, bias.shape, weight.dtype) == ((3, 3), (3,), np.float32)
+    held = runner.embed(session.pixels(32)[1], backbone="resnet18")
+    assert ((held @ weight.T + bias).argmax(1) == probe._holdout_out.argmax(1)).all()
+    session.submit(probe)
+    assert (session.workdir / codegen.NETWORK_PT).read_text() == "probe lr=0.001"
+
+
+def test_the_head_a_probe_saves_is_the_head_a_fine_tune_starts_from(tmp_path: Path) -> None:
+    session = _session(tmp_path, per_class=10, runner=SavingRunner())
+    train_px, holdout_px = session.pixels(32)
+    labels = np.asarray(session.labels)[session.fit_idx]
+    _, saved = session._probe("resnet18", 32, train_px, holdout_px, labels)
+    started = session._probe_head("resnet18", 32, train_px, labels)
+    assert np.array_equal(saved[0], started[0])
+    assert np.array_equal(saved[1], started[1])
+
+
+def test_a_number_runs_network_carries_the_folds_centre_and_spread(tmp_path: Path) -> None:
+    session = _session(tmp_path, task="regression", metric="rmse", runner=SavingRunner())
+    fit = session.fit(backbone="resnet18", epochs=2)
+    labels = np.asarray(session.labels)[session.fit_idx]
+    assert fit._network is not None
+    assert (fit._network.outputs, fit._network.classes) == (1, [])
+    assert fit._network.centre == pytest.approx(labels.mean())
+    assert fit._network.spread == pytest.approx(labels.std())
+
+
+def test_a_worse_fit_submitted_after_a_better_one_keeps_the_better_network(
+    tmp_path: Path, capsys: Any
+) -> None:
+    runner = SavingRunner()
+    session = _session(tmp_path, runner=runner)
+    session.submit(_networked(session, 0.9573, lr=0.001))
+    first = _network_files(session)
+    session.submit(_networked(session, 0.9313, lr=0.002))
+    assert _network_files(session) == first
+    assert first[-1] == b"fit lr=0.001"
+    assert len(runner.saved) == 1
+    assert "KEPT the earlier submission" in capsys.readouterr().out
+
+
+def test_a_better_fit_replaces_the_network_with_the_predictions(tmp_path: Path) -> None:
+    session = _session(tmp_path, runner=SavingRunner())
+    session.submit(_networked(session, 0.9313, lr=0.001))
+    session.submit(_networked(session, 0.9573, lr=0.002))
+    assert (session.workdir / codegen.NETWORK_PT).read_text() == "fit lr=0.002"
+    assert _recorded(session)["model_sha256"] == _network_digest(session)
+    assert _recorded(session)["lr"] == 0.002
+
+
+def test_a_save_stopped_part_way_leaves_the_earlier_submission_whole(tmp_path: Path) -> None:
+    """A cell timeout or Ctrl-C inside the save: nothing of the earlier submission was
+    deleted up front, so its network, predictions and recipe still describe each other
+    and the keep-best guard still holds its score."""
+    runner = SavingRunner()
+    session = _session(tmp_path, runner=runner)
+    session.submit(_networked(session, 0.90, lr=0.001))
+    first = _network_files(session)
+    runner.save_fails = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        session.submit(_networked(session, 0.95, lr=0.002))
+    assert _network_files(session) == first
+    assert _recorded(session)["model_sha256"] == _network_digest(session)
+    digest = hashlib.sha256((session.workdir / codegen.PREDICTIONS_CSV).read_bytes()).hexdigest()
+    assert _recorded(session)["predictions_sha256"] == digest
+    assert not (session.workdir / (codegen.NETWORK_PT + ".part")).exists()
+    assert session._kept_val() == 0.90
+    runner.save_fails = None
+    session.submit(_networked(session, 0.95, lr=0.002))
+    assert (session.workdir / codegen.NETWORK_PT).read_text() == "fit lr=0.002"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("PytorchStreamWriter failed writing file data/0: file write failed"),
+        OSError(28, "No space left on device"),
+    ],
+)
+def test_a_network_that_cannot_be_written_never_costs_the_predictions(
+    tmp_path: Path, capsys: Any, error: Exception
+) -> None:
+    runner = SavingRunner()
+    session = _session(tmp_path, runner=runner)
+    session.submit(_networked(session, 0.90, lr=0.001))
+    runner.save_fails = error
+    session.submit(_networked(session, 0.95, lr=0.002))
+    assert _recorded(session)["lr"] == 0.002
+    assert "model_sha256" not in _recorded(session)
+    assert not (session.workdir / codegen.NETWORK_PT).exists()
+    assert not (session.workdir / (codegen.NETWORK_PT + ".part")).exists()
+    out = capsys.readouterr().out
+    assert [s["lr"] for s in _printed_in(out, "SUBMITTED")] == [0.001, 0.002]
+    assert out.splitlines()[-1] == (
+        f"predictions were submitted; its network file was not written: {error}"
+    )
+
+
+def test_an_own_model_submission_takes_the_fits_network_away(tmp_path: Path) -> None:
+    session = _session(tmp_path, holdout=6, runner=SavingRunner())
+    session.submit(_networked(session, 0.95, lr=0.001))
+    session.submit_probabilities(np.full((6, 3), 1 / 3), model="vit")
+    assert _recorded(session)["model"] == "vit"
+    assert "model_sha256" not in _recorded(session)
+    assert not (session.workdir / codegen.NETWORK_PT).exists()
+    session.submit(_networked(session, 0.5, lr=0.002))
+    assert (session.workdir / codegen.NETWORK_PT).read_text() == "fit lr=0.002"
+
+
+@pytest.mark.parametrize("name", ["model.pt", "best_model.pt"])
+def test_a_cell_that_writes_its_own_checkpoint_changes_nothing(tmp_path: Path, name: str) -> None:
+    session = _session(tmp_path, runner=SavingRunner())
+    own = session.workdir / name
+    own.write_bytes(b"the agent's own state_dict")
+    session.submit(_networked(session, 0.90, lr=0.001))
+    assert own.read_bytes() == b"the agent's own state_dict"
+    own.write_bytes(b"written again after the submit")
+    assert _recorded(session)["model_sha256"] == _network_digest(session)
+    assert session._kept_val() == 0.90
+    session.submit(_networked(session, 0.80, lr=0.002))
+    assert (session.workdir / codegen.NETWORK_PT).read_text() == "fit lr=0.001"
+    assert own.read_bytes() == b"written again after the submit"
+
+
+def test_a_runner_that_cannot_save_submits_exactly_as_before(tmp_path: Path, capsys: Any) -> None:
+    runner = FakeVisionRunner()
+    session = _session(tmp_path, per_class=10, runner=runner)
+    fit = session.fit(backbone="resnet18", epochs=2)
+    probe = session.fit(unfreeze="none")
+    assert [job.save_to for job in runner.jobs] == [None]
+    assert (fit._network, probe._network) == (None, None)
+    capsys.readouterr()
+    session.submit(fit)
+    assert capsys.readouterr().out.splitlines() == [
+        "SUBMITTED " + json.dumps(fit.line, default=str),
+        "submitted 6 predictions for the holdout",
+    ]
+    names = {p.name for p in session.workdir.iterdir()}
+    assert codegen.NETWORK_PT not in names
+    assert vision_session.FITS_DIR not in names
+    assert set(_recorded(session)) == {*fit.line, "predictions_sha256"}
+
+
+@pytest.mark.parametrize(
+    ("task", "metric", "gone"),
+    [("classification", "accuracy", "1.pt"), ("regression", "rmse", "2.pt")],
+)
+def test_staged_weights_are_capped_by_bytes_and_the_best_fit_is_never_the_one_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, task: str, metric: str, gone: str
+) -> None:
+    """Three 10-byte files against a 25-byte cap, scored 0.5, 0.9, 0.7: the oldest goes
+    unless the metric's direction makes it the best, and then the next oldest does."""
+    monkeypatch.setattr(vision_session, "STAGED_BYTES", 25)
+    session = _session(tmp_path, task=task, metric=metric, runner=SavingRunner())
+    folder = session.workdir / vision_session.FITS_DIR
+    folder.mkdir()
+    for n, val in enumerate((0.5, 0.9, 0.7), start=1):
+        (folder / f"{n}.pt").write_bytes(b"w" * 10)
+        session._cap_staged(folder / f"{n}.pt", val)
+    assert sorted(p.name for p in folder.iterdir()) == sorted({"1.pt", "2.pt", "3.pt"} - {gone})
+
+
+def test_every_fit_keeps_its_weights_while_they_fit_under_the_cap(tmp_path: Path) -> None:
+    runner = SavingRunner()
+    session = _session(tmp_path, per_class=10, runner=runner)
+    for lr in (1e-3, 2e-3, 3e-3, 4e-3, 5e-3):
+        session.fit(backbone="resnet18", epochs=2, lr=lr)
+        session.begin_cell()
+    staged = sorted(p.name for p in (session.workdir / vision_session.FITS_DIR).iterdir())
+    assert staged == ["1.pt", "2.pt", "3.pt", "4.pt", "5.pt"]
+
+
+def test_a_fit_whose_weights_are_gone_still_submits_its_predictions(
+    tmp_path: Path, capsys: Any
+) -> None:
+    session = _session(tmp_path, runner=SavingRunner())
+    session.submit(_networked(session, 0.90, lr=0.001))
+    fit = _networked(session, 0.95, lr=0.002)
+    assert fit._network is not None
+    assert fit._network.weights is not None
+    fit._network.weights.unlink()
+    session.submit(fit)
+    assert _recorded(session)["lr"] == 0.002
+    assert "model_sha256" not in _recorded(session)
+    assert not (session.workdir / codegen.NETWORK_PT).exists()
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert last == "predictions were submitted; this fit has no weights file"
+
+
+def test_a_new_session_clears_the_weights_an_earlier_one_staged(tmp_path: Path) -> None:
+    session = _session(tmp_path, runner=SavingRunner())
+    session.submit(_networked(session, 0.90, lr=0.001))
+    part = session.workdir / (codegen.NETWORK_PT + ".part")
+    part.write_bytes(b"half a file")
+    restarted = _session(tmp_path, runner=SavingRunner())
+    assert not (restarted.workdir / vision_session.FITS_DIR).exists()
+    assert not part.exists()
+    assert (restarted.workdir / codegen.NETWORK_PT).read_text() == "fit lr=0.001"
+    assert restarted._kept_val() == 0.90
+
+
 # ─── evaluate ────────────────────────────────────────────────────────────────
 
 
@@ -763,3 +1160,34 @@ def test_a_fit_returns_its_holdout_predictions_only_through_submit(tmp_path: Pat
     assert isinstance(fit, Fit)
     assert "_holdout_out" not in repr(fit)
     assert len(fit._holdout_out) == 6
+
+
+# ─── images that are not there any more ──────────────────────────────────────
+
+
+def test_images_all_present_say_nothing(tmp_path: Path, capsys: Any) -> None:
+    session = _session(tmp_path)
+    vision_session._say_what_cannot_be_opened(session)
+    assert capsys.readouterr().out == ""
+
+
+def test_a_session_whose_images_are_all_gone_refuses_to_start(tmp_path: Path) -> None:
+    """`decode` turns a path it cannot open into a blank frame, so without this a Run
+    All after the image cache was deleted trains on black and prints a score."""
+    session = _session(tmp_path)
+    for path in (*session.train_paths, *session.holdout_paths):
+        os.remove(path)
+    with pytest.raises(FileNotFoundError, match="could not be opened, starting with"):
+        vision_session._say_what_cannot_be_opened(session)
+
+
+def test_a_session_missing_some_images_says_how_many_and_which(tmp_path: Path, capsys: Any) -> None:
+    session = _session(tmp_path)
+    gone = session.train_paths[0]
+    os.remove(gone)
+    vision_session._say_what_cannot_be_opened(session)
+    out = capsys.readouterr().out
+    total = len(session.train_paths) + len(session.holdout_paths)
+    assert f"1 of {total} images could not be opened" in out
+    assert gone in out
+    assert "blank frames" in out

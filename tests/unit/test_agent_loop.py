@@ -752,3 +752,11 @@ def test_an_empty_inspection_is_not_carried_into_the_prompt() -> None:
 
     assert sup.seen_inspection == ["", ""]
     assert coder.inspections == 1  # it ran; it just found nothing worth carrying
+
+
+def test_a_table_experiment_records_no_recipe_it_started_from() -> None:
+    """`started_from` is the image family's: the other two hand their session no recipe,
+    and their recorded experiments must not grow a key for one."""
+    sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
+    result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1))
+    assert "started_from" not in result.history[0].candidate.changes

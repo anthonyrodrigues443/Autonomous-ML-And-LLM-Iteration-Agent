@@ -18,6 +18,8 @@ from iterate.core.scoring import direction, requires_proba, score, task_for_metr
 from iterate.schemas.experiment import ExperimentResult, Metrics
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from iterate.adapters.data.tabular import TabularDataset
 
 # File names exchanged with the runner's working directory.
@@ -37,6 +39,10 @@ PROMPT_JSON = "prompt.json"
 # The image path's twin of PROMPT_JSON: the recipe (or own-model line) that produced
 # the predictions on disk, with their digest.
 RECIPE_JSON = "recipe.json"
+# The network behind a submitted `fit()`, beside the predictions it made; recipe.json
+# carries its digest. Dotted and harness-only: `model.pt` and `best_model.pt` are the
+# names an agent's own torch code writes.
+NETWORK_PT = ".iterate-network.pt"
 # Written by the host before the session starts: the recipe the carried best used, so
 # `fit()` in a new session starts where the last one finished.
 INCUMBENT_JSON = "incumbent.json"
@@ -428,6 +434,38 @@ def vision_session_preamble() -> str:
     )
 
 
+def vision_notebook_setup(started_from: Mapping[str, Any] | None) -> str:
+    """The one cell the host adds ahead of a delivered image session, so Run All starts
+    where the session did.
+
+    It writes the recipe the session departed from and clears what an earlier Run All
+    left in the folder: the session's own state file, which would otherwise carry the
+    last re-run's fit, and the submission files, which the keep-best guard reads and
+    would hold a second Run All's fit against a first one's. `best_model.pt`, the
+    delivered network, is not among them and is never touched.
+    """
+    from iterate.core.vision_session import SESSION_JSON
+
+    stale = (SESSION_JSON, PREDICTIONS_CSV, PROBABILITIES_CSV, RECIPE_JSON, NETWORK_PT)
+    recipe = (
+        f"with open({INCUMBENT_JSON!r}, 'w') as _f:\n"
+        f"    _f.write({json.dumps(dict(started_from), default=str)!r})\n"
+        if started_from
+        else ""
+    )
+    return (
+        "# Written by iterate, not by the session: the recipe it started from, and a\n"
+        "# clean slate so this Run All behaves like the first one.\n"
+        "import os\n"
+        + recipe
+        + "for _stale in (\n"
+        + "".join(f"    {name!r},\n" for name in stale)
+        + "):\n"
+        "    if os.path.exists(_stale):\n"
+        "        os.remove(_stale)\n"
+    )
+
+
 # First statement of every image cell: frees the last cell's device memory and starts
 # this cell's fit clock, then restores the three input frames. `__import__` rather than
 # a name, so a cell that deleted SESSION or re-bound the helpers still gets them back.
@@ -450,6 +488,11 @@ def vision_worked_example(task: str) -> list[str]:
         "  submit(f)                         # the holdout predictions THIS fit made",
         "  g = fit(image_size=128)           # same recipe, new size, same fold",
         "  print(g.val, 'vs', f.val)         # like for like: both scored on VAL_IDX",
+        # Never indented by two spaces: the contract test reads the indented blocks as the
+        # runnable cells, and a third block would mean a third cell to keep working.
+        "fit(layers=[('conv', 32), ('pool',), ('linear', 256)]) trains that network from",
+        "zero; fit(head=[('linear', 512), ('dropout', 0.5)]) puts those layers where the",
+        "backbone's final layer was. Four names: conv, pool, dropout, linear.",
         "",
         "YOUR OWN MODEL, from any library research names:",
         "  import time, timm, torch",
@@ -990,6 +1033,7 @@ __all__ = [
     "INCUMBENT_JSON",
     "META_JSON",
     "MISSING_IMPORTS",
+    "NETWORK_PT",
     "PREDICTIONS_CSV",
     "PROBABILITIES_CSV",
     "RECIPE_JSON",
@@ -1009,6 +1053,7 @@ __all__ = [
     "session_preamble",
     "validate_train_and_predict",
     "vision_fallback_baseline",
+    "vision_notebook_setup",
     "vision_session_preamble",
     "vision_worked_example",
 ]

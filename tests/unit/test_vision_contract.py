@@ -205,3 +205,33 @@ def test_an_explicit_size_on_the_first_fine_tune_reads_as_a_move(
     assert vl.tries(cells)[-1].recipe["image_size"] == 32
     assert vl.tries(cells)[-1].start["image_size"] == 64
     assert vl.moved_levers(cells, carried) == ["backbone", "image-size"]
+
+
+def test_a_repair_line_is_a_fit_the_session_takes_back() -> None:
+    """A repair hands the coder a `fit(...)` to run, so what it writes has to survive the
+    merge that fit does. A layers net's line carries the stack and nothing the from-zero
+    reference owns: the carried best is the tuned network, not the try that failed, so an
+    epochs= or a backbone= from it would retrain a from-zero network for three epochs."""
+    from iterate.core.vision_session import merge
+    from iterate.targets.dl import BASELINE, LAYERS_NET, Recipe
+
+    vl = _levers()
+
+    def refit(line: str, best: Recipe) -> Recipe:
+        changes: dict[str, Any] = {}
+        eval(line, {"fit": lambda **kw: changes.update(kw)})
+        return merge(best, changes, "classification", baseline=BASELINE)[0]
+
+    tuned = Recipe(backbone="resnet18", unfreeze="all", epochs=5, image_size=224)
+    again = refit(vl.fit_call(vars(tuned), batch_size=32), tuned)
+    assert (again.backbone, again.image_size, again.batch_size) == ("resnet18", 224, 32)
+
+    stack = Recipe(
+        backbone="layers_net", unfreeze="all", epochs=20, image_size=64, layers="conv(32) pool"
+    )
+    line = vl.fit_call({"layers": stack.layers}, batch_size=32)
+    assert "epochs=" not in line
+    assert "backbone=" not in line
+    back = refit(line, tuned)
+    assert (back.backbone, back.layers, back.batch_size) == (LAYERS_NET, stack.layers, 32)
+    assert back.epochs == BASELINE.epochs

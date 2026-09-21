@@ -149,6 +149,14 @@ def run_supervised(
             )
 
         controller.snapshot = _snapshot
+        if vision is not None:
+            # Image runs only: the two layer classes open on what the user typed, and
+            # the note has to carry the mark the harness read out of it. The reader sees
+            # this run's experiments, so the reply can say an ask opens nothing.
+            def _read_ask(text: str) -> tuple[str, str]:
+                return vl.ask_note(text, current_run, vl.recipe_of(best))
+
+            controller.note_reader = _read_ask
 
     try:
         while True:
@@ -242,7 +250,7 @@ def run_supervised(
                 outcome = "proposer_error"
                 if controller is not None:  # the drained steers must survive the retry
                     for note in guidance:
-                        controller.add_brief_note(note)
+                        controller.requeue_brief_note(note)
             else:
                 if decision.stop:
                     stopped_because = "supervisor"
@@ -585,6 +593,7 @@ def _run_experiment(
     markers = () if vision is not None else lever_markers_for_brief(decision.brief)
     extra: dict[str, Any] = {}
     gate: Callable[[list[Any]], bool] | None = None
+    started_from: dict[str, Any] | None = None
     if vision is not None:
         # What the run carried in, for the gate and the prompt, and separately the
         # recipe the kernel's fit() may depart from: an own-model win is the carried
@@ -592,6 +601,7 @@ def _run_experiment(
         # last fit instead.
         carried = vl.recipe_of(best) or vision["baseline"]
         incumbent = vl.fit_recipe_of(best) or vision["baseline"]
+        started_from = incumbent
         lever = vl.lever_class(decision.brief) or ""
 
         def gate(cells: list[Any]) -> bool:
@@ -636,6 +646,9 @@ def _run_experiment(
     )
     changes: dict[str, object] = {"code": code, "cells": cells}
     if vision is not None and gate is not None:
+        # The recipe the kernel was handed, kept so the delivered notebook can hand the
+        # same one to its own Run All: the kernel's folder is gone by then.
+        changes["started_from"] = started_from
         agent_cells = [c for c in cells if c["source"] == "agent"]
         carried = vl.recipe_of(best) or vision["baseline"]
         if (recipe := vl.submitted(agent_cells)) is not None:

@@ -645,6 +645,123 @@ def test_each_iteration_notebook_is_saved_the_moment_it_finishes(
     assert (run_dir / "best.ipynb").exists()  # best.ipynb tracks the best-so-far
 
 
+def test_the_winner_notebook_gets_the_files_its_first_cell_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run All has failed at cell 1 since v0.2: the session read its three files from
+    the kernel's folder, which is deleted when the run ends. They land beside the
+    notebook now, as the same bytes the kernel was started with."""
+    from iterate.config import get_settings
+    from iterate.core import codegen
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "runs"))
+    get_settings.cache_clear()
+    captured = _stub_run_supervised(monkeypatch, invoke_hook=True)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--data",
+                str(data),
+                "--target",
+                "churn",
+                "--metric",
+                "f1",
+                "--code",
+                "--memory",
+                str(tmp_path / "m.db"),
+            ],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code == 0, result.stdout
+    run_dir = tmp_path / "runs" / "t"
+    started = codegen.build_inputs(captured["dataset"])
+    started.update(captured["coder"]._extra_inputs or {})
+    assert started  # a table run adds none of its own, so this is build_inputs alone
+    for name, sent in started.items():
+        assert (run_dir / name).read_bytes() == sent, name
+    assert "churn" not in (run_dir / codegen.HOLDOUT_CSV).read_text().splitlines()[0]
+
+
+def test_a_prompt_winner_gets_the_rows_the_loop_scored_and_no_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prompt run swaps the dataset for a smaller-holdout one before the loop, so
+    the delivered files have to come from that one and not from a second read."""
+    import pandas as pd
+
+    from iterate.config import get_settings
+    from iterate.core import codegen
+
+    data = tmp_path / "d.csv"
+    pd.DataFrame(
+        {"text": [f"comment {i}" for i in range(60)], "label": [i % 2 for i in range(60)]}
+    ).to_csv(data, index=False)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "runs"))
+    get_settings.cache_clear()
+    captured = _stub_run_supervised(monkeypatch, invoke_hook=True)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--data",
+                str(data),
+                "--target",
+                "label",
+                "--task",
+                "say whether the comment is toxic",
+                "--loop-holdout",
+                "4",
+                "--memory",
+                str(tmp_path / "m.db"),
+                "--plain",
+            ],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code == 0, result.stdout
+    run_dir = tmp_path / "runs" / "t"
+    started = codegen.build_inputs(captured["dataset"])
+    for name in (codegen.TRAIN_CSV, codegen.HOLDOUT_CSV):
+        assert (run_dir / name).read_bytes() == started[name], name
+    held = pd.read_csv(run_dir / codegen.HOLDOUT_CSV)
+    assert "label" not in held.columns
+    assert len(held) == 4  # the loop's slice, not the full holdout
+    meta = json.loads((run_dir / codegen.META_JSON).read_text())
+    assert meta["target_model"]
+    assert meta["target_backend"]
+
+
+def test_a_run_that_is_refused_leaves_no_run_folder_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `.gitignore` marker mkdirs the folder, so it has to sit below the last
+    refusal: the e2b key check is the one that can fire after the data is loaded."""
+    from iterate.config import get_settings
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    dot = tmp_path / "dot"
+    monkeypatch.delenv("E2B_API_KEY", raising=False)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(dot / "runs"))
+    get_settings.cache_clear()
+    try:
+        result = runner.invoke(
+            app,
+            ["run", "--data", str(data), "--target", "churn", "--compute", "e2b", "--plain"],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code != 0
+    assert "E2B API key" in result.output
+    assert not dot.exists()
+
+
 def test_research_is_on_by_default_and_can_be_turned_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -904,6 +1021,44 @@ def test_a_prompt_kernel_gets_the_answer_cache_and_the_key_from_the_project_env(
     assert kernel._target_key == "gsk-only-in-the-project"
     assert kernel._confinement.files == ((tmp_path / ".iterate" / "prompt-answers.db").resolve(),)
     assert "they open their own folder, the answer cache, and model weights" in output
+
+
+def test_a_table_run_and_a_prompt_run_hand_the_coder_no_network_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`keep_model` is the image family's alone: without it the coder never asks the
+    kernel for a network, so these two families run exactly as they did."""
+    import tempfile
+
+    from iterate.core import coder as coder_module
+
+    real, built = coder_module.CodingAgent, []
+    monkeypatch.setattr(
+        coder_module, "CodingAgent", lambda *a, **kw: built.append(kw) or real(*a, **kw)
+    )
+    monkeypatch.setattr(
+        tempfile, "mkdtemp", lambda *a, **kw: pytest.fail("only an image run stages a network")
+    )
+    _write_tiny_csv(tmp_path / "d.csv")
+    lines = ["text,label"] + [
+        f"comment {i},{'toxic' if i % 3 == 0 else 'clean'}" for i in range(30)
+    ]
+    (tmp_path / "eval.csv").write_text("\n".join(lines), encoding="utf-8")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    table = ["--data", "d.csv", "--target", "churn", "--metric", "f1"]
+    prompt = [
+        *["--data", "eval.csv", "--target", "label", "--metric", "f1"],
+        *["--task", "say whether the comment is toxic"],
+        *["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+    ]
+    for argv in (table, prompt):
+        built.clear()
+        extra = [*argv, "--memory", str(tmp_path / "m.db")]
+        captured, _ = _captured_local_run(tmp_path, monkeypatch, sandbox=False, extra=extra)
+        (kw,) = built
+        assert "keep_model" not in kw
+        assert captured["coder"]._keep_model is None
+    assert built[0]["family"] == "prompt"
 
 
 # ─── cells never install; the harness installs for local runs with consent ───
