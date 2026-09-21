@@ -62,7 +62,12 @@ accuracy exactly, 0.9496, and `f1_macro` went from 0.9477 to 0.9848 (accuracy 0.
 on the first iteration, a convnext_tiny fine-tune at 128 px. The third iteration wrote
 its own torch code, a timm efficientnet_b0, and scored 0.9478.
 
-Certification run: SLOT_CERT
+Certification run, 2026-09-21, on the released code (gemma4:12b, Apple M5 with MPS,
+10 iterations allowed, stopped on patience after 4): the baseline reproduced the stored
+0.9496 exactly, and iteration 1 reached 0.9876 with resnet18 fine-tuned at 128 px for 10
+epochs. Iterations 2 to 4 tried convnext_tiny 0.9604, resnet50 0.9756 and a timm resnet50
+0.9461, none of which beat it. No traceback. `iterate.vision.load(best_model.pt).predict()`
+re-scored the winner at 0.9876 over all 5,400 sealed holdout images.
 
 GPU compatible: it trains on an Apple GPU (MPS) or an NVIDIA GPU (CUDA), and falls back
 to CPU.
