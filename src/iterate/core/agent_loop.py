@@ -151,8 +151,12 @@ def run_supervised(
         controller.snapshot = _snapshot
         if vision is not None:
             # Image runs only: the two layer classes open on what the user typed, and
-            # the note has to carry the stack the harness read out of it.
-            controller.note_reader = vl.ask_note
+            # the note has to carry the mark the harness read out of it. The reader sees
+            # this run's experiments, so the reply can say an ask opens nothing.
+            def _read_ask(text: str) -> tuple[str, str]:
+                return vl.ask_note(text, current_run, vl.recipe_of(best))
+
+            controller.note_reader = _read_ask
 
     try:
         while True:
@@ -246,7 +250,7 @@ def run_supervised(
                 outcome = "proposer_error"
                 if controller is not None:  # the drained steers must survive the retry
                     for note in guidance:
-                        controller.add_brief_note(note)
+                        controller.requeue_brief_note(note)
             else:
                 if decision.stop:
                     stopped_because = "supervisor"

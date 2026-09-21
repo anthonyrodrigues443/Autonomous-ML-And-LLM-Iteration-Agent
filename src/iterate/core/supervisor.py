@@ -351,6 +351,14 @@ class Supervisor:
                         log.info("supervisor: rejected a %s", reason)
                         messages.append(Message(role="user", content=nudge))
                         continue
+                    elif vision and (refused := _layer_stack_refused(decision.brief, ready)):
+                        # The layer classes are the two that train an arbitrary network,
+                        # so a persisted layer brief is never accepted: the attempts run
+                        # out into a proposer failure and the next iteration researches.
+                        detail = f"layer brief refused: {refused}"
+                        log.info("supervisor: %s persisted; %s", reason, detail)
+                        messages.append(Message(role="user", content=nudge))
+                        continue
                     elif vision:
                         # Nothing this run's numbers open, and the model will not brief
                         # inside the guards: accepting its retry would switch the
@@ -703,6 +711,26 @@ def _vision_so_far(metric: str, baseline_score: float, carried: Experiment | Non
     )
 
 
+def _layer_stack_refused(brief: str, ready: Sequence[vl.Ready]) -> str:
+    """Why a layer brief may not run: the two layer classes train whatever network the
+    move names, so the stack has to be one an entry on the line opened. A class with no
+    entry, and an entry that carries no stack, are both "nothing to copy" — the guard
+    stays on, or the run trains a network no fact and no ask chose."""
+    lever = vl.lever_class(brief)
+    if lever is None or lever not in vl.LAYER_LEVERS:
+        return ""
+    opens = sorted({r.stack for r in ready if r.lever == lever and r.stack})
+    if not opens:
+        return f"no fact on the line names a stack for {lever}"
+    stack = vl.proposed_value(lever, vl.change_clause(brief))
+    if stack not in opens:
+        return (
+            f"the {lever} move trains {stack}, and the line opens "
+            f"{' or '.join(opens)}; copy one of them exactly"
+        )
+    return ""
+
+
 def _vision_violation(
     decision: SupervisorDecision,
     history: Sequence[Experiment],
@@ -756,21 +784,12 @@ def _vision_violation(
             _PROMPTS["vision_not_ready_nudge"].format(lever=lever, ready=ready_text),
             seen,
         )
-    # A mis-copied stack is not the one the entry's fact opened, and it would leave that
-    # entry untried and reopening for ever. Entries that name no stack are the repairs of
-    # a try whose own brief named none: there is nothing there to copy.
-    if lever in vl.LAYER_LEVERS and (opens := sorted({r.stack for r in entries if r.stack})):
-        stack = vl.proposed_value(lever, vl.change_clause(decision.brief))
-        if stack not in opens:
-            reason = (
-                f"the {lever} move trains {stack}, and the line opens "
-                f"{' or '.join(opens)}; copy one of them exactly"
-            )
-            return (
-                f"stack not the entry's — {lever}",
-                _PROMPTS["vision_no_value_nudge"].format(reason=reason, ready=ready_text),
-                seen,
-            )
+    if wrong_stack := _layer_stack_refused(decision.brief, ready):
+        return (
+            f"stack not the entry's — {lever}",
+            _PROMPTS["vision_no_value_nudge"].format(reason=wrong_stack, ready=ready_text),
+            seen,
+        )
     if spent := vl.banked(decision.brief, carried) or vl.measured_lost(
         decision.brief, history, carried, direction(metric)
     ):

@@ -144,20 +144,48 @@ def found_strict(value: Any, name: str = "layers") -> Spec | None:
     findings filters comparative sentences."""
     if not isinstance(value, str):
         return None
+    for run in _candidates(value):
+        if (found := _run(run, name)) is not None:
+            return found
+    return None
+
+
+def found_reason(value: Any, name: str = "layers") -> str:
+    """Why the layers a sentence writes are not a stack this runner will execute: the
+    refusal of the longest run in it that reads as layers and then fails a bound. Empty
+    when the words hold no such run, so a caller can tell prose from a refused stack."""
+    if not isinstance(value, str):
+        return ""
+    reason = ""
+    longest = 0
+    for run in _candidates(value):
+        if len(run) <= max(1, longest) or _run(run, name) is not None:
+            continue
+        try:
+            parse(" ".join(run), name)
+        except RecipeError as exc:
+            longest, reason = len(run), str(exc)
+    return reason
+
+
+def _candidates(value: str) -> list[list[str]]:
+    """Every run of layer names in a sentence, in the order each one ends: a word that is
+    not a layer, and a layer name with no number after it, both end the run."""
     low = value.lower()
+    out: list[list[str]] = []
     run: list[str] = []
     end = 0
     for match in _STRICT_AT.finditer(low):
         broken = bool(run) and not _GAP.fullmatch(low[end : match.start()])
         bare = match.group(2) is None and _ALIASES.get(match.group(1), match.group(1)) != "pool"
         if broken or bare:
-            if (found := _run(run, name)) is not None:
-                return found
+            out.append(run)
             run = []
         if not bare:
             run.append(match.group(0))
         end = match.end()
-    return _run(run, name)
+    out.append(run)
+    return out
 
 
 def text(value: Any, name: str = "layers") -> str:

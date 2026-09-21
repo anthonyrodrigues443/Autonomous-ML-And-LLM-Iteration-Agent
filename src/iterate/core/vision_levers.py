@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from importlib import resources
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from iterate.targets import layers as arch
 
@@ -125,17 +125,23 @@ _TOKEN = re.compile(r"(?<![\w/.:])(?:timm[_/])?([a-z][a-z0-9_]*[a-z0-9])", re.IG
 # The recipe keys whose value is a layer spec: a list cannot go in the set of tried
 # values, so everything that compares one compares its canonical text instead.
 _SPEC_KEYS = frozenset({"layers", "head"})
-# A word of refusal anywhere in an ask shuts every lever the ask could open. "never build
-# a network from scratch" is a ban, and reading it as a request opened the lever it bans.
+# A word of refusal anywhere in an ask shuts every lever the ask could open:
+# "never build a network from scratch" is a ban, not a request.
 _NO = re.compile(r"\b(?:never|no|not|don'?t|do not|stop|skip|avoid|without)\b", re.IGNORECASE)
 _ASK_ZERO = re.compile(
     r"from[\s-]+(?:scratch|zero)|layer[\s-]+stack|(?:custom|own)[\s-]+(?:cnn|network|architecture)",
     re.IGNORECASE,
 )
+# Multi-word only, like the aliases: a bare "head with" is how a fine-tune-depth ask
+# ("train more than the head with a lower lr") is written.
 _ASK_HEAD = re.compile(
-    r"(?:own|custom|new|bigger|deeper)[\s-]+(?:classifier[\s-]+)?head|head with", re.IGNORECASE
+    r"(?:own|custom|new|bigger|deeper)[\s-]+(?:classifier[\s-]+)?head", re.IGNORECASE
 )
 _ASK_BLOCK = re.compile(r"last[\s_-]+(?:block|stage)", re.IGNORECASE)
+# What the reader writes in front of a typed note, and the ONLY thing the ladder reads
+# back: the note is clipped after the reader saw it, so a "no" word can fall off the end
+# and a clipped stack still parses as a smaller network.
+_MARK = re.compile(r"\[ask: ([^\]\n]*)\]")
 # A stack written the way `fit_call` prints one, inside a sentence: a repair line hands
 # the model a whole call, and what it copies back has to read as the value it names.
 _IN_CALL = {
@@ -716,7 +722,8 @@ def ready(
     default_size: int | None = None,
 ) -> list[Ready]:
     """The lever classes this run's evidence opens, each with the fact that opened it.
-    A failure closes everything but its repair.
+    A failure closes everything but its repair and whatever the human asked for on this
+    turn, which is a recorded fact of its own.
 
     ``asks`` is what the human typed into THIS iteration, a recorded fact like any other:
     it adds an entry, and every guard the supervisor runs still runs on the brief."""
@@ -888,83 +895,190 @@ def _stack_move(stack: str) -> str:
     return f"train a network from zero through fit(), with layers {stack}"
 
 
-def _head_move(stack: str, recipe: dict[str, Any], ask: str) -> str:
+def _head_move(stack: str, recipe: dict[str, Any], backbone: str, last_block: bool) -> str:
     """The whole ask as ONE move. A brief may name one class, so the backbone the user
     named and the depth they asked for ride along inside the head entry."""
-    name = _backbone_named(ask) or model_name(recipe)
+    name = backbone or model_name(recipe)
     if not name or name in FROM_ZERO or recipe.get("model"):
         name = "resnet18"
-    if _ASK_BLOCK.search(ask):
-        depth = "the last stage and the head (unfreeze last_block)"
-    else:
-        depth = "all layers (unfreeze all)"
+    depth = (
+        "the last stage and the head (unfreeze last_block)"
+        if last_block
+        else "all layers (unfreeze all)"
+    )
     return f"fine-tune {name} through fit(), {depth}, {BENCH_EPOCHS} epochs, with head {stack}"
+
+
+def _depth_move() -> str:
+    return "keep the recipe and fine-tune the last stage and the head (unfreeze last_block)"
 
 
 def _spent_asks(history: Sequence[Experiment], ask: str) -> set[str]:
     """The classes an experiment these same words already steered spent. One ask buys one
     experiment per class; after that the run's own closed rule decides, so a steer cannot
-    pin the rest of the run on a stack the model keeps mis-copying."""
+    pin the rest of the run on a stack the model keeps mis-copying. The whole ask, or the
+    mark one of its notes carries, has to match: a note as short as "please" is a
+    substring of half the asks there are, and it would make every one of them dead."""
+    marks = set(_MARK.findall(ask))
     out: set[str] = set()
     for exp in history:
         stamped = exp.candidate.changes.get("user_guidance")
-        if isinstance(stamped, str) and stamped.strip() and stamped.strip() in ask:
+        if not isinstance(stamped, str) or not stamped.strip():
+            continue
+        if stamped.strip() == ask.strip() or marks & set(_MARK.findall(stamped)):
             out |= _classes_spent(exp)
     return out
 
 
-def _asked(ask: str, history: Sequence[Experiment], recipe: dict[str, Any]) -> list[Ready]:
-    """What a one-shot user ask opens, with the ask itself as the recorded fact. A word of
-    refusal opens nothing, a value already tried stays shut, a spent ask stays spent, and
-    every brief guard still runs on whatever the model writes from it."""
-    if not ask.strip() or _NO.search(ask):
-        return []
-    spec = arch.found_strict(ask)
-    key, _ = _stack_kind(spec) if spec is not None else (None, "")
-    invented = False
+class _Ask(NamedTuple):
+    """One thing the reader understood in one typed note, canonical enough to store and
+    read back without the note's own words."""
+
+    key: str  # "layers", "head" or "unfreeze"
+    stack: str  # empty on the depth ask, which names no stack
+    invented: bool
+    backbone: str
+    last_block: bool
+
+
+_ASK_LEVER = {"layers": "layer-stack", "head": "custom-head", "unfreeze": "fine-tune-depth"}
+
+
+def _read_ask(text: str) -> tuple[str, str]:
+    """What one typed note asks for: the canonical verdict to store in the mark, and what
+    to tell the user it was read as. Two empty strings mean the note named no layer lever
+    and no depth, and the run says nothing about it."""
+    spec = arch.found_strict(text)
+    key, why = _stack_kind(spec) if spec is not None else (None, arch.found_reason(text))
+    zero, head, block = (r.search(text) for r in (_ASK_ZERO, _ASK_HEAD, _ASK_BLOCK))
+    if key is None and not (zero or head or why or block):
+        return "", ""
+    if no := _NO.search(text):
+        return "none", (
+            f"the ask holds the word {no.group(0).lower()!r}, so it opens no lever; "
+            "type what you want on its own line to open one"
+        )
+    if key is None and why:
+        return "none", f"read a layer stack and refused it: {why}"
+    extras = ""
+    if key == "head" or (key is None and head):
+        # A brief names ONE class, so a head ask carries the backbone and the depth the
+        # same words named: the whole ask has to run as one experiment.
+        named = _backbone_named(text)
+        extras = f"; on {named}" if named else ""
+        extras += "; last_block" if block else ""
+    if key is None and zero:
+        return "zero", "read as a network from zero with no layers named, so it names the example"
+    if key is None and head:
+        return f"head-example{extras}", (
+            "read as your own head with no layers named, so it names the example"
+        )
     if key is None:
-        if _ASK_ZERO.search(ask):
-            key, invented = "layers", True
-        elif _ASK_HEAD.search(ask):
-            key, invented = "head", True
-        else:
-            return []
-        spec = arch.found_strict(arch.EXAMPLE if key == "layers" else arch.HEAD_EXAMPLE)
-    if spec is None:  # pragma: no cover - the two examples parse, this keeps mypy honest
-        return []
-    lever = "layer-stack" if key == "layers" else "custom-head"
+        return "last_block", "read as the last stage and the head"
     stack = arch.text(spec, key)
-    if lever in _spent_asks(history, ask) or stack in _tried_values(history, key):
-        return []
-    what = "a network from zero" if key == "layers" else "its own head"
+    return f"{key} {stack}{extras}", f"read {key} {stack}"
+
+
+def _parse_verdict(verdict: str) -> _Ask | None:
+    """A mark's verdict back as what it meant. Only the canonical text the reader writes
+    is read, so a stack the grammar refused can never come back through the mark."""
+    parts = [p.strip() for p in verdict.split(";")]
+    backbone = next((p[3:] for p in parts[1:] if p.startswith("on ")), "")
+    block = "last_block" in parts[1:]
+    kind, _, written = parts[0].partition(" ")
+    if kind == "last_block":
+        return _Ask("unfreeze", "", False, "", True)
+    if kind in ("zero", "head-example"):
+        key = "layers" if kind == "zero" else "head"
+        example = arch.EXAMPLE if key == "layers" else arch.HEAD_EXAMPLE
+        return _Ask(key, arch.text(example, key), True, backbone, block)
+    if kind not in ("layers", "head") or not written:
+        return None
+    spec = arch.found_strict(written, kind)
+    if spec is None or _stack_kind(spec)[0] != kind:
+        return None
+    return _Ask(kind, arch.text(spec, kind), False, backbone, block)
+
+
+def _ask_entry(
+    read: _Ask, history: Sequence[Experiment], recipe: dict[str, Any], spent: set[str]
+) -> Ready | None:
+    lever = _ASK_LEVER[read.key]
+    if lever in spent:
+        return None
+    if read.key == "unfreeze":
+        if (
+            "last_block" in {str(v) for v in _tried_values(history, "unfreeze")}
+            or str(recipe.get("unfreeze")) == "last_block"
+        ):
+            return None
+        return Ready(lever, "the user asked for the last block", _depth_move())
+    if read.stack in _tried_values(history, read.key):
+        return None
+    what = "a network from zero" if read.key == "layers" else "its own head"
     reason = (
         f"the user asked for {what} and named no layers, so this is the example stack"
-        if invented
-        else f"the user asked for {'this layer stack' if key == 'layers' else 'this head'}"
+        if read.invented
+        else f"the user asked for {'this layer stack' if read.key == 'layers' else 'this head'}"
     )
-    move = _stack_move(stack) if key == "layers" else _head_move(stack, recipe, ask)
-    return [Ready(lever, reason, move, stack=stack, invented=invented)]
+    move = (
+        _stack_move(read.stack)
+        if read.key == "layers"
+        else _head_move(read.stack, recipe, read.backbone, read.last_block)
+    )
+    return Ready(lever, reason, move, stack=read.stack, invented=read.invented)
 
 
-def ask_note(text: str) -> tuple[str, str]:
-    """What the harness reads in a typed ask, BEFORE the note is clipped: the canonical
-    stack to store in front of it, because a clip mid-stack still parses as a shorter
-    network, and one line for the user. Two empty strings mean the ask named no layer
-    lever, and the run says nothing about it."""
-    spec = arch.found_strict(text)
-    key, why = _stack_kind(spec) if spec is not None else (None, "")
-    vague = _ASK_ZERO.search(text) or _ASK_HEAD.search(text)
-    if key is None and not (vague or why):
+def _asked(ask: str, history: Sequence[Experiment], recipe: dict[str, Any]) -> list[Ready]:
+    """What one-shot user asks open, with the ask itself as the recorded fact. Only the
+    marks the reader wrote are read, one per typed note, so a "no" word in one note cannot
+    kill another note's ask and the stored words are never re-read. An ask that carries no
+    mark never met the reader (no image controller), so it is read here, once, whole.
+
+    A value already tried stays shut, a spent ask stays spent, and every brief guard still
+    runs on whatever the model writes from it."""
+    marks = _MARK.findall(ask)
+    if not marks:
+        verdict, _ = _read_ask(ask) if ask.strip() else ("", "")
+        marks = [verdict] if verdict else []
+    spent = _spent_asks(history, ask)
+    out: list[Ready] = []
+    for verdict in marks:
+        read = _parse_verdict(verdict)
+        if read is None:
+            continue
+        entry = _ask_entry(read, history, recipe, spent)
+        if entry is not None and entry.lever not in {r.lever for r in out}:
+            out.append(entry)
+    return out
+
+
+def ask_note(
+    text: str, history: Sequence[Experiment] = (), recipe: dict[str, Any] | None = None
+) -> tuple[str, str]:
+    """What the harness reads in a typed ask, BEFORE the note is clipped: the mark to
+    store in front of it, and one line telling the user what was read and whether it opens
+    anything. Two empty strings mean the ask named no layer lever, and the run says
+    nothing about it."""
+    verdict, said = _read_ask(text)
+    if not verdict:
         return "", ""
-    if _NO.search(text):
-        return "", "read as a limit on the layers, so it opens no lever"
-    if key is None and why:
-        return "", f"read a layer stack and refused it: {why}"
-    if key is None:
-        what = "a network from zero" if _ASK_ZERO.search(text) else "your own head"
-        return "", f"read as {what} with no layers named; the example stack is what opens"
-    stack = arch.text(spec, key)
-    return f"{key} {stack}", f"read {key} {stack}; it opens the next experiment"
+    mark = f"[ask: {verdict}]"
+    if verdict == "none":
+        return mark, said
+    if _asked(mark, history, recipe or {}):
+        return mark, f"{said}; it opens the next experiment"
+    return mark, f"{said}, but {_shut(mark, history)}"
+
+
+def _shut(mark: str, history: Sequence[Experiment]) -> str:
+    """Why an ask the harness understood opens nothing, for the line the user reads."""
+    read = _parse_verdict(_MARK.findall(mark)[0])
+    if read is None:  # pragma: no cover - the reader only writes verdicts it can read back
+        return "it opens no lever"
+    if _ASK_LEVER[read.key] in _spent_asks(history, mark):
+        return "an experiment already ran on this ask, so it opens nothing again"
+    return "the run has already tried that, so it opens nothing"
 
 
 _WHERE = re.compile(r"batch_size=(\d+), image_size=(\d+)")
@@ -986,6 +1100,10 @@ def _repair(history: Sequence[Experiment], carried: dict[str, Any]) -> Ready | N
     cells = _cells(last)
     errors = " ".join(_parts(c)[2] for c in cells if _agent(c))
     failed = _failed_recipe(last, carried)
+    if lever in LAYER_LEVERS and not _repair_stack(lever, failed):
+        # A try whose own brief named no stack leaves nothing for the next brief to copy,
+        # and a layer entry with no stack is a layer class the stack guard cannot judge.
+        lever = ""
     if any(t.kind == "oom" for t in tries(cells)) and _score(last) is None:
         # An out-of-memory fit the session recovered from and submitted is not a
         # failure to repair: the run has its number, and the ladder has its evidence.

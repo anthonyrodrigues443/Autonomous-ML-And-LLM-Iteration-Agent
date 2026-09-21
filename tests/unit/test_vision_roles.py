@@ -219,6 +219,22 @@ def head_try(head: str = HEAD, score: float = 0.99) -> Experiment:
     )
 
 
+def typed(
+    text: str, history: list[Experiment] | None = None, carried: Experiment | None = None
+) -> tuple[str, str]:
+    """One note as a live image run holds it: read whole, then stored clipped, with the
+    line the user was told. Every ask test goes through this, because the stored note is
+    what the ladder actually reads an iteration later."""
+    from iterate.core.interactive import RunController
+
+    said: list[str] = []
+    ctrl = RunController(reply=said.append)
+    ctrl.note_reader = lambda t: vl.ask_note(t, history or [], vl.recipe_of(carried))
+    ctrl.add_brief_note(text)
+    (note,) = ctrl.take_brief_notes()
+    return note, said[0] if said else ""
+
+
 def ready_for(history: list[Experiment], carried: Experiment | None, **kw: Any) -> list[vl.Ready]:
     kw.setdefault("task", "classification")
     kw.setdefault("direction", "maximize")
@@ -733,6 +749,9 @@ def test_an_ask_that_says_no_opens_nothing(ask: str) -> None:
         "run a linear probe first",
         "please aim for better accuracy",
         "conv is fine but watch the budget",
+        # A fine-tune-depth ask in plain English: "head with" is two ordinary words.
+        "train more than the head with a lower learning rate",
+        "unfreeze more than the head with lr 1e-4",
     ],
 )
 def test_prose_is_not_a_layer_stack(ask: str) -> None:
@@ -775,7 +794,9 @@ def test_the_headline_ask_runs_as_one_experiment_and_the_gate_credits_the_head()
     one. So it is ONE custom-head entry that carries the backbone and the depth, and the
     fit it asks for has to credit custom-head or the try lands unmeasured."""
     best = first_try()
-    items = ready_for([best], best, asks=HEADLINE_ASK)
+    note, said = typed(HEADLINE_ASK)
+    assert f"read head {HEAD}; it opens the next experiment" == said
+    items = ready_for([best], best, asks=note)
     (entry,) = [r for r in items if r.lever in vl.LAYER_LEVERS]
     assert entry.lever == "custom-head"
     assert all(word in entry.move for word in ("resnet50", "last_block", HEAD))
@@ -785,6 +806,154 @@ def test_the_headline_ask_runs_as_one_experiment_and_the_gate_credits_the_head()
     )
     ran = head_try()
     assert "custom-head" in ran.candidate.changes["levers_moved"]
+
+
+# ─── what the stored note carries, which is all the ladder reads ─────────────
+
+# The two asks a skeptic typed: the refusal and the opener both sit past the clip.
+_BANNED = (
+    f"{STACK} is the shape the paper uses and I would like to see it tried on this dataset "
+    "at some point in the future when we have more compute available on the laptop, but "
+    "never build it from scratch now"
+)
+_VAGUE_LATE = (
+    "the backbone swaps keep landing in the same place and the images here are tiny "
+    "thumbnails so imagenet features are probably a poor match for them, which makes me "
+    "think the right move is to just build a custom cnn from scratch and see what happens"
+)
+
+
+def test_a_no_word_the_clip_ate_still_shuts_every_lever() -> None:
+    """The blocker: the reader saw "never", the stored note did not, and the ban opened
+    the lever it bans and led the line."""
+    best = first_try()
+    note, said = typed(_BANNED)
+    assert "never" not in note.split("]", 1)[1]
+    assert "opens no lever" in said
+    assert not [r for r in ready_for([best], best, asks=note) if r.lever in vl.LAYER_LEVERS]
+
+
+def test_a_refused_ask_names_the_word_that_refused_it() -> None:
+    """The stack is read and valid; the "do not" is about the epochs. Refusing is the
+    safe direction, but the line said the user's words were a limit on the layers."""
+    best = first_try()
+    note, said = typed(f"use layers {STACK}, do not go above 10 epochs")
+    assert "'do not'" in said
+    assert "opens no lever" in said
+    assert not [r for r in ready_for([best], best, asks=note) if r.lever in vl.LAYER_LEVERS]
+
+
+def test_a_vague_ask_the_clip_ate_still_opens_the_example_stack() -> None:
+    """The words that opened it sat past the clip, so the promise in the reply was kept
+    by nothing."""
+    best = first_try()
+    note, said = typed(_VAGUE_LATE)
+    assert "from scratch" not in note.split("]", 1)[1]
+    assert "it opens the next experiment" in said
+    (entry,) = [r for r in ready_for([best], best, asks=note) if r.lever in vl.LAYER_LEVERS]
+    assert (entry.lever, entry.invented) == ("layer-stack", True)
+
+
+@pytest.mark.parametrize(
+    ("ask", "lever", "stack"),
+    [
+        (STACK, "layer-stack", STACK),
+        ("conv(32) pool conv(64) pool conv(128) pool", "layer-stack", None),
+        (f"{HEAD} on resnet50", "custom-head", HEAD),
+        (f"{HEAD} head on resnet50, last block", "custom-head", HEAD),
+    ],
+)
+def test_an_ask_that_opens_with_its_stack_opens_that_stack_once(
+    ask: str, lever: str, stack: str | None
+) -> None:
+    """Typing the stack first is how a stack gets typed. Reading the stored mark and the
+    words it stands for as one run merged the two and trained a doubled network."""
+    best = first_try()
+    note, said = typed(ask)
+    (entry,) = [r for r in ready_for([best], best, asks=note) if r.lever in vl.LAYER_LEVERS]
+    assert (entry.lever, entry.stack) == (lever, stack or ask)
+    assert f"read {entry.stack}" in said.replace("layers ", "").replace("head ", "")
+
+
+def test_a_no_word_in_another_note_does_not_kill_the_ask() -> None:
+    """Notes are judged one at a time: the batch reaches the ladder as one joined string,
+    and a "no hurry" typed after a stack used to shut the stack."""
+    best = first_try()
+    ask, _ = typed(f"build a cnn from scratch {STACK}")
+    polite, _ = typed("no rush, take your time")
+    (entry,) = [
+        r for r in ready_for([best], best, asks=f"{ask}; {polite}") if r.lever in vl.LAYER_LEVERS
+    ]
+    assert entry.stack == STACK
+
+
+def test_a_short_earlier_note_does_not_make_a_later_ask_dead() -> None:
+    """The spend was a substring test, so one earlier "please" killed every later ask
+    that held the word, with the reply still promising an experiment."""
+    best = first_try()
+    earlier = head_try("linear(256) dropout(0.2)")
+    earlier.candidate.changes["user_guidance"] = "please"
+    note, said = typed(f"use resnet50 with a head of {HEAD} please", [best, earlier], best)
+    assert "it opens the next experiment" in said
+    assert "custom-head" in [r.lever for r in ready_for([best, earlier], best, asks=note)]
+
+
+def test_a_stack_the_grammar_refuses_opens_nothing_at_all() -> None:
+    """The refusal reached the user and the example stack opened behind it, so the run
+    proposed a network nobody had written."""
+    best = first_try()
+    fifteen = (
+        "build from scratch conv(32) pool conv(64) pool conv(96) pool conv(128) pool "
+        "conv(160) pool conv(192) pool conv(256) linear(512) linear(256)"
+    )
+    note, said = typed(fifteen)
+    assert "refused it" in said
+    assert not [r for r in ready_for([best], best, asks=note) if r.lever in vl.LAYER_LEVERS]
+
+
+def test_a_head_whose_number_is_out_of_range_gets_a_line_of_its_own() -> None:
+    """A concrete head that fails a bound is the case where "why nothing opened" is worth
+    most, and it was the one case that printed nothing at all."""
+    note, said = typed("put linear(4096) dropout(0.5) on resnet50")
+    assert "refused it" in said
+    assert "2048" in said
+    assert note.startswith("[ask: none]")
+
+
+def test_an_ask_already_tried_says_so_instead_of_promising_an_experiment() -> None:
+    best = first_try()
+    ran = head_try()
+    note, said = typed(f"use a head of {HEAD}", [best, ran], best)
+    assert "already tried" in said
+    assert not [r for r in ready_for([best, ran], best, asks=note) if r.lever in vl.LAYER_LEVERS]
+
+
+def test_a_bare_last_block_ask_opens_the_depth_it_names() -> None:
+    """The three plain words an ask may use are "from scratch", "custom head" and "last
+    block". The third opened nothing and printed nothing."""
+    best = first_try()
+    note, said = typed("train only the last block")
+    assert "it opens the next experiment" in said
+    (entry,) = [r for r in ready_for([best], best, asks=note) if r.lever == "fine-tune-depth"]
+    assert "last_block" in entry.move
+    brief = f"next: fine-tune-depth: {entry.move} (because {entry.reason})."
+    assert vl.missing_value(brief) is None
+
+
+def test_a_failed_layer_try_that_named_no_stack_is_not_a_layer_repair() -> None:
+    """A layer entry with no stack is a layer class the stack guard cannot judge, and it
+    would let the next brief name any network at all."""
+    best = first_try()
+    failed = experiment(
+        [{"code": "f = fit()", "stdout": "", "source": "agent", "error": "boom"}],
+        "next: layer-stack: build a deeper cnn",
+        None,
+        carried=RECIPE,
+        error="no predictions were written",
+    )
+    (repair,) = ready_for([best, failed], best)[:1]
+    assert repair.lever not in vl.LAYER_LEVERS
+    assert repair.stack == ""
 
 
 def test_a_last_block_best_is_not_described_as_training_the_head_only() -> None:
@@ -1592,28 +1761,57 @@ def test_a_typed_ask_opens_the_class_and_the_line_says_so() -> None:
     assert vl.lever_class(decision.brief) == "layer-stack"
 
 
-def test_a_layer_brief_is_refused_even_when_the_ready_line_is_empty() -> None:
-    """Any valid stack clears every other guard, so with nothing ready the run would
-    train a network no fact opened. The empty line is exactly when that bites."""
-    probe_cell, probe_payload = fit_cell(
+def opens_nothing() -> Experiment:
+    """A best whose numbers open no lever at all: a 12-epoch fine-tune at 200s an epoch
+    has no budget for a stronger backbone, a bigger image or more epochs."""
+    cell, payload = fit_cell(
         {**RECIPE, "unfreeze": "all", "epochs": 12}, [0.99] * 12, 0.99, secs=200, start=BENCH
     )
-    best = experiment(
-        [probe_cell, submit_cell(probe_payload)],
+    return experiment(
+        [cell, submit_cell(payload)],
         "next: backbone: fine-tune resnet18",
         0.99,
         carried=BASELINE,
     )
+
+
+def test_a_layer_brief_is_refused_even_when_the_ready_line_is_empty() -> None:
+    """Any valid stack clears every other guard, so with nothing ready the run would
+    train a network no fact opened. The empty line is exactly when that bites: the nudge
+    was sent and the same brief was then accepted on the last attempt."""
+    best = opens_nothing()
     assert not ready_for([best], best)
     brief = f"next: layer-stack: train a network from zero through fit(), with layers {STACK}"
     client = Scripted(brief, brief)
-    vision_supervisor(client).decide(
-        data_summary="Images: 10",
-        baseline=baseline_result(),
-        history=[best],
-        carried_best=best,
-    )
+    with pytest.raises(sup.SupervisorError):
+        vision_supervisor(client).decide(
+            data_summary="Images: 10",
+            baseline=baseline_result(),
+            history=[best],
+            carried_best=best,
+        )
     assert "opens layer-stack" in client.seen[1][0][-1].content
+
+
+def test_a_mis_copied_stack_is_refused_when_the_only_entry_is_a_vague_ask() -> None:
+    """An entry the harness filled in is not a brief the harness writes, so there is no
+    fallback to swap in: the mis-copied stack has to be refused outright."""
+    best = opens_nothing()
+    note, _ = typed("give it a bigger head")
+    wrong = (
+        "next: custom-head: fine-tune resnet18 through fit(), all layers (unfreeze all), "
+        "3 epochs, with head linear(2048) dropout(0.4)"
+    )
+    client = Scripted(wrong, wrong)
+    with pytest.raises(sup.SupervisorError):
+        vision_supervisor(client).decide(
+            data_summary="Images: 10",
+            baseline=baseline_result(),
+            history=[best],
+            carried_best=best,
+            user_guidance=note,
+        )
+    assert "copy one of them exactly" in client.seen[1][0][-1].content
 
 
 def test_a_mis_copied_stack_is_refused_so_the_entry_cannot_reopen_for_ever() -> None:
@@ -1706,4 +1904,8 @@ def test_an_image_run_reads_a_typed_ask_and_a_table_run_leaves_the_note_alone() 
             family=family,
             controller=ctrl,
         )
-        assert (ctrl.note_reader is vl.ask_note) is reads
+        if reads:
+            assert ctrl.note_reader is not None
+            assert ctrl.note_reader(f"try {STACK}")[0] == f"[ask: layers {STACK}]"
+        else:
+            assert ctrl.note_reader is None
