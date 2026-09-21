@@ -529,6 +529,48 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-09-21 | Sprint 4 Day 14 | The image prompts learn the two layer classes, and the coder is handed the call
+
+**Task:** PR E of the v0.6.0 hold, on the branch that already holds PR A (the saved model), PR B (the re-runnable notebook), PR C (the layer params in `fit()`) and PR D (the two lever classes and the user ask). PR C gave `fit()` the params and PR D gave the supervisor the classes, but no prompt key had moved, so the 12B did not know the words existed. This is the prompts, and three Ollama-only probes that decide what ships.
+
+**Image keys only.** `supervisor.vision_system` gains two class definitions and one clause in WHAT A TRY CAN BE; its tool's brief field lists the two names. `coder.vision_system`'s EASY PATH names `layers=` and `head=`. A new `coder.vision_brief_call` carries the finished call, appended to the task message for the two layer classes and nothing else. `researcher.vision_suggest_system` and its tool's technique field allow a layer stack. `_TABLE_CALL_ON_MAIN` in test_researcher.py did not move, which is the proof the table pair was not touched, and the table and prompt digest tests passed untouched.
+
+**What each key costs, counted by gemma4:12b itself (`prompt_eval_count`, the same text before and after):**
+
+| Key | Before | After | Added |
+|---|---|---|---|
+| `supervisor.vision_system` (always on) | 990 | 1047 | **+57** |
+| `supervisor.vision_tool` brief field (always on) | 169 | 177 | **+8** |
+| `coder.vision_system` | 1085 | 1215 | +130 |
+| `coder.vision_brief_call` (two briefs a run) | 0 | 47 | +47 |
+| `researcher.vision_suggest_system` | 279 | 394 | +115 |
+| `researcher.vision_suggest_tool` technique field | 44 | 73 | +29 |
+
+The always-on planning prompt grew by **65 tokens**, against the read-out's estimate of about 45. The first draft cost 78 and was cut twice against the counter: "a network from zero, out of the layers you name" became "a network from zero", and the clause lost six words. What is left is the floor for two definitions and one clause that still shows an example stack, and the example is the part the probe shows the model copies.
+
+**Probe R3.1, the supervisor: 10 of 10 and 10 of 10.** A typed ask at iteration 2, through the real `decide()` so the ask reaches both the ladder and the guidance message, gemma4:12b at the run's own 0.4, ten calls a case, first answer only with no nudge allowed to correct it. Every first brief opened with the right class, passed `missing_value`, and its stack equalled the entry's character for character, for `layer-stack` and for `custom-head`.
+
+One thing the probe found on the way. A first draft sent the ask only through the ready line, with no guidance message, and the model briefed `image-size` 10 of 10 and ignored the leading entry. The control says that is not this PR: on the same fixture with no ask at all it picks `image-size` 10 of 10 on the OLD image prompt too, so this 12B prefers an entry with a number from a fit line behind it over the first entry on the line. It does not reach the live path, which always sends both, but it is what R4b has to watch: if a live ask is ever passed over, this is why.
+
+**Probe R3.2, the coder: 10 of 10 and 10 of 10, and the counterfactual is what pays for the sentence.** Ten calls a case at the coder's own 0.7, judged on the FIRST cell only.
+
+| Coder prompt | Brief | First cell is the right `fit()` call | Wrote its own torch net |
+|---|---|---|---|
+| Old (pre PR E) | `layer-stack`, no call line | **0 of 10** | 10 of 10 |
+| Old (pre PR E) | `custom-head`, no call line | **0 of 10** | 7 of 10 |
+| New, call line cut off | `layer-stack` | 10 of 10 | 0 |
+| New, call line cut off | `custom-head` | 10 of 10 | 0 |
+| New, as it ships | `layer-stack` | 10 of 10 | 0 |
+| New, as it ships | `custom-head` | 10 of 10 | 0 |
+
+The old prompt fails exactly the way the read-out predicted: "Since fit() is for standard architectures, I must implement this myself", then `class LayerStack(nn.Module)`. The EASY PATH sentence is what fixes it. The call line rescued nothing on this fixture, and the honest reading is that it is insurance for a stack longer than the example, at 47 tokens on the two briefs a run that use it.
+
+**Probe R3.3, the researcher: the rewording ships.** Five calls each at the Researcher's own 0.3, on a recorded land-cover paper shortlist taken from this machine's own search cache (7 papers, deduped across two real queries). Old prompt and new both named a loadable timm or torchvision model in 5 of 5 answers, so the rewording costs nothing it was earning before. Neither wrote a layer stack at all, because none of those abstracts states a width, which is what LIMITATIONS now says to expect.
+
+So the abstract check was proved on planted papers instead. Given an abstract that really writes `conv(32) pool conv(64) pool dropout(0.3) linear(256)` out, the model suggested exactly that stack 5 of 5 and the check kept it 5 of 5. Given only a paper that says "several convolutional blocks, pooling and dropout" with no width anywhere, the model wrote no stack at all in 5 of 5 and named a pretrained model instead, so there was nothing to drop. The unit tests carry the case the live model would not produce: one width changed from 64 to 128 drops the whole suggestion.
+
+**Not in this PR:** anything a table or prompt run reads, `last_block` in the supervisor's `unfreeze` list (the ready entry carries the exact value, so the word is not needed and the tokens are), and the live runs. R4a to R4d are the next thing, and today's image certification does not carry over.
+
 ### 2026-09-21 | Sprint 4 Day 12 | The builders: a network from a list of layers, a head on a pretrained one
 
 **Task:** PR C part 2 of the v0.6.0 hold, on the branch that already holds part 1 (the pure-Python grammar, `targets/layers.py`). Part 1 could read a stack and refuse a bad one; nothing could build one. This part makes it real in torch and closes PR A's blocker for good: `net.model_for` learns the new shapes, so a file saved from one opens again. Part 1's dl.py and vision_session.py work was not in the branch, so it is here too: the three `Recipe` fields, the merge rules and the recipe-level refusals.

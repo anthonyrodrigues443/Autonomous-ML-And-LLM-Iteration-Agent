@@ -1710,7 +1710,7 @@ def test_two_iterations_through_the_real_supervisor_read_each_other() -> None:
 # new thing on the wire there, so it kept main 621987d's digest; PR E reworded the image
 # system prompt on purpose (two class definitions and one clause), so the digest was
 # recomputed once, against a run with no guidance and no layer class on the line.
-_IMAGE_CALL_ON_MAIN = "4dcc1967c3792150c0e99f3e296945ae43b507b8426ecef3fa2ccea3d3f980ae"
+_IMAGE_CALL_ON_MAIN = "b1f86d5a52628723914ed46aab876aa0585c2da5440bf87cd970ec35d1187af5"
 _SWAP_BRIEF = (
     "next: backbone: keep the recipe and swap the backbone to convnext_tiny (because resnet18 "
     "took 12s an epoch, so convnext_tiny fits the budget at about 126s)"
@@ -1978,9 +1978,9 @@ def test_the_easy_path_names_the_two_settings_so_a_12b_does_not_write_its_own_ne
 
 def test_the_supervisor_prompt_defines_both_classes_and_the_tool_lists_them() -> None:
     system = sup._PROMPTS["vision_system"]
-    assert "layer-stack: a network from zero" in system
-    assert "custom-head: your own layers in place of a pretrained backbone's final" in system
-    assert "It also takes layers, a stack like conv(32) pool linear(256)" in system
+    assert "layer-stack: a network from zero." in system
+    assert "custom-head: your layers in place of a backbone's final layer." in system
+    assert "It also takes layers (conv(32) pool linear(256), trained from zero)" in system
     brief_field = sup._PROMPTS["vision_tool"]["fields"]["brief"]
     assert "fine-tune-depth, layer-stack, custom-head" in brief_field
 
