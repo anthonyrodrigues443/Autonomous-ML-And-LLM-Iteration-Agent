@@ -533,6 +533,57 @@ The discovery agent is what makes the demo wow. It does:
 
 ## Done
 
+### 2026-09-21 | Sprint 4 release gate | Four live runs on the released code
+
+**Task:** the hold's own gate. The image certification did not carry over, because the image
+prompts, the lever ladder and `fit()` itself all moved, so every claim is re-measured here on
+the code that ships. All four ran on `911997f`, gemma4:12b, an Apple M5 with MPS, one at a
+time. **Zero tracebacks in four runs.**
+
+| run | dataset | metric | baseline | best | iterations |
+|---|---|---|---|---|---|
+| R4a re-certification | EuroSAT | accuracy | 0.9496 | **0.9876** | 4, stopped on patience |
+| R4b typed ask | EuroSAT | accuracy | 0.9496 | 0.9874 | 4 |
+| R4c custom head | Flowers102 | accuracy | 0.5544 | **0.9719** | 5 |
+| R4d regression | cyclone_wind | rmse | 13.1203 | **9.0190** | 5 |
+
+**R4a is the certification.** 0.9876 is above the 0.9848 this release was certified at before
+the hold, the baseline reproduced the stored 0.9496 exactly, and `load(best_model.pt).predict()`
+re-scored the winner at 0.9876 over all 5,400 sealed images.
+
+**R4b and R4c are what the hold was for, and they answer it in the agent's own words.** A stack
+typed into a running run reached the live session, and the coder wrote:
+
+> `# The brief requires a new model structure: conv(32) pool conv(64) pool conv(128) linear(256)`
+> `# This is a "from zero" architecture, so we use the layers argument.`
+> `f = fit(layers=[('conv', 32), ('pool',), ('conv', 64), ('pool',), ('conv', 128), ('linear', 256)])`
+
+It trained for its full 20 epochs and scored `val accuracy = 0.9417` from zero. In R4c a head
+typed the same way went further and **changed the winner**:
+
+> `# The brief asks to keep the recipe but change epochs to 6.`
+> `# The user note also specifies a custom head: linear(512) and dropout(0.5).`
+> `# Since fit() supports the head argument, I will include both changes.`
+
+R4c's saved winner is `convnext_tiny` with `head: linear(512) dropout(0.5)`, holdout 0.9719.
+The model also reached for `head=` unprompted in iteration 1, with no ask involved at all.
+
+**What the guards did, all seen live for the first time.** The keep-best guard refused a
+genuinely worse fit twice, not on a tie: `KEPT the earlier submission: its val accuracy 0.9634
+is not beaten by 0.9511` in R4c, and `its val rmse 9.1694 is not beaten by 9.2789` in a Run All
+of a delivered notebook, which then let a better 8.3266 through. A session that lost its way was
+cut and labelled rather than banked: R4c iteration 3 errored six cells in a row
+(`'Fit' object has no attribute 'eval'`), ended early, and its floor submission is recorded as a
+fallback at 0.0318 with the run's real best untouched. And the wall ceiling fired for the first
+time in R4d: `wall-clock ceiling (5400s) reached after 34 cells; ending session`.
+
+**What the runs found that the suite did not.** Five defects, each now fixed or written down with
+the measurement behind it: a Run All with the image cache gone trained on all-black frames and
+submitted a score; a refused setting named its type and never its values, so the model guessed
+again and looped (fixed in #82); the lever ledger would have changed the bytes every existing
+image run sends; a 200-character clip swallowed the "no" word in a negated ask; and a session
+writing cheap cells spends neither budget, so it can hold an iteration for the full 90 minutes.
+
 ### 2026-09-21 | Sprint 4 release gate | The release was held, and what the hold added
 
 **Task:** the release was drafted for Sun 2026-09-20 and held that evening. Watching his own demo run, Tony saw that an image run trained a model for an hour and saved nothing, that `best.ipynb` had never actually run, and that `fit()` could not be told what network to build. Five PRs and one fix round answered that; the release mechanics below are the standing checklist, re-measured on the held code.
