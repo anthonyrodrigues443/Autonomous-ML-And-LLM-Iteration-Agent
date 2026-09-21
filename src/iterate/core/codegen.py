@@ -488,6 +488,11 @@ def vision_worked_example(task: str) -> list[str]:
         "  submit(f)                         # the holdout predictions THIS fit made",
         "  g = fit(image_size=128)           # same recipe, new size, same fold",
         "  print(g.val, 'vs', f.val)         # like for like: both scored on VAL_IDX",
+        # Never indented by two spaces: the contract test reads the indented blocks as the
+        # runnable cells, and a third block would mean a third cell to keep working.
+        "fit(layers=[('conv', 32), ('pool',), ('linear', 256)]) trains that network from",
+        "zero; fit(head=[('linear', 512), ('dropout', 0.5)]) puts those layers where the",
+        "backbone's final layer was. Four names: conv, pool, dropout, linear.",
         "",
         "YOUR OWN MODEL, from any library research names:",
         "  import time, timm, torch",

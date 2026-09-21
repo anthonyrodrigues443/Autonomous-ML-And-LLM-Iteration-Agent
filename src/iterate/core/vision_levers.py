@@ -869,6 +869,19 @@ def ready(
                 "input size its pretrained_cfg names",
             )
         )
+    for key, stack in _found_in(findings):
+        if stack in _tried_values(history, key):
+            continue
+        what = "network" if key == "layers" else "head"
+        out.append(
+            Ready(
+                _ASK_LEVER[key],
+                f"a literature finding writes this {what} out, and the paper's abstract "
+                "states every number in it",
+                _stack_move(stack) if key == "layers" else _head_move(stack, recipe, "", False),
+                stack=stack,
+            )
+        )
     opened = {r.lever for r in asked}
     return [*led, *(r for r in out if r.lever not in closed and r.lever not in opened), *trailing]
 
@@ -882,6 +895,24 @@ def _stack_kind(spec: arch.Spec) -> tuple[str | None, str]:
     except arch.RecipeError as exc:
         return None, str(exc)
     return looks, ""
+
+
+def _found_in(findings: str) -> list[tuple[str, str]]:
+    """The stacks the research findings write out, as (recipe key, canonical text).
+
+    Strict form only, one line at a time, so a sentence about a network opens nothing and
+    two lines cannot be read as one stack. What reaches here has already passed the
+    researcher's check that the cited abstract states every number in it."""
+    out: list[tuple[str, str]] = []
+    for line in findings.splitlines():
+        spec = arch.found_strict(line)
+        key = _stack_kind(spec)[0] if spec is not None else None
+        if key is None:
+            continue
+        pair = (key, arch.text(spec, key))
+        if pair not in out:
+            out.append(pair)
+    return out
 
 
 def _backbone_named(text: str) -> str:
@@ -1175,14 +1206,21 @@ def _failed_recipe(exp: Experiment, carried: dict[str, Any]) -> dict[str, Any]:
     return {**recipe, key: value} if key else recipe
 
 
+# Recorded briefs show the model copies the ready line almost word for word, and a width
+# it retypes is a different value the gate then refuses. Added only when a stack is on the
+# line, so a run that opens no layer class sends the bytes it sent before the classes.
+_COPY_THE_STACK = " Copy a layer stack into the brief exactly as it is written here."
+
+
 def ready_line(items: Sequence[Ready]) -> str:
     if not items:
         return "Levers ready now: none; no lever's evidence fires on this run's numbers."
-    return (
+    line = (
         "Levers ready now: "
         + "; ".join(f"{r.lever}: {r.move} (because {r.reason})" for r in items)
         + "."
     )
+    return line + _COPY_THE_STACK if any(r.lever in LAYER_LEVERS for r in items) else line
 
 
 def ledger_line(history: Sequence[Experiment]) -> str:

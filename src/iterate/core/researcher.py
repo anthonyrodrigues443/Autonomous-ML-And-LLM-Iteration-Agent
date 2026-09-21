@@ -9,12 +9,14 @@ findings.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from iterate.adapters.research import ArxivClient, OpenAlexClient, search_all
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
+from iterate.targets import layers as arch
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -322,6 +324,9 @@ class Researcher:
             # specialist exists to rule out.
             if not technique or paper is None:
                 continue
+            if self._family == "vision" and not _stack_is_stated(technique, paper.abstract):
+                log.info("researcher: dropped a stack the abstract does not state (%s)", technique)
+                continue
             out.append(
                 Suggestion(technique=technique, rationale=rationale, citation=paper.identifier)
             )
@@ -375,6 +380,24 @@ class Researcher:
             if attempt == 0:
                 messages = [*messages, Message(role="user", content=_PROMPTS["retry_nudge"])]
         return None
+
+
+_NUMBER = re.compile(r"\d*\.\d+|\d+")
+
+
+def _stack_is_stated(technique: str, abstract: str) -> bool:
+    """Whether an image suggestion that writes a layer stack may become a finding: every
+    number in the stack has to appear in the abstract the suggestion cites.
+
+    A 12B copies the example it is shown, so a stack it invented would arrive with a real
+    paper pinned to it, and the lever ladder opens on findings. A suggestion that writes
+    no stack is not touched. Abstracts seldom list widths, so this drops more than it
+    keeps, which is the safe direction."""
+    spec = arch.found_strict(technique)
+    if spec is None:
+        return True
+    stated = {float(m.group()) for m in _NUMBER.finditer(abstract)}
+    return all(float(value) in stated for layer in spec for value in layer[1:])
 
 
 def _resolve(index: Any, papers: list[Paper]) -> Paper | None:

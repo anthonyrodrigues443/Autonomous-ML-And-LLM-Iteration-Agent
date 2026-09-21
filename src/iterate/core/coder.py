@@ -1248,6 +1248,11 @@ def _vision_messages(
         .replace("{predictions_csv}", codegen.PREDICTIONS_CSV)
         .replace("{preamble_output}", preamble_output)
     )
+    # Only the two layer classes: every other brief names a value fit() already takes by
+    # name, and the call is the one thing a stack in prose keeps losing on the way here.
+    call = vision_levers.brief_call(brief or "")
+    if call is not None:
+        user += "\n\n" + _PROMPTS["vision_brief_call"].replace("{call}", call)
     return [Message(role="system", content=system), Message(role="user", content=user)]
 
 

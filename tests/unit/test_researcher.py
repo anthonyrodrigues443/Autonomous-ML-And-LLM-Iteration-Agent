@@ -255,9 +255,11 @@ def test_a_prompt_run_is_asked_for_changes_to_the_prompt() -> None:
 
 
 # Digests of what main 6485be3 sends. Only a deliberate rewording of the table or
-# image pair may change them.
+# image pair may change them. The image digest was recomputed once, for the v0.6 hold's
+# PR E, which teaches the image pair to suggest a layer stack; the table digest is
+# untouched since 6485be3 and is the proof that rewording did not reach the table pair.
 _TABLE_CALL_ON_MAIN = "7a7976476f0f298724187c0fec556809dd2f53a63e902c1bd901ceebb9b254b2"
-_IMAGE_CALL_ON_MAIN = "4c6f808e1d025ce72dca66c2bc39ec55a59c60d1debce0f88a02c005d7e3d57c"
+_IMAGE_CALL_ON_MAIN = "a300345dc2b798eccb706d6f039a60718d3acb54258ee34a92366efd4dfa985b"
 
 
 @pytest.mark.parametrize(
@@ -342,3 +344,66 @@ def test_a_pre_v05_cache_file_is_still_readable(tmp_path: Path) -> None:
     )
 
     assert _Cache(tmp_path).get("arxiv", "legacy", 5) is not None
+
+
+# ─── an image suggestion may not invent a network (v0.6 hold, PR E) ──────────
+
+
+_STACK_PAPERS = [
+    Paper(
+        "A small CNN for land cover",
+        "doi:10.1000/stack",
+        "Our network is conv(32) pool conv(64) pool dropout(0.3) linear(256), trained from "
+        "scratch on 27000 tiles.",
+        2022,
+        40,
+        "openalex",
+    )
+]
+
+
+def _vision_suggestion(technique: str) -> list[Suggestion]:
+    llm = _FakeLLM([
+        _queries("q"),
+        _suggest({"technique": technique, "rationale": "r", "paper": 1}),
+    ])
+    researcher = Researcher(
+        llm,
+        metric="accuracy",
+        direction="maximize",
+        family="vision",
+        sources=[_FakeSource(list(_STACK_PAPERS))],
+    )
+    return researcher.research(profile="27000 images, 10 classes").suggestions
+
+
+@pytest.mark.parametrize(
+    ("technique", "kept"),
+    [
+        ("train conv(32) pool conv(64) pool dropout(0.3) linear(256) from zero", True),
+        # One width the abstract never states: the whole suggestion goes.
+        ("train conv(32) pool conv(128) pool dropout(0.3) linear(256) from zero", False),
+        ("a head of linear(512) dropout(0.5) on resnet50", False),
+        # No stack written out at all: this check does not touch it.
+        ("fine-tune timm efficientnet_b0 on all layers at 128 px", True),
+    ],
+)
+def test_an_image_stack_survives_only_when_the_abstract_states_every_number(
+    technique: str, kept: bool
+) -> None:
+    """The lever ladder opens a layer class on a finding, and a 12B copies the example it
+    is shown. A network it made up, with a real paper against it, is the failure to stop."""
+    assert [s.technique for s in _vision_suggestion(technique)] == ([technique] if kept else [])
+
+
+def test_a_table_run_is_never_checked_against_the_abstract() -> None:
+    """Image family only: "conv(32)" in a tabular technique is not a network this harness
+    would ever build, and the check must not quietly drop a table suggestion."""
+    llm = _FakeLLM([
+        _queries("q"),
+        _suggest({"technique": "conv(32) pool conv(999) linear(7)", "rationale": "r", "paper": 1}),
+    ])
+    findings = Researcher(
+        llm, metric="f1", direction="maximize", sources=[_FakeSource(list(_STACK_PAPERS))]
+    ).research(profile="p")
+    assert len(findings.suggestions) == 1
