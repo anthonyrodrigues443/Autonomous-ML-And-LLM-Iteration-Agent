@@ -8,6 +8,7 @@ of that contract, where a real session prints them.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -62,6 +63,10 @@ LIVE_BRIEF_OWN = (
     "layers, 3 epochs at 64 px, and score it with evaluate() (because a literature finding "
     "names efficientnet_b0)."
 )
+STACK = "conv(32) pool conv(64) pool dropout(0.3) linear(256)"
+HEAD = "linear(512) dropout(0.5)"
+# Tony's own words for the call this hold exists for: one backbone, one head, one depth.
+HEADLINE_ASK = "use resnet50 with a head of linear(512) dropout(0.5) and train the last block"
 
 
 def fit_cell(
@@ -179,6 +184,38 @@ def own_try(model: str = "efficientnet_b0", score: float = 0.9830) -> Experiment
     ]
     return experiment(
         cells, f"next: own-model: write torch code for {model}", score, carried=RECIPE
+    )
+
+
+def stack_try(
+    stack: str = STACK, score: float = 0.90, *, guidance: str | None = None
+) -> Experiment:
+    """A from-zero fit: `fit(layers=...)` names no backbone, so merge starts it from the
+    from-zero reference and the line carries the stack as its canonical text."""
+    recipe = {**BASELINE, "backbone": "layers_net", "layers": stack}
+    trains = [0.50 + 0.02 * i for i in range(int(BASELINE["epochs"]))]
+    cell, payload = fit_cell(recipe, trains, score, start=BASELINE)
+    exp = experiment(
+        [cell, submit_cell(payload)],
+        f"next: layer-stack: train a network from zero through fit(), with layers {stack}",
+        score,
+        carried=BASELINE,
+    )
+    if guidance is not None:
+        exp.candidate.changes["user_guidance"] = guidance
+    return exp
+
+
+def head_try(head: str = HEAD, score: float = 0.99) -> Experiment:
+    """The headline ask as one fit: a backbone, a head and the last block together."""
+    recipe = {**RECIPE, "backbone": "resnet50", "unfreeze": "last_block", "head": head}
+    cell, payload = fit_cell(recipe, [0.9, 0.95, 0.98], score, start=RECIPE)
+    return experiment(
+        [cell, submit_cell(payload)],
+        f"next: custom-head: fine-tune resnet50 through fit(), the last stage and the head "
+        f"(unfreeze last_block), 3 epochs, with head {head}",
+        score,
+        carried=RECIPE,
     )
 
 
@@ -661,6 +698,220 @@ def test_measured_lost_and_banked_read_the_clause_and_the_direction() -> None:
     assert vl.measured_lost(brief, [lost, best], best, "minimize")
     assert vl.measured_lost(brief, [lost, best], best, "maximize") is None
     assert vl.banked("next: epochs: keep the recipe and train 3 epochs", best)
+
+
+# ─── the two layer classes, and the user ask that opens them ─────────────────
+
+
+@pytest.mark.parametrize(
+    "ask",
+    [
+        "never build a network from scratch",
+        "don't use dropout 0.5",
+        "don't use dropout(0.5) on the head",
+        "don't use efficientnet_b0",
+        "no custom CNN this run",
+        f"stop trying {STACK}",
+        f"avoid a head like {HEAD}",
+    ],
+)
+def test_an_ask_that_says_no_opens_nothing(ask: str) -> None:
+    """The blocker a skeptic measured: word matching read "never build a network from
+    scratch" as a request for one, and put it first. A refusal anywhere shuts the lot."""
+    best = first_try()
+    assert [r.lever for r in ready_for([best], best, asks=ask)] == [
+        r.lever for r in ready_for([best], best)
+    ]
+
+
+@pytest.mark.parametrize(
+    "ask",
+    [
+        "try a CNN 5 layers deep",
+        "a CNN (2015) is what the paper used",
+        "go back to simple_cnn 64px",
+        "run a linear probe first",
+        "please aim for better accuracy",
+        "conv is fine but watch the budget",
+    ],
+)
+def test_prose_is_not_a_layer_stack(ask: str) -> None:
+    """Strict reading for an ask: prose that merely says the word must open nothing, or
+    the run trains a one-layer width-5 network and calls the ask spent."""
+    best = first_try()
+    items = ready_for([best], best, asks=ask)
+    assert not [r for r in items if r.lever in vl.LAYER_LEVERS]
+    assert vl.ask_note(ask) == ("", "")
+
+
+def test_an_ask_leads_the_line_only_when_the_user_wrote_the_stack() -> None:
+    """An ask with a stack is the user's own choice, so it leads and may become the
+    harness's brief. A vague ask only gets the example stack, which nobody chose: it
+    steers the model from the back of the line and never becomes the fallback."""
+    best = first_try()
+    wrote = ready_for([best], best, asks=f"please try {STACK}")
+    assert wrote[0].lever == "layer-stack"
+    assert wrote[0].stack == STACK
+    assert (vl.fallback_move(wrote) or ("", ""))[0] == "evidence: layer-stack"
+
+    vague = ready_for([best], best, asks="build a network from scratch")
+    assert vague[-1].lever == "layer-stack"
+    assert vague[0].lever != "layer-stack"
+    assert (vl.fallback_move(vague) or ("", ""))[0] != "evidence: layer-stack"
+
+
+def test_an_ask_buys_one_experiment_per_class_whatever_stack_ran() -> None:
+    """The ask is a fact, not a pin: once an experiment it steered has spent the class,
+    the run's own closed rule decides, even when the model ran a different stack."""
+    best = first_try()
+    ask = f"please try {STACK}"
+    other = stack_try("conv(64) pool conv(128) pool linear(256)", 0.90, guidance=ask)
+    assert "layer-stack" in [r.lever for r in ready_for([best], best, asks=ask)]
+    assert "layer-stack" not in [r.lever for r in ready_for([best, other], best, asks=ask)]
+
+
+def test_the_headline_ask_runs_as_one_experiment_and_the_gate_credits_the_head() -> None:
+    """resnet50 plus a head plus the last block is three classes, and a brief may name
+    one. So it is ONE custom-head entry that carries the backbone and the depth, and the
+    fit it asks for has to credit custom-head or the try lands unmeasured."""
+    best = first_try()
+    items = ready_for([best], best, asks=HEADLINE_ASK)
+    (entry,) = [r for r in items if r.lever in vl.LAYER_LEVERS]
+    assert entry.lever == "custom-head"
+    assert all(word in entry.move for word in ("resnet50", "last_block", HEAD))
+    assert vl.brief_call(f"next: custom-head: {entry.move} (because {entry.reason}).") == (
+        'fit(backbone=\'resnet50\', head=[("linear", 512), ("dropout", 0.5)], '
+        "unfreeze='last_block')"
+    )
+    ran = head_try()
+    assert "custom-head" in ran.candidate.changes["levers_moved"]
+
+
+def test_a_last_block_best_is_not_described_as_training_the_head_only() -> None:
+    """`unfreeze` gained a third value, and the reason read two ways before it."""
+    ran = head_try()
+    (depth,) = [r for r in ready_for([ran], ran) if r.lever == "fine-tune-depth"]
+    assert depth.reason == "the best trains the last stage and the head"
+
+
+def test_a_from_zero_fit_credits_the_stack_and_leaves_the_backbone_untouched() -> None:
+    assert stack_try().candidate.changes["levers_moved"] == ["layer-stack"]
+
+
+def test_two_losing_stack_tries_close_the_stack_and_leave_the_backbone_open() -> None:
+    best = first_try()
+    two = [stack_try(STACK, 0.90), stack_try("conv(64) pool conv(128) pool linear(256)", 0.91)]
+    levers = [r.lever for r in ready_for([best, *two], best)]
+    assert "layer-stack" not in levers
+    assert "backbone" in levers
+
+
+@pytest.mark.parametrize("kind", ["out of memory", "a crash"])
+def test_the_repair_for_a_failed_stack_try_keeps_the_stack_and_nothing_else(kind: str) -> None:
+    """The carried best is the pretrained network, not the try that failed, so a repair
+    built from it would retrain a from-zero net for three epochs at its backbone."""
+    best = first_try()
+    error = (
+        "out of memory on mps at batch_size=64, image_size=64: halve one of them"
+        if kind == "out of memory"
+        else "RuntimeError: Given groups=1, expected input to have 3 channels"
+    )
+    failed = experiment(
+        [{"code": "f = fit(layers=[...])", "stdout": "", "source": "agent", "error": error}],
+        f"next: layer-stack: train a network from zero through fit(), with layers {STACK}",
+        None,
+        carried=RECIPE,
+        error="no predictions were written",
+    )
+    (repair,) = ready_for([best, failed], best)[:1]
+    assert repair.lever == "layer-stack"
+    assert "epochs=" not in repair.move
+    assert "backbone=" not in repair.move
+    assert repair.stack == STACK
+    if kind == "out of memory":
+        assert "add a pool after the first conv" in repair.move
+
+
+def test_every_layer_entry_the_ready_line_can_emit_names_a_stack_the_guard_accepts() -> None:
+    """A brief copied from an entry has to clear the stack guard, or the harness refuses
+    its own line and the entry stays untried and reopens for ever."""
+    best = first_try()
+    failed = experiment(
+        [{"code": "f = fit(head=[...])", "stdout": "", "source": "agent", "error": "boom"}],
+        f"next: custom-head: keep the recipe and set head to {HEAD}",
+        None,
+        carried=RECIPE,
+        error="no predictions were written",
+    )
+    cases = [
+        ("a written stack", [best], best, {"asks": f"please try {STACK}"}),
+        ("a vague from-zero ask", [best], best, {"asks": "build a network from scratch"}),
+        ("a written head", [best], best, {"asks": HEADLINE_ASK}),
+        ("a vague head ask", [best], best, {"asks": "give it a bigger head"}),
+        ("a failed head try", [best, failed], best, {}),
+    ]
+    seen = 0
+    for label, history, carried, kw in cases:
+        items = ready_for(history, carried, **kw)
+        layer = [r for r in items if r.lever in vl.LAYER_LEVERS]
+        assert layer, f"{label} opens no layer lever"
+        for entry in layer:
+            seen += 1
+            brief = f"next: {entry.lever}: {entry.move} (because {entry.reason})."
+            assert vl.classes_named(brief)[:1] == [entry.lever], f"{label}: {brief}"
+            assert vl.missing_value(brief) is None, f"{label}: {brief}"
+            opens = {r.stack for r in items if r.lever == entry.lever and r.stack}
+            assert vl.proposed_value(entry.lever, vl.change_clause(brief)) in opens, label
+    assert seen >= 5
+
+
+# What main 621987d writes for these histories with no ask and no stack anywhere. PR D
+# adds classes; it must not move a word of a run that never opens one.
+_LINES_ON_MAIN: dict[str, tuple[str, str]] = {
+    "experiment 1": (
+        "Levers ready now: backbone: fine-tune resnet18 through fit(), all layers, 3 epochs, at "
+        "the session image size (because no pretrained model has scored this run); own-model: "
+        "write torch code for efficientnet_b0 with pretrained weights, all layers, at the input "
+        "size its pretrained_cfg names (because a literature finding names efficientnet_b0 and "
+        "vit_base_patch16_224).",
+        "Levers tried: none | Levers NOT yet tried: backbone, own-model, image-size, epochs, "
+        "augmentation, regularisation, fine-tune-depth",
+    ),
+    "a fine-tune carried": (
+        "Levers ready now: backbone: keep the recipe and swap the backbone to convnext_tiny "
+        "(because resnet18 took 12s an epoch, so convnext_tiny fits the budget at about 126s); "
+        "image-size: keep the best and train at 128 px (because a pretrained network sees more "
+        "detail above 64 px, and 128 px fits the budget at about 144s); own-model: write torch "
+        "code for efficientnet_b0 with pretrained weights, all layers, at the input size its "
+        "pretrained_cfg names (because a literature finding names efficientnet_b0 and "
+        "vit_base_patch16_224).",
+        "Levers tried: backbone | Levers NOT yet tried: own-model, image-size, epochs, "
+        "augmentation, regularisation, fine-tune-depth",
+    ),
+    "an own-code best": (
+        "Levers ready now: image-size: keep the best and train at 128 px (because a pretrained "
+        "network sees more detail above 64 px, and 128 px fits the budget at about 360s); "
+        "epochs: keep that code and train 6 epochs (because your own efficientnet_b0 trained "
+        "only 3 epochs in 90s); own-model: write torch code for vit_base_patch16_224 with "
+        "pretrained weights, all layers, at the input size its pretrained_cfg names (because a "
+        "literature finding names vit_base_patch16_224).",
+        "Levers tried: own-model | Levers NOT yet tried: backbone, image-size, epochs, "
+        "augmentation, regularisation, fine-tune-depth",
+    ),
+}
+
+
+@pytest.mark.parametrize("label", sorted(_LINES_ON_MAIN))
+def test_a_run_that_opens_no_layer_class_reads_exactly_as_main_read_it(label: str) -> None:
+    best, own = first_try(), own_try()
+    histories: dict[str, tuple[list[Experiment], Experiment | None, dict[str, Any]]] = {
+        "experiment 1": ([], None, {"findings": FINDINGS}),
+        "a fine-tune carried": ([best], best, {"findings": FINDINGS, "median_width": 64}),
+        "an own-code best": ([own], own, {"findings": FINDINGS}),
+    }
+    history, carried, kw = histories[label]
+    items = ready_for(history, carried, **kw)
+    assert (vl.ready_line(items), vl.ledger_line(history)) == _LINES_ON_MAIN[label]
 
 
 # ─── the supervisor ──────────────────────────────────────────────────────────
@@ -1281,3 +1532,178 @@ def test_two_iterations_through_the_real_supervisor_read_each_other() -> None:
     assert "Levers tried: backbone" in second
     assert "convnext_tiny" in second  # the ready line read iteration 1's seconds per epoch
     assert len(client.seen) == 2  # neither brief was nudged
+
+
+# ─── the ask, through the supervisor ─────────────────────────────────────────
+
+
+# The sha256 of every message main 621987d sends for this image call. An ask is the only
+# new thing on the wire, so a run with no guidance must send exactly these bytes.
+_IMAGE_CALL_ON_MAIN = "81da841bb08767d2e5f69f9699138f84bcef9aff4f7e020ce04a7c7e582ee312"
+_SWAP_BRIEF = (
+    "next: backbone: keep the recipe and swap the backbone to convnext_tiny (because resnet18 "
+    "took 12s an epoch, so convnext_tiny fits the budget at about 126s)"
+)
+
+
+def test_with_no_guidance_the_image_call_is_the_one_main_sent() -> None:
+    best = first_try()
+    client = Scripted(_SWAP_BRIEF)
+    vision_supervisor(client).decide(
+        data_summary="Images: 10",
+        baseline=baseline_result(),
+        history=[best],
+        carried_best=best,
+    )
+    sent = "\n".join(m.content for m in client.seen[0][0])
+    assert hashlib.sha256(sent.encode()).hexdigest() == _IMAGE_CALL_ON_MAIN
+
+
+def test_a_standing_rule_reaches_the_model_but_never_opens_a_lever() -> None:
+    """A rule comes in the shape "never use lightgbm", and it holds for every remaining
+    experiment. Read as a fact, a rule would open the lever it bans, for ever."""
+    best = first_try()
+    rule = f"always build a network from zero with {STACK}"
+    client = Scripted(_SWAP_BRIEF)
+    vision_supervisor(client).decide(
+        data_summary="Images: 10",
+        baseline=baseline_result(),
+        history=[best],
+        carried_best=best,
+        standing_rules=(rule,),
+    )
+    messages = client.seen[0][0]
+    assert "layer-stack" not in messages[1].content
+    assert rule in messages[-1].content
+
+
+def test_a_typed_ask_opens_the_class_and_the_line_says_so() -> None:
+    best = first_try()
+    client = Scripted(f"next: layer-stack: train a network from zero through fit(), layers {STACK}")
+    decision = vision_supervisor(client).decide(
+        data_summary="Images: 10",
+        baseline=baseline_result(),
+        history=[best],
+        carried_best=best,
+        user_guidance=f"please try {STACK}",
+    )
+    assert "layer-stack: train a network from zero" in client.seen[0][0][1].content
+    assert len(client.seen) == 1  # the brief cleared every guard first time
+    assert vl.lever_class(decision.brief) == "layer-stack"
+
+
+def test_a_layer_brief_is_refused_even_when_the_ready_line_is_empty() -> None:
+    """Any valid stack clears every other guard, so with nothing ready the run would
+    train a network no fact opened. The empty line is exactly when that bites."""
+    probe_cell, probe_payload = fit_cell(
+        {**RECIPE, "unfreeze": "all", "epochs": 12}, [0.99] * 12, 0.99, secs=200, start=BENCH
+    )
+    best = experiment(
+        [probe_cell, submit_cell(probe_payload)],
+        "next: backbone: fine-tune resnet18",
+        0.99,
+        carried=BASELINE,
+    )
+    assert not ready_for([best], best)
+    brief = f"next: layer-stack: train a network from zero through fit(), with layers {STACK}"
+    client = Scripted(brief, brief)
+    vision_supervisor(client).decide(
+        data_summary="Images: 10",
+        baseline=baseline_result(),
+        history=[best],
+        carried_best=best,
+    )
+    assert "opens layer-stack" in client.seen[1][0][-1].content
+
+
+def test_a_mis_copied_stack_is_refused_so_the_entry_cannot_reopen_for_ever() -> None:
+    best = first_try()
+    ask = f"please try {STACK}"
+    wrong = "next: layer-stack: train a network from zero through fit(), layers conv(8) linear(8)"
+    client = Scripted(wrong, f"next: layer-stack: train from zero with layers {STACK}")
+    decision = vision_supervisor(client).decide(
+        data_summary="Images: 10",
+        baseline=baseline_result(),
+        history=[best],
+        carried_best=best,
+        user_guidance=ask,
+    )
+    assert "copy one of them exactly" in client.seen[1][0][-1].content
+    assert vl.proposed_value("layer-stack", vl.change_clause(decision.brief)) == STACK
+
+
+def test_a_table_run_and_a_prompt_run_never_ask_what_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lever ladder is the image family's. A table or prompt run calling it would
+    read an image recipe out of a tabular experiment."""
+
+    def boom(*_: Any, **__: Any) -> list[vl.Ready]:
+        raise AssertionError("ready() is the image family's")
+
+    monkeypatch.setattr(vl, "ready", boom)
+    for family in ("tabular", "prompt"):
+        client = Scripted("next: model-family: try a gradient boosting model")
+        sup.Supervisor(client, metric="f1", family=family).decide(
+            data_summary="120 rows", baseline=baseline_result(), history=[]
+        )
+
+
+def test_an_image_run_reads_a_typed_ask_and_a_table_run_leaves_the_note_alone() -> None:
+    """The reader is the image family's: it stores a canonical stack in front of the
+    note, which a tabular note has no use for and a tabular brief cannot spend."""
+    from iterate.core.agent_loop import run_supervised
+    from iterate.core.coder import Cell, CodingResult
+    from iterate.core.interactive import RunController
+    from iterate.core.memory import InMemoryMemory
+    from iterate.core.supervisor import SupervisorDecision
+    from iterate.core.terminator import MaxIterations
+
+    def scored(score: float) -> ExperimentResult:
+        return ExperimentResult(
+            experiment_id="x",
+            metrics=Metrics(
+                values={"accuracy": score}, primary="accuracy", direction="maximize", n_samples=100
+            ),
+        )
+
+    class Target:
+        name = "vision-model"
+
+        def baseline(self) -> ExperimentResult:
+            return scored(0.9496).model_copy(
+                update={"artifacts": {"recipe.json": json.dumps(BASELINE)}}
+            )
+
+        def meta_json(self) -> bytes:
+            return json.dumps({"image_size": 64}).encode()
+
+    class Supervisor:
+        def decide(self, **kw: Any) -> SupervisorDecision:
+            return SupervisorDecision(
+                False, "t", "next: backbone: fine-tune resnet18 through fit()"
+            )
+
+    class Coder:
+        def run(self, **kw: Any) -> CodingResult:
+            cell, payload = fit_cell(RECIPE, [0.9, 0.95, 0.98], 0.97, start=BENCH)
+            cells = [
+                Cell(c["code"], c["stdout"], "", None, "agent")
+                for c in [cell, submit_cell(payload)]
+            ]
+            return CodingResult(result=scored(0.97), cells=cells, predictions_sha256="x")
+
+    for family, reads in (("vision", True), ("tabular", False)):
+        ctrl = RunController()
+        run_supervised(
+            target=Target(),
+            dataset=object(),  # type: ignore[arg-type]
+            supervisor=Supervisor(),  # type: ignore[arg-type]
+            make_coder=Coder,  # type: ignore[arg-type]
+            terminator=MaxIterations(1),
+            memory=InMemoryMemory(),
+            data_summary="d",
+            family=family,
+            controller=ctrl,
+        )
+        assert (ctrl.note_reader is vl.ask_note) is reads

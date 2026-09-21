@@ -149,6 +149,10 @@ def run_supervised(
             )
 
         controller.snapshot = _snapshot
+        if vision is not None:
+            # Image runs only: the two layer classes open on what the user typed, and
+            # the note has to carry the stack the harness read out of it.
+            controller.note_reader = vl.ask_note
 
     try:
         while True:

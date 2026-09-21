@@ -163,7 +163,11 @@ class Supervisor:
         ``standing_rules`` (instructions that hold for every remaining experiment)
         enter as ONE lean appended message; the guards below judge the decision
         AFTER the model has read them, so guidance can steer a brief but can never
-        re-commission banked work or bypass a gate.
+        re-commission banked work. On an image run the steer is ALSO a recorded fact
+        the lever ladder reads: it can add an entry, with its words as the reason, and
+        every guard then runs on that entry like any other. A standing rule is not
+        passed, because "never build from scratch" is a ban and reading it as a fact
+        would open the lever it forbids.
 
         ``this_run`` is the experiments of THIS run alone. Every image run shares one
         target name, so ``history`` can hold a previous run's rows; a lever is opened
@@ -179,6 +183,7 @@ class Supervisor:
                 task=self._task,
                 direction=direction(self._metric),
                 findings=known_findings or research,
+                asks=user_guidance or "",
                 median_width=self._image_width,
                 default_size=self._image_size,
             )
@@ -742,12 +747,30 @@ def _vision_violation(
             _PROMPTS["vision_dead_lever_nudge"].format(ready=ready_text),
             seen,
         )
-    if ready and lever not in {r.lever for r in ready}:
+    entries = [r for r in ready if r.lever == lever]
+    # A layer class is refused even when nothing is ready at all: any stack passes every
+    # other guard, so with an empty line the run would train a network nothing opened.
+    if not entries and (ready or lever in vl.LAYER_LEVERS):
         return (
             f"lever not ready — {lever}",
             _PROMPTS["vision_not_ready_nudge"].format(lever=lever, ready=ready_text),
             seen,
         )
+    # A mis-copied stack is not the one the entry's fact opened, and it would leave that
+    # entry untried and reopening for ever. Entries that name no stack are the repairs of
+    # a try whose own brief named none: there is nothing there to copy.
+    if lever in vl.LAYER_LEVERS and (opens := sorted({r.stack for r in entries if r.stack})):
+        stack = vl.proposed_value(lever, vl.change_clause(decision.brief))
+        if stack not in opens:
+            reason = (
+                f"the {lever} move trains {stack}, and the line opens "
+                f"{' or '.join(opens)}; copy one of them exactly"
+            )
+            return (
+                f"stack not the entry's — {lever}",
+                _PROMPTS["vision_no_value_nudge"].format(reason=reason, ready=ready_text),
+                seen,
+            )
     if spent := vl.banked(decision.brief, carried) or vl.measured_lost(
         decision.brief, history, carried, direction(metric)
     ):

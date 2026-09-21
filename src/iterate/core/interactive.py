@@ -77,6 +77,11 @@ class RunController:
         # incrementally, so nothing already earned is lost). When absent (tests,
         # or no front end bound yet), stop degrades to the graceful wind-down.
         self.on_stop_now: Callable[[], None] | None = None
+        # Bound by the loop on an IMAGE run only: reads a typed ask before the clip
+        # below shortens it, and returns (what to store in front of the note, one
+        # line for the user). A clipped layer stack still parses, as a smaller
+        # network, so what the harness read has to travel with the note.
+        self.note_reader: Callable[[str], tuple[str, str]] | None = None
         # Live run snapshot, bound by the loop: returns a RunResult built from
         # whatever has FINISHED so far, callable at any instant — the hard quit
         # uses it to print the summary table even while a cell is mid-flight.
@@ -171,7 +176,19 @@ class RunController:
         self._session_notes.append(_clip(text))
 
     def add_brief_note(self, text: str) -> None:
-        self._brief_notes.append(_clip(text))
+        lead, said = self._read_note(text)
+        self._brief_notes.append(f"{lead}; {_clip(text)}" if lead else _clip(text))
+        if said:
+            self.reply(said)
+
+    def _read_note(self, text: str) -> tuple[str, str]:
+        if self.note_reader is None:
+            return "", ""
+        try:
+            return self.note_reader(text)
+        except Exception:  # reading a steer degrades, it never crashes the run
+            log.warning("interactive: note_reader failed; storing the note as typed", exc_info=True)
+            return "", ""
 
     def add_rule(self, text: str) -> None:
         clipped = _clip(text, _RULE_CHARS)
