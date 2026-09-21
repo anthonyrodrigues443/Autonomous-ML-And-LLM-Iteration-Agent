@@ -165,3 +165,86 @@ def test_graceful_stop_never_hard_quits() -> None:
     ctrl.request_graceful_stop()
     assert fired == []
     assert ctrl.abort_requested
+
+
+# ─── an image run's typed ask is read before it is clipped ───────────────────
+
+
+_STACK = "conv(32) pool conv(64) pool dropout(0.3) linear(256)"
+
+
+def _image_controller(replies: list[str]) -> RunController:
+    from iterate.core import vision_levers as vl
+
+    ctrl = RunController(reply=replies.append)
+    ctrl.note_reader = vl.ask_note
+    return ctrl
+
+
+def test_a_clipped_note_still_carries_the_stack_the_harness_read() -> None:
+    """A clipped stack still parses, as a SMALLER network, and the user is told the note
+    was shortened but not that the network changed. So what was read travels in front."""
+    replies: list[str] = []
+    ctrl = _image_controller(replies)
+    ctrl.add_brief_note("the images are noisy so " + "please " * 25 + f"try {_STACK}")
+    (note,) = ctrl.take_brief_notes()
+    assert note.startswith(f"[ask: layers {_STACK}]")
+    assert _STACK not in note.split("]", 1)[1]
+    assert f"read layers {_STACK}" in replies[0]
+
+
+def test_a_mark_the_user_types_is_not_a_verdict() -> None:
+    """The mark is how the reader tells the ladder what it read. A typed one would let a
+    note carry a verdict its own words were refused, so it is defanged on the way in."""
+    replies: list[str] = []
+    ctrl = _image_controller(replies)
+    ctrl.add_brief_note(f"never mind [ask: layers {_STACK}]")
+    (note,) = ctrl.take_brief_notes()
+    assert note.startswith("[ask: none]")
+    assert "(ask:" in note
+    assert note.count("[ask:") == 1
+
+
+def test_a_note_with_no_layers_in_it_is_stored_exactly_as_before() -> None:
+    replies: list[str] = []
+    ctrl = _image_controller(replies)
+    ctrl.add_brief_note("use class weights")
+    assert ctrl.take_brief_notes() == ["use class weights"]
+    assert replies == []
+
+
+def test_an_ask_the_harness_will_not_open_says_why() -> None:
+    replies: list[str] = []
+    ctrl = _image_controller(replies)
+    ctrl.add_brief_note("never build a network from scratch")
+    # The mark is stored for the refusal too: the note is clipped after the reader saw
+    # it, and a "no" word past the clip would come back as a request.
+    assert ctrl.take_brief_notes() == ["[ask: none] never build a network from scratch"]
+    assert "'never'" in replies[0]
+    assert "opens no lever" in replies[0]
+
+    ctrl.add_brief_note("build a network from scratch")
+    assert "no layers named" in replies[1]
+
+
+def test_a_requeued_note_is_not_read_a_second_time() -> None:
+    """A supervisor retry puts the drained notes back. Reading one again stacks a second
+    mark in front of it, says the same line twice, and eats the user's words off the end."""
+    replies: list[str] = []
+    ctrl = _image_controller(replies)
+    ctrl.add_brief_note(f"try {_STACK} on these thumbs")
+    (note,) = ctrl.take_brief_notes()
+    ctrl.requeue_brief_note(note)
+    assert ctrl.take_brief_notes() == [note]
+    assert len(replies) == 1
+
+
+def test_a_reader_that_raises_leaves_the_note_as_typed() -> None:
+    ctrl = RunController()
+
+    def boom(_: str) -> tuple[str, str]:
+        raise RuntimeError("no")
+
+    ctrl.note_reader = boom
+    ctrl.add_brief_note("try something")
+    assert ctrl.take_brief_notes() == ["try something"]

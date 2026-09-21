@@ -163,7 +163,11 @@ class Supervisor:
         ``standing_rules`` (instructions that hold for every remaining experiment)
         enter as ONE lean appended message; the guards below judge the decision
         AFTER the model has read them, so guidance can steer a brief but can never
-        re-commission banked work or bypass a gate.
+        re-commission banked work. On an image run the steer is ALSO a recorded fact
+        the lever ladder reads: it can add an entry, with its words as the reason, and
+        every guard then runs on that entry like any other. A standing rule is not
+        passed, because "never build from scratch" is a ban and reading it as a fact
+        would open the lever it forbids.
 
         ``this_run`` is the experiments of THIS run alone. Every image run shares one
         target name, so ``history`` can hold a previous run's rows; a lever is opened
@@ -179,6 +183,7 @@ class Supervisor:
                 task=self._task,
                 direction=direction(self._metric),
                 findings=known_findings or research,
+                asks=user_guidance or "",
                 median_width=self._image_width,
                 default_size=self._image_size,
             )
@@ -344,6 +349,14 @@ class Supervisor:
                         decision = SupervisorDecision(stop=False, title=title, brief=move)
                     elif not seen_or_last:
                         log.info("supervisor: rejected a %s", reason)
+                        messages.append(Message(role="user", content=nudge))
+                        continue
+                    elif vision and (refused := _layer_stack_refused(decision.brief, ready)):
+                        # The layer classes are the two that train an arbitrary network,
+                        # so a persisted layer brief is never accepted: the attempts run
+                        # out into a proposer failure and the next iteration researches.
+                        detail = f"layer brief refused: {refused}"
+                        log.info("supervisor: %s persisted; %s", reason, detail)
                         messages.append(Message(role="user", content=nudge))
                         continue
                     elif vision:
@@ -698,6 +711,26 @@ def _vision_so_far(metric: str, baseline_score: float, carried: Experiment | Non
     )
 
 
+def _layer_stack_refused(brief: str, ready: Sequence[vl.Ready]) -> str:
+    """Why a layer brief may not run: the two layer classes train whatever network the
+    move names, so the stack has to be one an entry on the line opened. A class with no
+    entry, and an entry that carries no stack, are both "nothing to copy" — the guard
+    stays on, or the run trains a network no fact and no ask chose."""
+    lever = vl.lever_class(brief)
+    if lever is None or lever not in vl.LAYER_LEVERS:
+        return ""
+    opens = sorted({r.stack for r in ready if r.lever == lever and r.stack})
+    if not opens:
+        return f"no fact on the line names a stack for {lever}"
+    stack = vl.proposed_value(lever, vl.change_clause(brief))
+    if stack not in opens:
+        return (
+            f"the {lever} move trains {stack}, and the line opens "
+            f"{' or '.join(opens)}; copy one of them exactly"
+        )
+    return ""
+
+
 def _vision_violation(
     decision: SupervisorDecision,
     history: Sequence[Experiment],
@@ -742,10 +775,19 @@ def _vision_violation(
             _PROMPTS["vision_dead_lever_nudge"].format(ready=ready_text),
             seen,
         )
-    if ready and lever not in {r.lever for r in ready}:
+    entries = [r for r in ready if r.lever == lever]
+    # A layer class is refused even when nothing is ready at all: any stack passes every
+    # other guard, so with an empty line the run would train a network nothing opened.
+    if not entries and (ready or lever in vl.LAYER_LEVERS):
         return (
             f"lever not ready — {lever}",
             _PROMPTS["vision_not_ready_nudge"].format(lever=lever, ready=ready_text),
+            seen,
+        )
+    if wrong_stack := _layer_stack_refused(decision.brief, ready):
+        return (
+            f"stack not the entry's — {lever}",
+            _PROMPTS["vision_no_value_nudge"].format(reason=wrong_stack, ready=ready_text),
             seen,
         )
     if spent := vl.banked(decision.brief, carried) or vl.measured_lost(

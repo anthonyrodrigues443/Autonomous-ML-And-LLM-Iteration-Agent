@@ -209,11 +209,11 @@ def test_an_explicit_size_on_the_first_fine_tune_reads_as_a_move(
 
 def test_a_repair_line_is_a_fit_the_session_takes_back() -> None:
     """A repair hands the coder a `fit(...)` to run, so what it writes has to survive the
-    merge that fit does. It writes backbone, image_size and epochs only: a layers net's
-    line loses the stack and is refused, which is why no prompt key offers layers= yet.
-    The day `fit_call` learns the layer settings, this check goes red and says so."""
+    merge that fit does. A layers net's line carries the stack and nothing the from-zero
+    reference owns: the carried best is the tuned network, not the try that failed, so an
+    epochs= or a backbone= from it would retrain a from-zero network for three epochs."""
     from iterate.core.vision_session import merge
-    from iterate.targets.dl import BASELINE, Recipe, RecipeError
+    from iterate.targets.dl import BASELINE, LAYERS_NET, Recipe
 
     vl = _levers()
 
@@ -229,9 +229,9 @@ def test_a_repair_line_is_a_fit_the_session_takes_back() -> None:
     stack = Recipe(
         backbone="layers_net", unfreeze="all", epochs=20, image_size=64, layers="conv(32) pool"
     )
-    line = vl.fit_call(vars(stack), batch_size=32)
-    assert "layers=" not in line
-    # The carried best is not the try that failed, so the repair starts from the tuned
-    # network above and the stack is gone for good.
-    with pytest.raises(RecipeError, match="needs layers="):
-        refit(line, tuned)
+    line = vl.fit_call({"layers": stack.layers}, batch_size=32)
+    assert "epochs=" not in line
+    assert "backbone=" not in line
+    back = refit(line, tuned)
+    assert (back.backbone, back.layers, back.batch_size) == (LAYERS_NET, stack.layers, 32)
+    assert back.epochs == BASELINE.epochs
