@@ -137,7 +137,10 @@ class Recipe:
                 changes[name] = arch.parse(changes[name], name)
         for name, value in changes.items():
             if name in kinds and not _is_kind(value, kinds[name]):
-                raise RecipeError(f"{name} must be {kinds[name]}, got {value!r}")
+                # A wrong type on a choice field never reaches validate(), so without
+                # the list here the caller is told what is wrong and not what to write.
+                wanted = f"one of {list(_CHOICES[name])}" if name in _CHOICES else kinds[name]
+                raise RecipeError(f"{name} must be {wanted}, got {value!r}")
         recipe = cls(**{k: v for k, v in changes.items() if k in kinds})
         recipe.validate(task)
         return recipe
