@@ -228,6 +228,15 @@ def test_a_fine_tune_runs_through_the_runner_and_records_its_epochs(tmp_path: Pa
         ({"unfreeze": "all", "epochs": 3, "seed": -1}, "seed=-1 is outside"),
         ({"unfreeze": "all", "epochs": 3, "seed": 2**64}, "is outside 0 to"),
         ({"backbone": "efficientnet_b0"}, "backbone must be one of"),
+        # A wrong TYPE on a choice field is refused before validate() runs, so the
+        # message has to carry the values: a 12B that is only told "must be str"
+        # guesses again. Seen looping in the 2026-09-21 certification run.
+        ({"augment": True}, "augment must be one of ['none', 'flip', 'flip_crop'], got True"),
+        ({"unfreeze": True}, "unfreeze must be one of ['none', 'head', 'last_block', 'all']"),
+        ({"backbone": 3}, "backbone must be one of ['resnet18'"),
+        ({"optimizer": 1}, "optimizer must be one of ['adamw', 'sgd'], got 1"),
+        ({"schedule": False}, "schedule must be one of ['onecycle', 'cosine', 'constant']"),
+        ({"head_init": 0}, "head_init must be one of ['random', 'probe'], got 0"),
         ({"unfreeze": "all", "epochs": 0}, "the probe takes 0 epochs"),
         ({"unfreeze": "all", "epochs": 3, "image_size": 16}, "image_size=16 is outside"),
         ({"code": "def train_and_predict(): ..."}, "unknown recipe keys ['code']"),
