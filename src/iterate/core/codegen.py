@@ -239,10 +239,12 @@ def prompt_session_preamble() -> str:
         # BASEL_PROMPT / BASELINES_PROMPT. The name is long and a 12B fumbles it; a
         # short alias costs one line and removes a recurring wasted turn.
         "BASE = BASELINE_PROMPT\n"
-        "def ask(prompt, rows):\n"
+        "def _ask_with_stats(prompt, rows):\n"
         "    frame = rows.to_dict(orient='records') if hasattr(rows, 'to_dict') else list(rows)\n"
         "    stats = AskStats()\n"
-        "    out = _ask(prompt, frame, stats=stats)\n"
+        "    return _ask(prompt, frame, stats=stats), stats\n"
+        "def ask(prompt, rows):\n"
+        "    out, stats = _ask_with_stats(prompt, rows)\n"
         "    print('ask:', stats.summary())\n"
         "    return out\n"
         "def evaluate(answers, truth):\n"
@@ -258,14 +260,21 @@ def prompt_session_preamble() -> str:
         "[str(a) for a in answers], include=(_metric,), open_vocabulary=True)\n"
         "    return values[_metric]\n"
         "def submit(prompt):\n"
-        "    answers = ask(prompt, X_holdout)\n"
+        "    answers, _stats = _ask_with_stats(prompt, X_holdout)\n"
+        "    print('ask:', _stats.summary())\n"
         f"    pd.Series(answers).to_csv({PREDICTIONS_CSV!r}, index=False, header=False)\n"
         # Fingerprint of what the model answered, so the host can detect a later
         # cell overwriting predictions.csv while prompt.json still sits there.
         "    import hashlib as _hl\n"
         "    _digest = _hl.sha256(chr(10).join(str(a) for a in answers).encode()).hexdigest()\n"
+        # The tokens the model under test spent per record, kept for the serving price.
+        # Cached answers cost no tokens, so only the records that were really asked count.
+        "    _n = _stats.calls\n"
+        "    _tokens = {'tokens_in_per_record': _stats.prompt_tokens / _n if _n else None,\n"
+        "               'tokens_out_per_record': _stats.completion_tokens / _n if _n else None,\n"
+        "               'records_measured': _n}\n"
         f"    with open({PROMPT_JSON!r}, 'w') as _f:\n"
-        "        json.dump({**prompt.as_dict(), 'answers_sha256': _digest}, _f)\n"
+        "        json.dump({**prompt.as_dict(), 'answers_sha256': _digest, **_tokens}, _f)\n"
         "    print('submitted', len(answers), 'answers for the holdout')\n"
         "    return answers\n"
         "def finish(*args, **kwargs):\n"

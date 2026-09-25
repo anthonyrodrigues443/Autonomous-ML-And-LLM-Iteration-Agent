@@ -226,3 +226,23 @@ def test_no_final_score_means_no_misleading_headline() -> None:
 
     assert "best_score_on_full_holdout" not in document
     assert "note" not in document
+
+
+def test_the_serving_profile_sits_above_the_versions() -> None:
+    serving = {"requests_per_hour": 1000, "chosen": None, "by_cloud": [],
+               "usd_per_1k_requests": None, "prices_as_of": "2026-09-25",
+               "unpriced_because": "no public price for m on groq", "basis": []}
+    text = prompt_record.build(
+        task="t",
+        metric="accuracy",
+        direction="maximize",
+        model_under_test="m",
+        baseline_prompt=BASELINE,
+        baseline_score=0.5,
+        history=[],
+        serving=serving,
+    )
+    document = yaml.safe_load(text)
+
+    assert document["serving"] == serving
+    assert list(document).index("serving") < list(document).index("versions")

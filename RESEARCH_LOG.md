@@ -304,3 +304,39 @@ The CNN beats the mean by 13.4 knots, 95% interval 10.9 to 15.8, and the fine-tu
 **How I'll verify it works:** the prepare script rebuilt the measured subset offline with the manifest pin matching and both CSVs byte-identical; the ceiling sweep's baseline row reproduced the pre-build measurement to the fourth decimal, 13.1203.
 
 **Out of scope today:** SKIPP'D as a second number-label example; stacks of past frames, which is how the competition winners won; a per-group error bar inside the sweep, which cannot see storms: a formula that treats every frame as independent came out two to five times smaller than the storm-level one, depending on the row and the formula, so a number-label sweep stores none and the example's README carries the storm-level error bar instead.
+
+---
+
+## 2026-09-25 - Research: what a winner costs to serve (v0.7, Day 1)
+
+**Question:** v0.7's flagship is a serving budget: the best score you can afford to serve, never score per dollar. Before a wall can refuse anything, the harness needs a price it can stand behind for every winner a run can produce: a scikit-learn pipeline it never sees (only its predictions reach the host), a torch network it knows by recipe, and a prompt on a model it knows by name. What does each cost a month at a request rate, on the cheapest machine or API that can serve it, and which parts of that number are measured, published, or assumed?
+
+**Sources reviewed:**
+1. [AWS EC2 on-demand prices via Vantage](https://instances.vantage.sh/aws/ec2/t3.small), [GCP via gcloud-compute.com](https://gcloud-compute.com/e2-small.html) and [Azure's retail prices API](https://prices.azure.com/api/retail/prices) - on-demand Linux hourly prices for two CPU boxes and the T4, L4 and A10 GPU boxes per cloud, read 2026-09-25. The AWS and GCP official pages are script-rendered, so those rows are mirrors and say so; Azure's API needs no key and answered directly. [AWS's bulk price index](https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/index.json) needs no key either; [GCP's catalog](https://cloudbilling.googleapis.com/v1/services) needs one.
+2. [OpenAI pricing](https://developers.openai.com/api/docs/pricing), [Together serverless models](https://docs.together.ai/docs/serverless-models) and [DeepSeek pricing](https://api-docs.deepseek.com/quick_start/pricing) - per-million token prices for the models a prompt run can name today. Groq's self-serve Llama models were retired in August 2026 and its pricing page renders nothing, so a Groq target is unpriced. DeepSeek prices are peak and off-peak; the table stores peak and says so.
+3. [torchvision's classification table](https://docs.pytorch.org/vision/stable/models.html) - resnet18 11.7M weights and 1.81 GFLOPS, resnet50 25.6M and 4.09, convnext_tiny 28.6M and 4.46 at 224 px; the weights match the built networks on torchvision 0.29 to the parameter.
+4. [NVIDIA's ResNet-50 v1.5 PyTorch README](https://github.com/NVIDIA/DeepLearningExamples/blob/master/PyTorch/Classification/ConvNets/resnet50v1.5/README.md) - a T4 at batch 1, FP32 eager, 10.7 ms an image, the one published GPU number that matches the plain torch file this tool delivers. The L4 and A10 numbers in [MLPerf v3.1](https://raw.githubusercontent.com/mlcommons/inference_results_v3.1/main/closed/NVIDIA/results/L4x1_TRT/resnet50/SingleStream/performance/run_1/mlperf_log_summary.txt) and v1.1 are INT8 TensorRT at 0.35 and 0.47 ms, a different deployment, so those rows carry no rate.
+5. [Optimizing PyTorch inference on CPU](https://towardsdatascience.com/optimizing-pytorch-model-inference-on-cpu/) - resnet50 at 224 px, batch 1, FP32 eager on an AWS c7i.xlarge: about 44 ms. Not a vendor number, but the one absolute cloud-CPU figure found, and within 12% of the 49.8 ms measured here.
+6. [llama.cpp's benchmark thread](https://github.com/ggml-org/llama.cpp/discussions/15013) - a 7B model at 4-bit decodes at about 46 tokens a second on a T4 and 108 on an A10G, community-submitted. Kept for a later calibration, not used: the local-model capacity is not claimed.
+
+**Approaches considered:**
+- **Score per dollar:** fold cost into the objective. Rejected in May and again here: it prefers a cheaper worse model over an affordable better one. The objective stays the score; the cost is a wall, and this entry is only about the number the wall reads.
+- **Measure the winner's latency inside the run:** the kernel has the model. For tables it means a harness-owned `submit()` that changes the prompt contract a 12B has learned; for images the FIT line is what the 12B reads and every key added to it is a key it will try to pass to `fit()`; and a latency on the user's Mac still needs a mapping to a cloud box. Deferred: the facts the host already has price every family today.
+- **Publish throughput per box from vendor benchmarks:** only the T4 has a plain-PyTorch batch-1 number, and no cloud CPU has one. Multiply-adds alone under-predict small images by four times (resnet18 at 64 px measures 6.9 ms, multiply-adds say 1.8), because fixed overhead dominates. So the CPU rate is a measured table per backbone and size, taken as a 2-vCPU box, and a custom stack scales from resnet18's measured rate.
+- **A rate for every GPU row from the INT8 numbers:** would over-state capacity thirty-fold for the torch file a run delivers. Those rows price one box and say the capacity is not estimated.
+
+**Decision:** a dated snapshot ships in the package (`core/serving_prices.json`), every row with its source and the day it was read, and a pure-arithmetic Pricer (`core/serving.py`) turns the winner's facts into a profile with a basis line for every number. A month is 730 hours; the default rate is 1,000 requests an hour. An API model costs tokens times price per request, with the tokens per record measured by the prompt runtime on the holdout submit (the kernel writes them into `prompt.json`; when every answer came from the cache the prompt text stands in and the basis says so). A machine-hosted model takes the cheapest row whose memory fits the weights and whose capacity covers the rate, instances rounded up; a row with no rate prices one box. Measured on this Mac, batch 1, two threads, torch 2.14, for the CPU reference table:
+
+| backbone | 64 px | 128 px | 224 px |
+|---|---|---|---|
+| resnet18 | 6.9 ms | 11.1 ms | 26.3 ms |
+| resnet50 | 13.2 ms | 21.7 ms | 49.8 ms |
+| convnext_tiny | 166 ms | 265 ms | 527 ms |
+
+And for tables, the slowest single-row predict per estimator family over laptop_price, mobile_price, heart_risk and adult_income, scikit-learn 1.8.0, two threads: linear 2.9 ms, tree ensemble 12.2 ms, boosting 4.5 ms, nearest neighbours 3.2 ms, svm 2.9 ms, mlp 2.8 ms; doubled as the margin. The pipeline overhead dominates every family, since a batch of 100 rows costs 0.02 to 0.16 ms a row.
+
+**Smallest viable implementation:** the schema, the snapshot, the Pricer, the token capture in the prompt preamble, `--requests-per-hour`, and the `serving:` line and blocks. No budget, no refusal, no lever, no prompt change.
+
+**How I'll verify it works:** the arithmetic to the cent on a fake snapshot; the shipped snapshot parses, is dated, and every row is sourced; the backbone table equals the vision runner's; a priced block lands in `best.json` and `prompts.yaml` from the real CLI with a stubbed loop; the printed `ask:` line is byte-identical to before.
+
+**Out of scope today:** the wall and the price gate (Day 2); `iterate cost` (Day 3); a measured latency inside the run; a price refresh script; tokens a second for local models on cloud GPUs; quantization; sizes for the agent's own timm networks.

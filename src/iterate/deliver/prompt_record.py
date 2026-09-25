@@ -95,6 +95,7 @@ def build(
     baseline_score: float | None,
     history: Sequence[Experiment],
     final_score: dict[str, Any] | None = None,
+    serving: dict[str, Any] | None = None,
 ) -> str:
     """Render the whole record. Pure, so it is testable without a run.
 
@@ -102,7 +103,8 @@ def build(
     ended. The per-version scores come from the cheap slice every candidate was
     ranked on, which is the right basis for choosing between them and the wrong
     basis for quoting one. When it is present it leads the file, because it is the
-    only number here a user should put in a sentence.
+    only number here a user should put in a sentence. `serving` is the winner's
+    serving profile, what it costs a month to run at the request rate, with its basis.
     """
     entries: list[dict[str, Any]] = [
         {
@@ -149,6 +151,8 @@ def build(
             "ranked against. best_score_on_full_holdout above is the winner measured "
             "on the whole holdout and is the number to quote."
         )
+    if serving is not None:
+        document["serving"] = serving
     document["versions"] = entries
     body = str(yaml.safe_dump(document, sort_keys=False, allow_unicode=True, width=100))
     return "".join(f"# {line}\n" for line in _HEADER.splitlines()) + "\n" + body

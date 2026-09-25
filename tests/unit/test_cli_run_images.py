@@ -806,3 +806,35 @@ def test_only_the_notebook_that_gets_the_input_files_carries_the_setup_cell() ->
         journey = _sources(cli_module._render_experiment(exp, is_best=is_best, **common))
         assert not any("Setup (added by iterate" in source for source in journey), is_best
         assert not any(codegen.INCUMBENT_JSON in source for source in journey), is_best
+
+
+# ─── the winner leaves with its serving price (Sprint 5 Day 1) ───────────
+
+
+def test_a_recipe_winner_is_priced_in_the_sidecar_and_the_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _run_with_a_winner(
+        tmp_path, monkeypatch, network=b"weights", extra=("--requests-per-hour", "20000")
+    )
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    serving = json.loads(kept.with_name("best.json").read_text())["serving"]
+    assert serving["requests_per_hour"] == 20000
+    assert serving["chosen"]["host"]["kind"] == "cpu"
+    assert serving["basis"][0] == "resnet18 at 64 px"
+    assert serving["unpriced_because"] is None
+    assert "serving: about $" in _plain(result.output)
+
+
+def test_an_own_network_winner_is_not_priced_and_says_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    own = {"model": "hf_hub:timm/vit_base", "seconds": 12, "val": 0.9}
+    result, _ = _run_with_a_winner(tmp_path, monkeypatch, network=None, recipe=own)
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    serving = json.loads(kept.with_name("best.json").read_text())["serving"]
+    assert serving["chosen"] is None
+    assert "the agent's own network" in serving["unpriced_because"]
+    assert "serving: not priced:" in _plain(result.output)

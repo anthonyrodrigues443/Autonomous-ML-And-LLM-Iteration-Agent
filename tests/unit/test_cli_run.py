@@ -1126,3 +1126,57 @@ def test_an_e2b_run_leaves_saved_installs_alone(
     cli_module._install_saved_packages(install=True, compute="e2b")
     assert ran == []
     assert "installs" not in capsys.readouterr().out
+
+
+# ─── the winner leaves with its serving price (Sprint 5 Day 1) ───────────
+
+
+def test_a_spec_winner_gets_a_serving_block_in_the_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """best.json carries the winner's serving profile, and the summary prints it."""
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    out = tmp_path / "models" / "best_model.joblib"
+
+    _stub_run_orchestrator(monkeypatch, best_model="sklearn.linear_model.LogisticRegression")
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--spec",
+            "--memory",
+            str(tmp_path / "memory.db"),
+            "--output",
+            str(out),
+            "--requests-per-hour",
+            "5000",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    serving = json.loads(out.with_name("best.json").read_text())["serving"]
+    assert serving["requests_per_hour"] == 5000
+    assert serving["chosen"]["host"]["kind"] == "cpu"
+    assert serving["usd_per_1k_requests"] > 0
+    assert serving["basis"][0].startswith("linear pipeline (LogisticRegression)")
+    assert "serving: about $" in _plain(result.output)
+    assert "prices as of" in _plain(result.output)
+
+
+def test_requests_per_hour_must_be_at_least_one(tmp_path: Path) -> None:
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+
+    result = runner.invoke(
+        app,
+        ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
+         "--requests-per-hour", "0"],
+    )
+    assert result.exit_code != 0
+    assert "requests-per-hour" in (result.stderr or result.stdout)

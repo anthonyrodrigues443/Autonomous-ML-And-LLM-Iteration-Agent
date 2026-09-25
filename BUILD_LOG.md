@@ -374,23 +374,26 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 ---
 
-## Sprint 5: v0.7, cost-constrained serving. Mon 2026-08-17 to Sat 2026-08-22, release Sun 2026-08-23
+## Sprint 5: v0.7, cost-constrained serving. Sat 2026-09-26 to Sat 2026-10-03, release Sun 2026-10-04
 
-**Carried in from sprint 4 (moved 2026-09-16):** the twelve carry-ins listed under sprint 4, from small-slice-then-promote prompt scoring to the harness deciding to inspect. Their dates re-anchor with this sprint's at the v0.6 release.
+*(Re-dated 2026-09-25 at the Day 1 plan gate, the day after v0.6.0 shipped. The August dates below it were set before v0.5 waited on its certification run. A row is a calendar day and a day can carry several PRs. Tony's calls at the gate: the Claude API adapter stays in v1.0 with the benchmark; quantization moves to the backlog, since no full agent run has finished on CUDA; the price gate names the first entry on the ready line that fits, never the cheapest.)*
 
-**Not re-dated yet (2026-09-20):** the windows in this heading, in the sprint 6 and sprint 7 headings and in the phase and release tables above are the ones set before v0.5 waited on its certification run, and all of them are past. The v0.6 release PR changes none of them. The new dates are Tony's call.
+**Carried in from sprint 4 (moved 2026-09-16):** the twelve carry-ins listed under sprint 4, from small-slice-then-promote prompt scoring to the harness deciding to inspect. Carry-in 1 is the one with a public promise on it (the v0.5 and v0.6 posts) and is Day 4. Carry-ins 10 and 11 run on idle nights. The rest are the backlog behind the release.
 
-**Goal:** the flagship differentiator. Semantics locked long ago: score is the pure objective inside a hard serving-cost wall, never score-per-dollar; zero reward for being cheaper than the budget. Deliverable is a serving profile: best model within budget, cheapest cloud to host it, estimated $/month, requests/hour.
+**Goal:** the flagship differentiator. Semantics locked long ago: score is the pure objective inside a hard serving-cost wall, never score-per-dollar; zero reward for being cheaper than the budget. The cost is what it takes to SERVE the winner, the machine or the API, never what the driver spent finding it. Deliverable is a serving profile: best model within budget, cheapest cloud to host it, estimated $/month, requests/hour. The check is the Pricer, arithmetic over a dated price table, and its refusal is the price gate beside the lever gate.
 
 | Date | Focus | Lands | Done? |
 |---|---|---|---|
-| Mon Aug 17 | Pricing research (per-cloud instance pricing snapshots, refresh policy; model-size/quantization → feasibility mapping) + serving-cost model + serving-profile schema; RESEARCH_LOG entry | `core/serving.py` + tests + RESEARCH_LOG | |
-| Tue Aug 18 | Constraint wiring: `--serving-budget` makes infeasible candidates losers regardless of score (a feasible-region filter in the compare step, not a penalty term) | wiring + tests | |
-| Wed Aug 19 | `iterate cost` command: per-experiment + cumulative agent operating cost by compute and LLM backend (`ExperimentResult.cost_usd` aggregation); operating cost reported, never a constraint (infra-over-model stance) | CLI + tests | |
-| Thu Aug 20 | Quantization as a feasibility lever for DL winners (4050 if reachable; MPS/e2b fallback) | lever + tests | |
-| Fri Aug 21 | End-to-end demo: the same task with and without a budget produces different recommendations; validation | example + validation | |
-| Sat Aug 22 | Buffer + carried items if green | fixes | |
-| Sun Aug 23 | **Release v0.7.0** per the standing checklist; comparison-table cost rows flip to shipped; the parked cost-win post angle becomes honest here | v0.7.0 out | |
+| Sat Sep 26 | **Day 1: the winner comes with its serving price.** A dated price snapshot in the package (13 machines across AWS, GCP and Azure, the API models a prompt run can name, every row sourced), the Pricer, facts per family (a table by the classes on its winning cell, an image by its recipe through the layer grammar, a prompt by its model and the tokens it spent per record, which the kernel now keeps), `--requests-per-hour`, the `serving:` line after `best:` and the `serving` block in `best.json` and `prompts.yaml`. No budget, no refusal, no prompt change | `schemas/serving.py`, `core/serving.py`, `core/serving_prices.json`, codegen token keys, cli, tests, RESEARCH_LOG | built Fri Sep 25 evening, PR open |
+| Sun Sep 27 | **Day 2: the wall.** `--serving-budget` and `--cloud`; every candidate priced before it is briefed; over-budget findings listed but off the ready line; a brief naming one refused by the price gate, which names the first entry on the ready line, top down, that fits; refusals remembered on the run's history; a baseline over budget refused before the loop; one sentence in the supervisor prompt, probed on gemma4:12b | `core/serving.py`, `core/supervisor.py`, `core/vision_levers.py`, `core/ledger.py`, prompts.yaml, tests, a live check | |
+| Mon Sep 28 | **Day 3: `iterate cost`.** Every driver call's usage summed per role and per experiment, `cost_usd` filled from the same snapshot, the command reads a run's db; operating cost reported, never a constraint | `llm/`, `core/agent_loop.py`, `cli.py`, tests | |
+| Tue Sep 29 | **Day 4: cheaper prompt runs (carry-in 1).** Variants ranked on a 25-record slice, the survivor promoted to the full slice before submit; replayed on the recorded runs before it ships | `core/prompt_runtime.py`, `targets/prompt.py`, prompts.yaml, tests | |
+| Wed Sep 30 | **Day 5: the demo.** The same task with and without a budget gives two recommendations: a prompt run on a priced API target, an image run with a CPU-only budget, a table run | example, RESULTS, README | |
+| Thu Oct 1 | **Day 6: the fix round** from the live runs, plus the cheap v0.6.1 rows: the lost-try guard refusing a marker the best carries, the cheap-cell cap, the refused-run test that reads the working folder's `.env`, the three dev one-liners; the price refresh script if green | fixes, tests | |
+| Fri Oct 2 to Sat Oct 3 | **Day 7: the release gate.** Re-certification runs (laptop_price, tweet_irony, EuroSAT) on the final code, README "What v0.7 adds", LIMITATIONS sync, version bump, launch drafts | release PR | |
+| Sun Oct 4 | **Release v0.7.0** per the standing checklist; comparison-table cost rows flip to shipped; the parked cost-win post angle becomes honest here | v0.7.0 out | |
+
+**Cut order if a day runs short:** the `also:` line and the `prompts.yaml` block (Day 1); the researcher's budget sentence (Day 2); the refresh script (Day 6). **Backlog behind the release:** carry-ins 2 to 12, quantization, a measured latency inside the run, tokens a second for local models on cloud GPUs, sizes for the agent's own timm networks.
 
 ---
 

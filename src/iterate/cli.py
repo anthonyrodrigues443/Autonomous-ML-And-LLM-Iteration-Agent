@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult
     from iterate.schemas.link import LinkPlan
     from iterate.schemas.monitor import DataReport
+    from iterate.schemas.serving import ServingProfile
     from iterate.targets.model import ModelTarget
 
 app = typer.Typer(
@@ -738,6 +739,14 @@ def run(
         help="Archive the existing memory db and start a new chapter with the factory default baseline.",
     ),
     memory_path: Path | None = typer.Option(None, "--memory", help="Override the memory db path."),
+    requests_per_hour: int = typer.Option(
+        1000,
+        "--requests-per-hour",
+        min=1,
+        help="How many predictions an hour the winner will serve. Prices the winner at the "
+        "end of the run: the cheapest machine or API that serves that rate, and the "
+        "monthly cost, with where each number came from.",
+    ),
     output: Path | None = typer.Option(
         None,
         "--output",
@@ -1448,6 +1457,17 @@ def run(
     # A run that got an id but no finished experiment still leaves the checks behind.
     if prepared is not None and result.run_id:
         _copy_report(dataset, run_dir)
+    # What the winner costs to serve, priced once and shown in three places: the
+    # summary line, best.json, prompts.yaml.
+    serving_profile = _serving_profile(
+        result,
+        family="vision" if prepared is not None else "prompt" if is_prompt_run else "tabular",
+        n_features=len(dataset.features),
+        provider=target_backend or backend,
+        model_under_test=getattr(model_target, "model_under_test", None),
+        baseline_prompt=getattr(model_target, "baseline_prompt", None),
+        requests_per_hour=requests_per_hour,
+    )
     if is_prompt_run:
         # For a prompt run the artifact is the prompt, and a notebook cannot say
         # which of its cells held the winner. Written by the harness, never by the
@@ -1471,15 +1491,23 @@ def run(
                 else None
             ),
             history=result.history,
+            serving=serving_profile.model_dump() if serving_profile is not None else None,
         )
         console.print(f"[dim]prompts written to {record}[/dim]")
     elif result.best is not None and result.best.result is not None:
         if prepared is not None:
             kept = run_dir / saved_model.BEST_MODEL
-            _save_best_model(model_target, result, metric, output or kept, network=kept)
+            _save_best_model(
+                model_target,
+                result,
+                metric,
+                output or kept,
+                network=kept,
+                serving=serving_profile,
+            )
         else:
             out_path = output or (run_dir / "best_model.joblib")
-            _save_best_model(model_target, result, metric, out_path)
+            _save_best_model(model_target, result, metric, out_path, serving=serving_profile)
     elif prepared is not None and result.baseline.metrics is not None:
         console.print("\n[dim]no network was saved: no try beat the baseline[/dim]")
 
@@ -1497,7 +1525,7 @@ def run(
         )
 
     # ─── Summary ───────────────────────────────────────────────────────────
-    _render_summary(result, metric)
+    _render_summary(result, metric, serving=serving_profile)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -1881,6 +1909,54 @@ def _resolved_api_key_from_env(settings: object, backend: str) -> str | None:
     return api_key_for(backend, settings)
 
 
+def _serving_profile(
+    result: RunResult,
+    *,
+    family: str,
+    n_features: int,
+    provider: str,
+    model_under_test: str | None,
+    baseline_prompt: Any,
+    requests_per_hour: int,
+) -> ServingProfile | None:
+    """What the winner costs to serve, from the facts the run already has. None when
+    there is no winner. A pricing failure never costs the run its deliverables: it
+    prints one line and the profile is left out."""
+    from iterate.core import codegen, serving
+
+    best = result.best
+    if best is None or best.result is None:
+        return None
+    changes = best.candidate.changes
+    try:
+        if family == "vision":
+            recipe = changes.get("recipe")
+            facts = serving.facts_from_recipe(recipe if isinstance(recipe, dict) else {})
+        elif family == "prompt":
+            prompt_json = best.result.artifacts.get(codegen.PROMPT_JSON)
+            chars = 0
+            if baseline_prompt is not None:
+                chars = len(str(baseline_prompt.system)) + len(str(baseline_prompt.user_template))
+            facts = serving.facts_from_prompt(
+                prompt_json,
+                provider=provider,
+                model=model_under_test or "",
+                prompt_chars=chars,
+            )
+        else:
+            cells = changes.get("cells")
+            code = changes.get("code") or (
+                f"{changes['model'].rsplit('.', 1)[-1]}()" if changes.get("model") else ""
+            )
+            facts = serving.facts_from_code(
+                cells if isinstance(cells, list) else None, code, n_features=n_features
+            )
+        return serving.profile(facts, requests_per_hour, serving.load_prices())
+    except Exception as exc:
+        console.print(f"[dim]serving price not computed: {type(exc).__name__}: {exc}[/dim]")
+        return None
+
+
 def _candidate_model(candidate: Candidate) -> str:
     """A display string for a candidate's approach: the estimator name (spec path)
     or the description (code path, where there is no single estimator name)."""
@@ -1981,6 +2057,7 @@ def _save_best_model(
     path: Path,
     *,
     network: Path | None = None,
+    serving: ServingProfile | None = None,
 ) -> None:
     """Persist the winning approach + a sidecar best.json.
 
@@ -1988,7 +2065,8 @@ def _save_best_model(
     save the `train_and_predict` source (a code-gen winner returns predictions, not
     a pickled model — by design; see LIMITATIONS.md). The notebook deliverable
     (Day 6) turns that source into a runnable artifact. An image run passes `network`,
-    where the loop left the winner's file, and it is moved to `path`.
+    where the loop left the winner's file, and it is moved to `path`. `serving` is the
+    winner's serving profile, written into the sidecar beside the score.
     """
     best = result.best
     assert best is not None
@@ -2041,6 +2119,7 @@ def _save_best_model(
                 "metric": metric,
                 "score": score,
                 "artifact_path": str(artifact) if artifact else None,
+                "serving": serving.model_dump() if serving is not None else None,
             },
             indent=2,
         ),
@@ -2287,7 +2366,9 @@ def _write_notebooks(
         console.print(f"[bold]best notebook[/bold] → {run_dir / 'best.ipynb'}")
 
 
-def _render_summary(result: RunResult, metric: str) -> None:
+def _render_summary(
+    result: RunResult, metric: str, *, serving: ServingProfile | None = None
+) -> None:
     baseline_score = (
         result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
     )
@@ -2329,6 +2410,9 @@ def _render_summary(result: RunResult, metric: str) -> None:
             f"({metric}={result.best.result.metrics.primary_value:.4f}, "
             f"{improvement:+.4f} vs baseline)"
         )
+        if serving is not None:
+            for line in serving.render():
+                console.print(line, markup=False, highlight=False)
     else:
         console.print("[dim]no candidate beat the baseline.[/dim]")
 
