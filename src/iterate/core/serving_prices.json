@@ -78,7 +78,7 @@
       "resnet50_224_ms": 10.7,
       "source": "https://instances.vantage.sh/aws/ec2/g4dn.xlarge",
       "read_on": "2026-09-25",
-      "note": "one T4; the rate is NVIDIA's own ResNet-50 v1.5 PyTorch README, batch 1, FP32 eager, 10.7 ms (https://github.com/NVIDIA/DeepLearningExamples/blob/master/PyTorch/Classification/ConvNets/resnet50v1.5/README.md)"
+      "note": "one T4; the rate is NVIDIA's own ResNet-50 v1.5 PyTorch README, batch 1, FP32, 10.7 ms average latency (https://github.com/NVIDIA/DeepLearningExamples/blob/master/PyTorch/Classification/ConvNets/resnet50v1.5/README.md)"
     },
     {
       "cloud": "azure",

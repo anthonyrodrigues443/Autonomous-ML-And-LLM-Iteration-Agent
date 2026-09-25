@@ -109,6 +109,17 @@ class CpuReference(BaseModel):
     tabular_ms: dict[str, float]
     tabular_margin: float = Field(default=2.0, ge=1.0)
 
+    @model_validator(mode="after")
+    def _every_table_has_a_size(self) -> Self:
+        for backbone, table in self.backbone_ms.items():
+            if not table:
+                raise ValueError(f"{backbone} has no measured size")
+            if any(not size.isdigit() or ms <= 0 for size, ms in table.items()):
+                raise ValueError(f"{backbone} needs whole-number sizes and positive ms")
+        if any(ms <= 0 for ms in self.tabular_ms.values()):
+            raise ValueError("a table family needs a positive ms")
+        return self
+
 
 class Prices(BaseModel):
     """The dated snapshot: machines, API models, and the reference latencies."""
@@ -177,11 +188,19 @@ class ServingProfile(BaseModel):
             return [f"serving: not priced: {self.unpriced_because}"]
         chosen = self.chosen
         where = chosen.host.label + (f" x{chosen.instances}" if chosen.instances > 1 else "")
-        lines = [
-            f"serving: about ${chosen.usd_per_month:,.2f} a month at "
-            f"{self.requests_per_hour:,} requests an hour on {where}, "
-            f"prices as of {self.prices_as_of}"
-        ]
+        if chosen.capacity_per_hour is None and chosen.host.kind != "api":
+            # One box, and whether it keeps up with the rate is not claimed.
+            lines = [
+                f"serving: about ${chosen.usd_per_month:,.2f} a month for one {where} "
+                f"(whether it serves {self.requests_per_hour:,} requests an hour is not "
+                f"estimated), prices as of {self.prices_as_of}"
+            ]
+        else:
+            lines = [
+                f"serving: about ${chosen.usd_per_month:,.2f} a month at "
+                f"{self.requests_per_hour:,} requests an hour on {where}, "
+                f"prices as of {self.prices_as_of}"
+            ]
         lines.extend(f"  basis: {line}" for line in self.basis)
         others = [cost for cost in self.by_cloud if cost != chosen]
         if others:

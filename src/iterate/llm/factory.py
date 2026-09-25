@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from iterate.llm.ollama_client import OllamaClient
 from iterate.llm.openai_compatible import OpenAICompatibleClient
@@ -45,6 +46,17 @@ class UnknownBackendError(ValueError):
 def resolve_base_url(name: str, base_url: str | None) -> str | None:
     """Explicit ``base_url`` wins; otherwise a known cloud alias supplies its own."""
     return base_url if base_url is not None else _ALIAS_BASE_URLS.get(name)
+
+
+def alias_for_base_url(base_url: str | None) -> str | None:
+    """The cloud alias whose endpoint an explicit base URL points at, or None."""
+    if not base_url:
+        return None
+    host = urlparse(base_url).netloc.lower()
+    for alias, url in _ALIAS_BASE_URLS.items():
+        if urlparse(url).netloc.lower() == host:
+            return alias
+    return None
 
 
 def build_client(
@@ -113,4 +125,10 @@ def api_key_for(backend: str, settings: object | None = None) -> str | None:
     return None
 
 
-__all__ = ["UnknownBackendError", "api_key_for", "build_client", "resolve_base_url"]
+__all__ = [
+    "UnknownBackendError",
+    "alias_for_base_url",
+    "api_key_for",
+    "build_client",
+    "resolve_base_url",
+]

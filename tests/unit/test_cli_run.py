@@ -1175,8 +1175,17 @@ def test_requests_per_hour_must_be_at_least_one(tmp_path: Path) -> None:
 
     result = runner.invoke(
         app,
-        ["run", "--data", str(data), "--target", "churn", "--metric", "f1",
-         "--requests-per-hour", "0"],
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--requests-per-hour",
+            "0",
+        ],
     )
     assert result.exit_code != 0
     assert "requests-per-hour" in (result.stderr or result.stdout)

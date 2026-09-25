@@ -1463,7 +1463,8 @@ def run(
         result,
         family="vision" if prepared is not None else "prompt" if is_prompt_run else "tabular",
         n_features=len(dataset.features),
-        provider=target_backend or backend,
+        backend=target_backend or backend,
+        base_url=base_url,
         model_under_test=getattr(model_target, "model_under_test", None),
         baseline_prompt=getattr(model_target, "baseline_prompt", None),
         requests_per_hour=requests_per_hour,
@@ -1914,7 +1915,8 @@ def _serving_profile(
     *,
     family: str,
     n_features: int,
-    provider: str,
+    backend: str,
+    base_url: str | None,
     model_under_test: str | None,
     baseline_prompt: Any,
     requests_per_hour: int,
@@ -1939,7 +1941,7 @@ def _serving_profile(
                 chars = len(str(baseline_prompt.system)) + len(str(baseline_prompt.user_template))
             facts = serving.facts_from_prompt(
                 prompt_json,
-                provider=provider,
+                provider=serving.provider_for(backend, base_url),
                 model=model_under_test or "",
                 prompt_chars=chars,
             )
@@ -1953,7 +1955,12 @@ def _serving_profile(
             )
         return serving.profile(facts, requests_per_hour, serving.load_prices())
     except Exception as exc:
-        console.print(f"[dim]serving price not computed: {type(exc).__name__}: {exc}[/dim]")
+        console.print(
+            f"serving price not computed: {type(exc).__name__}: {exc}",
+            style="dim",
+            markup=False,
+            highlight=False,
+        )
         return None
 
 

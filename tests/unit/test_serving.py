@@ -284,7 +284,9 @@ def test_a_pretrained_backbone_is_sized_from_the_table_and_the_image_size() -> N
     facts = serving.facts_from_recipe({"backbone": "resnet18", "image_size": 128})
 
     weights, macs_224 = serving.BACKBONE_SIZES["resnet18"]
-    assert facts.weights == weights
+    # torchvision's count carries the 1,000-class ImageNet classifier; the served network
+    # replaces it with the run's own final layer.
+    assert facts.weights == weights - (512 + 1) * 1000
     assert facts.multiply_adds == int(macs_224 * (128 / 224) ** 2)
     assert facts.basis[0] == "resnet18 at 128 px"
 
@@ -423,3 +425,146 @@ def test_the_profile_round_trips_through_json() -> None:
     again = ServingProfile.model_validate_json(profile.model_dump_json())
     assert again == profile
     assert again.render() == profile.render()
+
+
+# ─── what review found, kept out for good ────────────────────────────────
+
+
+def test_a_machine_with_no_rate_is_offered_only_when_no_rated_machine_fits() -> None:
+    """At a high rate the rated boxes need many instances, and an unrated box would
+    look cheaper while promising nothing. It stays out until nothing rated fits."""
+    facts = serving.facts_from_recipe({"backbone": "resnet18", "image_size": 224})
+    profile = serving.profile(facts, 2_000_000, _prices())
+
+    assert profile.chosen is not None
+    assert profile.chosen.capacity_per_hour is not None
+    assert all(cost.capacity_per_hour is not None for cost in profile.by_cloud)
+
+
+def test_zero_reported_tokens_are_not_a_measurement() -> None:
+    """A backend that sends no usage leaves zeros, and zero tokens is not a price."""
+    record = json.dumps(
+        {
+            "system": "s" * 400,
+            "user_template": "{input}",
+            "tokens_in_per_record": 0.0,
+            "tokens_out_per_record": 0.0,
+            "records_measured": 50,
+        }
+    )
+    facts = serving.facts_from_prompt(record, provider="openai", model="mini")
+
+    assert facts.records_measured == 0
+    assert facts.tokens_in == pytest.approx(407 / 4)
+    assert "the backend reported no token usage" in facts.basis[0]
+
+
+def test_the_cached_answer_estimate_reads_the_winners_own_prompt() -> None:
+    record = json.dumps({"system": "x" * 800, "user_template": "{input}", "records_measured": 0})
+    facts = serving.facts_from_prompt(record, provider="openai", model="mini", prompt_chars=40)
+
+    assert facts.tokens_in == pytest.approx(807 / 4)
+
+
+def test_cells_after_the_one_that_wrote_the_predictions_do_not_price_the_winner() -> None:
+    cells = [
+        {
+            "code": "m = HistGradientBoostingClassifier().fit(X_train, y_train)\n"
+            "pd.Series(m.predict(X_holdout)).to_csv('predictions.csv', index=False)",
+            "error": None,
+        },
+        {
+            "code": "m2 = RandomForestClassifier().fit(X_train, y_train)\nprint(m2.score(X, y))",
+            "error": None,
+        },
+    ]
+    facts = serving.facts_from_code(cells, "", n_features=5)
+
+    assert facts.estimator_family == "boosting"
+
+
+@pytest.mark.parametrize("name", ["QuantileTransformer", "KNeighborsTransformer", "SGDOneClassSVM"])
+def test_a_preprocessor_that_shares_a_prefix_with_an_estimator_is_not_one(name: str) -> None:
+    assert serving.estimator_family(name) is None
+
+
+def test_dropped_stages_narrow_the_head_and_are_said_out_loud() -> None:
+    whole = serving.facts_from_recipe(
+        {"backbone": "resnet18", "image_size": 224, "head": [("linear", 256)]}
+    )
+    cut = serving.facts_from_recipe(
+        {"backbone": "resnet18", "image_size": 224, "drop_stages": 1, "head": [("linear", 256)]}
+    )
+
+    assert whole.weights is not None
+    assert cut.weights is not None
+    # The head starts from the kept stage's width, 256, instead of the last stage's 512.
+    assert whole.weights - cut.weights == (512 + 1) * 256 - (256 + 1) * 256
+    assert cut.basis[0] == "resnet18 with 1 stage dropped and head linear(256) at 224 px"
+    assert "served network is smaller than this" in cut.basis[-1]
+
+
+def test_a_stack_with_nothing_to_compute_prices_one_box_instead_of_dividing_by_zero() -> None:
+    facts = serving.facts_from_recipe(
+        {"backbone": "layers_net", "image_size": 64, "layers": [("pool",)]}
+    )
+    profile = serving.profile(facts, 1000, _prices())
+
+    assert profile.chosen is not None
+    assert profile.chosen.capacity_per_hour is None
+
+
+def test_a_mixture_model_is_sized_by_all_its_experts() -> None:
+    facts = serving.facts_from_prompt(None, provider="ollama", model="mixtral:8x7b")
+
+    assert facts.parameters == 56_000_000_000
+
+
+def test_a_recipe_with_layers_prices_the_stack_whatever_the_backbone_says() -> None:
+    facts = serving.facts_from_recipe(
+        {"backbone": "resnet18", "image_size": 64, "layers": [("conv", 16), ("linear", 8)]}
+    )
+
+    assert facts.backbone == "layers_net"
+    assert facts.basis[0].startswith("your own stack conv(16) linear(8)")
+
+
+def test_an_empty_recipe_is_unpriced_rather_than_priced_as_a_default() -> None:
+    profile = serving.profile(serving.facts_from_recipe({}), 1000, _prices())
+
+    assert profile.unpriced_because == "the winner left no recipe to price"
+
+
+@pytest.mark.parametrize(
+    ("backend", "base_url", "provider"),
+    [
+        ("openai", None, "openai"),
+        ("openai-compatible", "https://api.openai.com/v1", "openai"),
+        ("openai-compatible", "https://API.together.xyz/v1/", "together"),
+        ("openai-compatible", "http://10.0.0.5:8000/v1", "openai-compatible"),
+        ("vllm", None, "vllm"),
+    ],
+)
+def test_the_provider_is_the_cloud_the_base_url_points_at(
+    backend: str, base_url: str | None, provider: str
+) -> None:
+    assert serving.provider_for(backend, base_url) == provider
+
+
+def test_the_reference_table_refuses_a_backbone_with_no_size() -> None:
+    with pytest.raises(ValidationError, match="no measured size"):
+        CpuReference(measured_on="x", backbone_ms={"resnet18": {}}, tabular_ms={})
+
+
+def test_a_one_box_machine_says_the_rate_is_not_estimated_on_its_own_line() -> None:
+    facts = serving.facts_from_prompt(None, provider="ollama", model="gemma4:12b")
+    line = serving.profile(facts, 1000, _prices()).render()[0]
+
+    assert line.startswith("serving: about $365.00 a month for one aws t4 (whether it serves 1,000")
+
+
+def test_the_basis_says_interpolated_when_the_size_was_not_measured() -> None:
+    facts = serving.facts_from_recipe({"backbone": "resnet18", "image_size": 96})
+    profile = serving.profile(facts, 1000, _prices())
+
+    assert any("interpolated between sizes measured" in line for line in profile.basis)
