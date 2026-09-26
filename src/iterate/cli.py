@@ -2639,6 +2639,11 @@ def _render_summary(
         if serving is not None:
             for line in serving.render():
                 console.print(line, markup=False, highlight=False)
+    elif wall is not None and any(r.kind == "trained" for r in wall.refused):
+        console.print(
+            "[dim]no candidate within the serving budget beat the baseline; the ones that "
+            "beat it could not be served for the money.[/dim]"
+        )
     else:
         console.print("[dim]no candidate beat the baseline.[/dim]")
     if wall is not None and wall.refused:

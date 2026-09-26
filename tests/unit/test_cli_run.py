@@ -1558,6 +1558,7 @@ def test_the_summary_names_what_the_wall_turned_away_and_how_far_each_got(
     with cli_module.console.capture() as captured:
         cli_module._render_summary(result, "f1", wall=wall)
     text = _plain(captured.get())
+    assert "no candidate within the serving budget beat the baseline" in text
     # The table cell may wrap, so the marker is checked in order, not as one string.
     assert re.search(r"a wide forest.*over the serving budget: \$37 a month", text)
     assert (

@@ -539,13 +539,15 @@ def _hold_against_the_wall(
         return
     priced = wall.stamp(experiment, budget=budget)
     if priced is not None:
+        from iterate.schemas.serving import money
+
         log.info(
             "agent loop: iteration %d costs about $%.0f a month to serve on %s, over the %s "
             "a month serving budget; it cannot be the winner",
             iteration,
             priced.usd_per_month or 0.0,
             priced.host,
-            f"${budget:,.2f}" if budget is not None else "?",
+            money(budget) if budget is not None else "the wall's",
         )
 
 
