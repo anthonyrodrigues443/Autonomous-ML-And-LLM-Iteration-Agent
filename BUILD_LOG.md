@@ -55,9 +55,9 @@
 | Jul 27 to Aug 1 | **Specialists + eval hardening**: Researcher + Critic, dossier + lean ledger, probability metrics, agent picks the metric + starting model → **v0.4 · Sun 2026-08-02** |
 | Aug 3-8 | Dial B: `PromptTarget`, agentic prompt iteration (toxicity + intent examples) → **v0.5 · Sun 2026-08-09** |
 | Sep 13-20 | Dial B: `DLModelTarget`, images on the same loop: classes and numbers, a plain CNN baseline, fine-tuned pretrained backbones and the agent's own torch code · **v0.6.0 shipped 2026-09-20** *(re-dated 2026-09-12, confirmed 2026-09-16)* |
-| Aug 17-22 | Cost-constrained recommendation + serving profile + `iterate cost` → **v0.7 · Sun 2026-08-23** |
-| Aug 24-29 | Dial A, both steps: infer inputs from data + a description AND MCP discovery (filesystem/Postgres, gap-fill pause) → **v0.9 · Sun 2026-08-30** *(absorbs v0.8)* |
-| Aug 31 to Sep 5 | One-sentence input + benchmark + dashboard + Reporter + docs + launch → **v1.0 · Sun 2026-09-06** *(absorbs v0.10)* |
+| Sep 25 to Oct 10 | Cost-constrained recommendation: the serving budget as a hard wall, live prices from the clouds' own lists, the Researcher and the Pricer going back and forth until a model fits, the serving profile on every winner, `iterate cost`, the cheaper prompt runs → **v0.7 · Sun 2026-10-11** *(re-dated 2026-09-26; was Aug 23)* |
+| after v0.7 | Dial A, both steps: infer inputs from data + a description AND MCP discovery (filesystem/Postgres, gap-fill pause) → **v0.9**, date set at the v0.7 release *(absorbs v0.8; was Aug 30)* |
+| after v0.9 | One-sentence input + benchmark + dashboard + Reporter + Anthropic adapter + docs + launch → **v1.0**, date set at the v0.9 release *(absorbs v0.10; was Sep 6)* |
 
 ### Releases (incremental — ship a working slice, then iterate)
 
@@ -71,9 +71,9 @@ Semantic versioning: `0.x` = early/evolving, `1.0.0` = the full v1 vision. **The
 | v0.4.0 | sprint 2 | **Sun 2026-08-02** | tabular | data + features + target + baseline + deadline  *(Researcher + Critic specialists at the tool boundary; agent picks metric + starting model from research; probability metrics)* |
 | v0.5.0 | sprint 3 | **RELEASED 2026-09-09** (planned Aug 9; slipped to Aug 11 for the regression half, then waited on the certification run) | + prompts | data + target + a task line (+ your current prompt, optional) + deadline: **the same loop on LLM prompts**, classification and regression, sealed holdout, `prompts.yaml` deliverable, eval suite with a measured ceiling per dataset |
 | v0.6.0 | sprint 4 | **held on 2026-09-20, released 2026-09-21** (planned Aug 16; re-dated 2026-09-12 after v0.5 waited on its certification run, confirmed 2026-09-16; held on release day so the winner is saved and `fit()` can be told what to build) | + images | an image folder laid out however it came, or a CSV of image paths + target, or your own `--train` + `--holdout` split, + deadline: **the same loop on images**, classes and numbers, a plain CNN baseline, `fit()` over three pretrained backbones plus the agent's own torch code, sealed holdout; the data linker and the monitor for folders; a run reads only the data it was given, the macOS cell sandbox and harness-side installs for every local run. GPU compatible: Apple (MPS) and NVIDIA (CUDA) |
-| v0.7.0 | sprint 5 | **Sun 2026-08-23** | all three | + serving budget / cloud  *(cost-constrained recommendation + serving profile + `iterate cost`)* |
-| v0.9.0 | sprint 6 | **Sun 2026-08-30** | all | data + a one-line description OR one sentence + a data source  *(absorbs v0.8: infers features/target/metric with a confirm pause; MCP discovery over filesystem + Postgres with the gap-fill pause)* |
-| v1.0.0 | sprint 7 | **Sun 2026-09-06** | all | one sentence  *(absorbs v0.10: multi-backend benchmark + read-only dashboard + prose report; full discovery + docs + launch)* |
+| v0.7.0 | sprint 5 | **Sun 2026-10-11** *(re-dated 2026-09-26; was Aug 23)* | all three | + `--serving-budget`, `--cloud`, `--region`, `--requests-per-hour`  *(cost-constrained recommendation: the budget is a hard wall on what it costs to serve the winner; live prices from the clouds' own lists with a cache; the Researcher names models with no cost in the question and the Pricer says which fit, back and forth until one does; a serving profile on every winner; `iterate cost`; the cheaper prompt runs promised in the v0.5 post)* |
+| v0.9.0 | sprint 6 | date set at the v0.7 release *(was Aug 30)* | all | data + a one-line description OR one sentence + a data source  *(absorbs v0.8: infers features/target/metric with a confirm pause; MCP discovery over filesystem + Postgres with the gap-fill pause)* |
+| v1.0.0 | sprint 7 | date set at the v0.9 release *(was Sep 6)* | all | one sentence  *(absorbs v0.10: multi-backend benchmark + read-only dashboard + prose report + the Anthropic adapter; full discovery + docs + launch)* |
 
 Sprint arithmetic, stated so it can be checked: 7 releases in 43 calendar days means ~1 build day per calendar day around college (9-5) and Keeper (6pm-2am); weekday build slots are late-night, weekends carry the heavy days. The compression is bought with the per-week cut lists below (cut items go to the post-v1.0 backlog, and LIMITATIONS.md states each cut honestly at release time). A slipped day rolls into that week's Saturday; a slipped WEEK does not move the Sunday: the release ships whatever passed the gate and the release notes say what made it. README's public status table gets synced to this calendar at the v0.3 release.
 
@@ -400,7 +400,9 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 ---
 
-## Sprint 6: v0.9, infer the inputs + MCP discovery (absorbs v0.8). Mon 2026-08-24 to Sat 2026-08-29, release Sun 2026-08-30
+## Sprint 6: v0.9, infer the inputs + MCP discovery (absorbs v0.8). Dates set at the v0.7 release
+
+*(The August dates in the table below predate v0.5's certification wait and are past. They are re-set at the v0.7 release, Sun 2026-10-11, the way sprint 5's were at v0.6's.)*
 
 **Goal:** Dial A turns hard, both steps in one release. Half the week is the v0.8 scope (data + a one-line description in, proposed target/features/metric out, confirmed at a pause), half is trimmed MCP discovery (the agent finds the data/code itself over filesystem + Postgres, then pauses for gap-fill). The PRD discovery-heuristics table is the ready-made spec. Security scoping is not optional: isolated subprocesses, path-restricted filesystem, read-only Postgres, every MCP call logged to Memory for audit.
 
@@ -418,7 +420,9 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 
 ---
 
-## Sprint 7: v1.0, one-sentence input + the evidence release (absorbs v0.10). Mon 2026-08-31 to Sat 2026-09-05, release Sun 2026-09-06
+## Sprint 7: v1.0, one-sentence input + the evidence release (absorbs v0.10). Dates set at the v0.9 release
+
+*(The August and September dates in the table below are past and are re-set at the v0.9 release. The Anthropic adapter stays on this sprint's Tuesday row, Tony's call of 2026-09-25.)*
 
 **Goal:** make every public positioning claim literally true, then launch. `iterate "improve our churn baseline"` end to end: discovery → gap-fill pause → bounded iteration → serving profile + notebook + report, with human-approval gates throughout. The v0.10 evidence items (benchmark, dashboard, reporter) ship inside this release.
 
@@ -460,7 +464,7 @@ Learned from the v0.2 release arc (release mechanics alone took 11 calendar days
 | PromptTarget + toxicity_jigsaw + intent_clinc150 examples | v0.5 | sprint 3 (release Aug 9) |
 | DLModelTarget + 4050 validation | v0.6 | sprint 4 (release Aug 16) |
 | Cloud-GPU adapter | interface ~v0.6, implementation later | interface: sprint 4 Sat if green, else post-v1.0 (CUT 2026-09-20 → post-v1.0); implementation trigger-based |
-| Cost-constrained recommendation + serving profile + `iterate cost` + quantization lever | v0.7 / v1 moat | sprint 5 (release Aug 23) |
+| Cost-constrained recommendation (the wall, live prices, the Researcher and the Pricer back and forth) + serving profile + `iterate cost` | v0.7 / v1 moat | sprint 5 (release Sun Oct 11, re-dated 2026-09-26); the quantization lever moved to the backlog on 2026-09-25, since no full agent run has finished on CUDA |
 | Infer features/target/metric + confirm pause | v0.8 | sprint 6, Mon Aug 24 (ships inside v0.9.0) |
 | Hash-based splitting + data-version Memory scoping + split-snapshot persist | old Week 8/9 + IDEAS deferrals | sprint 6, Tue Aug 25 |
 | Source-artifact ask on claimed prior scores | old Week 7-8 anchor | CUT → post-v1.0 |
