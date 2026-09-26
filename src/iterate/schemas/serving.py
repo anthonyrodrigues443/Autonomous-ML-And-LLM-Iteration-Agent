@@ -2,7 +2,8 @@
 
 `ServingFacts` is what the harness knows about a winner, enough to price it: the
 classes a table pipeline named, an image recipe's weights and multiply-adds, a prompt's
-model and its tokens per record. `Prices` is the dated snapshot shipped with the package.
+model and its tokens per record. `Prices` is the table the Pricer reads: the clouds' cached
+lists where a refresh exists, the shipped snapshot where not, with a source per cloud.
 `ServingProfile` is the answer: the cheapest machine or API that serves the request rate,
 the monthly cost, and a basis line for every number, so an estimate is never mistaken
 for a measurement. Extra fields are refused and the parts must agree.
@@ -10,9 +11,12 @@ for a measurement. Extra fields are refused and the parts must agree.
 
 from __future__ import annotations
 
-from typing import Literal, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 Family = Literal["tabular", "vision", "prompt"]
 Kind = Literal["cpu", "gpu", "api"]
@@ -37,6 +41,10 @@ class ServingFacts(BaseModel):
     tokens_out: float | None = Field(default=None, ge=0.0)
     records_measured: int | None = Field(default=None, ge=0)
     parameters: int | None = Field(default=None, ge=0)
+    # For a network sized from timm's table: its milliseconds per image at this size on
+    # the reference box, already scaled from timm's measurement. None for the pinned
+    # backbones, whose latency the reference table carries.
+    reference_ms: float | None = Field(default=None, ge=0.0)
     basis: list[str] = Field(default_factory=list)
     unpriced_because: str | None = None
 
@@ -55,14 +63,31 @@ class ServingFacts(BaseModel):
         return self
 
 
+class Source(BaseModel):
+    """Where one cloud's rows came from: the shipped snapshot, or a refreshed list."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["shipped", "refreshed"]
+    date: str
+    url: str | None = None
+    region: str | None = None
+
+    @property
+    def label(self) -> str:
+        where = f" ({self.region})" if self.region else ""
+        return f"{self.kind} {self.date}{where}"
+
+
 class Host(BaseModel):
-    """One row of the price snapshot: a machine, or an API model."""
+    """One row of the price table: a machine, or an API model."""
 
     model_config = ConfigDict(extra="forbid")
 
     cloud: str
     name: str
     kind: Kind
+    region: str | None = None
     vcpu: int | None = Field(default=None, ge=1)
     memory_gb: float | None = Field(default=None, gt=0.0)
     vram_gb: float | None = Field(default=None, gt=0.0)
@@ -122,7 +147,8 @@ class CpuReference(BaseModel):
 
 
 class Prices(BaseModel):
-    """The dated snapshot: machines, API models, and the reference latencies."""
+    """The price table the Pricer reads: machines, API models, the reference latencies,
+    and per cloud whether the machines came from a refreshed list or the shipped file."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -130,6 +156,9 @@ class Prices(BaseModel):
     hosts: list[Host]
     api_models: list[Host]
     cpu_reference: CpuReference
+    # Per cloud, whether `hosts` came from a refreshed list or the shipped file. Empty
+    # means everything is shipped, which is what the file itself says.
+    sources: dict[str, Source] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _rows_in_their_lists(self) -> Self:
@@ -141,6 +170,23 @@ class Prices(BaseModel):
 
     def machines(self, kind: Kind) -> list[Host]:
         return [h for h in self.hosts if h.kind == kind]
+
+    def provenance(self, clouds: Iterable[str] | None = None) -> str:
+        """What the line prints after the price: per cloud, refreshed or shipped, and
+        the date, so an old number is never read as a current one."""
+        if clouds is not None:
+            names = list(clouds)
+        elif self.sources:
+            names = sorted(self.sources)
+        else:
+            names = sorted({h.cloud for h in self.hosts})
+        parts = []
+        for cloud in names:
+            source = self.sources.get(cloud)
+            parts.append(
+                f"{cloud} {source.label}" if source else f"{cloud} shipped {self.snapshot_date}"
+            )
+        return ", ".join(parts) if parts else f"shipped {self.snapshot_date}"
 
     def api(self, provider: str, model: str) -> Host | None:
         wanted = (provider.lower(), model.lower())
@@ -193,13 +239,13 @@ class ServingProfile(BaseModel):
             lines = [
                 f"serving: about ${chosen.usd_per_month:,.2f} a month for one {where} "
                 f"(whether it serves {self.requests_per_hour:,} requests an hour is not "
-                f"estimated), prices as of {self.prices_as_of}"
+                f"estimated), prices: {self.prices_as_of}"
             ]
         else:
             lines = [
                 f"serving: about ${chosen.usd_per_month:,.2f} a month at "
                 f"{self.requests_per_hour:,} requests an hour on {where}, "
-                f"prices as of {self.prices_as_of}"
+                f"prices: {self.prices_as_of}"
             ]
         lines.extend(f"  basis: {line}" for line in self.basis)
         others = [cost for cost in self.by_cloud if cost != chosen]
@@ -220,4 +266,5 @@ __all__ = [
     "Prices",
     "ServingFacts",
     "ServingProfile",
+    "Source",
 ]

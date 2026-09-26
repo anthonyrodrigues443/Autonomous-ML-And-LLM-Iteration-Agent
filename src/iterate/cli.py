@@ -747,6 +747,18 @@ def run(
         "end of the run: the cheapest machine or API that serves that rate, and the "
         "monthly cost, with where each number came from.",
     ),
+    cloud: str | None = typer.Option(
+        None,
+        "--cloud",
+        help="Price the winner on one cloud: aws | gcp | azure. Omitted, the run compares "
+        "AWS and GCP and shows the cheapest first.",
+    ),
+    region: str | None = typer.Option(
+        None,
+        "--region",
+        help="The cloud region the prices are for (needs --cloud). Defaults: us-east-1, "
+        "us-central1, eastus.",
+    ),
     output: Path | None = typer.Option(
         None,
         "--output",
@@ -827,11 +839,18 @@ def run(
         if labels is not None or key is not None or yes:
             raise typer.BadParameter("--labels, --key and --yes describe a folder of images")
 
+    if cloud is not None and cloud.lower() not in ("aws", "gcp", "azure"):
+        raise typer.BadParameter(f"--cloud must be aws | gcp | azure, got {cloud!r}")
+    if region is not None and cloud is None:
+        raise typer.BadParameter("--region needs --cloud, since each cloud names its regions")
+    clouds = (cloud.lower(),) if cloud is not None else None
+
     # ─── First run with no saved config? Offer the setup wizard. ───────────
     if not userconfig.exists() and sys.stdin.isatty():
         console.print("[dim]No saved config found — let's set your defaults once.[/dim]\n")
         setup()
         console.print()
+
     cfg = userconfig.load_user_config()
 
     # ─── Resolve: explicit flag > saved config > built-in default ──────────
@@ -987,6 +1006,12 @@ def run(
     # ─── The run folder, from here on ──────────────────────────────────────
     # Below every refusal, like the archive: a run that cannot start makes no folder.
     _ignore_run_folder(Path(settings.iterate_runs_dir))
+    # Azure's price list is small enough to fetch while the run works; AWS's is 300 MB and
+    # only `iterate prices refresh` fetches it. Silent, daemon, never blocks.
+    if clouds is not None and "azure" in clouds:
+        from iterate.core import prices as prices_mod
+
+        prices_mod.refresh_azure_in_background(region)
 
     data_summary = prepared.profile.render() if prepared is not None else summarize_dataset(dataset)
 
@@ -1468,6 +1493,8 @@ def run(
         model_under_test=getattr(model_target, "model_under_test", None),
         baseline_prompt=getattr(model_target, "baseline_prompt", None),
         requests_per_hour=requests_per_hour,
+        clouds=clouds,
+        region=region,
     )
     if is_prompt_run:
         # For a prompt run the artifact is the prompt, and a notebook cannot say
@@ -1527,6 +1554,52 @@ def run(
 
     # ─── Summary ───────────────────────────────────────────────────────────
     _render_summary(result, metric, serving=serving_profile)
+
+
+prices_app = typer.Typer(
+    name="prices",
+    help="The price lists the Pricer reads: refresh them from the clouds' own lists, or "
+    "show what it would read right now.",
+    no_args_is_help=True,
+)
+app.add_typer(prices_app, name="prices")
+
+
+@prices_app.command("refresh")
+def prices_refresh(
+    cloud: str | None = typer.Option(
+        None, "--cloud", help="One cloud: aws | gcp | azure. Omitted, all three."
+    ),
+    region: str | None = typer.Option(
+        None, "--region", help="The region to price (needs --cloud). Defaults per cloud."
+    ),
+) -> None:
+    """Fetch the clouds' own price lists into the cache, then timm's network sizes.
+
+    AWS's list is about 300 MB and is streamed and reduced here, once; Azure's API is
+    walked page by page; GCP's catalog needs a key, so its shipped rows stand. Every row
+    keeps its source and today's date, and the end of a run says which list it used.
+    """
+    from iterate.core import prices as prices_mod
+
+    if cloud is not None and cloud.lower() not in prices_mod.CLOUDS:
+        raise typer.BadParameter(f"--cloud must be aws | gcp | azure, got {cloud!r}")
+    if region is not None and cloud is None:
+        raise typer.BadParameter("--region needs --cloud, since each cloud names its regions")
+    try:
+        prices_mod.refresh(cloud.lower() if cloud else None, region, log=typer.echo)
+    except Exception as exc:
+        typer.echo(f"refresh stopped: {type(exc).__name__}: {exc}; what was cached so far stands")
+        raise typer.Exit(1) from exc
+
+
+@prices_app.command("show")
+def prices_show() -> None:
+    """What the Pricer would read right now, per cloud: refreshed or shipped, and when."""
+    from iterate.core import prices as prices_mod
+
+    for line in prices_mod.describe():
+        typer.echo(line)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -1920,6 +1993,8 @@ def _serving_profile(
     model_under_test: str | None,
     baseline_prompt: Any,
     requests_per_hour: int,
+    clouds: tuple[str, ...] | None = None,
+    region: str | None = None,
 ) -> ServingProfile | None:
     """What the winner costs to serve, from the facts the run already has. None when
     there is no winner. A pricing failure never costs the run its deliverables: it
@@ -1953,7 +2028,20 @@ def _serving_profile(
             facts = serving.facts_from_code(
                 cells if isinstance(cells, list) else None, code, n_features=n_features
             )
-        return serving.profile(facts, requests_per_hour, serving.load_prices())
+        prices = serving.load_prices(clouds, region)
+        if region is not None:
+            for cloud in clouds or ():
+                source = prices.sources.get(cloud)
+                if source is not None and source.kind == "shipped":
+                    console.print(
+                        f"no price list cached for {cloud} {region}: the shipped "
+                        f"{source.region} rows stand in; run `iterate prices refresh "
+                        f"--cloud {cloud} --region {region}` for that region's prices",
+                        style="dim",
+                        markup=False,
+                        highlight=False,
+                    )
+        return serving.profile(facts, requests_per_hour, prices)
     except Exception as exc:
         console.print(
             f"serving price not computed: {type(exc).__name__}: {exc}",

@@ -1,6 +1,7 @@
 """The Pricer: what a run's winner costs to serve, from facts the run already has.
 
-Pure arithmetic over the dated snapshot in `serving_prices.json`. It never reads an
+Pure arithmetic over the price table `load_prices` assembles, the clouds' cached lists
+where a refresh exists and the shipped snapshot where not. It never reads an
 abstract or asks a model, so it cannot invent a price, and it never imports torch, so
 it runs on the host after every family. Three facts builders read the
 winner: a table pipeline by the classes it named, an image recipe by its weights and
@@ -14,7 +15,6 @@ from __future__ import annotations
 import json
 import math
 import re
-from importlib import resources
 from typing import TYPE_CHECKING, Any
 
 from iterate.core import codegen
@@ -30,7 +30,7 @@ from iterate.schemas.serving import (
 from iterate.targets import layers
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 HOURS_PER_MONTH = 730
 DEFAULT_REQUESTS_PER_HOUR = 1000
@@ -41,7 +41,8 @@ RUNTIME_GB = 1.0
 # A local LLM at 4-bit: about 0.6 GB per billion weights, plus room for the context.
 LLM_GB_PER_BILLION = 0.6
 LLM_HEADROOM_GB = 2.0
-PRICES_FILE = "serving_prices.json"
+# One request uses about two threads, so a bigger box serves one worker per two vCPUs.
+THREADS_PER_REQUEST = 2
 
 # Weights and multiply-adds per image at 224 px: torchvision's model table, read
 # 2026-09-25, and the weights checked against the built network on torchvision 0.29.
@@ -100,10 +101,12 @@ IMAGENET_CLASSES = 1000
 FEATURES: dict[str, int] = {name: widths[-1] for name, widths in STAGE_WIDTHS.items()}
 
 
-def load_prices() -> Prices:
-    """The snapshot shipped with this version of the package."""
-    text = resources.files("iterate.core").joinpath(PRICES_FILE).read_text(encoding="utf-8")
-    return Prices.model_validate_json(text)
+def load_prices(clouds: Sequence[str] | None = None, region: str | None = None) -> Prices:
+    """The clouds' current lists where a refresh has cached them, the shipped snapshot
+    where it has not, with a source per cloud so the line can say which."""
+    from iterate.core import prices
+
+    return prices.load(clouds, region)
 
 
 # ─── facts: what the run knows about its winner ─────────────────────────────
@@ -140,9 +143,14 @@ def facts_from_recipe(recipe: Mapping[str, Any]) -> ServingFacts:
         why = "the winner left no recipe to price"
         return ServingFacts(family="vision", backbone="none", basis=[why], unpriced_because=why)
     if recipe.get("model"):
+        # The agent's own network: timm's table sizes it when the name is there.
         name = str(recipe["model"])
-        why = f"the winner is the agent's own network ({name}); its size is not known"
-        return ServingFacts(family="vision", backbone=name, basis=[why], unpriced_because=why)
+        sized = facts_from_model_name(name, int(recipe.get("image_size") or REFERENCE_SIZE))
+        if sized.unpriced_because:
+            why = f"the winner is the agent's own network ({name}), and {sized.unpriced_because}"
+            return ServingFacts(family="vision", backbone=name, basis=[why], unpriced_because=why)
+        sized.basis[0] = f"the agent's own network: {sized.basis[0]}"
+        return sized
     backbone = str(recipe.get("backbone") or "resnet18")
     size = int(recipe.get("image_size") or REFERENCE_SIZE)
     if backbone == "simple_cnn":
@@ -204,6 +212,62 @@ def _sized_facts(backbone: str, size: int, weights: int, macs: int, what: str) -
 def _megabytes(size: int) -> str:
     mb = size / 2**20
     return f"{mb:.1f} MB" if mb < 10 else f"{mb:.0f} MB"
+
+
+def facts_from_model_name(
+    name: str, image_size: int, *, reference: CpuReference | None = None
+) -> ServingFacts:
+    """A network the Researcher names, sized from timm's published batch-1 table: weights,
+    multiply-adds, and a CPU latency scaled from timm's measurement relative to resnet50
+    measured on the reference box. timm measured with torch.compile and a plain
+    `load().predict()` runs eager, so the basis says a plain deployment can be slower."""
+    from iterate.core import prices
+
+    sizes, source = prices.timm_sizes()
+    plain = name.lower()
+    for prefix in ("timm/", "hf-hub:timm/", "hf_hub:timm/", "torchvision.models."):
+        plain = plain.removeprefix(prefix)
+    # A pretrained tag (`resnet50.a1_in1k`) names weights, not a different network.
+    plain = plain.split(".")[0]
+    rows = sizes.get(plain)
+    if not rows:
+        why = f"{name} is not in timm's published table, so its size is not known"
+        return ServingFacts(family="vision", backbone=name, basis=[why], unpriced_because=why)
+    row = min(rows, key=lambda r: abs(r.img_size - image_size))
+    scale = (image_size / row.img_size) ** 2
+    weights = int(row.param_count_m * 1e6)
+    macs = int(row.gmacs * 1e9 * scale)
+    anchor = _timm_anchor(sizes, reference)
+    reference_ms = row.ms_batch1_cpu * scale * anchor if anchor else None
+    return ServingFacts(
+        family="vision",
+        backbone=plain,
+        image_size=image_size,
+        weights=weights,
+        multiply_adds=macs,
+        reference_ms=reference_ms,
+        basis=[
+            f"{plain} at {image_size} px, sized from timm's published table "
+            f"({source.kind} {source.date})",
+            f"{weights / 1e6:.1f}M weights ({_megabytes(weights * FLOAT_BYTES)}), "
+            f"{macs / 1e9:.2f} billion multiply-adds an image",
+        ],
+    )
+
+
+def _timm_anchor(
+    sizes: Mapping[str, Sequence[Any]], reference: CpuReference | None
+) -> float | None:
+    """How much slower the reference box is than timm's compiled i9 on resnet50 at 224 px:
+    timm's per-model times are scaled by this before they price anything."""
+    from iterate.core import prices
+
+    ref = reference or prices.shipped().cpu_reference
+    ours = ref.backbone_ms.get(REFERENCE_BACKBONE, {}).get(str(REFERENCE_SIZE))
+    theirs = [r for r in sizes.get(REFERENCE_BACKBONE, []) if r.img_size == REFERENCE_SIZE]
+    if ours is None or not theirs or theirs[0].ms_batch1_cpu <= 0:
+        return None
+    return float(ours) / float(theirs[0].ms_batch1_cpu)
 
 
 def provider_for(backend: str, base_url: str | None) -> str:
@@ -309,7 +373,7 @@ def profile(facts: ServingFacts, requests_per_hour: int, prices: Prices) -> Serv
         chosen=chosen,
         by_cloud=by_cloud,
         usd_per_1k_requests=per_1k,
-        prices_as_of=prices.snapshot_date,
+        prices_as_of=prices.provenance(sorted({h.cloud for h in _machines_for(facts, prices)})),
         basis=[*facts.basis, *_capacity_basis(chosen, facts, prices.cpu_reference)],
     )
 
@@ -369,7 +433,7 @@ def _api_profile(facts: ServingFacts, rate: int, prices: Prices) -> ServingProfi
         requests_per_hour=rate,
         chosen=HostCost(host=row, usd_per_month=month),
         usd_per_1k_requests=per_request * 1000,
-        prices_as_of=prices.snapshot_date,
+        prices_as_of=f"{row.cloud} shipped {prices.snapshot_date}",
         basis=[*facts.basis, "rate limits are not modelled"],
     )
 
@@ -377,7 +441,7 @@ def _api_profile(facts: ServingFacts, rate: int, prices: Prices) -> ServingProfi
 def _unpriced(facts: ServingFacts, rate: int, prices: Prices, why: str) -> ServingProfile:
     return ServingProfile(
         requests_per_hour=rate,
-        prices_as_of=prices.snapshot_date,
+        prices_as_of=prices.provenance(),
         unpriced_because=why,
         basis=[line for line in facts.basis if line != why],
     )
@@ -400,12 +464,19 @@ def _memory_gb(facts: ServingFacts) -> float:
         return billions * LLM_GB_PER_BILLION + LLM_HEADROOM_GB
     if facts.family == "vision":
         return (facts.weights or 0) * FLOAT_BYTES / GB + RUNTIME_GB
-    return 0.5
+    # scikit-learn, numpy, pandas and a pickled forest do not live in half a gigabyte.
+    return RUNTIME_GB
 
 
 def _fits(host: Host, needed_gb: float) -> bool:
     room = host.vram_gb if host.kind == "gpu" else host.memory_gb
     return room is not None and room >= needed_gb
+
+
+def _workers(host: Host) -> float:
+    """How many requests a CPU box works on at once against the 2-thread reference: one
+    worker per two vCPUs, and half a worker on a single vCPU."""
+    return (host.vcpu or THREADS_PER_REQUEST) / THREADS_PER_REQUEST
 
 
 def _cost_on(host: Host, facts: ServingFacts, rate: int, ref: CpuReference) -> HostCost | None:
@@ -414,7 +485,10 @@ def _cost_on(host: Host, facts: ServingFacts, rate: int, ref: CpuReference) -> H
     # No rate, or a zero from a stack with nothing to compute: one box, capacity unsaid.
     if not seconds:
         return HostCost(host=host, usd_per_month=host.usd_per_hour * HOURS_PER_MONTH)
-    capacity = max(1, int(3600 / seconds))
+    # The CPU rate was measured on two threads; a bigger box runs one worker per two vCPUs
+    # and a one-vCPU box half of one.
+    workers = _workers(host) if host.kind == "cpu" else 1.0
+    capacity = max(1, int(3600 / seconds * workers))
     instances = max(1, math.ceil(rate / capacity))
     return HostCost(
         host=host,
@@ -448,6 +522,8 @@ def _cpu_ms(facts: ServingFacts, ref: CpuReference) -> float | None:
     from resnet18's measured rate for a stack the table has no row for."""
     backbone, image_size = facts.backbone or "", facts.image_size or 0
     macs = facts.multiply_adds or 0
+    if facts.reference_ms:
+        return facts.reference_ms
     if backbone in ref.backbone_ms and backbone in BACKBONE_SIZES:
         return _interpolate(ref.backbone_ms[backbone], BACKBONE_SIZES[backbone][1], image_size)
     anchor = ref.backbone_ms.get("resnet18")
@@ -491,11 +567,25 @@ def _capacity_basis(chosen: HostCost, facts: ServingFacts, ref: CpuReference) ->
             f"one request takes about {ms:.1f} ms, scaled by multiply-adds from the "
             f"published resnet50 rate for this GPU"
         ]
+    workers = _workers(chosen.host)
+    per_request = ms * workers
+    if workers == 1:
+        box = "taken as a 2-vCPU box"
+    elif workers < 1:
+        box = f"scaled to half a worker on {chosen.host.vcpu} vCPU"
+    else:
+        box = f"scaled to {workers:g} workers on {chosen.host.vcpu} vCPUs"
     if facts.family == "tabular":
         return [
-            f"one row predicts in about {ms / ref.tabular_margin:.1f} ms, measured on the "
-            f"corpus on {ref.measured_on} and taken as a 2-vCPU box, "
-            f"with a {ref.tabular_margin:g}x margin"
+            f"one row predicts in about {per_request / ref.tabular_margin:.1f} ms, measured "
+            f"on the corpus on {ref.measured_on} and {box}, with a {ref.tabular_margin:g}x "
+            "margin"
+        ]
+    if facts.reference_ms:
+        return [
+            f"one request takes about {per_request:.1f} ms, scaled from timm's compiled CPU "
+            f"table relative to resnet50 measured on {ref.measured_on} and {box}; a plain "
+            "deployment can be slower"
         ]
     table = ref.backbone_ms.get(facts.backbone or "")
     if table is None:
@@ -504,9 +594,7 @@ def _capacity_basis(chosen: HostCost, facts: ServingFacts, ref: CpuReference) ->
         how = "measured"
     else:
         how = "interpolated between sizes measured"
-    return [
-        f"one request takes about {ms:.1f} ms, {how} on {ref.measured_on} and taken as a 2-vCPU box"
-    ]
+    return [f"one request takes about {per_request:.1f} ms, {how} on {ref.measured_on} and {box}"]
 
 
 __all__ = [
@@ -516,8 +604,10 @@ __all__ = [
     "FEATURES",
     "HOURS_PER_MONTH",
     "STAGE_WIDTHS",
+    "THREADS_PER_REQUEST",
     "estimator_family",
     "facts_from_code",
+    "facts_from_model_name",
     "facts_from_prompt",
     "facts_from_recipe",
     "load_prices",

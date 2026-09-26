@@ -1166,7 +1166,7 @@ def test_a_spec_winner_gets_a_serving_block_in_the_sidecar(
     assert serving["usd_per_1k_requests"] > 0
     assert serving["basis"][0].startswith("linear pipeline (LogisticRegression)")
     assert "serving: about $" in _plain(result.output)
-    assert "prices as of" in _plain(result.output)
+    assert "prices: aws shipped" in _plain(result.output)
 
 
 def test_requests_per_hour_must_be_at_least_one(tmp_path: Path) -> None:
@@ -1189,3 +1189,103 @@ def test_requests_per_hour_must_be_at_least_one(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "requests-per-hour" in (result.stderr or result.stdout)
+
+
+# ─── live prices: the flags and the two commands (Sprint 5 Day 2) ─────────
+
+
+def test_region_needs_a_cloud_and_the_cloud_must_be_one_of_three(tmp_path: Path) -> None:
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    base = ["run", "--data", str(data), "--target", "churn", "--metric", "f1"]
+
+    result = runner.invoke(app, [*base, "--region", "us-east-1"])
+    assert result.exit_code != 0
+    assert "--region needs --cloud" in (result.stderr or result.stdout)
+
+    result = runner.invoke(app, [*base, "--cloud", "ibm"])
+    assert result.exit_code != 0
+    assert "--cloud must be aws | gcp | azure" in (result.stderr or result.stdout)
+
+
+def test_a_spec_winner_priced_on_one_cloud_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.core import prices as prices_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    # The background refresh is wired, and a unit test never reaches for the network.
+    started: list[str | None] = []
+    monkeypatch.setattr(
+        prices_mod, "refresh_azure_in_background", lambda region=None: started.append(region)
+    )
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    out = tmp_path / "models" / "best_model.joblib"
+
+    _stub_run_orchestrator(monkeypatch, best_model="sklearn.linear_model.LogisticRegression")
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--spec",
+            "--memory",
+            str(tmp_path / "memory.db"),
+            "--output",
+            str(out),
+            "--cloud",
+            "azure",
+            "--region",
+            "eastus",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert started == ["eastus"]
+    serving = json.loads(out.with_name("best.json").read_text())["serving"]
+    assert serving["chosen"]["host"]["cloud"] == "azure"
+    assert [cost["host"]["cloud"] for cost in serving["by_cloud"]] == ["azure"]
+    assert "prices: azure shipped" in _plain(result.output)
+    assert "no price list cached for azure eastus" in _plain(result.output)
+
+
+def test_prices_show_lists_every_cloud_and_the_timm_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    result = runner.invoke(app, ["prices", "show"])
+
+    assert result.exit_code == 0, result.output
+    assert "aws us-east-1: shipped rows" in result.output
+    assert "gcp us-central1: shipped rows" in result.output
+    assert "azure eastus: shipped rows" in result.output
+    assert "timm:" in result.output
+
+
+def test_prices_refresh_for_gcp_touches_no_network_and_says_the_shipped_rows_stand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.core import prices as prices_mod
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    fetched: list[str] = []
+    monkeypatch.setattr(prices_mod, "refresh_timm", lambda **kw: fetched.append("timm"))
+
+    result = runner.invoke(app, ["prices", "refresh", "--cloud", "gcp"])
+
+    assert result.exit_code == 0, result.output
+    assert "gcp: shipped rows stand" in result.output
+    assert fetched == ["timm"]
+
+
+def test_prices_refresh_refuses_a_region_without_a_cloud() -> None:
+    result = runner.invoke(app, ["prices", "refresh", "--region", "eastus"])
+
+    assert result.exit_code != 0
+    assert "--region needs --cloud" in (result.stderr or result.stdout)
