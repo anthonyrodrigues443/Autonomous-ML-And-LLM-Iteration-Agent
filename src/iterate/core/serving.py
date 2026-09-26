@@ -1,6 +1,7 @@
 """The Pricer: what a run's winner costs to serve, from facts the run already has.
 
-Pure arithmetic over the dated snapshot in `serving_prices.json`. It never reads an
+Pure arithmetic over the price table `load_prices` assembles, the clouds' cached lists
+where a refresh exists and the shipped snapshot where not. It never reads an
 abstract or asks a model, so it cannot invent a price, and it never imports torch, so
 it runs on the host after every family. Three facts builders read the
 winner: a table pipeline by the classes it named, an image recipe by its weights and

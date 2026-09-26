@@ -2,7 +2,8 @@
 
 `ServingFacts` is what the harness knows about a winner, enough to price it: the
 classes a table pipeline named, an image recipe's weights and multiply-adds, a prompt's
-model and its tokens per record. `Prices` is the dated snapshot shipped with the package.
+model and its tokens per record. `Prices` is the table the Pricer reads: the clouds' cached
+lists where a refresh exists, the shipped snapshot where not, with a source per cloud.
 `ServingProfile` is the answer: the cheapest machine or API that serves the request rate,
 the monthly cost, and a basis line for every number, so an estimate is never mistaken
 for a measurement. Extra fields are refused and the parts must agree.
@@ -146,7 +147,8 @@ class CpuReference(BaseModel):
 
 
 class Prices(BaseModel):
-    """The dated snapshot: machines, API models, and the reference latencies."""
+    """The price table the Pricer reads: machines, API models, the reference latencies,
+    and per cloud whether the machines came from a refreshed list or the shipped file."""
 
     model_config = ConfigDict(extra="forbid")
 

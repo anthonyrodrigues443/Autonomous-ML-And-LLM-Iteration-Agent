@@ -536,7 +536,10 @@ def refresh_timm(*, client: httpx.Client | None = None, log: Log = _quiet) -> Pa
         raise ValueError("timm: the table gave no networks; the old cache stands")
     body = {"date": today(), "url": TIMM_CSV_URL, "rows": [row.__dict__ for row in rows]}
     path = _write_atomic(timm_cache_path(), json.dumps(body))
-    log(f"timm: {len(rows)} networks from timm's published table, refreshed {today()}")
+    log(
+        f"timm: {len(rows)} rows over {len(_by_name(rows))} networks from timm's published "
+        f"table, refreshed {today()}"
+    )
     return path
 
 
@@ -649,7 +652,7 @@ def describe() -> list[str]:
             )
     sizes, source = timm_sizes()
     lines.append(
-        f"timm: {sum(len(v) for v in sizes.values())} networks, {source.kind} {source.date}"
+        f"timm: {sum(len(v) for v in sizes.values())} rows over {len(sizes)} networks, {source.kind} {source.date}"
     )
     lines.append(
         f"api models: {len(base.api_models)} rows, shipped {base.snapshot_date} "
