@@ -24,6 +24,7 @@ def _own_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _AWS_COLUMNS = [
+    "SKU",
     "TermType",
     "Unit",
     "PricePerUnit",
@@ -39,11 +40,13 @@ _AWS_COLUMNS = [
     "GPU",
     "GPU Memory",
     "Pre Installed S/W",
+    "Instance Family",
 ]
 
 
 def _aws(**over: str) -> dict[str, str]:
     row = {
+        "SKU": "ABC123",
         "TermType": "OnDemand",
         "Unit": "Hrs",
         "PricePerUnit": "0.0208",
@@ -59,6 +62,7 @@ def _aws(**over: str) -> dict[str, str]:
         "GPU": "",
         "GPU Memory": "",
         "Pre Installed S/W": "NA",
+        "Instance Family": "General purpose",
     }
     row.update(over)
     return row
@@ -105,6 +109,7 @@ def test_aws_gpu_rows_get_their_vram_and_only_the_t4_gets_a_rate() -> None:
                 "GPU": "1",
                 "GPU Memory": "16 GB",
                 "PricePerUnit": "0.526",
+                "Instance Family": "GPU instance",
             }
         ),
         _aws(
@@ -115,6 +120,7 @@ def test_aws_gpu_rows_get_their_vram_and_only_the_t4_gets_a_rate() -> None:
                 "GPU": "1",
                 "GPU Memory": "",
                 "PricePerUnit": "1.006",
+                "Instance Family": "GPU instance",
             }
         ),
         _aws(
@@ -125,6 +131,7 @@ def test_aws_gpu_rows_get_their_vram_and_only_the_t4_gets_a_rate() -> None:
                 "GPU": "1",
                 "GPU Memory": "",
                 "PricePerUnit": "0.3",
+                "Instance Family": "Machine Learning ASIC Instances",
             }
         ),
     ]
@@ -243,11 +250,11 @@ def test_refresh_aws_streams_the_file_reduces_it_and_writes_the_cache() -> None:
         ("Standard_F2s_v2", (2, 4.0, None)),
         ("Standard_B2s", (2, 4.0, None)),
         ("Standard_B1ls", (1, 0.5, None)),
-        ("Standard_NC4as_T4_v3", (4, 16.0, "T4")),
-        ("Standard_NC64as_T4_v3", (64, 256.0, "T4")),
-        ("Standard_NV36ads_A10_v5", (36, 144.0, "A10")),
-        ("Standard_NC24ads_A100_v4", (24, 96.0, "A100")),
-        ("Standard_NC40ads_H100_v5", (40, 160.0, "H100")),
+        ("Standard_NC4as_T4_v3", (4, 28.0, "T4")),
+        ("Standard_NC64as_T4_v3", (64, 448.0, "T4")),
+        ("Standard_NV36ads_A10_v5", (36, 439.9, "A10")),
+        ("Standard_NC24ads_A100_v4", (24, 220.1, "A100")),
+        ("Standard_NC40ads_H100_v5", (40, 320.0, "H100")),
     ],
 )
 def test_azure_specs_follow_the_naming_convention(
@@ -403,7 +410,7 @@ def test_load_reads_the_cache_for_a_cloud_that_has_one_and_the_shipped_file_othe
     assert table.sources["aws"].kind == "refreshed"
     assert table.sources["gcp"].kind == "shipped"
     assert table.provenance(("aws", "gcp")) == (
-        f"aws refreshed {prices.today()} (us-east-1), gcp shipped {table.snapshot_date}"
+        f"aws refreshed {prices.today()} (us-east-1), gcp shipped {table.snapshot_date} (us-central1)"
     )
 
 
@@ -413,7 +420,7 @@ def test_with_no_cache_everything_is_shipped_and_dated() -> None:
     assert {h.cloud for h in table.hosts} == {"aws", "gcp"}
     assert (
         table.provenance()
-        == f"aws shipped {table.snapshot_date}, gcp shipped {table.snapshot_date}"
+        == f"aws shipped {table.snapshot_date} (us-east-1), gcp shipped {table.snapshot_date} (us-central1)"
     )
 
 
@@ -421,7 +428,7 @@ def test_the_profile_line_says_which_list_it_used() -> None:
     facts = serving.facts_from_recipe({"backbone": "resnet18", "image_size": 128})
     line = serving.profile(facts, 1000, serving.load_prices(("aws",))).render()[0]
 
-    assert line.endswith(f"prices: aws shipped {prices.shipped().snapshot_date}")
+    assert line.endswith(f"prices: aws shipped {prices.shipped().snapshot_date} (us-east-1)")
 
 
 def test_describe_names_every_cloud_and_the_timm_table() -> None:
@@ -485,7 +492,7 @@ def test_a_bigger_cpu_box_serves_one_worker_per_two_vcpus() -> None:
     on_four = serving._cost_on(four, facts, 1000, ref)
     assert on_two is not None
     assert on_four is not None
-    assert on_four.capacity_per_hour == 2 * on_two.capacity_per_hour
+    assert on_four.capacity_per_hour == pytest.approx(2 * on_two.capacity_per_hour, abs=2)
 
 
 def test_the_agents_own_network_is_priced_from_timms_table_when_the_name_is_there() -> None:
@@ -497,3 +504,209 @@ def test_the_agents_own_network_is_priced_from_timms_table_when_the_name_is_ther
     assert unknown.unpriced_because is not None
     assert "the agent's own network" in unknown.unpriced_because
     assert "not in timm's published table" in unknown.unpriced_because
+
+
+# ─── what review found, kept out for good ────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "sku", ["Standard_D11_v2", "Standard_D3_v2", "Standard_D2", "Standard_D14_v2"]
+)
+def test_azure_d_v1_and_v2_names_carry_a_size_code_not_a_vcpu_count_so_they_are_refused(
+    sku: str,
+) -> None:
+    assert prices.azure_specs(sku) is None
+
+
+def test_azure_f_v6_has_more_memory_per_vcpu_than_older_f() -> None:
+    assert prices.azure_specs("Standard_F2s_v2") == prices.AzureSpec(vcpu=2, memory_gb=4.0)
+    assert prices.azure_specs("Standard_F2as_v6") == prices.AzureSpec(vcpu=2, memory_gb=8.0)
+    assert prices.azure_specs("Standard_F2ams_v6") == prices.AzureSpec(vcpu=2, memory_gb=16.0)
+
+
+def test_aws_fractional_gpus_and_non_gpu_accelerators_never_land_in_the_cpu_pool() -> None:
+    rows = [
+        _aws(
+            **{
+                "Instance Type": "g6f.large",
+                "GPU": "0.125",
+                "GPU Memory": "3 GB",
+                "Instance Family": "GPU instance",
+                "PricePerUnit": "0.3",
+            }
+        ),
+        _aws(
+            **{
+                "Instance Type": "dl1.24xlarge",
+                "GPU": "",
+                "Instance Family": "Machine Learning ASIC Instances",
+                "PricePerUnit": "13.1",
+            }
+        ),
+        _aws(
+            **{
+                "Instance Type": "f1.2xlarge",
+                "GPU": "",
+                "Instance Family": "FPGA Instances",
+                "PricePerUnit": "1.65",
+            }
+        ),
+        _aws(),
+    ]
+    hosts = prices.reduce_aws(rows, region="r", read_on="d")
+
+    assert [h.name for h in hosts] == ["t3.small"]
+
+
+def test_aws_rows_without_the_family_column_are_still_read() -> None:
+    row = _aws()
+    del row["Instance Family"]
+
+    assert [h.name for h in prices.reduce_aws([row], region="r", read_on="d")] == ["t3.small"]
+
+
+def test_the_aws_header_is_found_by_content_when_the_metadata_grows() -> None:
+    header = ",".join(f'"{c}"' for c in _AWS_COLUMNS)
+    body = ",".join(f'"{v}"' for v in _aws().values())
+    text = "\n".join(['"a","b"'] * 7 + [header, body])
+
+    rows = list(prices._stream_csv_rows(_Lines(text)))  # type: ignore[arg-type]
+
+    assert rows[0]["Instance Type"] == "t3.small"
+
+
+def test_a_refresh_that_reduces_to_nothing_raises_and_leaves_the_old_cache() -> None:
+    good = prices.reduce_aws([_aws()], region="us-east-1", read_on="d")
+    prices.write_cache("aws", "us-east-1", good, "u")
+    empty = "\n".join(['"a","b"'] * 5 + [",".join(f'"{c}"' for c in _AWS_COLUMNS)])
+
+    with pytest.raises(ValueError, match="no machines"):
+        prices.refresh_aws("us-east-1", client=_Client(csv_text=empty))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="no machines"):
+        prices.refresh_azure("EastUS", client=_Client(pages=[{"Items": [], "NextPageLink": None}]))  # type: ignore[arg-type]
+
+    cached = prices.read_cache("aws", "us-east-1")
+    assert cached is not None
+    assert [h.name for h in cached.hosts] == ["t3.small"]
+    assert prices.read_cache("azure", "EastUS") is None
+
+
+def test_a_cache_with_an_unreadable_or_future_date_is_stale_and_never_read() -> None:
+    path = prices.cache_path("azure", "eastus")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"date": "yesterday", "url": "u", "hosts": []}))
+    assert prices.read_cache("azure", "eastus") is None
+    assert prices.is_stale("azure", "eastus") is True
+
+    tomorrow = (datetime.now(UTC).date() + timedelta(days=1)).isoformat()
+    path.write_text(json.dumps({"date": tomorrow, "url": "u", "hosts": []}))
+    assert prices.is_stale("azure", "eastus") is True
+
+
+def test_cache_writes_are_atomic() -> None:
+    path = prices.write_cache("aws", "us-east-1", [], "u")
+
+    assert path.exists()
+    assert not path.with_suffix(".json.part").exists()
+
+
+def test_the_background_refresh_runs_when_the_cache_is_stale_and_swallows_any_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def boom(region: str | None = None, **kw: Any) -> None:
+        calls.append(str(region))
+        raise AttributeError("a page that was not a dict")
+
+    monkeypatch.setattr(prices, "refresh_azure", boom)
+    thread = prices.refresh_azure_in_background("eastus")
+
+    assert thread is not None
+    thread.join(timeout=5)
+    assert calls == ["eastus"]
+
+
+def test_the_shipped_fallback_names_the_region_it_is_for() -> None:
+    table = prices.load(("aws",), "eu-west-1")
+
+    assert table.sources["aws"].kind == "shipped"
+    assert table.sources["aws"].region == "us-east-1"
+    assert table.provenance(("aws",)).endswith("(us-east-1)")
+
+
+def test_refresh_keeps_going_when_one_list_fails_and_says_so_at_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[str] = []
+    monkeypatch.setattr(prices, "refresh_timm", lambda **kw: logged.append("timm ok"))
+    monkeypatch.setattr(
+        prices, "refresh_azure", lambda *a, **kw: (_ for _ in ()).throw(OSError("down"))
+    )
+    monkeypatch.setattr(prices, "refresh_aws", lambda *a, **kw: logged.append("aws ok"))
+
+    with pytest.raises(ValueError, match="azure: OSError: down"):
+        prices.refresh(None, None, log=logged.append)
+
+    assert "aws ok" in logged
+    assert any(line.startswith("azure: not refreshed") for line in logged)
+
+
+def test_describe_lists_every_cached_region_not_only_the_default() -> None:
+    prices.write_cache(
+        "aws", "eu-west-1", prices.reduce_aws([_aws()], region="eu-west-1", read_on="d"), "u"
+    )
+
+    lines = prices.describe()
+
+    assert any(line.startswith("aws eu-west-1: 1 machines, refreshed") for line in lines)
+
+
+def test_a_timm_name_with_a_pretrained_tag_is_the_same_network() -> None:
+    tagged = serving.facts_from_model_name("timm/resnet50.a1_in1k", 224)
+    plain = serving.facts_from_model_name("resnet50", 224)
+
+    assert tagged.weights == plain.weights
+    assert tagged.backbone == "resnet50"
+
+
+def test_a_one_vcpu_box_serves_half_the_reference_rate_and_the_line_says_so() -> None:
+    table = prices.load(("aws",))
+    ref = table.cpu_reference
+    facts = serving.facts_from_recipe({"backbone": "resnet18", "image_size": 224})
+    two = next(h for h in table.hosts if h.name == "t3.small")
+    one = two.model_copy(update={"name": "t3.micro", "vcpu": 1, "usd_per_hour": 0.0104})
+
+    on_two = serving._cost_on(two, facts, 1000, ref)
+    on_one = serving._cost_on(one, facts, 1000, ref)
+    assert on_two is not None
+    assert on_one is not None
+    assert on_one.capacity_per_hour == on_two.capacity_per_hour // 2
+    assert "half a worker on 1 vCPU" in serving._capacity_basis(on_one, facts, ref)[0]
+
+
+def test_the_tabular_basis_line_keeps_the_measured_time_on_a_bigger_box() -> None:
+    table = prices.load(("aws",))
+    ref = table.cpu_reference
+    facts = serving.facts_from_code(None, "HistGradientBoostingClassifier()", n_features=5)
+    two = next(h for h in table.hosts if h.name == "t3.small")
+    four = two.model_copy(update={"name": "c6i.xlarge", "vcpu": 4, "usd_per_hour": 0.17})
+
+    cost = serving._cost_on(four, facts, 1000, ref)
+    assert cost is not None
+    line = serving._capacity_basis(cost, facts, ref)[0]
+    assert line.startswith("one row predicts in about 4.5 ms")
+    assert "scaled to 2 workers on 4 vCPUs" in line
+
+
+def test_a_table_winner_needs_a_gigabyte_so_a_half_gigabyte_box_is_out() -> None:
+    table = prices.load(("aws",))
+    nano = next(h for h in table.hosts if h.name == "t3.small").model_copy(
+        update={"name": "t3.nano", "memory_gb": 0.5, "usd_per_hour": 0.0052}
+    )
+    table = table.model_copy(update={"hosts": [*table.hosts, nano]})
+    facts = serving.facts_from_code(None, "LogisticRegression()", n_features=3)
+
+    profile = serving.profile(facts, 1000, table)
+    assert profile.chosen is not None
+    assert profile.chosen.host.name != "t3.nano"

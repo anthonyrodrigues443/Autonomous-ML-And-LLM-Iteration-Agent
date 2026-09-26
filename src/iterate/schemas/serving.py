@@ -172,7 +172,12 @@ class Prices(BaseModel):
     def provenance(self, clouds: Iterable[str] | None = None) -> str:
         """What the line prints after the price: per cloud, refreshed or shipped, and
         the date, so an old number is never read as a current one."""
-        names = list(clouds) if clouds is not None else sorted({h.cloud for h in self.hosts})
+        if clouds is not None:
+            names = list(clouds)
+        elif self.sources:
+            names = sorted(self.sources)
+        else:
+            names = sorted({h.cloud for h in self.hosts})
         parts = []
         for cloud in names:
             source = self.sources.get(cloud)

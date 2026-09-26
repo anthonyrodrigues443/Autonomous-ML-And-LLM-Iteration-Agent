@@ -226,6 +226,8 @@ def facts_from_model_name(
     plain = name.lower()
     for prefix in ("timm/", "hf-hub:timm/", "hf_hub:timm/", "torchvision.models."):
         plain = plain.removeprefix(prefix)
+    # A pretrained tag (`resnet50.a1_in1k`) names weights, not a different network.
+    plain = plain.split(".")[0]
     rows = sizes.get(plain)
     if not rows:
         why = f"{name} is not in timm's published table, so its size is not known"
@@ -257,7 +259,9 @@ def _timm_anchor(
 ) -> float | None:
     """How much slower the reference box is than timm's compiled i9 on resnet50 at 224 px:
     timm's per-model times are scaled by this before they price anything."""
-    ref = reference or load_prices(()).cpu_reference
+    from iterate.core import prices
+
+    ref = reference or prices.shipped().cpu_reference
     ours = ref.backbone_ms.get(REFERENCE_BACKBONE, {}).get(str(REFERENCE_SIZE))
     theirs = [r for r in sizes.get(REFERENCE_BACKBONE, []) if r.img_size == REFERENCE_SIZE]
     if ours is None or not theirs or theirs[0].ms_batch1_cpu <= 0:
@@ -459,12 +463,19 @@ def _memory_gb(facts: ServingFacts) -> float:
         return billions * LLM_GB_PER_BILLION + LLM_HEADROOM_GB
     if facts.family == "vision":
         return (facts.weights or 0) * FLOAT_BYTES / GB + RUNTIME_GB
-    return 0.5
+    # scikit-learn, numpy, pandas and a pickled forest do not live in half a gigabyte.
+    return RUNTIME_GB
 
 
 def _fits(host: Host, needed_gb: float) -> bool:
     room = host.vram_gb if host.kind == "gpu" else host.memory_gb
     return room is not None and room >= needed_gb
+
+
+def _workers(host: Host) -> float:
+    """How many requests a CPU box works on at once against the 2-thread reference: one
+    worker per two vCPUs, and half a worker on a single vCPU."""
+    return (host.vcpu or THREADS_PER_REQUEST) / THREADS_PER_REQUEST
 
 
 def _cost_on(host: Host, facts: ServingFacts, rate: int, ref: CpuReference) -> HostCost | None:
@@ -473,9 +484,10 @@ def _cost_on(host: Host, facts: ServingFacts, rate: int, ref: CpuReference) -> H
     # No rate, or a zero from a stack with nothing to compute: one box, capacity unsaid.
     if not seconds:
         return HostCost(host=host, usd_per_month=host.usd_per_hour * HOURS_PER_MONTH)
-    # The CPU rate was measured on two threads; a bigger box runs one worker per two vCPUs.
-    workers = max(1, (host.vcpu or THREADS_PER_REQUEST) // THREADS_PER_REQUEST)
-    capacity = max(1, int(3600 / seconds) * (workers if host.kind == "cpu" else 1))
+    # The CPU rate was measured on two threads; a bigger box runs one worker per two vCPUs
+    # and a one-vCPU box half of one.
+    workers = _workers(host) if host.kind == "cpu" else 1.0
+    capacity = max(1, int(3600 / seconds * workers))
     instances = max(1, math.ceil(rate / capacity))
     return HostCost(
         host=host,
@@ -554,19 +566,20 @@ def _capacity_basis(chosen: HostCost, facts: ServingFacts, ref: CpuReference) ->
             f"one request takes about {ms:.1f} ms, scaled by multiply-adds from the "
             f"published resnet50 rate for this GPU"
         ]
+    workers = _workers(chosen.host)
+    per_request = ms * workers
+    if workers == 1:
+        box = "taken as a 2-vCPU box"
+    elif workers < 1:
+        box = f"scaled to half a worker on {chosen.host.vcpu} vCPU"
+    else:
+        box = f"scaled to {workers:g} workers on {chosen.host.vcpu} vCPUs"
     if facts.family == "tabular":
         return [
-            f"one row predicts in about {ms / ref.tabular_margin:.1f} ms, measured on the "
-            f"corpus on {ref.measured_on} and taken as a 2-vCPU box, "
-            f"with a {ref.tabular_margin:g}x margin"
+            f"one row predicts in about {per_request / ref.tabular_margin:.1f} ms, measured "
+            f"on the corpus on {ref.measured_on} and {box}, with a {ref.tabular_margin:g}x "
+            "margin"
         ]
-    workers = max(1, (chosen.host.vcpu or THREADS_PER_REQUEST) // THREADS_PER_REQUEST)
-    per_request = ms * workers
-    box = (
-        "taken as a 2-vCPU box"
-        if workers == 1
-        else f"scaled to {workers} workers on {chosen.host.vcpu} vCPUs"
-    )
     if facts.reference_ms:
         return [
             f"one request takes about {per_request:.1f} ms, scaled from timm's compiled CPU "

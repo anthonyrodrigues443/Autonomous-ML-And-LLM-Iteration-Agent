@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -49,11 +50,13 @@ CLOUDS: tuple[str, ...] = ("aws", "gcp", "azure")
 DEFAULT_REGIONS: dict[str, str] = {"aws": "us-east-1", "gcp": "us-central1", "azure": "eastus"}
 STALE_AFTER = timedelta(days=1)
 TIMEOUT = httpx.Timeout(120.0, connect=15.0)
+MAX_AZURE_PAGES = 200
 # The one GPU with a published plain-PyTorch batch-1 number (NVIDIA's ResNet-50 v1.5
 # README): 10.7 ms. Every other GPU prices one box with its capacity unsaid.
 T4_RESNET50_224_MS = 10.7
 # AWS's list carries a GPU count and, for most types, the GPU memory; the GPU model is
-# read from the instance family. Only the T4 families get the published rate.
+# read from the instance family. Only the T4 families get the published rate. A family
+# not here (FPGAs, Gaudi, Inferentia, video cards) cannot be sized and is dropped.
 AWS_GPU_FAMILIES: dict[str, tuple[str, float]] = {
     "g4dn": ("T4", 16),
     "g5": ("A10G", 24),
@@ -61,13 +64,20 @@ AWS_GPU_FAMILIES: dict[str, tuple[str, float]] = {
     "g6e": ("L40S", 48),
     "gr6": ("L4", 24),
     "p3": ("V100", 16),
+    "p3dn": ("V100", 32),
     "p4d": ("A100", 40),
     "p4de": ("A100", 80),
     "p5": ("H100", 80),
 }
+# What AWS calls the families that are plain CPU boxes; every other family carries an
+# accelerator of some kind, and a row with no GPU count in one of those is not a CPU box.
+AWS_CPU_FAMILIES = frozenset(
+    {"General purpose", "Compute optimized", "Memory optimized", "Storage optimized"}
+)
 # Azure's API carries no specs. Memory per vCPU follows the family letter, and the
 # GPU follows the accelerator token in the name. Families not listed are dropped and
-# counted, never guessed.
+# counted, never guessed. The D v1 and v2 names carry a size code, not a vCPU count
+# (D11_v2 is 2 vCPUs), so they are refused too.
 AZURE_GB_PER_VCPU: dict[str, float] = {"D": 4.0, "DC": 4.0, "E": 8.0, "EC": 8.0, "F": 2.0}
 AZURE_B_SERIES_GB: dict[str, float] = {
     "B1ls": 0.5,
@@ -81,12 +91,13 @@ AZURE_B_SERIES_GB: dict[str, float] = {
     "B16ms": 64,
     "B20ms": 80,
 }
-# (family, accelerator) -> (GPU, VRAM in GB per GPU, the vCPU counts that carry a whole GPU)
-AZURE_GPUS: dict[tuple[str, str], tuple[str, float, tuple[int, ...]]] = {
-    ("NC", "T4"): ("T4", 16, (4, 8, 16, 64)),
-    ("NV", "A10"): ("A10", 24, (36, 72)),
-    ("NC", "A100"): ("A100", 80, (24, 48, 96)),
-    ("NC", "H100"): ("H100", 94, (40, 80)),
+# (family, accelerator) -> (GPU, VRAM per GPU in GB, GB of memory per vCPU, the vCPU
+# counts that carry a whole GPU)
+AZURE_GPUS: dict[tuple[str, str], tuple[str, float, float, tuple[int, ...]]] = {
+    ("NC", "T4"): ("T4", 16, 7.0, (4, 8, 16, 64)),
+    ("NV", "A10"): ("A10", 24, 12.22, (36, 72)),
+    ("NC", "A100"): ("A100", 80, 9.17, (24, 48, 96)),
+    ("NC", "H100"): ("H100", 94, 8.0, (40, 80)),
 }
 _AZURE_SKU = re.compile(
     r"^Standard_(?P<family>[A-Z]+)(?P<vcpu>\d+)(?P<constrained>-\d+)?(?P<letters>[a-z]*)"
@@ -146,7 +157,8 @@ def region_for(cloud: str, region: str | None) -> str:
 
 def load(clouds: Sequence[str] | None = None, region: str | None = None) -> Prices:
     """The cache where it exists, the shipped file where it does not, and a source per
-    cloud so the profile can say which it used."""
+    cloud so the profile can say which it used. The shipped rows are for the default
+    region, and the source says so even when another region was asked for."""
     base = shipped()
     hosts: list[Host] = []
     sources: dict[str, Source] = {}
@@ -160,7 +172,9 @@ def load(clouds: Sequence[str] | None = None, region: str | None = None) -> Pric
             )
         else:
             hosts.extend(h for h in base.hosts if h.cloud == cloud)
-            sources[cloud] = Source(kind="shipped", date=base.snapshot_date)
+            sources[cloud] = Source(
+                kind="shipped", date=base.snapshot_date, region=DEFAULT_REGIONS[cloud]
+            )
     return base.model_copy(update={"hosts": hosts, "sources": sources})
 
 
@@ -174,14 +188,14 @@ def read_cache(cloud: str, region: str) -> Cached | None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         hosts = [Host.model_validate(row) for row in raw["hosts"]]
-        return Cached(hosts=hosts, date=str(raw["date"]), url=str(raw["url"]), region=region)
+        date = str(raw["date"])
+        datetime.fromisoformat(date)
+        return Cached(hosts=hosts, date=date, url=str(raw["url"]), region=region)
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
 def write_cache(cloud: str, region: str, hosts: Sequence[Host], url: str) -> Path:
-    path = cache_path(cloud, region)
-    path.parent.mkdir(parents=True, exist_ok=True)
     body = {
         "cloud": cloud,
         "region": region,
@@ -189,20 +203,35 @@ def write_cache(cloud: str, region: str, hosts: Sequence[Host], url: str) -> Pat
         "url": url,
         "hosts": [h.model_dump() for h in hosts],
     }
-    path.write_text(json.dumps(body, indent=1), encoding="utf-8")
+    return _write_atomic(cache_path(cloud, region), json.dumps(body, indent=1))
+
+
+def _write_atomic(path: Path, text: str) -> Path:
+    """A reader in another thread, or a run ending mid-write, sees the old file or the
+    new one and never a truncated one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_suffix(path.suffix + ".part")
+    part.write_text(text, encoding="utf-8")
+    os.replace(part, path)
     return path
 
 
 def cache_age(cloud: str, region: str) -> timedelta | None:
+    """How old the cache is, or None when there is none or its date cannot be read."""
     cached = read_cache(cloud, region)
     if cached is None:
         return None
-    return datetime.now(UTC).date() - datetime.fromisoformat(cached.date).date()
+    try:
+        written = datetime.fromisoformat(cached.date).date()
+    except ValueError:
+        return None
+    return datetime.now(UTC).date() - written
 
 
 def is_stale(cloud: str, region: str) -> bool:
+    """A day old, unreadable, or dated in the future: all of them call for a refresh."""
     age = cache_age(cloud, region)
-    return age is None or age >= STALE_AFTER
+    return age is None or age < timedelta(0) or age >= STALE_AFTER
 
 
 # ─── AWS: a 300 MB file, streamed and reduced ────────────────────────────
@@ -210,7 +239,8 @@ def is_stale(cloud: str, region: str) -> bool:
 
 def reduce_aws(rows: Iterable[Mapping[str, str]], *, region: str, read_on: str) -> list[Host]:
     """On-demand, Linux, shared tenancy, nothing pre-installed, current generation, priced
-    by the hour in dollars; the cheapest row per instance type when there are several."""
+    by the hour in dollars; the cheapest row per instance type when there are several. A
+    fraction of a GPU, or an accelerator that is not a GPU, cannot be sized and is dropped."""
     url = AWS_CSV_URL.format(region=region)
     best: dict[str, Host] = {}
     for r in rows:
@@ -229,19 +259,24 @@ def reduce_aws(rows: Iterable[Mapping[str, str]], *, region: str, read_on: str) 
         try:
             price = float(r.get("PricePerUnit") or 0)
             vcpu = int(r.get("vCPU") or 0)
+            accelerators = float(r.get("GPU") or 0)
         except ValueError:
             continue
         memory = _gb(r.get("Memory"))
         if price <= 0 or vcpu <= 0 or memory is None:
             continue
         name = str(r["Instance Type"])
-        gpus = _int(r.get("GPU"))
-        kind: Kind = "gpu" if gpus else "cpu"
+        family_kind = r.get("Instance Family")
+        if not accelerators and family_kind and family_kind not in AWS_CPU_FAMILIES:
+            continue
+        kind: Kind = "gpu" if accelerators else "cpu"
         vram: float | None = None
         rate: float | None = None
-        if gpus:
-            family = name.split(".")[0]
-            known = AWS_GPU_FAMILIES.get(family)
+        if accelerators:
+            if accelerators < 1:
+                continue
+            gpus = int(accelerators)
+            known = AWS_GPU_FAMILIES.get(name.split(".")[0])
             if known is None:
                 continue
             model, table_vram = known
@@ -271,11 +306,25 @@ def reduce_aws(rows: Iterable[Mapping[str, str]], *, region: str, read_on: str) 
 
 
 def _stream_csv_rows(response: httpx.Response, *, skip: int = 5) -> Iterator[dict[str, str]]:
-    """AWS's file opens with five metadata lines before the header."""
+    """AWS's file opens with metadata lines before the header. The header is found by
+    its first column, `SKU`, so an extra line of metadata does not shift every field."""
     lines = response.iter_lines()
-    for _ in range(skip):
-        next(lines, None)
-    yield from csv.DictReader(lines)
+    header: str | None = None
+    for _ in range(skip + 5):
+        line = next(lines, None)
+        if line is None:
+            return
+        if line.lstrip('"').startswith("SKU"):
+            header = line
+            break
+    if header is None:
+        return
+    yield from csv.DictReader(_chain(header, lines))
+
+
+def _chain(first: str, rest: Iterator[str]) -> Iterator[str]:
+    yield first
+    yield from rest
 
 
 def refresh_aws(
@@ -292,6 +341,8 @@ def refresh_aws(
     finally:
         if client is None:
             own.close()
+    if not hosts:
+        raise ValueError(f"aws {where}: the list reduced to no machines; the old cache stands")
     path = write_cache("aws", where, hosts, url)
     log(f"aws {where}: {len(hosts)} machines, refreshed {today()}")
     return path
@@ -310,27 +361,32 @@ class AzureSpec:
 
 def azure_specs(sku: str) -> AzureSpec | None:
     """What Azure's naming convention says about a SKU, or None for a family this table
-    does not know or a fraction of a GPU."""
+    does not know, a size code that is not a vCPU count, or a fraction of a GPU."""
     found = _AZURE_SKU.match(sku)
     if found is None or found.group("constrained"):
         return None
     family, vcpu = found.group("family"), int(found.group("vcpu"))
     letters, accel = found.group("letters") or "", found.group("accel")
-    if family == "B" and not found.group("version"):
+    version = found.group("version")
+    if family == "B" and not version:
         memory = AZURE_B_SERIES_GB.get(f"B{vcpu}{letters}")
         return None if memory is None else AzureSpec(vcpu=vcpu, memory_gb=memory)
     if accel:
         gpu = AZURE_GPUS.get((family, accel))
-        if gpu is None or vcpu not in gpu[2]:
+        if gpu is None or vcpu not in gpu[3]:
             return None
-        model, vram, _ = gpu
-        return AzureSpec(vcpu=vcpu, memory_gb=vcpu * 4.0, gpu=model, vram_gb=vram)
-    per_vcpu = AZURE_GB_PER_VCPU.get(family)
-    if per_vcpu is None:
+        model, vram, per_vcpu, _ = gpu
+        return AzureSpec(vcpu=vcpu, memory_gb=round(vcpu * per_vcpu, 1), gpu=model, vram_gb=vram)
+    if family == "D" and version in (None, "2"):
         return None
-    if "l" in letters and family.startswith("D"):
-        per_vcpu = 2.0
-    return AzureSpec(vcpu=vcpu, memory_gb=vcpu * per_vcpu)
+    gb = AZURE_GB_PER_VCPU.get(family)
+    if gb is None:
+        return None
+    if family.startswith("D") and "l" in letters:
+        gb = 2.0
+    if family == "F" and version == "6":
+        gb = 8.0 if "m" in letters else 4.0
+    return AzureSpec(vcpu=vcpu, memory_gb=vcpu * gb)
 
 
 def reduce_azure(
@@ -338,7 +394,7 @@ def reduce_azure(
 ) -> tuple[list[Host], int]:
     """Linux, pay as you go, priced by the hour; Spot, Low Priority and Windows rows
     dropped; the cheapest meter per SKU. Returns the hosts and how many SKUs were dropped
-    because their family is not in the spec table."""
+    because the name could not be sized."""
     best: dict[str, float] = {}
     for item in items:
         sku = str(item.get("armSkuName") or "")
@@ -389,7 +445,7 @@ def _azure_pages(client: httpx.Client, region: str) -> Iterator[list[dict[str, A
     response.raise_for_status()
     page = response.json()
     yield list(page.get("Items") or [])
-    for _ in range(200):
+    for _ in range(MAX_AZURE_PAGES):
         link = page.get("NextPageLink")
         if not link:
             return
@@ -397,6 +453,7 @@ def _azure_pages(client: httpx.Client, region: str) -> Iterator[list[dict[str, A
         response.raise_for_status()
         page = response.json()
         yield list(page.get("Items") or [])
+    raise ValueError(f"azure {region}: more than {MAX_AZURE_PAGES} pages; stopping short")
 
 
 def refresh_azure(
@@ -414,10 +471,12 @@ def refresh_azure(
         if client is None:
             own.close()
     hosts, unknown = reduce_azure(items, region=where, read_on=today())
+    if not hosts:
+        raise ValueError(f"azure {where}: the API gave no machines; the old cache stands")
     path = write_cache("azure", where, hosts, AZURE_API_URL)
     log(
         f"azure {where}: {len(hosts)} machines from Azure's retail price API, {pages} pages, "
-        f"refreshed {today()}; {unknown} SKUs dropped, their families are not in the spec table"
+        f"refreshed {today()}; {unknown} SKUs dropped, their names could not be sized"
     )
     return path
 
@@ -433,7 +492,7 @@ def refresh_azure_in_background(region: str | None = None) -> threading.Thread |
     def work() -> None:
         try:
             refresh_azure(where)
-        except (httpx.HTTPError, OSError, ValueError):
+        except Exception:
             return
 
     thread = threading.Thread(target=work, name="iterate-prices-azure", daemon=True)
@@ -450,17 +509,17 @@ def reduce_timm(rows: Iterable[Mapping[str, str]]) -> list[TimmRow]:
         try:
             if int(r.get("infer_batch_size") or 1) != 1:
                 continue
-            out.append(
-                TimmRow(
-                    model=str(r["model"]),
-                    img_size=int(r["infer_img_size"]),
-                    param_count_m=float(r["param_count"]),
-                    gmacs=float(r["infer_gmacs"]),
-                    ms_batch1_cpu=float(r["infer_step_time"]),
-                )
+            row = TimmRow(
+                model=str(r["model"]),
+                img_size=int(r["infer_img_size"]),
+                param_count_m=float(r["param_count"]),
+                gmacs=float(r["infer_gmacs"]),
+                ms_batch1_cpu=float(r["infer_step_time"]),
             )
         except (KeyError, ValueError):
             continue
+        if row.img_size > 0 and row.ms_batch1_cpu > 0:
+            out.append(row)
     return out
 
 
@@ -473,12 +532,10 @@ def refresh_timm(*, client: httpx.Client | None = None, log: Log = _quiet) -> Pa
     finally:
         if client is None:
             own.close()
-    path = timm_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"date": today(), "url": TIMM_CSV_URL, "rows": [row.__dict__ for row in rows]}),
-        encoding="utf-8",
-    )
+    if not rows:
+        raise ValueError("timm: the table gave no networks; the old cache stands")
+    body = {"date": today(), "url": TIMM_CSV_URL, "rows": [row.__dict__ for row in rows]}
+    path = _write_atomic(timm_cache_path(), json.dumps(body))
     log(f"timm: {len(rows)} networks from timm's published table, refreshed {today()}")
     return path
 
@@ -491,7 +548,10 @@ def timm_sizes() -> tuple[dict[str, list[TimmRow]], Source]:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             rows = [TimmRow(**row) for row in raw["rows"]]
-            return _by_name(rows), Source(kind="refreshed", date=str(raw["date"]), url=raw["url"])
+            if rows:
+                return _by_name(rows), Source(
+                    kind="refreshed", date=str(raw["date"]), url=str(raw["url"])
+                )
         except (OSError, ValueError, KeyError, TypeError):
             pass
     text = resources.files("iterate.core").joinpath(TIMM_FILE).read_text(encoding="utf-8")
@@ -515,7 +575,8 @@ def timm_sizes() -> tuple[dict[str, list[TimmRow]], Source]:
 def _by_name(rows: Iterable[TimmRow]) -> dict[str, list[TimmRow]]:
     out: dict[str, list[TimmRow]] = {}
     for row in rows:
-        out.setdefault(row.model, []).append(row)
+        if row.img_size > 0:
+            out.setdefault(row.model, []).append(row)
     return out
 
 
@@ -523,41 +584,68 @@ def _by_name(rows: Iterable[TimmRow]) -> dict[str, list[TimmRow]]:
 
 
 def refresh(cloud: str | None, region: str | None, *, log: Log) -> None:
-    """`iterate prices refresh`: every cloud, or one, then timm."""
-    for name in (cloud,) if cloud else CLOUDS:
-        if name == "aws":
-            refresh_aws(region, log=log)
-        elif name == "azure":
-            refresh_azure(region, log=log)
-        else:
-            rows = [h for h in shipped().hosts if h.cloud == "gcp"]
-            log(
-                f"gcp: shipped rows stand ({len(rows)} machines, {shipped().snapshot_date}); "
-                "GCP's catalog needs a key, which this version does not take"
-            )
-    refresh_timm(log=log)
+    """`iterate prices refresh`: timm first, then the clouds smallest first, so a failure
+    on AWS's 300 MB file never costs the cheap ones."""
+    wanted = (cloud,) if cloud else CLOUDS
+    failures: list[str] = []
+
+    def step(name: str, work: Callable[[], object]) -> None:
+        try:
+            work()
+        except Exception as exc:
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+            log(f"{name}: not refreshed ({type(exc).__name__}: {exc}); what was cached stands")
+
+    log(f"timm: fetching timm's published table ({TIMM_CSV_URL})")
+    step("timm", lambda: refresh_timm(log=log))
+    if "gcp" in wanted:
+        rows = [h for h in shipped().hosts if h.cloud == "gcp"]
+        note = (
+            f" (--region {region} does not apply; the shipped rows are us-central1)"
+            if region
+            else ""
+        )
+        log(
+            f"gcp: shipped rows stand ({len(rows)} machines, {shipped().snapshot_date}); "
+            f"GCP's catalog needs a key, which this version does not take{note}"
+        )
+    if "azure" in wanted:
+        step("azure", lambda: refresh_azure(region, log=log))
+    if "aws" in wanted:
+        step("aws", lambda: refresh_aws(region, log=log))
+    if failures:
+        raise ValueError("; ".join(failures))
 
 
 def describe() -> list[str]:
-    """`iterate prices show`: what the Pricer would read right now, per cloud."""
+    """`iterate prices show`: what the Pricer would read right now, per cloud and region."""
     base = shipped()
     lines: list[str] = []
+    root = cache_root()
     for cloud in CLOUDS:
-        region = DEFAULT_REGIONS[cloud]
-        cached = read_cache(cloud, region)
         rows = [h for h in base.hosts if h.cloud == cloud]
-        if cached is not None:
+        cached_files = sorted(root.glob(f"{cloud}-*.json")) if root.exists() else []
+        if not cached_files:
+            default = DEFAULT_REGIONS[cloud]
+            how = (
+                "GCP's catalog needs a key"
+                if cloud == "gcp"
+                else f"run `iterate prices refresh --cloud {cloud}`"
+            )
+            lines.append(
+                f"{cloud} {default}: shipped rows ({len(rows)} machines, "
+                f"{base.snapshot_date}); {how}"
+            )
+            continue
+        for path in cached_files:
+            region = path.stem.removeprefix(f"{cloud}-")
+            cached = read_cache(cloud, region)
+            if cached is None:
+                lines.append(f"{cloud} {region}: a cache that cannot be read; refresh it")
+                continue
             lines.append(
                 f"{cloud} {region}: {len(cached.hosts)} machines, refreshed {cached.date} "
                 f"from {cached.url}"
-            )
-        else:
-            lines.append(
-                f"{cloud} {region}: shipped rows ({len(rows)} machines, {base.snapshot_date}); "
-                f"run `iterate prices refresh --cloud {cloud}`"
-                if cloud != "gcp"
-                else f"{cloud} {region}: shipped rows ({len(rows)} machines, "
-                f"{base.snapshot_date}); GCP's catalog needs a key"
             )
     sizes, source = timm_sizes()
     lines.append(
@@ -573,15 +661,8 @@ def describe() -> list[str]:
 def _gb(value: str | None) -> float | None:
     if not value:
         return None
-    found = _GB.search(value)
+    found = _GB.search(value.replace(",", ""))
     return float(found.group(1)) if found else None
-
-
-def _int(value: str | None) -> int:
-    try:
-        return int(float(value or 0))
-    except ValueError:
-        return 0
 
 
 __all__ = [

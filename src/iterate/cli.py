@@ -839,16 +839,17 @@ def run(
         if labels is not None or key is not None or yes:
             raise typer.BadParameter("--labels, --key and --yes describe a folder of images")
 
-    # ─── First run with no saved config? Offer the setup wizard. ───────────
-    if not userconfig.exists() and sys.stdin.isatty():
-        console.print("[dim]No saved config found — let's set your defaults once.[/dim]\n")
-        setup()
-        console.print()
     if cloud is not None and cloud.lower() not in ("aws", "gcp", "azure"):
         raise typer.BadParameter(f"--cloud must be aws | gcp | azure, got {cloud!r}")
     if region is not None and cloud is None:
         raise typer.BadParameter("--region needs --cloud, since each cloud names its regions")
     clouds = (cloud.lower(),) if cloud is not None else None
+
+    # ─── First run with no saved config? Offer the setup wizard. ───────────
+    if not userconfig.exists() and sys.stdin.isatty():
+        console.print("[dim]No saved config found — let's set your defaults once.[/dim]\n")
+        setup()
+        console.print()
 
     cfg = userconfig.load_user_config()
 
@@ -2027,7 +2028,20 @@ def _serving_profile(
             facts = serving.facts_from_code(
                 cells if isinstance(cells, list) else None, code, n_features=n_features
             )
-        return serving.profile(facts, requests_per_hour, serving.load_prices(clouds, region))
+        prices = serving.load_prices(clouds, region)
+        if region is not None:
+            for cloud in clouds or ():
+                source = prices.sources.get(cloud)
+                if source is not None and source.kind == "shipped":
+                    console.print(
+                        f"no price list cached for {cloud} {region}: the shipped "
+                        f"{source.region} rows stand in; run `iterate prices refresh "
+                        f"--cloud {cloud} --region {region}` for that region's prices",
+                        style="dim",
+                        markup=False,
+                        highlight=False,
+                    )
+        return serving.profile(facts, requests_per_hour, prices)
     except Exception as exc:
         console.print(
             f"serving price not computed: {type(exc).__name__}: {exc}",

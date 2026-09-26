@@ -1211,7 +1211,14 @@ def test_region_needs_a_cloud_and_the_cloud_must_be_one_of_three(tmp_path: Path)
 def test_a_spec_winner_priced_on_one_cloud_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from iterate.core import prices as prices_mod
+
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    # The background refresh is wired, and a unit test never reaches for the network.
+    started: list[str | None] = []
+    monkeypatch.setattr(
+        prices_mod, "refresh_azure_in_background", lambda region=None: started.append(region)
+    )
     data = tmp_path / "d.csv"
     _write_tiny_csv(data)
     out = tmp_path / "models" / "best_model.joblib"
@@ -1239,10 +1246,12 @@ def test_a_spec_winner_priced_on_one_cloud_says_so(
         ],
     )
     assert result.exit_code == 0, result.stdout
+    assert started == ["eastus"]
     serving = json.loads(out.with_name("best.json").read_text())["serving"]
     assert serving["chosen"]["host"]["cloud"] == "azure"
     assert [cost["host"]["cloud"] for cost in serving["by_cloud"]] == ["azure"]
     assert "prices: azure shipped" in _plain(result.output)
+    assert "no price list cached for azure eastus" in _plain(result.output)
 
 
 def test_prices_show_lists_every_cloud_and_the_timm_table(
