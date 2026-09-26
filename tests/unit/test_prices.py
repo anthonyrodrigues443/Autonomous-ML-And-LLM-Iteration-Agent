@@ -486,3 +486,14 @@ def test_a_bigger_cpu_box_serves_one_worker_per_two_vcpus() -> None:
     assert on_two is not None
     assert on_four is not None
     assert on_four.capacity_per_hour == 2 * on_two.capacity_per_hour
+
+
+def test_the_agents_own_network_is_priced_from_timms_table_when_the_name_is_there() -> None:
+    facts = serving.facts_from_recipe({"model": "timm/convnext_small", "image_size": 224})
+    unknown = serving.facts_from_recipe({"model": "hf_hub:timm/vit_base"})
+
+    assert facts.unpriced_because is None
+    assert facts.basis[0].startswith("the agent's own network: convnext_small at 224 px")
+    assert unknown.unpriced_because is not None
+    assert "the agent's own network" in unknown.unpriced_because
+    assert "not in timm's published table" in unknown.unpriced_because

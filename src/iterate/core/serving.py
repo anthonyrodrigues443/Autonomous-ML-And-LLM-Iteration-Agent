@@ -142,9 +142,14 @@ def facts_from_recipe(recipe: Mapping[str, Any]) -> ServingFacts:
         why = "the winner left no recipe to price"
         return ServingFacts(family="vision", backbone="none", basis=[why], unpriced_because=why)
     if recipe.get("model"):
+        # The agent's own network: timm's table sizes it when the name is there.
         name = str(recipe["model"])
-        why = f"the winner is the agent's own network ({name}); its size is not known"
-        return ServingFacts(family="vision", backbone=name, basis=[why], unpriced_because=why)
+        sized = facts_from_model_name(name, int(recipe.get("image_size") or REFERENCE_SIZE))
+        if sized.unpriced_because:
+            why = f"the winner is the agent's own network ({name}), and {sized.unpriced_because}"
+            return ServingFacts(family="vision", backbone=name, basis=[why], unpriced_because=why)
+        sized.basis[0] = f"the agent's own network: {sized.basis[0]}"
+        return sized
     backbone = str(recipe.get("backbone") or "resnet18")
     size = int(recipe.get("image_size") or REFERENCE_SIZE)
     if backbone == "simple_cnn":
