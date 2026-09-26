@@ -838,3 +838,41 @@ def test_an_own_network_winner_is_not_priced_and_says_why(
     assert serving["chosen"] is None
     assert "the agent's own network" in serving["unpriced_because"]
     assert "serving: not priced:" in _plain(result.output)
+
+
+# ─── the serving budget is a wall (Sprint 5 Day 3) ──────────────────────────
+
+
+def test_an_image_run_whose_baseline_is_over_the_budget_is_refused_before_a_folder_is_made(
+    tmp_path: Path,
+) -> None:
+    folder = class_tree(tmp_path / "pets", per_class=8)
+    result = runner.invoke(
+        app,
+        ["run", "--data", str(folder), "--metric", "accuracy", "--serving-budget", "5", "--plain"],
+    )
+    assert result.exit_code != 0, result.output
+    text = _plain(result.output)
+    assert "the baseline alone (the plain CNN at " in text
+    assert "a month at 1,000 requests an hour on " in text
+    assert "above your --serving-budget of $5; the cheapest machine that could hold it is " in text
+    assert "so no request rate fits this budget. Raise the budget" in text
+    assert "lower --requests-per-hour" not in text
+    assert not (tmp_path / "dot" / "runs").exists()
+
+
+def test_a_recipe_winner_within_the_budget_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # monkeypatch feeds the stubbed loop
+    result, _ = _run_with_a_winner(
+        tmp_path,
+        monkeypatch,
+        network=b"weights",
+        extra=("--serving-budget", "40", "--requests-per-hour", "20000"),
+    )
+    assert result.exit_code == 0, result.output
+    kept = tmp_path / "dot" / "runs" / "r1" / saved_model.BEST_MODEL
+    serving = json.loads(kept.with_name("best.json").read_text())["serving"]
+    assert serving["budget_usd_per_month"] == 40.0
+    assert serving["within_budget"] is True
+    assert "within the $40 serving budget, prices:" in _plain(result.output)

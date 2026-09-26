@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from iterate.core.agent_loop import _winning_code, run_supervised
 from iterate.core.coder import Cell, CodingResult
 from iterate.core.memory import InMemoryMemory
@@ -64,7 +66,7 @@ class _FakeCoder:
 
 
 def _loop(supervisor: object, coders: list[_FakeCoder], terminator: object,
-          on_experiment=None, summarizer=None, memory=None, controller=None):
+          on_experiment=None, summarizer=None, memory=None, controller=None, wall=None):
     it = iter(coders)
     return run_supervised(
         target=_FakeTarget(),  # type: ignore[arg-type]
@@ -77,6 +79,7 @@ def _loop(supervisor: object, coders: list[_FakeCoder], terminator: object,
         summarizer=summarizer,
         on_experiment=on_experiment,
         controller=controller,
+        wall=wall,
     )
 
 
@@ -760,3 +763,118 @@ def test_a_table_experiment_records_no_recipe_it_started_from() -> None:
     sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
     result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1))
     assert "started_from" not in result.history[0].candidate.changes
+
+
+# ─── the serving budget is a wall (Sprint 5 Day 3) ──────────────────────────
+
+
+def _linear_wall(budget: float | None):
+    """A wall that reads every experiment as a linear pipeline on the shipped table."""
+    from iterate.core import serving
+
+    def linear(_experiment):
+        return serving.facts_from_code(None, "LogisticRegression()", n_features=3)
+
+    prices = serving.load_prices()
+    price = serving.profile(linear(None), 1000, prices).chosen.usd_per_month
+    wall = serving.Wall(requests_per_hour=1000, prices=prices, budget=budget, facts_of=linear)
+    return wall, price
+
+
+def test_an_experiment_over_the_serving_budget_is_stamped_and_never_the_best() -> None:
+    wall, price = _linear_wall(None)
+    wall.budget = price - 1
+    sup = _FakeSupervisor(
+        [SupervisorDecision(False, "a", "try a"), SupervisorDecision(False, "b", "try b")]
+    )
+    result = _loop(
+        sup, [_FakeCoder(_result(0.60)), _FakeCoder(_result(0.70))], MaxIterations(2), wall=wall
+    )
+    assert result.best is None  # both beat the baseline, neither can be served
+    assert [e.candidate.changes["over_budget"] for e in result.history] == [round(price, 2)] * 2
+    # Named as the run names them, at the budget they were judged under.
+    assert [(r.what, r.usd_per_month, r.budget, r.kind) for r in wall.refused] == [
+        ("a", price, price - 1, "trained"),
+        ("b", price, price - 1, "trained"),
+    ]
+
+
+def test_an_experiment_within_the_budget_is_not_stamped_and_can_be_the_best() -> None:
+    wall, price = _linear_wall(None)
+    wall.budget = price + 1
+    sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
+    result = _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), wall=wall)
+    assert result.best is not None
+    assert "over_budget" not in result.best.candidate.changes
+    assert wall.refused == []
+
+
+def test_a_typed_budget_moves_the_wall_and_is_never_a_steer() -> None:
+    from iterate.core.interactive import RunController
+
+    said: list[str] = []
+    ctrl = RunController(reply=said.append)
+    wall, _ = _linear_wall(None)
+    ctrl.submit_line("budget $1,200 a month")
+    sup = _GuidedSupervisor([SupervisorDecision(False, "a", "try a")])
+    _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), controller=ctrl, wall=wall)
+    assert wall.budget == 1200.0
+    assert sup.seen_guidance == [None]
+    assert (
+        "serving budget is now $1,200 a month at 1,000 requests an hour; it holds from the "
+        "next brief on, and nothing already recorded is re-judged"
+    ) in said
+
+
+def test_no_budget_lifts_the_wall_and_a_zero_leaves_it_where_it_was() -> None:
+    from iterate.core.interactive import RunController
+
+    said: list[str] = []
+    ctrl = RunController(reply=said.append)
+    wall, _ = _linear_wall(50.0)
+    ctrl.submit_line("budget 0")
+    ctrl.submit_line("no budget")
+    sup = _GuidedSupervisor([SupervisorDecision(False, "a", "try a")])
+    _loop(sup, [_FakeCoder(_result(0.60))], MaxIterations(1), controller=ctrl, wall=wall)
+    assert wall.budget is None
+    assert sup.seen_guidance == [None]
+    assert (
+        'a budget is dollars a month above zero, e.g. "budget $80"; the wall is unchanged'
+    ) in said
+    assert "the serving budget is lifted; from here on nothing is refused for its price" in said
+
+
+@pytest.mark.parametrize(
+    ("line", "budget"),
+    [
+        ("budget $80", 80.0),
+        ("Budget: 80", 80.0),
+        ("serving budget is $120/month", 120.0),
+        ("budget 1,500 dollars a month.", 1500.0),
+        ("budget to 42.5", 42.5),
+    ],
+)
+def test_the_shapes_a_typed_budget_takes(line: str, budget: float) -> None:
+    from iterate.core.agent_loop import _move_the_wall
+
+    wall, _ = _linear_wall(None)
+    assert _move_the_wall(line, wall) is not None
+    assert wall.budget == budget
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "the budget for epochs is 6",
+        "prefer smaller models",
+        "budget",
+        "no budget for that",
+        "budget 1,,5",
+    ],
+)
+def test_a_line_that_is_not_a_budget_leaves_the_wall_and_goes_to_the_supervisor(line: str) -> None:
+    from iterate.core.agent_loop import _move_the_wall
+
+    wall, _ = _linear_wall(50.0)
+    assert _move_the_wall(line, wall) is None
+    assert wall.budget == 50.0

@@ -927,6 +927,27 @@ supervisor:
     Rejected: label smoothing spreads probability across classes, and this run predicts
     a number, so it cannot apply. Call plan_next again with ONE class from the line
     below. {ready}
+  # Sent ONCE when a brief names a network that costs more to serve than the serving
+  # budget the user set. Placeholders: {reason}, {first}, {ready}
+  vision_over_budget_nudge: >-
+    Rejected: {reason}. The serving budget is a wall on what is in the running, not a
+    weight on the score: brief the first entry on Levers ready now instead, copied as it
+    is written there: {first}. {ready}
+  # The same, when the serving budget has taken every entry off the line. Only the user
+  # can move it. Placeholders: {reason}, {ready}
+  vision_all_over_budget_nudge: >-
+    Rejected: {reason}. Every entry this run's numbers opened is over the serving budget,
+    and only the user can move it, by typing a new one. There is nothing on the line to
+    brief: call plan_next with stop=true and say so. {ready}
+  # The block under the ready line, present only when a serving budget is set and an
+  # open entry is over it. Placeholders: {budget}, {rate}, {entries}
+  over_budget_block: >-
+    Over the serving budget ({budget} a month at {rate} requests an hour): {entries}.
+    These cost more to serve than the serving budget allows, so they are off the line,
+    and a brief naming one is rejected. The serving budget decides what is in the
+    running, never the ranking: among the entries on Levers ready now, take the first
+    unless a fit line or a finding gives a reason to prefer another, and never prefer
+    one for being cheaper.
   # No want_inspect: a free look at images needs a model that sees pixels, and the
   # profile already gives the counts, sizes and balance the table version asks for.
   vision_tool:

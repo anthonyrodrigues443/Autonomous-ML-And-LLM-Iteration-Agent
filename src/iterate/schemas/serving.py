@@ -22,6 +22,12 @@ Family = Literal["tabular", "vision", "prompt"]
 Kind = Literal["cpu", "gpu", "api"]
 
 
+def money(usd: float) -> str:
+    """A budget as the user typed it: whole dollars stay whole, cents are kept, so a
+    $36.80 budget never prints as the $37 a price beside it rounds to."""
+    return f"${usd:,.0f}" if float(usd).is_integer() else f"${usd:,.2f}"
+
+
 class ServingFacts(BaseModel):
     """What the harness knows about a winner. One family's fields are filled."""
 
@@ -219,6 +225,10 @@ class ServingProfile(BaseModel):
     prices_as_of: str
     unpriced_because: str | None = None
     basis: list[str] = Field(default_factory=list)
+    # The serving budget the run was given, and whether the chosen machine or API comes
+    # in under it. Both None on a run with no budget, so its profile is the one it had.
+    budget_usd_per_month: float | None = Field(default=None, gt=0.0)
+    within_budget: bool | None = None
 
     @model_validator(mode="after")
     def _priced_or_says_why(self) -> Self:
@@ -226,6 +236,14 @@ class ServingProfile(BaseModel):
             raise ValueError("a profile is priced, or it says why it is not")
         if self.chosen is not None and self.usd_per_1k_requests is None:
             raise ValueError("a priced profile has a cost per thousand requests")
+        if self.budget_usd_per_month is None and self.within_budget is not None:
+            raise ValueError("within_budget needs a budget to be within")
+        if (
+            self.budget_usd_per_month is not None
+            and self.chosen is not None
+            and self.within_budget != (self.chosen.usd_per_month <= self.budget_usd_per_month)
+        ):
+            raise ValueError("within_budget disagrees with the price and the budget")
         return self
 
     def render(self) -> list[str]:
@@ -245,7 +263,7 @@ class ServingProfile(BaseModel):
             lines = [
                 f"serving: about ${chosen.usd_per_month:,.2f} a month at "
                 f"{self.requests_per_hour:,} requests an hour on {where}, "
-                f"prices: {self.prices_as_of}"
+                f"{self.budget_clause()}prices: {self.prices_as_of}"
             ]
         lines.extend(f"  basis: {line}" for line in self.basis)
         others = [cost for cost in self.by_cloud if cost != chosen]
@@ -255,6 +273,14 @@ class ServingProfile(BaseModel):
                 + ", ".join(f"{cost.host.label} ${cost.usd_per_month:,.2f}" for cost in others)
             )
         return lines
+
+    def budget_clause(self) -> str:
+        """ "within the $50 serving budget, " or "over the $50 serving budget, "; empty
+        with no budget."""
+        if self.budget_usd_per_month is None or self.within_budget is None:
+            return ""
+        side = "within" if self.within_budget else "over"
+        return f"{side} the {money(self.budget_usd_per_month)} serving budget, "
 
 
 __all__ = [
@@ -267,4 +293,5 @@ __all__ = [
     "ServingFacts",
     "ServingProfile",
     "Source",
+    "money",
 ]

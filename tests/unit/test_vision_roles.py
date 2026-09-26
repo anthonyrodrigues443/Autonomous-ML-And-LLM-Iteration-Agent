@@ -18,10 +18,13 @@ import pytest
 from iterate.core import coder as coder_mod
 from iterate.core import critic as critic_mod
 from iterate.core import researcher as researcher_mod
+from iterate.core import serving
 from iterate.core import supervisor as sup
 from iterate.core import vision_levers as vl
+from iterate.core.serving import Priced
 from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult, Metrics
 from iterate.schemas.llm import ChatResponse, ToolCall
+from iterate.schemas.serving import CpuReference, Host, Prices
 
 RECIPE: dict[str, Any] = {
     "backbone": "resnet18",
@@ -2064,3 +2067,309 @@ def test_a_paper_stack_that_ends_in_the_class_count_never_reaches_a_brief() -> N
     assert [r.lever for r in opened if r.lever in vl.LAYER_LEVERS] == ["layer-stack"]
     known = ready_for([first_try()], first_try(), findings=finding, outputs=10)
     assert [r for r in known if r.lever in vl.LAYER_LEVERS] == []
+
+
+# ─── the wall: entries priced before the brief (Sprint 5 Day 3) ──────────────
+
+
+def _entry(lever: str, move: str, stack: str = "") -> vl.Ready:
+    return vl.Ready(lever, "a fact", move, stack=stack)
+
+
+_SWAP = _entry("backbone", "keep the recipe and swap the backbone to convnext_tiny")
+_BIGGER = _entry("image-size", "keep the best and train at 128 px")
+_MORE = _entry("epochs", "keep the recipe and train 6 epochs")
+_BIGGER_BRIEF = (
+    "next: image-size: keep the best and train at 128 px (because a pretrained network sees "
+    "more detail above 64 px, and 128 px fits the budget at about 144s)"
+)
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        (_SWAP, {"backbone": "convnext_tiny", "image_size": 64}),
+        (_BIGGER, {"backbone": "resnet18", "image_size": 128}),
+        # The levers that keep the network price as the incumbent's network.
+        (_MORE, {"backbone": "resnet18", "image_size": 64}),
+        (
+            _entry("augmentation", "keep the best and set augment to flip_crop"),
+            {"backbone": "resnet18", "image_size": 64},
+        ),
+        (
+            _entry("regularisation", "keep the best and set label_smoothing to 0.1"),
+            {"backbone": "resnet18", "image_size": 64},
+        ),
+        (
+            _entry("fine-tune-depth", "keep the recipe and fine-tune all layers"),
+            {"backbone": "resnet18", "image_size": 64},
+        ),
+        (
+            _entry(
+                "own-model",
+                "write torch code for efficientnet_b0 with pretrained weights, all layers, at "
+                "the input size its pretrained_cfg names",
+            ),
+            {"model": "efficientnet_b0"},
+        ),
+        (
+            _entry(
+                "layer-stack",
+                f"train a network from zero through fit(), with layers {STACK}",
+                STACK,
+            ),
+            {"backbone": "layers_net", "layers": STACK, "image_size": 64},
+        ),
+        (
+            _entry(
+                "custom-head",
+                f"fine-tune resnet50 through fit(), all layers (unfreeze all), 3 epochs, with "
+                f"head {HEAD}",
+                HEAD,
+            ),
+            {"backbone": "resnet50", "image_size": 64, "head": HEAD},
+        ),
+    ],
+)
+def test_an_entry_prices_as_the_network_it_would_train(
+    entry: vl.Ready, expected: dict[str, Any] | None
+) -> None:
+    assert vl.entry_recipe(entry, RECIPE, 64) == expected
+
+
+def test_a_swap_replaces_an_own_model_whole_and_a_head_rides_along_with_it() -> None:
+    own = {"model": "efficientnet_b0", "image_size": 64, "epochs": 3}
+    swap = _entry("backbone", "keep the recipe and swap the backbone to resnet50")
+    assert vl.entry_recipe(swap, own, 64) == {"backbone": "resnet50", "image_size": 64}
+    assert vl.entry_recipe(_BIGGER, own, 64) == {"model": "efficientnet_b0", "image_size": 128}
+    first = _entry(
+        "backbone",
+        "fine-tune resnet18 through fit(), all layers, 3 epochs, at the session image size",
+    )
+    assert vl.entry_recipe(first, {}, 96) == {"backbone": "resnet18", "image_size": 96}
+    headed = {**RECIPE, "head": HEAD}
+    assert vl.entry_recipe(swap, headed, 64) == {
+        "backbone": "resnet50",
+        "image_size": 64,
+        "head": HEAD,
+    }
+    # A head with no backbone named sits on the incumbent's, or on resnet18 over own code.
+    bare_head = _entry(
+        "custom-head", f"fine-tune through fit(), all layers, with head {HEAD}", HEAD
+    )
+    assert vl.entry_recipe(bare_head, own, 64) == {
+        "backbone": "resnet18",
+        "image_size": 64,
+        "head": HEAD,
+    }
+    assert vl.entry_recipe(_MORE, {}, 64) is None  # nothing carried, nothing named
+
+
+def test_a_brief_prices_as_the_guards_read_it() -> None:
+    assert vl.brief_recipe(_SWAP_BRIEF, RECIPE, 64) == {
+        "backbone": "convnext_tiny",
+        "image_size": 64,
+    }
+    assert vl.brief_recipe(_BIGGER_BRIEF, RECIPE, 64) == {"backbone": "resnet18", "image_size": 128}
+    stack_brief = f"next: layer-stack: train a network from zero through fit(), with layers {STACK}"
+    assert vl.brief_recipe(stack_brief, RECIPE, 64) == {
+        "backbone": "layers_net",
+        "layers": STACK,
+        "image_size": 64,
+    }
+    assert vl.brief_recipe("next: epochs: keep the recipe and train 6 epochs", RECIPE, 64) == {
+        "backbone": "resnet18",
+        "image_size": 64,
+    }
+    assert vl.brief_recipe("try a better model", RECIPE, 64) is None
+
+
+def test_the_split_keeps_the_lines_order_and_an_unpriced_entry_stays_on_it() -> None:
+    unsized = _entry("own-model", "write torch code for a network nobody has sized")
+
+    def pricer(recipe: Any) -> Priced:
+        if recipe is None:
+            return Priced(None, True)
+        if recipe.get("backbone") == "convnext_tiny":
+            return Priced(98.0, False, host="aws t4g.small x8")
+        return Priced(12.26, True, host="aws t4g.small")
+
+    line, over = vl.split_by_budget([_SWAP, _BIGGER, _MORE, unsized], RECIPE, 64, pricer)
+    assert line == [_BIGGER, _MORE, unsized]
+    assert over == [(_SWAP, 98.0)]
+    assert (
+        vl.ready_line([], all_over_budget=True)
+        == "Levers ready now: none; every open entry is over the serving budget."
+    )
+    assert (
+        vl.ready_line([])
+        == "Levers ready now: none; no lever's evidence fires on this run's numbers."
+    )
+    assert vl.entry_text(_SWAP) == (
+        "backbone: keep the recipe and swap the backbone to convnext_tiny (because a fact)"
+    )
+
+
+# A price table the tests own: one 2 GB box at $0.01 an hour ($7.30 a month) and measured
+# milliseconds that put convnext_tiny at 64 px on two boxes ($14.60) and resnet18 at
+# 128 px on one ($7.30) at 50,000 requests an hour.
+def _fake_prices() -> Prices:
+    return Prices(
+        snapshot_date="2026-09-25",
+        hosts=[
+            Host(
+                cloud="gcp",
+                name="small",
+                kind="cpu",
+                vcpu=2,
+                memory_gb=2,
+                usd_per_hour=0.01,
+                source="s",
+                read_on="2026-09-25",
+            )
+        ],
+        api_models=[],
+        cpu_reference=CpuReference(
+            measured_on="a test box",
+            backbone_ms={
+                "resnet18": {"64": 10.0, "128": 40.0, "224": 120.0},
+                "resnet50": {"64": 30.0},
+                "convnext_tiny": {"64": 100.0, "128": 400.0},
+            },
+            tabular_ms={"boosting": 1.0},
+        ),
+    )
+
+
+def _wall(budget: float | None, rate: int = 50_000) -> serving.Wall:
+    return serving.Wall(requests_per_hour=rate, prices=_fake_prices(), budget=budget)
+
+
+def _decide(client: Scripted, wall: serving.Wall, best: Experiment) -> sup.SupervisorDecision:
+    return vision_supervisor(client, wall=wall).decide(
+        data_summary="Images: 10", baseline=baseline_result(), history=[best], carried_best=best
+    )
+
+
+def test_the_wall_takes_an_over_budget_entry_off_the_line_and_prices_it_under_a_heading() -> None:
+    best = first_try()
+    client = Scripted(_BIGGER_BRIEF)
+    wall = _wall(10.0)
+    _decide(client, wall, best)
+    user = client.seen[0][0][1].content
+    before_heading, heading = user.split("Over the serving budget", maxsplit=1)
+    assert "convnext_tiny" not in before_heading
+    assert "Levers ready now: image-size: keep the best and train at 128 px" in before_heading
+    assert heading.startswith(
+        " ($10 a month at 50,000 requests an hour): backbone: keep the recipe and swap the "
+        "backbone to convnext_tiny ($15 a month). These cost more to serve than the serving "
+        "budget allows"
+    )
+    assert "never prefer one for being cheaper" in heading
+    assert len(client.seen) == 1  # an affordable brief is not nudged
+    # The split is a refusal too, remembered for the end of the run and for Day 4.
+    assert [(r.what, round(r.usd_per_month, 2), r.kind) for r in wall.refused] == [
+        ("keep the recipe and swap the backbone to convnext_tiny", 14.6, "off the line")
+    ]
+
+
+def test_on_the_first_iteration_the_block_follows_the_line_under_no_experiments_yet() -> None:
+    client = Scripted("next: backbone: fine-tune resnet18 through fit(), all layers, 3 epochs")
+    with pytest.raises(sup.SupervisorError):  # $5 is under even the first pretrained try
+        vision_supervisor(client, wall=_wall(5.0)).decide(
+            data_summary="Images: 10", baseline=baseline_result(), history=[]
+        )
+    user = client.seen[0][0][1].content
+    after = user.split("No experiments yet")[1]
+    assert "Levers ready now: none; every open entry is over the serving budget." in after
+    assert "Over the serving budget ($5 a month at 50,000 requests an hour): backbone:" in after
+    assert "($7 a month)" in after
+
+
+def test_a_brief_naming_an_over_budget_network_is_refused_with_the_first_affordable_entry_named() -> (
+    None
+):
+    best = first_try()
+    client = Scripted(_SWAP_BRIEF, _BIGGER_BRIEF)
+    wall = _wall(10.0)
+    decision = _decide(client, wall, best)
+    assert len(client.seen) == 2
+    nudge = client.seen[1][0][-1].content
+    assert nudge.startswith(
+        "Rejected: keep the recipe and swap the backbone to convnext_tiny costs about $15 a "
+        "month to serve at 50,000 requests an hour, above the $10 a month serving budget. The "
+        "serving budget is a wall on what is in the running, not a weight on the score: brief "
+        "the first entry on Levers ready now instead, copied as it is written there: "
+        "image-size: keep the best and train at 128 px (because"
+    )
+    assert not decision.stop
+    assert "128 px" in decision.brief
+    assert [(r.what, r.kind) for r in wall.refused] == [
+        ("keep the recipe and swap the backbone to convnext_tiny", "off the line"),
+        ("keep the recipe and swap the backbone to convnext_tiny", "brief refused"),
+    ]
+
+
+def test_a_persisted_over_budget_brief_falls_back_to_the_first_affordable_entry() -> None:
+    best = first_try()
+    client = Scripted(_SWAP_BRIEF, _SWAP_BRIEF)
+    decision = _decide(client, _wall(10.0), best)
+    assert decision.title == "evidence: image-size"
+    assert "next: image-size: keep the best and train at 128 px (because" in decision.brief
+    assert "convnext_tiny" not in decision.brief
+
+
+def test_with_everything_over_the_budget_the_line_says_so_and_a_persisted_brief_is_a_failure() -> (
+    None
+):
+    best = first_try(trains=(0.98, 0.98, 0.98))  # not rising, so no epochs entry opens
+    client = Scripted(_SWAP_BRIEF, _SWAP_BRIEF)
+    with pytest.raises(sup.SupervisorError, match="over-budget brief refused"):
+        _decide(client, _wall(5.0), best)
+    user = client.seen[0][0][1].content
+    assert "Levers ready now: none; every open entry is over the serving budget." in user
+    assert (
+        "backbone: keep the recipe and swap the backbone to convnext_tiny ($15 a month); "
+        "image-size: keep the best and train at 128 px ($7 a month)."
+    ) in user
+    nudge = client.seen[1][0][-1].content
+    assert "Every entry this run's numbers opened is over the serving budget" in nudge
+    assert "call plan_next with stop=true and say so" in nudge
+
+
+def test_a_budget_typed_under_the_best_closes_the_levers_that_keep_its_network_too() -> None:
+    """Epochs keeps resnet18 at 64 px, which costs what the best costs: under a $5 budget
+    it is over the wall with everything else, so the run trains nothing it cannot bank."""
+    line, over = vl.split_by_budget([_SWAP, _BIGGER, _MORE], RECIPE, 64, _wall(5.0).price_recipe)
+    assert line == []
+    assert [(r.lever, round(usd, 2)) for r, usd in over] == [
+        ("backbone", 14.6),
+        ("image-size", 7.3),
+        ("epochs", 7.3),
+    ]
+
+
+def test_a_wall_with_no_budget_sends_the_bytes_main_sends() -> None:
+    best = first_try()
+    client = Scripted(_SWAP_BRIEF)
+    _decide(client, _wall(None), best)
+    sent = "\n".join(m.content for m in client.seen[0][0])
+    assert hashlib.sha256(sent.encode()).hexdigest() == _IMAGE_CALL_ON_MAIN
+
+
+def test_a_wall_nothing_crosses_sends_the_bytes_main_sends_too() -> None:
+    best = first_try()
+    client = Scripted(_SWAP_BRIEF)
+    _decide(client, _wall(1000.0), best)
+    sent = "\n".join(m.content for m in client.seen[0][0])
+    assert hashlib.sha256(sent.encode()).hexdigest() == _IMAGE_CALL_ON_MAIN
+
+
+def test_the_history_row_says_when_a_score_was_over_the_budget() -> None:
+    best = first_try()
+    best.candidate.changes["over_budget"] = 36.79
+    row = sup._format_history([best], "accuracy", "vision")[0]
+    assert (
+        "accuracy=0.9785 [over the serving budget at $37 a month: a real score, but never "
+        "the winner]"
+    ) in row

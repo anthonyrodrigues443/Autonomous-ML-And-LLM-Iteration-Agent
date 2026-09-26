@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from iterate.adapters.compute.base import ComputeBackend
     from iterate.core.memory import Memory
     from iterate.core.proposer import SupportsPropose
+    from iterate.core.serving import Wall
     from iterate.core.terminator import Terminator
     from iterate.schemas.experiment import Candidate, ExperimentResult
     from iterate.targets.base import BenchmarkTarget
@@ -84,6 +85,9 @@ class Orchestrator:
         data_summary: str,
         baseline_model: str,
         baseline_candidate: Candidate | None = None,
+        # The serving budget as a wall, the same object the code path shares with its
+        # Supervisor: a spec winner over the budget is stamped and never the best.
+        wall: Wall | None = None,
     ) -> None:
         self._target = target
         self._proposer = proposer
@@ -93,6 +97,7 @@ class Orchestrator:
         self._data_summary = data_summary
         self._initial_model = baseline_model
         self._baseline_candidate = baseline_candidate
+        self._wall = wall
 
     def run(self) -> RunResult:
         baseline = (
@@ -154,6 +159,8 @@ class Orchestrator:
                         "finished_at": _now(),
                     }
                 )
+                if self._wall is not None:
+                    self._wall.stamp(experiment)
                 current_run.append(experiment)
                 self._memory.record(run_id, experiment)
                 last_experiment = experiment
@@ -175,7 +182,11 @@ class Orchestrator:
                         result.error,
                     )
 
-                if result.succeeded and _improves(result, best, baseline, direction):
+                if (
+                    result.succeeded
+                    and _improves(result, best, baseline, direction)
+                    and "over_budget" not in experiment.candidate.changes
+                ):
                     best = experiment
                     model = candidate.changes.get("model")
                     if isinstance(model, str):

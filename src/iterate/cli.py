@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from iterate.core.linker import Linker
     from iterate.core.memory import Memory
     from iterate.core.orchestrator import RunResult
+    from iterate.core.serving import Wall
     from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult
     from iterate.schemas.link import LinkPlan
     from iterate.schemas.monitor import DataReport
@@ -759,6 +760,15 @@ def run(
         help="The cloud region the prices are for (needs --cloud). Defaults: us-east-1, "
         "us-central1, eastus.",
     ),
+    serving_budget: float | None = typer.Option(
+        None,
+        "--serving-budget",
+        help="Dollars a month you can spend serving the winner at --requests-per-hour. A "
+        "hard wall, not a weight on the score: a model that costs more to serve is "
+        "never banked or recommended, and on an image run never briefed either; among "
+        "the models that fit, the best score wins. Refused before the run starts when "
+        'even the baseline is over it. Type "budget $80" or "no budget" mid-run to move it.',
+    ),
     output: Path | None = typer.Option(
         None,
         "--output",
@@ -843,6 +853,10 @@ def run(
         raise typer.BadParameter(f"--cloud must be aws | gcp | azure, got {cloud!r}")
     if region is not None and cloud is None:
         raise typer.BadParameter("--region needs --cloud, since each cloud names its regions")
+    if serving_budget is not None and serving_budget <= 0:
+        raise typer.BadParameter(
+            f"--serving-budget is dollars a month above zero, got {serving_budget:g}"
+        )
     clouds = (cloud.lower(),) if cloud is not None else None
 
     # ─── First run with no saved config? Offer the setup wizard. ───────────
@@ -982,6 +996,42 @@ def run(
     )
     if prepared is not None:
         dataset = prepared.dataset
+
+    # ─── The serving budget as a wall: the baseline itself has to fit ──────
+    # Built here because the refusal below needs it, and kept for the loop and the end
+    # of the run, so every price this run quotes comes from the same table. Above the
+    # archive and the folder, like every other refusal.
+    from iterate.core import serving as serving_mod
+
+    wall_family = "vision" if prepared is not None else "prompt" if task is not None else "tabular"
+    wall_provider = serving_mod.provider_for(
+        backend if task is None else (target_backend or backend), base_url
+    )
+    # The model under test, resolved the way the prompt target resolves it.
+    wall_model = (target_model or model or settings.iterate_model) if task is not None else ""
+    wall_prompt_chars = _prompt_chars(task, prompt_file)
+    wall = _build_wall(
+        family=wall_family,
+        budget=serving_budget,
+        requests_per_hour=requests_per_hour,
+        clouds=clouds,
+        region=region,
+        n_features=len(dataset.features),
+        provider=wall_provider,
+        model=wall_model,
+        prompt_chars=wall_prompt_chars,
+    )
+    if wall.budget is not None:
+        _refuse_over_budget(
+            wall,
+            family=wall_family,
+            image_size=min(_baseline_image_size(), prepared.image_size) if prepared else None,
+            task_kind=dataset.task,
+            n_features=len(dataset.features),
+            provider=wall_provider,
+            model=wall_model,
+            prompt_chars=wall_prompt_chars,
+        )
 
     # ─── New chapter? Archive the existing db. ─────────────────────────────
     # Any of --fresh, --source, --baseline+--source means "new chapter." Below every
@@ -1141,6 +1191,7 @@ def run(
             image_size=prepared.image_size if prepared is not None else None,
             image_width=prepared.profile.widths[1] if prepared is not None else None,
             outputs=n_classes or None,
+            wall=wall,
         )
         summarizer = Summarizer(client, metric=metric)
         # Same no-think client as the other strict roles: the Researcher must emit
@@ -1403,6 +1454,7 @@ def run(
                 on_experiment=on_experiment,
                 controller=controller,
                 family=role_family,
+                wall=wall,
             )
 
         try:
@@ -1468,6 +1520,7 @@ def run(
             data_summary=data_summary,
             baseline_model=baseline_model,
             baseline_candidate=baseline_candidate,
+            wall=wall,
         )
         result = orchestrator.run()
 
@@ -1484,18 +1537,7 @@ def run(
         _copy_report(dataset, run_dir)
     # What the winner costs to serve, priced once and shown in three places: the
     # summary line, best.json, prompts.yaml.
-    serving_profile = _serving_profile(
-        result,
-        family="vision" if prepared is not None else "prompt" if is_prompt_run else "tabular",
-        n_features=len(dataset.features),
-        backend=target_backend or backend,
-        base_url=base_url,
-        model_under_test=getattr(model_target, "model_under_test", None),
-        baseline_prompt=getattr(model_target, "baseline_prompt", None),
-        requests_per_hour=requests_per_hour,
-        clouds=clouds,
-        region=region,
-    )
+    serving_profile = _serving_profile(result, wall, clouds=clouds, region=region)
     if is_prompt_run:
         # For a prompt run the artifact is the prompt, and a notebook cannot say
         # which of its cells held the winner. Written by the harness, never by the
@@ -1553,7 +1595,7 @@ def run(
         )
 
     # ─── Summary ───────────────────────────────────────────────────────────
-    _render_summary(result, metric, serving=serving_profile)
+    _render_summary(result, metric, serving=serving_profile, wall=wall)
 
 
 prices_app = typer.Typer(
@@ -1983,52 +2025,135 @@ def _resolved_api_key_from_env(settings: object, backend: str) -> str | None:
     return api_key_for(backend, settings)
 
 
-def _serving_profile(
-    result: RunResult,
+def _build_wall(
     *,
     family: str,
-    n_features: int,
-    backend: str,
-    base_url: str | None,
-    model_under_test: str | None,
-    baseline_prompt: Any,
+    budget: float | None,
     requests_per_hour: int,
+    clouds: tuple[str, ...] | None,
+    region: str | None,
+    n_features: int,
+    provider: str,
+    model: str,
+    prompt_chars: int,
+) -> Wall:
+    """The one price table this run quotes from, with the budget on it when one was given,
+    and the reading of a finished experiment that the loop and the end of the run share."""
+    from functools import partial
+
+    from iterate.core import serving
+
+    return serving.Wall(
+        requests_per_hour=requests_per_hour,
+        prices=serving.load_prices(clouds, region),
+        budget=budget,
+        facts_of=partial(
+            serving.experiment_facts,
+            family=family,
+            n_features=n_features,
+            provider=provider,
+            model=model,
+            prompt_chars=prompt_chars,
+        ),
+    )
+
+
+def _prompt_chars(task: str | None, prompt_file: Path | None) -> int:
+    """The size of the starting prompt, for the estimate that prices it before it runs."""
+    if task is None:
+        return 0
+    chars = len(task)
+    if prompt_file is not None:
+        with contextlib.suppress(OSError):
+            chars += len(prompt_file.read_text(encoding="utf-8"))
+    return chars
+
+
+def _baseline_image_size() -> int:
+    from iterate.targets.dl import BASELINE_SIZE
+
+    return int(BASELINE_SIZE)
+
+
+def _refuse_over_budget(
+    wall: Wall,
+    *,
+    family: str,
+    image_size: int | None,
+    task_kind: str,
+    n_features: int,
+    provider: str,
+    model: str,
+    prompt_chars: int,
+) -> None:
+    """The baseline itself is priced before a folder is made: when even that costs more
+    than the budget, there is no use training anything, and the run is refused like a
+    wrong metric is, with the price, the budget and the cheapest machine that could hold
+    it. The same facts the wall reads after every experiment, so the two agree."""
+    from iterate.core import serving
+    from iterate.schemas.serving import money
+
+    assert wall.budget is not None
+    facts = serving.baseline_facts(
+        family,
+        image_size=image_size,
+        n_features=n_features,
+        task=task_kind,
+        provider=provider,
+        model=model,
+        prompt_chars=prompt_chars,
+    )
+    priced = wall.price(facts)
+    if priced.usd_per_month is None:
+        console.print(
+            f"the serving budget cannot be checked against the baseline: {priced.unpriced_because}",
+            style="dim",
+            markup=False,
+            highlight=False,
+        )
+        return
+    if priced.fits:
+        return
+    what = {
+        "vision": f"the plain CNN at {image_size} px",
+        "prompt": f"the starting prompt on {model or 'the model under test'}",
+        "tabular": f"the default boosting pipeline on {n_features} features",
+    }[family]
+    cheapest = wall.cheapest_machine(facts)
+    if cheapest is not None and cheapest[1] > wall.budget:
+        # Under the floor, no request rate helps: one box is the least anything costs.
+        tail = (
+            f"; the cheapest machine that could hold it is {cheapest[0]} at "
+            f"${cheapest[1]:,.2f} a month, so no request rate fits this budget. Raise the budget"
+        )
+    else:
+        tail = ". Raise the budget, or lower --requests-per-hour"
+    raise typer.BadParameter(
+        f"the baseline alone ({what}) costs about ${priced.usd_per_month:,.2f} a month at "
+        f"{wall.requests_per_hour:,} requests an hour on {priced.host}, above your "
+        f"--serving-budget of {money(wall.budget)}{tail}"
+    )
+
+
+def _serving_profile(
+    result: RunResult,
+    wall: Wall,
+    *,
     clouds: tuple[str, ...] | None = None,
     region: str | None = None,
 ) -> ServingProfile | None:
-    """What the winner costs to serve, from the facts the run already has. None when
-    there is no winner. A pricing failure never costs the run its deliverables: it
-    prints one line and the profile is left out."""
-    from iterate.core import codegen, serving
+    """What the winner costs to serve, read from the finished experiment the way the loop
+    read it, against the wall's own table and budget. None when there is no winner. A
+    pricing failure never costs the run its deliverables: it prints one line and the
+    profile is left out."""
+    from iterate.core import serving
 
     best = result.best
-    if best is None or best.result is None:
+    if best is None or best.result is None or wall.facts_of is None:
         return None
-    changes = best.candidate.changes
     try:
-        if family == "vision":
-            recipe = changes.get("recipe")
-            facts = serving.facts_from_recipe(recipe if isinstance(recipe, dict) else {})
-        elif family == "prompt":
-            prompt_json = best.result.artifacts.get(codegen.PROMPT_JSON)
-            chars = 0
-            if baseline_prompt is not None:
-                chars = len(str(baseline_prompt.system)) + len(str(baseline_prompt.user_template))
-            facts = serving.facts_from_prompt(
-                prompt_json,
-                provider=serving.provider_for(backend, base_url),
-                model=model_under_test or "",
-                prompt_chars=chars,
-            )
-        else:
-            cells = changes.get("cells")
-            code = changes.get("code") or (
-                f"{changes['model'].rsplit('.', 1)[-1]}()" if changes.get("model") else ""
-            )
-            facts = serving.facts_from_code(
-                cells if isinstance(cells, list) else None, code, n_features=n_features
-            )
-        prices = serving.load_prices(clouds, region)
+        facts = wall.facts_of(best)
+        prices = wall.prices
         if region is not None:
             for cloud in clouds or ():
                 source = prices.sources.get(cloud)
@@ -2041,7 +2166,7 @@ def _serving_profile(
                         markup=False,
                         highlight=False,
                     )
-        return serving.profile(facts, requests_per_hour, prices)
+        return serving.profile(facts, wall.requests_per_hour, prices, budget=wall.budget)
     except Exception as exc:
         console.print(
             f"serving price not computed: {type(exc).__name__}: {exc}",
@@ -2462,7 +2587,11 @@ def _write_notebooks(
 
 
 def _render_summary(
-    result: RunResult, metric: str, *, serving: ServingProfile | None = None
+    result: RunResult,
+    metric: str,
+    *,
+    serving: ServingProfile | None = None,
+    wall: Wall | None = None,
 ) -> None:
     baseline_score = (
         result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
@@ -2482,6 +2611,8 @@ def _render_summary(
         model_name = _candidate_model(exp.candidate)
         if exp.id == best_id:
             model_name += "  [bold green]← best[/bold green]"
+        elif over := exp.candidate.changes.get("over_budget"):
+            model_name += f"  [dim]over the serving budget: ${float(over):,.0f} a month[/dim]"
         if exp.result is None or exp.result.metrics is None:
             err = exp.result.error if exp.result else "no result"
             table.add_row(str(exp.iteration), model_name, "[red]FAILED[/red]", str(err)[:40])
@@ -2510,6 +2641,32 @@ def _render_summary(
                 console.print(line, markup=False, highlight=False)
     else:
         console.print("[dim]no candidate beat the baseline.[/dim]")
+    if wall is not None and wall.refused:
+        # What the wall turned away, by how far each got, priced at the budget of the
+        # moment, so a run that found nothing says why and one that did says what it
+        # passed over. Printed whatever the budget is now, since a lifted wall does not
+        # unmake the refusals it made.
+        from iterate.schemas.serving import money
+
+        kinds = (
+            ("off the line", "taken off the line before a brief"),
+            ("brief refused", "briefed anyway and refused"),
+            ("trained", "trained, over the budget, never the winner"),
+        )
+        for kind, said in kinds:
+            rows = [r for r in wall.refused if r.kind == kind]
+            if not rows:
+                continue
+            named = ", ".join(
+                f"{r.what} (${r.usd_per_month:,.0f} against {money(r.budget)})" for r in rows[:6]
+            )
+            more = f", and {len(rows) - 6} more" if len(rows) > 6 else ""
+            console.print(
+                f"over the serving budget this run, {said}: {named}{more}",
+                style="dim",
+                markup=False,
+                highlight=False,
+            )
 
 
 if __name__ == "__main__":

@@ -24,10 +24,12 @@ from iterate.core import vision_levers as vl
 from iterate.core.scoring import direction, metric_guidance, threshold_free
 from iterate.prompts import PROMPTS
 from iterate.schemas.llm import Message, ToolSpec
+from iterate.schemas.serving import money
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
+    from iterate.core.serving import Wall
     from iterate.llm.base import LLMClient
     from iterate.schemas.experiment import Experiment, ExperimentResult
 
@@ -131,6 +133,11 @@ class Supervisor:
         # as wide as this one is refused before it is briefed: fit() adds the final
         # layer itself, so the experiment would die on a RecipeError.
         outputs: int | None = None,
+        # The serving budget as a wall, shared with the loop. On an image run every
+        # entry on the ready line is priced before the brief and the ones over the
+        # budget come off it; a brief naming one anyway is refused. With no budget
+        # on the wall the messages are the ones a run without a wall sends.
+        wall: Wall | None = None,
     ) -> None:
         self._client = client
         self._metric = metric
@@ -143,6 +150,7 @@ class Supervisor:
         self._image_size = image_size
         self._image_width = image_width
         self._outputs = outputs
+        self._wall = wall
         self._tool = _build_tool(family)
 
     def decide(
@@ -196,6 +204,19 @@ class Supervisor:
             if vision
             else []
         )
+        # The wall, before the brief: what each entry would train is priced, the entries
+        # over the budget go under their own heading, and the line keeps its own order.
+        # The incumbent is the recipe the best scored, own model included, the same one
+        # the ladder sizes its entries from.
+        incumbent = vl.recipe_of(carried_best)
+        over: list[tuple[vl.Ready, float]] = []
+        if vision and self._wall is not None and self._wall.budget is not None:
+            ready, over = vl.split_by_budget(
+                ready, incumbent, self._image_size, self._wall.price_recipe
+            )
+            for entry, usd in over:
+                self._wall.record_refusal(entry.move, usd, "off the line")
+        ready_line = vl.ready_line(ready, all_over_budget=bool(over)) if vision else ""
         messages = _build_messages(
             data_summary=data_summary,
             metric=self._metric,
@@ -203,8 +224,9 @@ class Supervisor:
             score=baseline.metrics.primary_value,
             history=history,
             family=self._family,
-            ready_line=vl.ready_line(ready) if vision else "",
+            ready_line=ready_line,
             run_history=run_history,
+            budget_block=self._over_budget_block(over),
         )
         guidance = _guidance_message(user_guidance, standing_rules)
         if guidance is not None:
@@ -279,6 +301,10 @@ class Supervisor:
                         task=self._task,
                         metric=self._metric,
                         seen=vision_nudged,
+                        ready_text=ready_line,
+                        wall=self._wall,
+                        incumbent=incumbent,
+                        default_size=self._image_size,
                     )
                     vision_nudged = vision_nudged or violation is not None
                 elif dead_reason:
@@ -357,6 +383,14 @@ class Supervisor:
                         log.info("supervisor: rejected a %s", reason)
                         messages.append(Message(role="user", content=nudge))
                         continue
+                    elif vision and reason.startswith("brief over the serving budget:"):
+                        # Nothing affordable is on the line to fall back to, and the wall
+                        # never lets an over-budget brief through: the attempts run out
+                        # into a proposer failure, and patience decides the run.
+                        detail = f"over-budget brief refused: {reason}"
+                        log.info("supervisor: %s persisted; %s", reason, detail)
+                        messages.append(Message(role="user", content=nudge))
+                        continue
                     elif vision and (refused := _layer_stack_refused(decision.brief, ready)):
                         # The layer classes are the two that train an arbitrary network,
                         # so a persisted layer brief is never accepted: the attempts run
@@ -392,6 +426,21 @@ class Supervisor:
             detail = "model replied without calling plan_next"
             messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
         raise SupervisorError(f"no plan after {self._max_retries + 1} attempt(s): {detail}")
+
+    def _over_budget_block(self, over: Sequence[tuple[vl.Ready, float]]) -> str:
+        """The heading under the ready line: each entry the budget shut, with its price,
+        and the one sentence on what the budget is and is not. Empty when nothing is over
+        it, so a run without a wall sends the bytes it sent before the wall existed."""
+        if not over or self._wall is None or self._wall.budget is None:
+            return ""
+        entries = "; ".join(f"{r.lever}: {r.move} (${usd:,.0f} a month)" for r, usd in over)
+        return str(
+            _PROMPTS["over_budget_block"].format(
+                budget=money(self._wall.budget),
+                rate=f"{self._wall.requests_per_hour:,}",
+                entries=entries,
+            )
+        )
 
     def route_message(self, text: str, *, live_session: bool) -> str:
         """Classify ONE line the human typed mid-run: ``question`` | ``steer_now``
@@ -746,11 +795,18 @@ def _vision_violation(
     task: str,
     metric: str,
     seen: bool,
+    ready_text: str | None = None,
+    wall: Wall | None = None,
+    incumbent: Mapping[str, Any] | None = None,
+    default_size: int | None = None,
 ) -> tuple[str, str, bool] | None:
     """The image guards, in order. Every one but "not ready" runs whether or not a lever
-    is open: with nothing ready, an unguarded retry is what turns the gate off."""
+    is open: with nothing ready, an unguarded retry is what turns the gate off. The price
+    gate runs before "not ready", because an entry the budget took off the line was
+    opened by this run's numbers, and the nudge has to say which wall it hit."""
     named = vl.classes_named(decision.brief)
-    ready_text = vl.ready_line(ready)
+    if ready_text is None:
+        ready_text = vl.ready_line(ready)
     if len(named) >= 2:
         reason = f"the move names two lever classes ({' and '.join(named[:2])}); brief exactly ONE"
         return (
@@ -781,6 +837,29 @@ def _vision_violation(
             _PROMPTS["vision_dead_lever_nudge"].format(ready=ready_text),
             seen,
         )
+    if wall is not None and wall.budget is not None:
+        recipe = vl.brief_recipe(decision.brief, incumbent or {}, default_size)
+        priced = wall.price_recipe(recipe)
+        if priced.usd_per_month is not None and not priced.fits:
+            change = vl.change_clause(decision.brief)
+            reason = (
+                f"{change} costs about ${priced.usd_per_month:,.0f} a month to serve at "
+                f"{wall.requests_per_hour:,} requests an hour, above the {money(wall.budget)} "
+                "a month serving budget"
+            )
+            wall.record_refusal(change, priced.usd_per_month, "brief refused")
+            # The model may brief any entry left on the line, an invented one included;
+            # only the harness's own fallback skips those.
+            nudge = (
+                _PROMPTS["vision_over_budget_nudge"].format(
+                    reason=reason, first=vl.entry_text(ready[0]), ready=ready_text
+                )
+                if ready
+                else _PROMPTS["vision_all_over_budget_nudge"].format(
+                    reason=reason, ready=ready_text
+                )
+            )
+            return (f"brief over the serving budget: {reason}", nudge, seen)
     entries = [r for r in ready if r.lever == lever]
     # A layer class is refused even when nothing is ready at all: any stack passes every
     # other guard, so with an empty line the run would train a network nothing opened.
@@ -1175,6 +1254,7 @@ def _build_messages(
     family: str = "tabular",
     ready_line: str = "",
     run_history: Sequence[Experiment] | None = None,
+    budget_block: str = "",
 ) -> list[Message]:
     prompt_family = family.startswith("prompt")
     # A scoring run and a classification run are both prompt runs, and their rungs
@@ -1198,6 +1278,7 @@ def _build_messages(
             blocks: tuple[str, ...] = (
                 vl.ledger_line(list(run_history) if run_history is not None else history),
                 ready_line,
+                budget_block,
             )
         elif prompt_family:
             blocks = (_technique_table(recent, metric),)
@@ -1207,8 +1288,9 @@ def _build_messages(
         history_section = _PROMPTS["history_header"] + "\n" + "\n".join(lines) + "\n\n" + extras
     else:
         history_section = "No experiments yet — brief the first one.\n\n"
-        if ready_line:
-            history_section += ready_line + "\n\n"
+        for block in (ready_line, budget_block):
+            if block:
+                history_section += block + "\n\n"
     if family == "vision":
         user_key = "vision_user_template"
     else:
@@ -1577,6 +1659,14 @@ def _format_history(history: list[Experiment], metric: str, family: str = "tabul
                 outcome += f" [REJECTED, {reason} — this number is not a result]"
             elif flagged := exp.candidate.changes.get("critic_flagged"):
                 outcome += f" [{flagged}]"
+            elif over := exp.candidate.changes.get("over_budget"):
+                # A real score the user could not afford to serve: the loop never banked
+                # it, and the supervisor must not build on it as the best. Worded for the
+                # run that recorded it and for a later run reading it back from memory.
+                outcome += (
+                    f" [over the serving budget at ${float(over):,.0f} a month: a real "
+                    "score, but never the winner]"
+                )
             elif _was_floor_banked(exp):
                 # The score came from the harness's fallback submit, not the lever —
                 # the supervisor must not credit the lever for it.
