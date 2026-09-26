@@ -18,10 +18,12 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _isolate_user_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Point user config at a throwaway dir so tests never read the developer's real
-    ~/.config/iterate/config.toml (which would leak a saved backend/key into the run).
-    Tests that need their own config still override XDG_CONFIG_HOME themselves."""
+    """Point user config and the user cache at throwaway dirs so tests never read the
+    developer's real ~/.config/iterate/config.toml (which would leak a saved backend/key
+    into the run) or a refreshed price list under ~/.cache/iterate (which would change
+    what a priced winner prints). Tests that need their own still override the variables."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
 
 
 @pytest.fixture
