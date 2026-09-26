@@ -2337,6 +2337,18 @@ def test_with_everything_over_the_budget_the_line_says_so_and_a_persisted_brief_
     assert "call plan_next with stop=true and say so" in nudge
 
 
+def test_off_an_emptied_line_no_brief_of_any_kind_is_accepted() -> None:
+    """Seen live on the $20 run: with the wall having taken every entry off the line, the
+    model briefed an own model with no loadable name twice, and the older "nothing ready,
+    research" path accepted it. Off a line the wall emptied, nothing is accepted."""
+    best = first_try(trains=(0.98, 0.98, 0.98))
+    vague = "next: own-model: write torch code for a mystery network (because a paper says so)"
+    client = Scripted(vague, vague)
+    with pytest.raises(sup.SupervisorError, match="the serving budget emptied the line"):
+        _decide(client, _wall(5.0), best)
+    assert len(client.seen) == 2
+
+
 def test_a_budget_typed_under_the_best_closes_the_levers_that_keep_its_network_too() -> None:
     """Epochs keeps resnet18 at 64 px, which costs what the best costs: under a $5 budget
     it is over the wall with everything else, so the run trains nothing it cannot bank."""

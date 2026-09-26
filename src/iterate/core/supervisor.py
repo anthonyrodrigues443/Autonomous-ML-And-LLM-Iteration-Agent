@@ -391,6 +391,16 @@ class Supervisor:
                         log.info("supervisor: %s persisted; %s", reason, detail)
                         messages.append(Message(role="user", content=nudge))
                         continue
+                    elif vision and over and not ready:
+                        # The wall emptied the line. Seen live: the model then briefed an
+                        # own model with no loadable name twice, and the older "nothing
+                        # ready, research" path below accepted it, training a network the
+                        # wall could not price. Nothing is accepted off an emptied line;
+                        # the run says why, and Day 4 sends the Researcher back.
+                        detail = f"the serving budget emptied the line, and {reason} persisted"
+                        log.info("supervisor: %s", detail)
+                        messages.append(Message(role="user", content=nudge))
+                        continue
                     elif vision and (refused := _layer_stack_refused(decision.brief, ready)):
                         # The layer classes are the two that train an arbitrary network,
                         # so a persisted layer brief is never accepted: the attempts run
