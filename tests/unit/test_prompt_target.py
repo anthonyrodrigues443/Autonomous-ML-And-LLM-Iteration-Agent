@@ -717,3 +717,31 @@ def test_a_large_closed_set_keeps_its_kind_but_loses_the_enum(
     with caplog.at_level("WARNING"):
         assert label_set(dataset) is None
     assert "more than the 50-item answer tool" in caplog.text
+
+
+def test_submit_keeps_the_tokens_the_model_under_test_spent_per_record(
+    dataset: TabularDataset,
+    scripted: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The serving price needs tokens per record. The runtime already counts them; the
+    kernel's submit() writes them into prompt.json, and the printed ask line is the
+    one the model has always seen."""
+    scripted("not toxic")
+    target = _target(dataset)
+    job = target.build_code_job(Candidate(description="x", changes={"code": "pass"}, rationale="r"))
+    for name, blob in job.inputs.items():
+        (tmp_path / name).write_bytes(blob)
+    monkeypatch.chdir(tmp_path)
+
+    namespace: dict[str, Any] = {}
+    exec(codegen.prompt_session_preamble(), namespace)
+    namespace["submit"](namespace["BASELINE_PROMPT"])
+
+    submitted = json.loads((tmp_path / codegen.PROMPT_JSON).read_text())
+    assert submitted["records_measured"] == dataset.n_test
+    assert submitted["tokens_in_per_record"] == 5.0
+    assert submitted["tokens_out_per_record"] == 1.0
+    assert f"ask: {dataset.n_test} calls, 0 cached" in capsys.readouterr().out

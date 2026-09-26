@@ -1,0 +1,290 @@
+{
+  "snapshot_date": "2026-09-25",
+  "hosts": [
+    {
+      "cloud": "gcp",
+      "name": "e2-small",
+      "kind": "cpu",
+      "vcpu": 2,
+      "memory_gb": 2,
+      "usd_per_hour": 0.0168,
+      "source": "https://gcloud-compute.com/e2-small.html",
+      "read_on": "2026-09-25",
+      "note": "us-central1, on-demand; secondary mirror stamped 2026-09-21, because cloud.google.com's pricing page is script-rendered"
+    },
+    {
+      "cloud": "aws",
+      "name": "t3.small",
+      "kind": "cpu",
+      "vcpu": 2,
+      "memory_gb": 2,
+      "usd_per_hour": 0.0208,
+      "source": "https://instances.vantage.sh/aws/ec2/t3.small",
+      "read_on": "2026-09-25",
+      "note": "us-east-1, on-demand Linux; secondary mirror (Vantage), because aws.amazon.com's on-demand table is script-rendered"
+    },
+    {
+      "cloud": "azure",
+      "name": "B2s",
+      "kind": "cpu",
+      "vcpu": 2,
+      "memory_gb": 4,
+      "usd_per_hour": 0.0416,
+      "source": "https://prices.azure.com/api/retail/prices?$filter=armRegionName eq 'eastus' and armSkuName eq 'Standard_B2s' and priceType eq 'Consumption'",
+      "read_on": "2026-09-25",
+      "note": "eastus, consumption; Azure's retail prices API needs no key"
+    },
+    {
+      "cloud": "aws",
+      "name": "c6i.large",
+      "kind": "cpu",
+      "vcpu": 2,
+      "memory_gb": 4,
+      "usd_per_hour": 0.085,
+      "source": "https://instances.vantage.sh/aws/ec2/c6i.large",
+      "read_on": "2026-09-25",
+      "note": "us-east-1, on-demand Linux; secondary mirror (Vantage)"
+    },
+    {
+      "cloud": "azure",
+      "name": "D2s_v5",
+      "kind": "cpu",
+      "vcpu": 2,
+      "memory_gb": 8,
+      "usd_per_hour": 0.096,
+      "source": "https://prices.azure.com/api/retail/prices?$filter=armRegionName eq 'eastus' and armSkuName eq 'Standard_D2s_v5' and priceType eq 'Consumption'",
+      "read_on": "2026-09-25",
+      "note": "eastus, consumption"
+    },
+    {
+      "cloud": "gcp",
+      "name": "n2-standard-2",
+      "kind": "cpu",
+      "vcpu": 2,
+      "memory_gb": 8,
+      "usd_per_hour": 0.0971,
+      "source": "https://gcloud-compute.com/n2-standard-2.html",
+      "read_on": "2026-09-25",
+      "note": "us-central1, on-demand; secondary mirror stamped 2026-09-21"
+    },
+    {
+      "cloud": "aws",
+      "name": "g4dn.xlarge",
+      "kind": "gpu",
+      "vcpu": 4,
+      "memory_gb": 16,
+      "vram_gb": 16,
+      "usd_per_hour": 0.526,
+      "resnet50_224_ms": 10.7,
+      "source": "https://instances.vantage.sh/aws/ec2/g4dn.xlarge",
+      "read_on": "2026-09-25",
+      "note": "one T4; the rate is NVIDIA's own ResNet-50 v1.5 PyTorch README, batch 1, FP32, 10.7 ms average latency (https://github.com/NVIDIA/DeepLearningExamples/blob/master/PyTorch/Classification/ConvNets/resnet50v1.5/README.md)"
+    },
+    {
+      "cloud": "azure",
+      "name": "NC4as_T4_v3",
+      "kind": "gpu",
+      "vcpu": 4,
+      "memory_gb": 28,
+      "vram_gb": 16,
+      "usd_per_hour": 0.526,
+      "resnet50_224_ms": 10.7,
+      "source": "https://prices.azure.com/api/retail/prices?$filter=armRegionName eq 'eastus' and armSkuName eq 'Standard_NC4as_T4_v3' and priceType eq 'Consumption'",
+      "read_on": "2026-09-25",
+      "note": "one T4; the same NVIDIA batch-1 PyTorch rate as g4dn.xlarge"
+    },
+    {
+      "cloud": "gcp",
+      "name": "n1-standard-4 + T4",
+      "kind": "gpu",
+      "vcpu": 4,
+      "memory_gb": 15,
+      "vram_gb": 16,
+      "usd_per_hour": 0.54,
+      "resnet50_224_ms": 10.7,
+      "source": "https://gcloud-compute.com/n1-standard-4.html and https://gpucost.org/gpu/t4",
+      "read_on": "2026-09-25",
+      "note": "the VM at 0.19 plus the T4 at 0.35; the weakest row in this table, two secondary sources agree on the GPU price and neither is region-stamped"
+    },
+    {
+      "cloud": "gcp",
+      "name": "g2-standard-4",
+      "kind": "gpu",
+      "vcpu": 4,
+      "memory_gb": 16,
+      "vram_gb": 24,
+      "usd_per_hour": 0.7068,
+      "source": "https://gcloud-compute.com/g2-standard-4.html",
+      "read_on": "2026-09-25",
+      "note": "one L4; no rate: the published batch-1 number (MLPerf v3.1, 0.35 ms) is INT8 TensorRT, not the plain torch deployment this table prices"
+    },
+    {
+      "cloud": "aws",
+      "name": "g6.xlarge",
+      "kind": "gpu",
+      "vcpu": 4,
+      "memory_gb": 16,
+      "vram_gb": 24,
+      "usd_per_hour": 0.805,
+      "source": "https://instances.vantage.sh/aws/ec2/g6.xlarge",
+      "read_on": "2026-09-25",
+      "note": "one L4; no rate, as for g2-standard-4"
+    },
+    {
+      "cloud": "aws",
+      "name": "g5.xlarge",
+      "kind": "gpu",
+      "vcpu": 4,
+      "memory_gb": 16,
+      "vram_gb": 24,
+      "usd_per_hour": 1.006,
+      "source": "https://instances.vantage.sh/aws/ec2/g5.xlarge",
+      "read_on": "2026-09-25",
+      "note": "one A10G; no rate: the published A10 batch-1 number (MLPerf v1.1, 0.47 ms) is INT8 TensorRT"
+    },
+    {
+      "cloud": "azure",
+      "name": "NV36ads_A10_v5",
+      "kind": "gpu",
+      "vcpu": 36,
+      "memory_gb": 440,
+      "vram_gb": 24,
+      "usd_per_hour": 3.2,
+      "source": "https://prices.azure.com/api/retail/prices?$filter=armRegionName eq 'eastus' and armSkuName eq 'Standard_NV36ads_A10_v5' and priceType eq 'Consumption'",
+      "read_on": "2026-09-25",
+      "note": "one whole A10; the smallest whole-GPU A10 SKU on Azure; no rate, as for g5.xlarge"
+    }
+  ],
+  "api_models": [
+    {
+      "cloud": "openai",
+      "name": "gpt-4o-mini",
+      "kind": "api",
+      "usd_per_1m_in": 0.15,
+      "usd_per_1m_out": 0.6,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25"
+    },
+    {
+      "cloud": "openai",
+      "name": "gpt-4.1-mini",
+      "kind": "api",
+      "usd_per_1m_in": 0.4,
+      "usd_per_1m_out": 1.6,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25"
+    },
+    {
+      "cloud": "openai",
+      "name": "gpt-4.1",
+      "kind": "api",
+      "usd_per_1m_in": 2.0,
+      "usd_per_1m_out": 8.0,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25"
+    },
+    {
+      "cloud": "openai",
+      "name": "gpt-5-nano",
+      "kind": "api",
+      "usd_per_1m_in": 0.05,
+      "usd_per_1m_out": 0.4,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25"
+    },
+    {
+      "cloud": "openai",
+      "name": "gpt-5-mini",
+      "kind": "api",
+      "usd_per_1m_in": 0.25,
+      "usd_per_1m_out": 2.0,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25"
+    },
+    {
+      "cloud": "openai",
+      "name": "gpt-5",
+      "kind": "api",
+      "usd_per_1m_in": 1.25,
+      "usd_per_1m_out": 10.0,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25"
+    },
+    {
+      "cloud": "openai",
+      "name": "gpt-5.6-luna",
+      "kind": "api",
+      "usd_per_1m_in": 0.2,
+      "usd_per_1m_out": 1.2,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25"
+    },
+    {
+      "cloud": "openai",
+      "name": "gpt-5.6-terra",
+      "kind": "api",
+      "usd_per_1m_in": 2.0,
+      "usd_per_1m_out": 12.0,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25"
+    },
+    {
+      "cloud": "openai",
+      "name": "gpt-5.6-sol",
+      "kind": "api",
+      "usd_per_1m_in": 4.0,
+      "usd_per_1m_out": 20.0,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "read_on": "2026-09-25",
+      "note": "promotional price, published as holding at least through 2026-11-21"
+    },
+    {
+      "cloud": "together",
+      "name": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+      "kind": "api",
+      "usd_per_1m_in": 1.04,
+      "usd_per_1m_out": 1.04,
+      "source": "https://docs.together.ai/docs/serverless-models",
+      "read_on": "2026-09-25",
+      "note": "serverless; also on https://www.together.ai/pricing"
+    },
+    {
+      "cloud": "deepseek",
+      "name": "deepseek-flash",
+      "kind": "api",
+      "usd_per_1m_in": 0.3,
+      "usd_per_1m_out": 1.2,
+      "source": "https://api-docs.deepseek.com/quick_start/pricing",
+      "read_on": "2026-09-25",
+      "note": "DeepSeek-V4.1-Flash, cache-miss input, peak hours; off-peak (outside 01:00-04:00 and 06:00-10:00 UTC on weekdays) is half"
+    },
+    {
+      "cloud": "deepseek",
+      "name": "deepseek-v4-pro",
+      "kind": "api",
+      "usd_per_1m_in": 1.32,
+      "usd_per_1m_out": 3.96,
+      "source": "https://api-docs.deepseek.com/quick_start/pricing",
+      "read_on": "2026-09-25",
+      "note": "DeepSeek-V4-Pro-0813, cache-miss input, peak hours; off-peak is half"
+    }
+  ],
+  "cpu_reference": {
+    "measured_on": "an Apple M5 with two threads",
+    "note": "Measured 2026-09-25: batch 1, FP32, torch 2.14 eager. An independent measurement on an AWS c7i.xlarge (4 vCPU, PyTorch 2.8 eager, FP32) puts resnet50 at 224 px at about 44 ms (https://towardsdatascience.com/optimizing-pytorch-model-inference-on-cpu/, 2025-12-08), within 12% of the 49.8 ms here, which is why these numbers stand in for a 2-vCPU box until one is measured. Table rows are the slowest single-row predict per estimator family over laptop_price, mobile_price, heart_risk and adult_income, scikit-learn 1.8.0, two threads.",
+    "backbone_ms": {
+      "resnet18": {"64": 6.87, "128": 11.12, "224": 26.25},
+      "resnet50": {"64": 13.15, "128": 21.66, "224": 49.83},
+      "convnext_tiny": {"64": 166.17, "128": 264.97, "224": 526.89}
+    },
+    "tabular_ms": {
+      "linear": 2.9,
+      "tree_ensemble": 12.2,
+      "boosting": 4.5,
+      "nearest_neighbours": 3.2,
+      "svm": 2.9,
+      "mlp": 2.8
+    },
+    "tabular_margin": 2.0
+  }
+}
