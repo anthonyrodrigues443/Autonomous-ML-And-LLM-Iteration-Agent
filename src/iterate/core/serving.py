@@ -7,15 +7,19 @@ it runs on the host after every family. Three facts builders read the
 winner: a table pipeline by the classes it named, an image recipe by its weights and
 multiply-adds through the layer grammar, a prompt by its model and the tokens it used.
 `profile` turns facts and a request rate into the cheapest machine or API, the monthly
-cost, and a basis line for every number.
+cost, and a basis line for every number. `Wall` is the serving budget as a wall: it
+prices what a run is about to brief, and what it just ran, and says which fit. The
+objective stays the score; the wall only decides what is in the running.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from iterate.core import codegen
 from iterate.schemas.serving import (
@@ -26,11 +30,16 @@ from iterate.schemas.serving import (
     Prices,
     ServingFacts,
     ServingProfile,
+    money,
 )
 from iterate.targets import layers
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
+
+    from iterate.schemas.experiment import Experiment
+
+log = logging.getLogger(__name__)
 
 HOURS_PER_MONTH = 730
 DEFAULT_REQUESTS_PER_HOUR = 1000
@@ -335,15 +344,198 @@ def facts_from_prompt(
     )
 
 
+def baseline_facts(
+    family: str,
+    *,
+    image_size: int | None = None,
+    n_features: int | None = None,
+    task: str = "classification",
+    provider: str = "",
+    model: str = "",
+    prompt_chars: int = 0,
+) -> ServingFacts:
+    """What the run's own baseline would cost to serve, from what is in hand before the
+    run starts: the plain CNN at its size, the default boosting pipeline on the feature
+    count, the starting prompt on the model under test."""
+    if family == "vision":
+        return facts_from_recipe({"backbone": "simple_cnn", "image_size": image_size})
+    if family == "prompt":
+        return facts_from_prompt(None, provider=provider, model=model, prompt_chars=prompt_chars)
+    estimator = (
+        "HistGradientBoostingRegressor"
+        if task == "regression"
+        else ("HistGradientBoostingClassifier")
+    )
+    return facts_from_code(None, f"{estimator}()", n_features=n_features)
+
+
+def experiment_facts(
+    experiment: Experiment,
+    *,
+    family: str,
+    n_features: int | None = None,
+    provider: str = "",
+    model: str = "",
+    prompt_chars: int = 0,
+) -> ServingFacts:
+    """A finished experiment, by what it actually did: the recipe an image session
+    submitted, the estimator classes a table session used, the tokens a prompt spent per
+    record. The same reading prices the winner at the end of the run."""
+    changes = experiment.candidate.changes
+    if family == "vision":
+        recipe = changes.get("recipe")
+        return facts_from_recipe(recipe if isinstance(recipe, dict) else {})
+    if family == "prompt":
+        artifacts = experiment.result.artifacts if experiment.result is not None else {}
+        return facts_from_prompt(
+            artifacts.get(codegen.PROMPT_JSON),
+            provider=provider,
+            model=model,
+            prompt_chars=prompt_chars,
+        )
+    cells = changes.get("cells")
+    code = changes.get("code") or (
+        f"{changes['model'].rsplit('.', 1)[-1]}()" if changes.get("model") else ""
+    )
+    return facts_from_code(cells if isinstance(cells, list) else None, code, n_features=n_features)
+
+
+# ─── the wall ───────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Priced:
+    """One thing held against the wall: its monthly cost on the cheapest machine or API
+    that serves the rate, and whether that is within the budget. A thing the table cannot
+    price has no cost here and is not refused: the wall acts on numbers it has."""
+
+    usd_per_month: float | None
+    fits: bool
+    host: str = ""
+    unpriced_because: str | None = None
+
+
+class Refused(NamedTuple):
+    """One thing the wall turned away: what it was, its monthly price, the budget it was
+    held against, and how far it got (`off the line`, `brief refused`, `trained`)."""
+
+    what: str
+    usd_per_month: float
+    budget: float
+    kind: str
+
+
+@dataclass
+class Wall:
+    """The serving budget as a wall. One price table, one request rate, and `budget` in
+    dollars a month, which is the only part that moves and only the user moves it: None
+    means no wall, and everything fits. `facts_of` reads a finished experiment the way
+    the end of the run reads the winner, so the two never disagree. `refused` keeps what
+    the wall turned away this run, for the line that says so and for the Researcher to
+    read. Pricing never raises out of here: a row the arithmetic cannot take leaves the
+    thing unpriced, and unpriced is never refused."""
+
+    requests_per_hour: int
+    prices: Prices
+    budget: float | None = None
+    facts_of: Callable[[Experiment], ServingFacts] | None = None
+    refused: list[Refused] = field(default_factory=list)
+
+    def price(self, facts: ServingFacts, *, budget: float | None = None) -> Priced:
+        """`budget` overrides the wall's own, for work briefed under an earlier one."""
+        limit = self.budget if budget is None else budget
+        try:
+            result = profile(facts, self.requests_per_hour, self.prices)
+        except Exception as exc:
+            log.warning("pricer: could not price %s", facts.family, exc_info=True)
+            return Priced(None, True, unpriced_because=f"pricing failed: {exc}")
+        if result.chosen is None:
+            return Priced(None, True, unpriced_because=result.unpriced_because)
+        usd = result.chosen.usd_per_month
+        return Priced(usd, limit is None or usd <= limit, host=result.chosen.host.label)
+
+    def price_recipe(self, recipe: Mapping[str, Any] | None) -> Priced:
+        """The network an entry or a brief would train. None means no network is named
+        and none is carried, so there is nothing to hold against the wall."""
+        if recipe is None:
+            return Priced(None, True)
+        try:
+            facts = facts_from_recipe(recipe)
+        except Exception as exc:
+            log.warning("pricer: could not read a recipe", exc_info=True)
+            return Priced(None, True, unpriced_because=f"pricing failed: {exc}")
+        return self.price(facts)
+
+    def price_experiment(self, experiment: Experiment, *, budget: float | None = None) -> Priced:
+        if self.facts_of is None:
+            return Priced(None, True)
+        try:
+            facts = self.facts_of(experiment)
+        except Exception as exc:
+            log.warning("pricer: could not read an experiment", exc_info=True)
+            return Priced(None, True, unpriced_because=f"pricing failed: {exc}")
+        return self.price(facts, budget=budget)
+
+    def stamp(self, experiment: Experiment, *, budget: float | None = None) -> Priced | None:
+        """Hold a finished experiment against the wall (the budget it was briefed under,
+        or the wall's own) and stamp `changes["over_budget"]` when it cannot be served.
+        The stamp is what keeps it from ever becoming the best. Returns the price when
+        it stamped, else None."""
+        limit = self.budget if budget is None else budget
+        if limit is None:
+            return None
+        result = experiment.result
+        if result is None or not result.succeeded:
+            return None
+        priced = self.price_experiment(experiment, budget=limit)
+        if priced.usd_per_month is None or priced.fits:
+            return None
+        experiment.candidate.changes["over_budget"] = round(priced.usd_per_month, 2)
+        self.record_refusal(
+            experiment.candidate.description, priced.usd_per_month, "trained", limit
+        )
+        return priced
+
+    def record_refusal(
+        self, what: str, usd_per_month: float, kind: str, budget: float | None = None
+    ) -> None:
+        limit = self.budget if budget is None else budget
+        if limit is None:
+            return
+        entry = Refused(what, usd_per_month, limit, kind)
+        if entry not in self.refused:
+            self.refused.append(entry)
+
+    def cheapest_machine(self, facts: ServingFacts) -> tuple[str, float] | None:
+        """The cheapest machine in the table that could hold these facts at all, for a
+        month, so a refusal can say whether the budget is under everything the table
+        has. None for an API, which has no machine."""
+        if facts.family == "prompt" and facts.provider != "ollama":
+            return None
+        needed_gb = _memory_gb(facts)
+        hosts = [
+            h
+            for h in _machines_for(facts, self.prices)
+            if h.usd_per_hour is not None and _fits(h, needed_gb)
+        ]
+        if not hosts:
+            return None
+        host = min(hosts, key=lambda h: h.usd_per_hour or 0.0)
+        return host.label, (host.usd_per_hour or 0.0) * HOURS_PER_MONTH
+
+
 # ─── the profile ────────────────────────────────────────────────────────────
 
 
-def profile(facts: ServingFacts, requests_per_hour: int, prices: Prices) -> ServingProfile:
-    """The cheapest way to serve the winner at the rate, or why it cannot be priced."""
+def profile(
+    facts: ServingFacts, requests_per_hour: int, prices: Prices, *, budget: float | None = None
+) -> ServingProfile:
+    """The cheapest way to serve the winner at the rate, or why it cannot be priced. With
+    a budget, the profile also says whether the price comes in under it."""
     if facts.unpriced_because:
-        return _unpriced(facts, requests_per_hour, prices, facts.unpriced_because)
+        return _unpriced(facts, requests_per_hour, prices, facts.unpriced_because, budget)
     if facts.family == "prompt" and facts.provider != "ollama":
-        return _api_profile(facts, requests_per_hour, prices)
+        return _within(_api_profile(facts, requests_per_hour, prices), budget)
     needed_gb = _memory_gb(facts)
     costs = [
         cost
@@ -357,6 +549,7 @@ def profile(facts: ServingFacts, requests_per_hour: int, prices: Prices) -> Serv
             requests_per_hour,
             prices,
             f"no machine in the price table fits {needed_gb:.1f} GB",
+            budget,
         )
     # A machine with no benchmark rate cannot promise to cover the rate, so it is only
     # offered when no rated machine fits at all; then it prices one box and says so.
@@ -368,13 +561,27 @@ def profile(facts: ServingFacts, requests_per_hour: int, prices: Prices) -> Serv
     by_cloud = list(cheapest_per_cloud.values())
     chosen = by_cloud[0]
     per_1k = chosen.usd_per_month / (requests_per_hour * HOURS_PER_MONTH) * 1000
-    return ServingProfile(
-        requests_per_hour=requests_per_hour,
-        chosen=chosen,
-        by_cloud=by_cloud,
-        usd_per_1k_requests=per_1k,
-        prices_as_of=prices.provenance(sorted({h.cloud for h in _machines_for(facts, prices)})),
-        basis=[*facts.basis, *_capacity_basis(chosen, facts, prices.cpu_reference)],
+    return _within(
+        ServingProfile(
+            requests_per_hour=requests_per_hour,
+            chosen=chosen,
+            by_cloud=by_cloud,
+            usd_per_1k_requests=per_1k,
+            prices_as_of=prices.provenance(sorted({h.cloud for h in _machines_for(facts, prices)})),
+            basis=[*facts.basis, *_capacity_basis(chosen, facts, prices.cpu_reference)],
+        ),
+        budget,
+    )
+
+
+def _within(result: ServingProfile, budget: float | None) -> ServingProfile:
+    if budget is None or result.chosen is None:
+        return result
+    return result.model_copy(
+        update={
+            "budget_usd_per_month": budget,
+            "within_budget": result.chosen.usd_per_month <= budget,
+        }
     )
 
 
@@ -438,12 +645,15 @@ def _api_profile(facts: ServingFacts, rate: int, prices: Prices) -> ServingProfi
     )
 
 
-def _unpriced(facts: ServingFacts, rate: int, prices: Prices, why: str) -> ServingProfile:
+def _unpriced(
+    facts: ServingFacts, rate: int, prices: Prices, why: str, budget: float | None = None
+) -> ServingProfile:
     return ServingProfile(
         requests_per_hour=rate,
         prices_as_of=prices.provenance(),
         unpriced_because=why,
         basis=[line for line in facts.basis if line != why],
+        budget_usd_per_month=budget,
     )
 
 
@@ -605,12 +815,18 @@ __all__ = [
     "HOURS_PER_MONTH",
     "STAGE_WIDTHS",
     "THREADS_PER_REQUEST",
+    "Priced",
+    "Refused",
+    "Wall",
+    "baseline_facts",
     "estimator_family",
+    "experiment_facts",
     "facts_from_code",
     "facts_from_model_name",
     "facts_from_prompt",
     "facts_from_recipe",
     "load_prices",
+    "money",
     "profile",
     "provider_for",
 ]

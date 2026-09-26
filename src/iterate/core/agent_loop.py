@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     from iterate.core.interactive import RunController
     from iterate.core.memory import Memory
     from iterate.core.researcher import Findings, Researcher
+    from iterate.core.serving import Wall
     from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor, SupervisorDecision
     from iterate.core.terminator import Terminator
@@ -49,6 +51,20 @@ if TYPE_CHECKING:
     from iterate.targets.base import BenchmarkTarget
 
 log = logging.getLogger(__name__)
+
+# What a typed line has to look like to move the wall: "budget $80", "budget 80 a month",
+# "serving budget is $120/month"; and "no budget" (or drop / lift / remove the budget) to
+# take it down. Read before the Supervisor routes the line, so a budget is never a steer.
+_BUDGET_LINE = re.compile(
+    r"^\s*(?:serving\s+)?budget\s*(?:is|=|:|to|of)?\s*\$?\s*"
+    r"((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*"
+    r"(?:usd|dollars)?\s*(?:(?:a|per|/)\s*(?:month|mo))?\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+_NO_BUDGET_LINE = re.compile(
+    r"^\s*(?:no|drop|lift|remove|clear)\s+(?:the\s+)?(?:serving\s+)?budget\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
 
 
 def _now() -> datetime:
@@ -90,6 +106,10 @@ def run_supervised(
     # Which family's arm each iteration takes. "vision" carries the recipe the coder
     # starts from and gates the briefed lever on this run's own helper lines.
     family: str = "tabular",
+    # The serving budget as a wall, shared with the Supervisor. After every experiment
+    # the finished work is priced from what it did; one over the budget is stamped with
+    # its price and can never become the best, whatever it scored.
+    wall: Wall | None = None,
 ) -> RunResult:
     """Run the Supervisor + Coder loop until the terminator (or supervisor) stops.
 
@@ -135,6 +155,7 @@ def run_supervised(
             experiments=current_run,
             baseline=baseline,
             data_summary=data_summary,
+            wall=wall,
         )
 
         def _snapshot() -> RunResult:
@@ -241,6 +262,9 @@ def run_supervised(
                     carried_best=best,
                     **extra,
                 )
+                # The budget this brief was judged under. A budget typed while the
+                # session runs holds from the NEXT brief, as the reply promised.
+                briefed_budget = wall.budget if wall is not None else None
                 wants_research = decision.want_research
                 wants_inspect = decision.want_inspect
                 last_brief = decision.brief
@@ -306,6 +330,7 @@ def run_supervised(
                         experiment.candidate.changes["user_guidance"] = "; ".join(guidance)
                     if rules:
                         experiment.candidate.changes["user_rules"] = list(rules)
+                    _hold_against_the_wall(experiment, wall, iteration, briefed_budget)
                     if summarizer is not None:
                         experiment = _digest(summarizer, experiment, iteration)
                     experiment = _sanitize_unmeasured_digest(experiment, decision.brief)
@@ -342,6 +367,7 @@ def run_supervised(
                         result.succeeded
                         and _improves(result, best, baseline, direction)
                         and not was_rejected(experiment)
+                        and "over_budget" not in experiment.candidate.changes
                     ):
                         best = experiment
                         outcome = "improved"
@@ -416,6 +442,7 @@ def _make_interpreter(
     experiments: list[Experiment],
     baseline: ExperimentResult,
     data_summary: str,
+    wall: Wall | None = None,
 ) -> Callable[[list[str], bool], None]:
     """The plain-English message interpreter the controller calls at boundaries.
 
@@ -429,6 +456,11 @@ def _make_interpreter(
 
     def interpret(batch: list[str], live_session: bool) -> None:
         for text in batch:
+            if wall is not None and (moved := _move_the_wall(text, wall)) is not None:
+                # Only the user moves the wall, and this is how: the new budget holds
+                # from the next brief on, and nothing already recorded is re-judged.
+                controller.reply(moved)
+                continue
             kind = "steer_now"
             if callable(route):
                 try:
@@ -475,6 +507,48 @@ def _make_interpreter(
                     controller.reply("folding into the next experiment's brief")
 
     return interpret
+
+
+def _move_the_wall(text: str, wall: Wall) -> str | None:
+    """What a typed budget line does to the wall, and the reply; None for any other line."""
+    from iterate.schemas.serving import money
+
+    if _NO_BUDGET_LINE.match(text):
+        wall.budget = None
+        return "the serving budget is lifted; from here on nothing is refused for its price"
+    found = _BUDGET_LINE.match(text)
+    if found is None:
+        return None
+    budget = float(found.group(1).replace(",", ""))
+    if budget <= 0:
+        return 'a budget is dollars a month above zero, e.g. "budget $80"; the wall is unchanged'
+    wall.budget = budget
+    return (
+        f"serving budget is now {money(budget)} a month at {wall.requests_per_hour:,} requests "
+        "an hour; it holds from the next brief on, and nothing already recorded is re-judged"
+    )
+
+
+def _hold_against_the_wall(
+    experiment: Experiment, wall: Wall | None, iteration: int, budget: float | None
+) -> None:
+    """Price the finished experiment from what it actually did, against the budget it was
+    briefed under, and stamp it when that cannot cover it. The stamp is what keeps it
+    from ever becoming the best; a network the table cannot price is left alone."""
+    if wall is None:
+        return
+    priced = wall.stamp(experiment, budget=budget)
+    if priced is not None:
+        from iterate.schemas.serving import money
+
+        log.info(
+            "agent loop: iteration %d costs about $%.0f a month to serve on %s, over the %s "
+            "a month serving budget; it cannot be the winner",
+            iteration,
+            priced.usd_per_month or 0.0,
+            priced.host,
+            money(budget) if budget is not None else "the wall's",
+        )
 
 
 def _sanitize_unmeasured_digest(experiment: Experiment, brief: str) -> Experiment:

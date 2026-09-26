@@ -101,6 +101,7 @@ def _orch(
     proposer: _FakeProposer,
     terminator: Terminator,
     memory: InMemoryMemory | None = None,
+    wall: object = None,
 ) -> Orchestrator:
     return Orchestrator(
         target,  # type: ignore[arg-type]
@@ -110,6 +111,7 @@ def _orch(
         memory or InMemoryMemory(),
         data_summary="x",
         baseline_model="base.Model",
+        wall=wall,  # type: ignore[arg-type]
     )
 
 
@@ -261,3 +263,30 @@ def test_baseline_candidate_routes_through_executor_run() -> None:
     # Baseline came from running `seed`, not from target.baseline()
     assert res.baseline.metrics is not None
     assert res.baseline.metrics.primary_value == pytest.approx(0.74)
+
+
+# ─── the serving budget is a wall on the spec lane too (Sprint 5 Day 3) ─────
+
+
+def test_a_spec_winner_over_the_serving_budget_is_stamped_and_never_the_best() -> None:
+    from iterate.core import serving
+
+    def linear(_experiment: object) -> serving.ServingFacts:
+        return serving.facts_from_code(None, "LogisticRegression()", n_features=3)
+
+    prices = serving.load_prices()
+    chosen = serving.profile(linear(None), 1000, prices).chosen
+    assert chosen is not None
+    price = chosen.usd_per_month
+    target = _FakeTarget(baseline_score=0.70, results={"a.A": 0.72, "b.B": 0.75})
+    proposer = _FakeProposer([_cand("a.A"), _cand("b.B")])
+    wall = serving.Wall(requests_per_hour=1000, prices=prices, budget=price - 1, facts_of=linear)
+    res = _orch(target, proposer, MaxIterations(2), wall=wall).run()
+    assert res.best is None  # both beat the baseline, neither can be served
+    assert [e.candidate.changes["over_budget"] for e in res.history] == [round(price, 2)] * 2
+    assert [r.kind for r in wall.refused] == ["trained", "trained"]
+    wall.budget = price + 1
+    target = _FakeTarget(baseline_score=0.70, results={"a.A": 0.72})
+    res = _orch(target, _FakeProposer([_cand("a.A")]), MaxIterations(1), wall=wall).run()
+    assert res.best is not None
+    assert "over_budget" not in res.best.candidate.changes

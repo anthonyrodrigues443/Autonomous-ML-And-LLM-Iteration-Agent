@@ -568,3 +568,200 @@ def test_the_basis_says_interpolated_when_the_size_was_not_measured() -> None:
     profile = serving.profile(facts, 1000, _prices())
 
     assert any("interpolated between sizes measured" in line for line in profile.basis)
+
+
+# ─── the wall (Sprint 5 Day 3) ───────────────────────────────────────────────
+
+
+def _resnet18() -> ServingFacts:
+    return serving.facts_from_recipe({"backbone": "resnet18", "image_size": 64})
+
+
+def test_the_wall_prices_facts_against_the_table_and_says_whether_they_fit() -> None:
+    prices = _prices()
+    priced = serving.profile(_resnet18(), 1000, prices).chosen
+    assert priced is not None
+    wall = serving.Wall(requests_per_hour=1000, prices=prices, budget=priced.usd_per_month)
+    assert wall.price(_resnet18()) == serving.Priced(priced.usd_per_month, True, host="gcp small")
+    wall.budget = priced.usd_per_month - 0.01
+    assert wall.price(_resnet18()).fits is False
+    assert wall.price_recipe({"backbone": "resnet18", "image_size": 64}).fits is False
+    # The budget a brief was judged under outranks the wall's current one.
+    assert wall.price(_resnet18(), budget=1000.0).fits is True
+
+
+def test_no_budget_means_everything_fits_and_an_unpriced_thing_is_never_refused() -> None:
+    wall = serving.Wall(requests_per_hour=1000, prices=_prices())
+    assert wall.price(_resnet18()).fits
+    wall.budget = 0.5
+    unpriced = wall.price(serving.facts_from_recipe({}))
+    assert unpriced.usd_per_month is None
+    assert unpriced.fits
+    assert unpriced.unpriced_because == "the winner left no recipe to price"
+    # None means nothing named and nothing carried: nothing to hold against the wall.
+    assert wall.price_recipe(None) == serving.Priced(None, True)
+
+
+def test_a_pricing_failure_leaves_the_thing_unpriced_and_never_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*a: object, **kw: object) -> None:
+        raise ZeroDivisionError("a bad row")
+
+    monkeypatch.setattr(serving, "profile", boom)
+    wall = serving.Wall(requests_per_hour=1000, prices=_prices(), budget=1.0)
+    priced = wall.price(_resnet18())
+    assert (priced.usd_per_month, priced.fits) == (None, True)
+    assert priced.unpriced_because == "pricing failed: a bad row"
+    assert wall.price_recipe({"backbone": "resnet18", "layers": 42}).fits  # a recipe it cannot read
+
+
+def test_a_profile_with_a_budget_says_which_side_of_it_the_price_falls() -> None:
+    prices = _prices()
+    within = serving.profile(_resnet18(), 1000, prices, budget=1000.0)
+    assert within.within_budget is True
+    assert within.budget_usd_per_month == 1000.0
+    assert "on gcp small, within the $1,000 serving budget, prices:" in within.render()[0]
+    over = serving.profile(_resnet18(), 1000, prices, budget=1.0)
+    assert over.within_budget is False
+    assert "on gcp small, over the $1 serving budget, prices:" in over.render()[0]
+    cents = serving.profile(_resnet18(), 1000, prices, budget=12.5)
+    assert "the $12.50 serving budget, " in cents.render()[0]
+    plain = serving.profile(_resnet18(), 1000, prices)
+    assert plain.within_budget is None
+    assert plain.budget_usd_per_month is None
+    assert "budget" not in plain.render()[0]
+    unpriced = serving.profile(serving.facts_from_recipe({}), 1000, prices, budget=5.0)
+    assert unpriced.within_budget is None
+    assert unpriced.budget_usd_per_month == 5.0
+
+
+def test_within_budget_has_to_agree_with_the_price_and_needs_a_budget() -> None:
+    prices = _prices()
+    priced = serving.profile(_resnet18(), 1000, prices, budget=1000.0)
+    with pytest.raises(ValidationError, match="disagrees"):
+        ServingProfile(**{**priced.model_dump(), "within_budget": False})
+    plain = serving.profile(_resnet18(), 1000, prices)
+    with pytest.raises(ValidationError, match="needs a budget"):
+        ServingProfile(**{**plain.model_dump(), "within_budget": True})
+
+
+def test_the_baseline_of_each_family_is_priced_from_what_is_in_hand() -> None:
+    vision = serving.baseline_facts("vision", image_size=64)
+    assert (vision.backbone, vision.image_size) == ("simple_cnn", 64)
+    assert vision.basis[0] == "the plain CNN baseline at 64 px"
+    table = serving.baseline_facts("tabular", n_features=12)
+    assert table.estimator_family == "boosting"
+    assert table.basis == ["boosting pipeline (HistGradientBoostingClassifier) on 12 features"]
+    numbers = serving.baseline_facts("tabular", n_features=3, task="regression")
+    assert numbers.components == ["HistGradientBoostingRegressor"]
+    prompt = serving.baseline_facts("prompt", provider="openai", model="mini", prompt_chars=400)
+    assert (prompt.provider, prompt.model) == ("openai", "mini")
+    assert (prompt.tokens_in, prompt.records_measured) == (100.0, 0)
+
+
+def test_a_finished_experiment_is_read_by_what_it_actually_did() -> None:
+    from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult, Metrics
+
+    def finished(changes: dict[str, object], artifacts: dict[str, str] | None = None) -> Experiment:
+        metrics = Metrics(values={"f1": 0.9}, primary="f1", direction="maximize", n_samples=10)
+        return Experiment(
+            candidate=Candidate(description="d", changes=changes, rationale="r"),
+            target="t",
+            hypothesis="h",
+            status="completed",
+            result=ExperimentResult(experiment_id="e", metrics=metrics, artifacts=artifacts or {}),
+        )
+
+    image = serving.experiment_facts(
+        finished({"recipe": {"backbone": "resnet50", "image_size": 96}}), family="vision"
+    )
+    assert (image.backbone, image.image_size) == ("resnet50", 96)
+    cells = [
+        {
+            "code": "m = LogisticRegression().fit(X, y)\npd.DataFrame(p).to_csv('predictions.csv')",
+            "error": None,
+        }
+    ]
+    table = serving.experiment_facts(
+        finished({"cells": cells, "code": "x"}), family="tabular", n_features=4
+    )
+    assert (table.estimator_family, table.n_features) == ("linear", 4)
+    spec = serving.experiment_facts(
+        finished({"model": "sklearn.ensemble.RandomForestClassifier"}), family="tabular"
+    )
+    assert spec.estimator_family == "tree_ensemble"
+    record = json.dumps(
+        {
+            "system": "s",
+            "user_template": "u",
+            "tokens_in_per_record": 120,
+            "tokens_out_per_record": 6,
+            "records_measured": 50,
+        }
+    )
+    prompt = serving.experiment_facts(
+        finished({"code": "x"}, {"prompt.json": record}),
+        family="prompt",
+        provider="openai",
+        model="mini",
+    )
+    assert (prompt.tokens_in, prompt.tokens_out, prompt.records_measured) == (120.0, 6.0, 50)
+
+
+def test_the_cheapest_machine_that_could_hold_the_facts_and_the_list_of_refusals() -> None:
+    wall = serving.Wall(requests_per_hour=1000, prices=_prices(), budget=5.0)
+    assert wall.cheapest_machine(_resnet18()) == ("gcp small", pytest.approx(7.3))
+    # A network too big for the small boxes lands on the one that holds it, not the cheapest.
+    big = ServingFacts(
+        family="vision", backbone="x", image_size=64, weights=int(2.5 * 2**30 / 4), multiply_adds=1
+    )
+    assert wall.cheapest_machine(big) == ("azure small", pytest.approx(0.04 * 730))
+    api = serving.baseline_facts("prompt", provider="openai", model="mini", prompt_chars=40)
+    assert wall.cheapest_machine(api) is None  # an API has no machine floor to quote
+    wall.record_refusal("convnext_tiny", 98.0, "off the line")
+    wall.record_refusal("convnext_tiny", 98.0, "off the line")
+    wall.record_refusal("resnet50", 40.0, "brief refused", budget=20.0)
+    assert wall.refused == [
+        serving.Refused("convnext_tiny", 98.0, 5.0, "off the line"),
+        serving.Refused("resnet50", 40.0, 20.0, "brief refused"),
+    ]
+
+
+def test_a_finished_experiment_over_the_budget_it_was_briefed_under_is_stamped() -> None:
+    from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult, Metrics
+
+    metrics = Metrics(values={"f1": 0.9}, primary="f1", direction="maximize", n_samples=10)
+    exp = Experiment(
+        candidate=Candidate(
+            description="a fine-tune",
+            changes={"recipe": {"backbone": "resnet18", "image_size": 64}},
+            rationale="r",
+        ),
+        target="t",
+        hypothesis="h",
+        status="completed",
+        result=ExperimentResult(experiment_id="e", metrics=metrics),
+    )
+    prices = _prices()
+    chosen = serving.profile(_resnet18(), 1000, prices).chosen
+    assert chosen is not None
+    price = chosen.usd_per_month
+    wall = serving.Wall(
+        requests_per_hour=1000,
+        prices=prices,
+        budget=price - 1,
+        facts_of=lambda e: serving.facts_from_recipe(e.candidate.changes["recipe"]),
+    )
+    # Briefed under a budget that covered it: the wall's later, lower budget does not apply.
+    assert wall.stamp(exp, budget=price + 1) is None
+    assert "over_budget" not in exp.candidate.changes
+    assert wall.stamp(exp) is not None
+    assert exp.candidate.changes["over_budget"] == round(price, 2)
+    assert wall.refused == [serving.Refused("a fine-tune", price, price - 1, "trained")]
+    # A lifted wall stamps nothing, and neither does a failed experiment.
+    wall.budget = None
+    assert wall.stamp(exp) is None
+    failed = exp.model_copy(update={"result": ExperimentResult(experiment_id="f", error="boom")})
+    wall.budget = price - 1
+    assert wall.stamp(failed) is None

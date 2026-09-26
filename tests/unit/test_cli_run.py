@@ -7,6 +7,7 @@ path (the live integration test for the loop comes at Day 6).
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
@@ -25,7 +26,7 @@ from iterate.cli import (
     _read_source,
     app,
 )
-from iterate.schemas.experiment import Candidate, ExperimentResult, Metrics
+from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult, Metrics
 
 # Error panels wrap at the terminal width, which can split a phrase a test looks for.
 runner = CliRunner(env={"COLUMNS": "1000"})
@@ -1289,3 +1290,286 @@ def test_prices_refresh_refuses_a_region_without_a_cloud() -> None:
 
     assert result.exit_code != 0
     assert "--region needs --cloud" in (result.stderr or result.stdout)
+
+
+# ─── the serving budget is a wall (Sprint 5 Day 3) ──────────────────────────
+
+
+@pytest.mark.parametrize("budget", ["0", "-5"])
+def test_serving_budget_must_be_above_zero(tmp_path: Path, budget: str) -> None:
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--serving-budget",
+            budget,
+        ],
+    )
+    assert result.exit_code != 0
+    assert f"--serving-budget is dollars a month above zero, got {budget}" in _plain(result.output)
+
+
+def test_the_size_of_the_starting_prompt_is_read_for_the_estimate(tmp_path: Path) -> None:
+    prompt = tmp_path / "p.txt"
+    prompt.write_text("x" * 2000)
+    assert cli_module._prompt_chars(None, prompt) == 0  # not a prompt run
+    assert cli_module._prompt_chars("say whether", None) == len("say whether")
+    assert cli_module._prompt_chars("say whether", prompt) == len("say whether") + 2000
+    assert cli_module._prompt_chars("say whether", tmp_path / "missing.txt") == len("say whether")
+
+
+def _baseline_price(family: str, rate: int, **facts_kw: Any) -> tuple[float, str]:
+    """What the shipped table says the family's baseline costs, so the tests own no
+    dollar figure the next snapshot refresh would move."""
+    from iterate.core import serving
+
+    facts = serving.baseline_facts(family, **facts_kw)
+    chosen = serving.profile(facts, rate, serving.load_prices()).chosen
+    assert chosen is not None
+    return chosen.usd_per_month, chosen.host.label
+
+
+def test_a_table_run_whose_baseline_is_over_the_budget_is_refused_before_a_folder_is_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even the default boosting pipeline costs one small box a month; a budget under that
+    is refused like a wrong metric, with the price, the budget and the table's floor."""
+    from iterate.config import get_settings
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    dot = tmp_path / "dot"
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(dot / "runs"))
+    get_settings.cache_clear()
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--data",
+                str(data),
+                "--target",
+                "churn",
+                "--metric",
+                "f1",
+                "--serving-budget",
+                "5",
+                "--plain",
+            ],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code != 0
+    usd, host = _baseline_price("tabular", 1000, n_features=1)
+    assert usd > 5  # the fixture's premise: one small box costs more than the budget
+    assert (
+        f"the baseline alone (the default boosting pipeline on 1 features) costs about "
+        f"${usd:,.2f} a month at 1,000 requests an hour on {host}, above your --serving-budget "
+        f"of $5; the cheapest machine that could hold it is {host} at ${usd:,.2f} a month, so "
+        "no request rate fits this budget. Raise the budget"
+    ) in _plain(result.output)
+    assert "lower --requests-per-hour" not in _plain(result.output)
+    assert not dot.exists()
+
+
+def test_a_prompt_run_whose_starting_prompt_is_over_the_budget_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.config import get_settings
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    dot = tmp_path / "dot"
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(dot / "runs"))
+    get_settings.cache_clear()
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--data",
+                str(data),
+                "--target",
+                "churn",
+                "--metric",
+                "f1",
+                "--task",
+                "say whether the customer churns",
+                "--backend",
+                "openai",
+                "--api-key",
+                "k",
+                "--target-model",
+                "gpt-4o-mini",
+                "--serving-budget",
+                "1",
+                "--requests-per-hour",
+                "50000",
+                "--plain",
+            ],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code != 0
+    text = _plain(result.output)
+    usd, host = _baseline_price(
+        "prompt",
+        50000,
+        provider="openai",
+        model="gpt-4o-mini",
+        prompt_chars=len("say whether the customer churns"),
+    )
+    assert (
+        f"the baseline alone (the starting prompt on gpt-4o-mini) costs about ${usd:,.2f} a "
+        f"month at 50,000 requests an hour on {host}, above your --serving-budget of $1. Raise "
+        "the budget, or lower --requests-per-hour"
+    ) in text
+    assert "cheapest machine" not in text  # an API has no machine floor to quote
+    assert not dot.exists()
+
+
+def test_the_prompt_baseline_is_priced_at_the_size_of_the_starting_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 2,000-character prompt file is not one token: the pre-run price reads it, the
+    way the wall reads the winner's own prompt after the run."""
+    from iterate.config import get_settings
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    prompt = tmp_path / "p.txt"
+    prompt.write_text("x" * 2000)
+    monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "dot" / "runs"))
+    get_settings.cache_clear()
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                "--data",
+                str(data),
+                "--target",
+                "churn",
+                "--metric",
+                "f1",
+                "--task",
+                "say whether the customer churns",
+                "--prompt-file",
+                str(prompt),
+                "--backend",
+                "openai",
+                "--api-key",
+                "k",
+                "--target-model",
+                "gpt-4o-mini",
+                "--serving-budget",
+                "1000",
+                "--requests-per-hour",
+                "50000",
+                "--plain",
+            ],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code != 0
+    usd, _ = _baseline_price(
+        "prompt",
+        50000,
+        provider="openai",
+        model="gpt-4o-mini",
+        prompt_chars=len("say whether the customer churns") + 2000,
+    )
+    assert usd > 1000
+    assert f"costs about ${usd:,.2f} a month" in _plain(result.output)
+
+
+def test_a_winner_within_the_budget_says_so_on_the_serving_line_and_in_the_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    out = tmp_path / "models" / "best_model.joblib"
+    _stub_run_orchestrator(monkeypatch, best_model="sklearn.linear_model.LogisticRegression")
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--spec",
+            "--memory",
+            str(tmp_path / "memory.db"),
+            "--output",
+            str(out),
+            "--serving-budget",
+            "1000",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    serving = json.loads(out.with_name("best.json").read_text())["serving"]
+    assert serving["budget_usd_per_month"] == 1000.0
+    assert serving["within_budget"] is True
+    assert "within the $1,000 serving budget, prices:" in _plain(result.output)
+
+
+def test_the_summary_names_what_the_wall_turned_away_and_how_far_each_got(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from iterate.core import serving
+    from iterate.core.orchestrator import RunResult
+
+    monkeypatch.setenv("COLUMNS", "200")  # a wide console, so the table row stays on one line
+
+    baseline = ExperimentResult(
+        experiment_id="b",
+        metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize", n_samples=100),
+    )
+    over = Experiment(
+        candidate=Candidate(
+            description="a wide forest", changes={"over_budget": 36.79}, rationale="r"
+        ),
+        target="t",
+        hypothesis="h",
+        status="completed",
+        iteration=1,
+        result=ExperimentResult(
+            experiment_id="e",
+            metrics=Metrics(values={"f1": 0.9}, primary="f1", direction="maximize", n_samples=100),
+        ),
+    )
+    wall = serving.Wall(requests_per_hour=1000, prices=serving.load_prices(), budget=20.0)
+    wall.record_refusal("swap the backbone to convnext_tiny", 36.79, "off the line")
+    wall.record_refusal("swap the backbone to convnext_tiny", 36.79, "brief refused")
+    wall.record_refusal("a wide forest", 36.79, "trained", budget=30.0)
+    wall.budget = None  # lifted later: the refusals it made still print
+    result = RunResult(baseline=baseline, history=[over], best=None, stopped_because="patience")
+    with cli_module.console.capture() as captured:
+        cli_module._render_summary(result, "f1", wall=wall)
+    text = _plain(captured.get())
+    assert "no candidate within the serving budget beat the baseline" in text
+    # The table cell may wrap, so the marker is checked in order, not as one string.
+    assert re.search(r"a wide forest.*over the serving budget: \$37 a month", text)
+    assert (
+        "over the serving budget this run, taken off the line before a brief: swap the "
+        "backbone to convnext_tiny ($37 against $20)"
+    ) in text
+    assert (
+        "over the serving budget this run, briefed anyway and refused: swap the backbone to "
+        "convnext_tiny ($37 against $20)"
+    ) in text
+    assert (
+        "over the serving budget this run, trained, over the budget, never the winner: a wide "
+        "forest ($37 against $30)"
+    ) in text

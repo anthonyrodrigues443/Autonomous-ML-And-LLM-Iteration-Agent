@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from iterate.targets import layers as arch
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
 
+    from iterate.core.serving import Priced
     from iterate.schemas.experiment import Experiment
 
 LEVERS: tuple[str, ...] = (
@@ -1235,15 +1236,102 @@ def _failed_recipe(exp: Experiment, carried: dict[str, Any]) -> dict[str, Any]:
 _COPY_THE_STACK = " Copy a layer stack into the brief exactly as it is written here."
 
 
-def ready_line(items: Sequence[Ready]) -> str:
+def entry_text(entry: Ready) -> str:
+    """One entry as the line prints it, and as a nudge asks for it to be copied."""
+    return f"{entry.lever}: {entry.move} (because {entry.reason})"
+
+
+def ready_line(items: Sequence[Ready], *, all_over_budget: bool = False) -> str:
+    if not items and all_over_budget:
+        return "Levers ready now: none; every open entry is over the serving budget."
     if not items:
         return "Levers ready now: none; no lever's evidence fires on this run's numbers."
-    line = (
-        "Levers ready now: "
-        + "; ".join(f"{r.lever}: {r.move} (because {r.reason})" for r in items)
-        + "."
-    )
+    line = "Levers ready now: " + "; ".join(entry_text(r) for r in items) + "."
     return line + _COPY_THE_STACK if any(r.lever in LAYER_LEVERS for r in items) else line
+
+
+# The recipe keys that change what a served network costs. The rest (epochs, the
+# schedule, augmentation, the depth that trains) change the training, not the network.
+_PRICED_KEYS = ("backbone", "image_size", "layers", "head", "drop_stages", "model")
+
+
+def entry_recipe(
+    entry: Ready, incumbent: Mapping[str, Any], default_size: int | None
+) -> dict[str, Any] | None:
+    """The network this entry would train, as a recipe the Pricer can size. An entry that
+    keeps the incumbent's network (epochs, augmentation, regularisation, the fine-tune
+    depth) prices as that network, so a budget typed under the best closes the whole
+    line; None only when nothing is carried and nothing is named."""
+    return _recipe_for(entry.lever, entry.move, entry.stack, incumbent, default_size)
+
+
+def brief_recipe(
+    brief: str, incumbent: Mapping[str, Any], default_size: int | None
+) -> dict[str, Any] | None:
+    """The network a brief would train, read the way the guards read the brief: its
+    class from the tag and its one value from the change clause."""
+    lever = lever_class(brief)
+    if lever is None:
+        return None
+    clause = change_clause(brief)
+    stack = proposed_value(lever, clause) if lever in LAYER_LEVERS else None
+    return _recipe_for(lever, clause, str(stack or ""), incumbent, default_size)
+
+
+def _recipe_for(
+    lever: str, move: str, stack: str, incumbent: Mapping[str, Any], default_size: int | None
+) -> dict[str, Any] | None:
+    base = {k: v for k, v in incumbent.items() if k in _PRICED_KEYS and v}
+    size = int(base.get("image_size") or default_size or 64)
+    if lever == "backbone":
+        # A swap replaces the network whole: an own model or a from-zero stack does not
+        # travel with it, and a head sits on whichever backbone the recipe names. A size
+        # the move states ("resnet18 at 128 px") is the size it would train at.
+        kept = {k: base[k] for k in ("head", "drop_stages") if k in base}
+        stated = proposed_value("image-size", move)
+        return {
+            "backbone": proposed_value(lever, move) or "resnet18",
+            "image_size": int(stated) if stated is not None else size,
+            **kept,
+        }
+    if lever == "image-size":
+        value = proposed_value(lever, move)
+        return None if value is None else {**base, "image_size": int(value)}
+    if lever == "own-model":
+        # The size the agent's code will decode at is the network's own pretrained one,
+        # which the Pricer takes as 224 px when the recipe names none.
+        named = models_named(move)
+        return {"model": named[0]} if named else None
+    if lever == "layer-stack":
+        return {"backbone": "layers_net", "layers": stack, "image_size": size} if stack else None
+    if lever == "custom-head":
+        if not stack:
+            return None
+        backbone = _backbone_named(move) or str(base.get("backbone") or "")
+        if not backbone or backbone in FROM_ZERO or base.get("model"):
+            backbone = "resnet18"
+        return {"backbone": backbone, "image_size": size, "head": stack}
+    return {**base, "image_size": size} if base else None
+
+
+def split_by_budget(
+    entries: Sequence[Ready],
+    incumbent: Mapping[str, Any],
+    default_size: int | None,
+    pricer: Callable[[Mapping[str, Any] | None], Priced],
+) -> tuple[list[Ready], list[tuple[Ready, float]]]:
+    """The line with the entries the budget allows, in their own order, and the entries
+    it does not, each with its monthly price. An entry the table cannot price stays on
+    the line: the wall acts on numbers it has."""
+    line: list[Ready] = []
+    over: list[tuple[Ready, float]] = []
+    for entry in entries:
+        priced = pricer(entry_recipe(entry, incumbent, default_size))
+        if priced.fits or priced.usd_per_month is None:
+            line.append(entry)
+        else:
+            over.append((entry, priced.usd_per_month))
+    return line, over
 
 
 def ledger_line(history: Sequence[Experiment]) -> str:
