@@ -1285,11 +1285,13 @@ def _recipe_for(
     size = int(base.get("image_size") or default_size or 64)
     if lever == "backbone":
         # A swap replaces the network whole: an own model or a from-zero stack does not
-        # travel with it, and a head sits on whichever backbone the recipe names.
+        # travel with it, and a head sits on whichever backbone the recipe names. A size
+        # the move states ("resnet18 at 128 px") is the size it would train at.
         kept = {k: base[k] for k in ("head", "drop_stages") if k in base}
+        stated = proposed_value("image-size", move)
         return {
             "backbone": proposed_value(lever, move) or "resnet18",
-            "image_size": size,
+            "image_size": int(stated) if stated is not None else size,
             **kept,
         }
     if lever == "image-size":

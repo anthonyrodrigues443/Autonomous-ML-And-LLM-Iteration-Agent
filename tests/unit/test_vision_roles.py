@@ -2171,6 +2171,9 @@ def test_a_brief_prices_as_the_guards_read_it() -> None:
         "image_size": 64,
     }
     assert vl.brief_recipe(_BIGGER_BRIEF, RECIPE, 64) == {"backbone": "resnet18", "image_size": 128}
+    # A backbone brief that states a size trains at that size, and is priced there.
+    sized = "next: backbone: switch to resnet18 at 128 px (because the images carry the detail)"
+    assert vl.brief_recipe(sized, {}, 64) == {"backbone": "resnet18", "image_size": 128}
     stack_brief = f"next: layer-stack: train a network from zero through fit(), with layers {STACK}"
     assert vl.brief_recipe(stack_brief, RECIPE, 64) == {
         "backbone": "layers_net",
