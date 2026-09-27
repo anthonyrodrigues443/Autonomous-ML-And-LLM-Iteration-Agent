@@ -37,6 +37,10 @@ if TYPE_CHECKING:
 class SupervisorError(RuntimeError):
     """The supervisor failed to return a usable plan after retries."""
 
+    # The findings a budget round gathered before the decide that failed, so the loop
+    # keeps them for the next iteration.
+    findings: Any = None
+
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +60,9 @@ class SupervisorDecision:
     # before the next decide(); neither records a score or spends patience.
     want_research: bool = False
     want_inspect: bool = False
+    # Set by the harness, never read from the model's reply: "over_budget" when the
+    # serving budget took every open entry off the line and no model was asked.
+    stopped_because: str = ""
 
 
 def _build_tool(family: str = "tabular") -> ToolSpec:
@@ -135,8 +142,9 @@ class Supervisor:
         outputs: int | None = None,
         # The serving budget as a wall, shared with the loop. On an image run every
         # entry on the ready line is priced before the brief and the ones over the
-        # budget come off it; a brief naming one anyway is refused. With no budget
-        # on the wall the messages are the ones a run without a wall sends.
+        # budget come off it; a brief naming one anyway is refused, and a line it
+        # empties is a stop the loop acts on, with no model call. With no budget on
+        # the wall the messages are the ones a run without a wall sends.
         wall: Wall | None = None,
     ) -> None:
         self._client = client
@@ -189,6 +197,11 @@ class Supervisor:
             raise SupervisorError("baseline has no metrics")
         vision = self._family == "vision"
         run_history = list(this_run) if this_run is not None else history
+        wall = (
+            self._wall
+            if vision and self._wall is not None and self._wall.budget is not None
+            else None
+        )
         ready = (
             vl.ready(
                 run_history,
@@ -200,6 +213,8 @@ class Supervisor:
                 median_width=self._image_width,
                 default_size=self._image_size,
                 outputs=self._outputs,
+                ruled_out=wall.ruled_out() if wall is not None else (),
+                per_model=wall is not None,
             )
             if vision
             else []
@@ -209,14 +224,39 @@ class Supervisor:
         # The incumbent is the recipe the best scored, own model included, the same one
         # the ladder sizes its entries from.
         incumbent = vl.recipe_of(carried_best)
-        over: list[tuple[vl.Ready, float]] = []
-        if vision and self._wall is not None and self._wall.budget is not None:
-            ready, over = vl.split_by_budget(
-                ready, incumbent, self._image_size, self._wall.price_recipe
-            )
+        over: list[tuple[vl.Ready, float | None]] = []
+        if wall is not None:
+            ready, over = vl.split_by_budget(ready, incumbent, self._image_size, wall.price_recipe)
+            floor = int(incumbent.get("image_size") or self._image_size or 64)
             for entry, usd in over:
-                self._wall.record_refusal(entry.move, usd, "off the line")
-        ready_line = vl.ready_line(ready, all_over_budget=bool(over)) if vision else ""
+                recipe = vl.entry_recipe(entry, incumbent, self._image_size)
+                wall.record_refusal(
+                    entry.move,
+                    usd,
+                    "off the line",
+                    network=vl.recipe_network(recipe) if vl.at_its_floor(recipe, floor) else "",
+                )
+            # A model the findings name that the wall ruled out earlier is left off the line
+            # by the ladder itself, so an empty line can be all refusals of an earlier brief.
+            shut = {
+                vl.model_name({"model": n}) for n in vl.models_named(known_findings or research)
+            } & set(wall.ruled_out())
+            if not ready and (over or shut):
+                # Only the user moves the budget, and a model asked to brief off an empty
+                # line briefs around the wall: the loop takes it from here.
+                log.info(
+                    "supervisor: the serving budget left nothing on the line (%d over it, "
+                    "%d ruled out earlier)",
+                    len(over),
+                    len(shut),
+                )
+                return SupervisorDecision(
+                    stop=True,
+                    title="over the serving budget",
+                    brief="",
+                    stopped_because="over_budget",
+                )
+        ready_line = vl.ready_line(ready) if vision else ""
         messages = _build_messages(
             data_summary=data_summary,
             metric=self._metric,
@@ -391,14 +431,16 @@ class Supervisor:
                         log.info("supervisor: %s persisted; %s", reason, detail)
                         messages.append(Message(role="user", content=nudge))
                         continue
-                    elif vision and over and not ready:
-                        # The wall emptied the line. Seen live: the model then briefed an
-                        # own model with no loadable name twice, and the older "nothing
-                        # ready, research" path below accepted it, training a network the
-                        # wall could not price. Nothing is accepted off an emptied line;
-                        # the run says why, and Day 4 sends the Researcher back.
-                        detail = f"the serving budget emptied the line, and {reason} persisted"
-                        log.info("supervisor: %s", detail)
+                    elif (
+                        vision
+                        and self._wall is not None
+                        and self._wall.budget is not None
+                        and vl.lever_class(decision.brief) == "own-model"
+                    ):
+                        # Under a budget an own model with no loadable name has no price,
+                        # and the research path below would train it anyway.
+                        detail = f"own-model brief with no price refused: {reason}"
+                        log.info("supervisor: %s persisted; %s", reason, detail)
                         messages.append(Message(role="user", content=nudge))
                         continue
                     elif vision and (refused := _layer_stack_refused(decision.brief, ready)):
@@ -437,20 +479,24 @@ class Supervisor:
             messages.append(Message(role="user", content=_PROMPTS["retry_nudge"]))
         raise SupervisorError(f"no plan after {self._max_retries + 1} attempt(s): {detail}")
 
-    def _over_budget_block(self, over: Sequence[tuple[vl.Ready, float]]) -> str:
-        """The heading under the ready line: each entry the budget shut, with its price,
-        and the one sentence on what the budget is and is not. Empty when nothing is over
-        it, so a run without a wall sends the bytes it sent before the wall existed."""
+    def _over_budget_block(self, over: Sequence[tuple[vl.Ready, float | None]]) -> str:
+        """The heading under the ready line: each entry the budget shut, with its price or
+        "not priced", and the one sentence on what the budget is and is not. Empty when
+        nothing is over it, so a run without a wall sends the bytes it sent before the
+        wall existed."""
         if not over or self._wall is None or self._wall.budget is None:
             return ""
-        entries = "; ".join(f"{r.lever}: {r.move} (${usd:,.0f} a month)" for r, usd in over)
-        return str(
+        entries = "; ".join(f"{r.lever}: {r.move} ({_monthly(usd)})" for r, usd in over)
+        block = str(
             _PROMPTS["over_budget_block"].format(
                 budget=money(self._wall.budget),
                 rate=f"{self._wall.requests_per_hour:,}",
                 entries=entries,
             )
         )
+        if any(usd is None for _, usd in over):
+            block += " " + str(_PROMPTS["over_budget_unpriced_note"])
+        return block
 
     def route_message(self, text: str, *, live_session: bool) -> str:
         """Classify ONE line the human typed mid-run: ``question`` | ``steer_now``
@@ -796,6 +842,10 @@ def _layer_stack_refused(brief: str, ready: Sequence[vl.Ready]) -> str:
     return ""
 
 
+def _monthly(usd: float | None) -> str:
+    return "not priced" if usd is None else f"${usd:,.0f} a month"
+
+
 def _vision_violation(
     decision: SupervisorDecision,
     history: Sequence[Experiment],
@@ -850,14 +900,27 @@ def _vision_violation(
     if wall is not None and wall.budget is not None:
         recipe = vl.brief_recipe(decision.brief, incumbent or {}, default_size)
         priced = wall.price_recipe(recipe)
-        if priced.usd_per_month is not None and not priced.fits:
+        usd = priced.usd_per_month
+        # Under a budget an own model with no price is not affordable by default: a name
+        # outside timm's table can cost many times the budget to serve.
+        unsized = usd is None and lever == "own-model"
+        if unsized or (usd is not None and not priced.fits):
             change = vl.change_clause(decision.brief)
-            reason = (
-                f"{change} costs about ${priced.usd_per_month:,.0f} a month to serve at "
-                f"{wall.requests_per_hour:,} requests an hour, above the {money(wall.budget)} "
-                "a month serving budget"
-            )
-            wall.record_refusal(change, priced.usd_per_month, "brief refused")
+            floor = int((incumbent or {}).get("image_size") or default_size or 64)
+            network = vl.recipe_network(recipe) if vl.at_its_floor(recipe, floor) else ""
+            if usd is None:
+                reason = (
+                    f"the serving cost of {network or change} cannot be priced, and under the "
+                    f"{money(wall.budget)} a month serving budget an own model with no price "
+                    "is off the line"
+                )
+            else:
+                reason = (
+                    f"{change} costs about ${usd:,.0f} a month to serve at "
+                    f"{wall.requests_per_hour:,} requests an hour, above the "
+                    f"{money(wall.budget)} a month serving budget"
+                )
+            wall.record_refusal(change, usd, "brief refused", network=network)
             # The model may brief any entry left on the line, an invented one included;
             # only the harness's own fallback skips those.
             nudge = (
@@ -865,7 +928,7 @@ def _vision_violation(
                     reason=reason, first=vl.entry_text(ready[0]), ready=ready_text
                 )
                 if ready
-                else _PROMPTS["vision_all_over_budget_nudge"].format(
+                else _PROMPTS["vision_over_budget_empty_line_nudge"].format(
                     reason=reason, ready=ready_text
                 )
             )

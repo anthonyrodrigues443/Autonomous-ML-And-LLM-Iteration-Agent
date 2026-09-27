@@ -928,17 +928,17 @@ supervisor:
     a number, so it cannot apply. Call plan_next again with ONE class from the line
     below. {ready}
   # Sent ONCE when a brief names a network that costs more to serve than the serving
-  # budget the user set. Placeholders: {reason}, {first}, {ready}
+  # budget the user set, or, under one, an own model with no price.
+  # Placeholders: {reason}, {first}, {ready}
   vision_over_budget_nudge: >-
     Rejected: {reason}. The serving budget is a wall on what is in the running, not a
     weight on the score: brief the first entry on Levers ready now instead, copied as it
     is written there: {first}. {ready}
-  # The same, when the serving budget has taken every entry off the line. Only the user
-  # can move it. Placeholders: {reason}, {ready}
-  vision_all_over_budget_nudge: >-
-    Rejected: {reason}. Every entry this run's numbers opened is over the serving budget,
-    and only the user can move it, by typing a new one. There is nothing on the line to
-    brief: call plan_next with stop=true and say so. {ready}
+  # The same, when this run's numbers opened nothing to name instead. A line the budget
+  # emptied never reaches the model. Placeholders: {reason}, {ready}
+  vision_over_budget_empty_line_nudge: >-
+    Rejected: {reason}. Only the user moves the serving budget. Brief ONE change that
+    trains a network within it, with its exact value and a fact as the reason. {ready}
   # The block under the ready line, present only when a serving budget is set and an
   # open entry is over it. Placeholders: {budget}, {rate}, {entries}
   over_budget_block: >-
@@ -948,6 +948,10 @@ supervisor:
     running, never the ranking: among the entries on Levers ready now, take the first
     unless a fit line or a finding gives a reason to prefer another, and never prefer
     one for being cheaper.
+  # Appended to the block only when an entry in it is marked not priced.
+  over_budget_unpriced_note: >-
+    An own model marked not priced has no size to price it from, and under a serving
+    budget it is off the line too.
   # No want_inspect: a free look at images needs a model that sees pixels, and the
   # profile already gives the counts, sizes and balance the table version asks for.
   vision_tool:
@@ -1375,6 +1379,50 @@ researcher:
         size, how many there are, or whether the label is a class or a number.
       paper: >-
         The NUMBER of the supporting paper from the list shown. Never a DOI, URL or title.
+
+  # Appended to what was already attempted, on a pass after the serving wall refused
+  # every network on the line. It names them and nothing else: no price and no money
+  # word, so the search looks for what suits the images and the wall does the pricing.
+  # Placeholders: {names}
+  ruled_out_label: "; ruled out this run, do not suggest these: {names}"
+
+  # The catalog pass: a later round on an image run whose papers named no network a
+  # library loads. The model picks from the catalog the package ships, the harness keeps
+  # only names that catalog lists, and the finding cites the catalog, never a paper.
+  # Placeholders: {metric}, {direction}
+  catalog_system: |-
+    You name pretrained image networks worth fine-tuning on THESE images, optimizing '{metric}' ({direction}). No paper found this run names one, so you choose from the library catalog you are shown instead.
+
+    Name each network exactly as the catalog spells it, and only networks the catalog lists: a name it does not list is dropped. A network already attempted or ruled out this run is wasted. Judge from the image profile: what the images show, their size in pixels, how many there are, and whether the label is a class or a number. Prefer a network one notebook session fine-tunes on one GPU in minutes.
+
+    Name at most 3, ordered best first, and name fewer rather than padding. Call name_models; respond with nothing else.
+
+  # Placeholders: {profile}, {tried}, {catalog}
+  catalog_user: |-
+    Image profile (established facts, computed by the host; trust these):
+    {profile}
+
+    Already attempted this run (do NOT name these): {tried}
+
+    The library catalog, one family a line:
+    {catalog}
+
+    Name the networks now by calling name_models.
+
+  catalog_tool:
+    name: name_models
+    description: "Record which pretrained networks from the catalog are worth fine-tuning on these images."
+    fields:
+      models: >-
+        Up to 3 network names, each spelled exactly as the catalog lists it, best first.
+
+  # What a catalog finding says. The harness writes it, not the model: it becomes a
+  # finding line the lever ladder reads, and a name or a size in the model's own reason
+  # would open an entry nothing supports. No size, so the session's own size prices it.
+  # Short, because the Supervisor reads findings cut at 420 characters.
+  # Placeholders: {name}
+  catalog_technique: "fine-tune {name}, pretrained, all layers"
+  catalog_rationale: "from the library catalog, not a paper"
 
 
 reconstructor:

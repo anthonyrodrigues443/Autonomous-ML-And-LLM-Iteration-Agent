@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from iterate.targets import layers as arch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
     from iterate.core.serving import Priced
     from iterate.schemas.experiment import Experiment
@@ -124,8 +124,15 @@ _CUT = re.compile(r"^stopped in epoch (\d+)/(\d+): the fit budget ran out")
 _OOM = re.compile(r"out of memory|allocate memory|invalid buffer size", re.IGNORECASE)
 # An org/name id, kept apart from a DOI or a path by the lookbehind, and required to
 # carry a digit or a hyphen somewhere so "training/validation" is not a model.
-_HF_ID = re.compile(r"(?<![\w/.:])[a-z][\w-]*/(?=[\w.-]*[\d-])[a-z][\w.-]*[a-z0-9]", re.IGNORECASE)
+# The name part of a Hugging Face id carries a digit ("facebook/dinov2-small",
+# "microsoft/resnet-50"); "one-hot/target-encoding" is a phrase, not a model.
+_HF_ID = re.compile(r"(?<![\w/.:])[a-z][\w-]*/(?=[\w.-]*\d)[a-z][\w.-]*[a-z0-9]", re.IGNORECASE)
 _TOKEN = re.compile(r"(?<![\w/.:])(?:timm[_/])?([a-z][a-z0-9_]*[a-z0-9])", re.IGNORECASE)
+# A timm hub id is the one architecture it loads, whatever prefix and pretrained tag it
+# carries: "hf_hub:timm/efficientnet_b0.ra_in1k" is efficientnet_b0, not an org/name id.
+_TIMM_HUB = re.compile(
+    r"(?<![\w/.:])(?:hf[_-]hub:)?timm/([a-z][a-z0-9_]*[a-z0-9])(?:\.[\w-]+)?", re.IGNORECASE
+)
 # The recipe keys whose value is a layer spec: a list cannot go in the set of tried
 # values, so everything that compares one compares its canonical text instead.
 _SPEC_KEYS = frozenset({"layers", "head"})
@@ -159,6 +166,8 @@ def _timm_names() -> frozenset[str]:
 
 
 _TIMM = _timm_names()
+# What the catalog pass may name: every timm architecture shipped, and fit()'s pretrained ones.
+CATALOG = _TIMM | (FIT_BACKBONES - FROM_ZERO)
 
 
 def classes_named(brief: str) -> list[str]:
@@ -202,9 +211,44 @@ def change_clause(brief: str) -> str:
 def models_named(text: str) -> list[str]:
     """Names a library loads: a timm pretrained architecture or a Hugging Face id, never
     a plain English word and never a network fit() already trains."""
-    found = {m.group(1).lower() for m in _TOKEN.finditer(text) if m.group(1).lower() in _TIMM}
-    found |= {m.group(0) for m in _HF_ID.finditer(text)}
-    return sorted(found - FIT_BACKBONES)
+    return sorted(_named_in_order(text))
+
+
+def _named_in_order(text: str) -> list[str]:
+    """The names `models_named` reads, in the order the text first names them."""
+    hits: list[tuple[int, str]] = []
+    for m in _TIMM_HUB.finditer(text):
+        name = m.group(1).lower()
+        # The digit test is the one _HF_ID holds an id to, so "timm/models" names nothing.
+        if name in _TIMM or any(c.isdigit() for c in name):
+            hits.append((m.start(), name))
+    rest = _TIMM_HUB.sub(lambda m: " " * len(m.group(0)), text)
+    hits += [
+        (m.start(), m.group(1).lower())
+        for m in _TOKEN.finditer(rest)
+        if m.group(1).lower() in _TIMM
+    ]
+    hits += [(m.start(), m.group(0)) for m in _HF_ID.finditer(rest)]
+    found: dict[str, None] = {}
+    for _, name in sorted(hits):
+        if name not in FIT_BACKBONES:
+            found.setdefault(name, None)
+    return list(found)
+
+
+def new_models(
+    findings: str, ruled_out: Collection[str], tried: Collection[str] = ()
+) -> list[str]:
+    """The models the findings name that the wall has not ruled out and this run has not
+    tried: what makes one more pass through the Supervisor worth it once the wall has
+    emptied the line, since the ladder opens only untried models."""
+    shut = {model_name({"model": n}) for n in [*ruled_out, *tried]}
+    return [n for n in models_named(findings) if model_name({"model": n}) not in shut]
+
+
+def tried_models(history: Sequence[Experiment]) -> set[str]:
+    """The own models this run has spent an experiment on, by the names the ladder uses."""
+    return {str(name) for name in _tried_values(history, "name")}
 
 
 def _parts(cell: Any) -> tuple[str, str, str]:
@@ -303,13 +347,18 @@ class Try:
         return None
 
 
-def model_name(recipe: dict[str, Any] | None) -> str:
+def model_name(recipe: Mapping[str, Any] | None) -> str:
     if not recipe:
         return ""
     raw = str(recipe.get("model") or recipe.get("backbone") or "").strip().lower()
-    for prefix in ("timm/", "timm_", "hf-hub:", "hf_hub:", "torchvision.models."):
+    # The hub prefix first: "hf_hub:timm/x" has to lose both parts.
+    for prefix in ("hf-hub:", "hf_hub:", "timm/", "timm_", "torchvision.models."):
         raw = raw.removeprefix(prefix)
-    return raw.replace("-", "_")
+    # A pretrained tag (`efficientnet_b0.ra_in1k`) names weights, not another network. A
+    # Hugging Face id keeps its spelling: "google/vit-base-patch16-224" is what loads.
+    if "/" in raw:
+        return raw
+    return raw.split(".")[0].replace("-", "_")
 
 
 def tries(cells: Iterable[Any]) -> list[Try]:
@@ -725,6 +774,8 @@ def ready(
     median_width: int | None = None,
     default_size: int | None = None,
     outputs: int | None = None,
+    ruled_out: Collection[str] = (),
+    per_model: bool = False,
 ) -> list[Ready]:
     """The lever classes this run's evidence opens, each with the fact that opened it.
     A failure closes everything but its repair and whatever the human asked for on this
@@ -735,7 +786,12 @@ def ready(
 
     ``outputs`` is the class count, so a stack a paper ends in a final layer as wide as
     the class count is refused here rather than at the fit, which fit() would add a
-    second final layer after."""
+    second final layer after.
+
+    ``ruled_out`` is the networks the serving budget refused this run, never offered
+    again as an own model. ``per_model`` gives every untried model the findings name an
+    entry of its own, stating the size it trains at, so the wall can price each one; the
+    Supervisor asks for it only under a budget."""
     last = history[-1] if history else None
     best = best_try(carried)
     recipe = recipe_of(carried)
@@ -745,8 +801,11 @@ def ready(
     # so a vague ask can never become the fallback brief.
     led = [r for r in asked if not r.invented]
     trailing = [r for r in asked if r.invented]
+    # Under a budget the models the findings name stay on the line behind a repair: the
+    # wall may refuse the repair, and the line must still hold what the round found.
+    named = _per_model_entries(history, findings, ruled_out, size) if per_model else []
     if last is not None and (repair := _repair(history, recipe)) is not None:
-        return [repair, *led, *trailing]
+        return [repair, *led, *trailing, *named]
     if last is not None:
         cut = submitted_try(_cells(last))
         if cut is not None and cut.kind == "fit" and cut.cut:
@@ -760,6 +819,7 @@ def ready(
                 ),
                 *led,
                 *trailing,
+                *named,
             ]
     best_score = _score(carried) if carried is not None else None
     closed = _pivot_closed(history, best_score, direction)
@@ -868,8 +928,10 @@ def ready(
                     "keep the recipe and fine-tune all layers",
                 )
             )
-    untried = [n for n in models_named(findings) if n not in _tried_values(history, "name")]
-    if untried:
+    shut = _tried_values(history, "name") | {model_name({"model": n}) for n in ruled_out}
+    if per_model:
+        out.extend(named)
+    elif untried := [n for n in models_named(findings) if model_name({"model": n}) not in shut]:
         out.append(
             Ready(
                 "own-model",
@@ -893,6 +955,77 @@ def ready(
         )
     opened = {r.lever for r in asked}
     return [*led, *(r for r in out if r.lever not in closed and r.lever not in opened), *trailing]
+
+
+# How a catalog pass cites what it names (researcher.CATALOG_CITATION, rendered in <>).
+_CATALOG_MARK = "<catalog:"
+
+
+def native_size(name: str) -> int | None:
+    """The input size a network is fixed to, read off its name (vit_base_patch16_224,
+    swin_tiny_patch4_window7_224): the coder trains such a network at its pretrained
+    size whatever the brief says, so that is the size to price it at."""
+    plain = model_name({"model": name})
+    found = _NATIVE.search(plain)
+    if found is None or not any(mark in plain for mark in _FIXED_MARKS):
+        return None
+    size = int(found.group(1))
+    return size if size in _INPUT_SIZES else None
+
+
+def at_its_floor(recipe: Mapping[str, Any] | None, floor: int | None) -> bool:
+    """Whether a refusal at this recipe's size rules the network out: true at a fixed
+    input size or at no more than the size the ladder itself offers it at. Refused only at
+    a bigger size, the network may still fit where the ladder puts it."""
+    if not recipe:
+        return True
+    name = str(recipe.get("model") or recipe.get("backbone") or "")
+    at = recipe.get("image_size")
+    return bool(native_size(name)) or at is None or floor is None or int(at) <= floor
+
+
+def _own_part(line: str, name: str) -> str:
+    """The stretch of a finding line about one model: from its name to the next model
+    named, so a size stated for another network on the same line is not read as its own."""
+    low = line.lower()
+    start = low.find(name.lower())
+    if start < 0:
+        return low
+    after = [low.find(other.lower(), start + len(name)) for other in _named_in_order(line)]
+    ends = [i for i in after if i > start]
+    return low[start : min(ends)] if ends else low[start:]
+
+
+def _per_model_entries(
+    history: Sequence[Experiment], findings: str, ruled_out: Collection[str], size: int
+) -> list[Ready]:
+    shut = _tried_values(history, "name") | {model_name({"model": n}) for n in ruled_out}
+    return [
+        _own_model_entry(n, findings, size)
+        for n in _named_in_order(findings)
+        if model_name({"model": n}) not in shut
+    ]
+
+
+def _own_model_entry(name: str, findings: str, size: int) -> Ready:
+    """One named model as an entry of its own, at its fixed input size if it has one, else
+    the size the first finding line states for it, else ``size``: the size the wall prices
+    it at is the size it trains at."""
+    line = next((ln for ln in findings.splitlines() if name in _named_in_order(ln)), "")
+    stated = _ints_for(_own_part(line, name), _VALUE_WORDS["image-size"], 32, 384)
+    at = native_size(name) or (stated.pop() if len(stated) == 1 else size)
+    why = (
+        f"the Researcher picked {name} from the timm catalog"
+        if _CATALOG_MARK in line
+        else f"a literature finding names {name}"
+    )
+    # A timm id the catalog does not list reads back only with its "timm/" prefix.
+    spelled = name if name in _TIMM or "/" in name else f"timm/{name}"
+    return Ready(
+        "own-model",
+        why,
+        f"write torch code for {spelled} with pretrained weights, all layers, at {at} px",
+    )
 
 
 def _stack_kind(spec: arch.Spec, outputs: int | None = None) -> tuple[str | None, str]:
@@ -1241,15 +1374,18 @@ def entry_text(entry: Ready) -> str:
     return f"{entry.lever}: {entry.move} (because {entry.reason})"
 
 
-def ready_line(items: Sequence[Ready], *, all_over_budget: bool = False) -> str:
-    if not items and all_over_budget:
-        return "Levers ready now: none; every open entry is over the serving budget."
+def ready_line(items: Sequence[Ready]) -> str:
     if not items:
         return "Levers ready now: none; no lever's evidence fires on this run's numbers."
     line = "Levers ready now: " + "; ".join(entry_text(r) for r in items) + "."
     return line + _COPY_THE_STACK if any(r.lever in LAYER_LEVERS for r in items) else line
 
 
+_NATIVE = re.compile(r"_(\d{3,4})$")
+# The transformer-style families whose trailing number is the input size they are
+# fixed to; elsewhere a trailing number is a width or a variant (mobilenetv3_small_100).
+_FIXED_MARKS = ("patch", "window", "vit", "cait", "xcit", "beit", "eva", "coatnet", "mixer")
+_INPUT_SIZES = frozenset({224, 256, 288, 320, 336, 384, 448, 512, 518, 560})
 # The recipe keys that change what a served network costs. The rest (epochs, the
 # schedule, augmentation, the depth that trains) change the training, not the network.
 _PRICED_KEYS = ("backbone", "image_size", "layers", "head", "drop_stages", "model")
@@ -1263,6 +1399,18 @@ def entry_recipe(
     depth) prices as that network, so a budget typed under the best closes the whole
     line; None only when nothing is carried and nothing is named."""
     return _recipe_for(entry.lever, entry.move, entry.stack, incumbent, default_size)
+
+
+def entry_network(entry: Ready, incumbent: Mapping[str, Any], default_size: int | None) -> str:
+    """The network an entry would train, by the bare name a library loads, for the wall
+    to rule out and the Researcher to be told; "" when it names none."""
+    return recipe_network(entry_recipe(entry, incumbent, default_size))
+
+
+def recipe_network(recipe: Mapping[str, Any] | None) -> str:
+    """A stack trained from zero is "": it is not a network anyone can be told to avoid."""
+    name = model_name(recipe)
+    return "" if name in FROM_ZERO else name
 
 
 def brief_recipe(
@@ -1298,10 +1446,15 @@ def _recipe_for(
         value = proposed_value(lever, move)
         return None if value is None else {**base, "image_size": int(value)}
     if lever == "own-model":
-        # The size the agent's code will decode at is the network's own pretrained one,
-        # which the Pricer takes as 224 px when the recipe names none.
+        # Priced where the post-run stamp prices it: a network with a fixed input at that
+        # size, else the size the move states, else the session's, which is what the
+        # coder trains at when the brief names none.
         named = models_named(move)
-        return {"model": named[0]} if named else None
+        if not named:
+            return None
+        stated = proposed_value("image-size", move)
+        at = native_size(named[0]) or (int(stated) if stated is not None else size)
+        return {"model": named[0], "image_size": at}
     if lever == "layer-stack":
         return {"backbone": "layers_net", "layers": stack, "image_size": size} if stack else None
     if lever == "custom-head":
@@ -1319,15 +1472,19 @@ def split_by_budget(
     incumbent: Mapping[str, Any],
     default_size: int | None,
     pricer: Callable[[Mapping[str, Any] | None], Priced],
-) -> tuple[list[Ready], list[tuple[Ready, float]]]:
+) -> tuple[list[Ready], list[tuple[Ready, float | None]]]:
     """The line with the entries the budget allows, in their own order, and the entries
-    it does not, each with its monthly price. An entry the table cannot price stays on
-    the line: the wall acts on numbers it has."""
+    it does not, each with its monthly price. Called under a budget only. An entry the
+    table cannot price stays on the line, the wall acting on numbers it has, except an
+    own model: the agent's code can load any network at all, so one the Pricer cannot
+    size goes under the heading with None for its price."""
     line: list[Ready] = []
-    over: list[tuple[Ready, float]] = []
+    over: list[tuple[Ready, float | None]] = []
     for entry in entries:
         priced = pricer(entry_recipe(entry, incumbent, default_size))
-        if priced.fits or priced.usd_per_month is None:
+        if priced.usd_per_month is None and entry.lever == "own-model":
+            over.append((entry, None))
+        elif priced.fits or priced.usd_per_month is None:
             line.append(entry)
         else:
             over.append((entry, priced.usd_per_month))
@@ -1370,6 +1527,9 @@ _VALUE_WORDS = {
     "image-size": ("px", "pixels?", "image_size"),
     "epochs": ("epochs?",),
 }
+# A 12B writes the value alone ("next: image-size: 224 (because ...)"). Only a clause that
+# is the number and nothing else reads as one, so a number in prose names no value.
+_BARE = re.compile(r"(\d{1,3})\s*[.,;]?")
 
 
 def _ints_for(text: str, words: Sequence[str], low: int, high: int) -> set[int]:
@@ -1416,6 +1576,9 @@ def proposed_value(lever: str, clause: str) -> Any:
     if lever in _VALUE_WORDS:
         low, high = (32, 384) if lever == "image-size" else (1, 30)
         values = _ints_for(move, _VALUE_WORDS[lever], low, high)
+        bare = _BARE.fullmatch(move.strip())
+        if not values and bare is not None and low <= int(bare.group(1)) <= high:
+            values = {int(bare.group(1))}
         return values.pop() if len(values) == 1 else None
     if lever == "augmentation":
         return "flip_crop" if ("flip_crop" in move or "crop" in move) else None

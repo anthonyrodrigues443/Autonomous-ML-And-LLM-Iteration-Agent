@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import threading
+import time
+
+import pytest
 
 from iterate.core.interactive import RunController
+
+pytestmark = pytest.mark.unit
 
 
 class _FakeKernel:
@@ -248,3 +253,112 @@ def test_a_reader_that_raises_leaves_the_note_as_typed() -> None:
     ctrl.note_reader = boom
     ctrl.add_brief_note("try something")
     assert ctrl.take_brief_notes() == ["try something"]
+
+
+# ─── the wait for a serving budget (v0.7 Day 4) ──────────────────────────────
+
+
+_ASK = "over the serving budget ($20 a month at 400,000 requests an hour): type a budget"
+
+
+class _BudgetInterpreter:
+    """Settles a wait on a typed budget line the way the loop's own interpreter moves the
+    wall, routes anything else as a steer, and records the status each line met."""
+
+    def __init__(self, ctrl: RunController) -> None:
+        self._ctrl = ctrl
+        self.moved = False
+        self.statuses: list[str] = []
+
+    def __call__(self, batch: list[str], live_session: bool) -> None:
+        for text in batch:
+            self.statuses.append(self._ctrl.status)
+            if text.startswith("budget"):
+                self.moved = True
+            else:
+                self._ctrl.add_brief_note(text)
+
+
+def _budget_controller(replies: list[str]) -> tuple[RunController, _BudgetInterpreter]:
+    ctrl = RunController(reply=replies.append)
+    reader = _BudgetInterpreter(ctrl)
+    ctrl.interpreter = reader
+    return ctrl, reader
+
+
+def test_a_wait_asks_once_routes_what_is_typed_and_credits_the_time() -> None:
+    replies: list[str] = []
+    ctrl, reader = _budget_controller(replies)
+    ctrl.status = "between experiments"
+
+    def _type() -> None:
+        ctrl.submit_line("why is it so expensive?")
+        ctrl.submit_line("budget $80")
+
+    threading.Timer(0.4, _type).start()
+    waited = ctrl.wait_until(lambda: reader.moved, ask=_ASK)
+    assert waited >= 0.3
+    assert ctrl.paused_seconds_total == waited
+    assert replies.count(_ASK) == 1
+    assert any("queued (waiting for a serving budget)" in r for r in replies)
+    assert reader.statuses == ["waiting for a serving budget"] * 2
+    assert ctrl.status == "between experiments"
+    assert ctrl.take_brief_notes() == ["why is it so expensive?"]
+
+
+def test_a_budget_typed_before_the_ask_ends_the_wait_without_asking() -> None:
+    replies: list[str] = []
+    ctrl, reader = _budget_controller(replies)
+    ctrl.submit_line("budget $80")
+    assert ctrl.wait_until(lambda: reader.moved, ask=_ASK) == 0.0
+    assert _ASK not in replies
+    assert ctrl.paused_seconds_total == 0.0
+
+
+def test_a_typed_stop_ends_a_wait() -> None:
+    replies: list[str] = []
+    ctrl, _ = _budget_controller(replies)
+    threading.Timer(0.2, lambda: ctrl.submit_line("stop")).start()
+    ctrl.wait_until(lambda: False, ask=_ASK)
+    assert ctrl.abort_requested
+
+
+def test_a_graceful_stop_ends_a_wait() -> None:
+    ctrl = RunController()
+    threading.Timer(0.2, ctrl.request_graceful_stop).start()
+    ctrl.wait_until(lambda: False, ask=_ASK)
+    assert ctrl.abort_requested
+
+
+@pytest.mark.parametrize("line", ["budget $80", "pause", "resume", "/huh", "stop"])
+def test_every_typed_line_wakes_a_wait_at_once(line: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from iterate.core import interactive
+
+    monkeypatch.setattr(interactive, "_WAIT_SLICE", 60.0)
+    settled = threading.Event()
+    ctrl = RunController()
+
+    def _type() -> None:
+        settled.set()
+        ctrl.submit_line(line)
+
+    threading.Timer(0.1, _type).start()
+    started = time.monotonic()
+    ctrl.wait_until(settled.is_set, ask=_ASK)
+    assert time.monotonic() - started < 5.0  # a missed poke would sit out the 60 s slice
+
+
+def test_a_pause_typed_during_a_wait_does_not_end_it_and_parks_the_next_checkpoint() -> None:
+    ctrl = RunController()
+    settled = threading.Event()
+
+    def _settle() -> None:
+        settled.set()
+        ctrl.submit_line("carry on")
+
+    threading.Timer(0.1, lambda: ctrl.submit_line("pause")).start()
+    threading.Timer(0.4, _settle).start()
+    assert ctrl.wait_until(settled.is_set, ask=_ASK) >= 0.3
+    threading.Timer(0.3, lambda: ctrl.submit_line("resume")).start()
+    assert ctrl.checkpoint(None) >= 0.2
+    assert ctrl.take_brief_notes() == ["carry on"]

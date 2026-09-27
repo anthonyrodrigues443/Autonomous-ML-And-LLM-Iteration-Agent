@@ -2110,7 +2110,7 @@ _BIGGER_BRIEF = (
                 "write torch code for efficientnet_b0 with pretrained weights, all layers, at "
                 "the input size its pretrained_cfg names",
             ),
-            {"model": "efficientnet_b0"},
+            {"model": "efficientnet_b0", "image_size": 64},
         ),
         (
             _entry(
@@ -2187,23 +2187,20 @@ def test_a_brief_prices_as_the_guards_read_it() -> None:
     assert vl.brief_recipe("try a better model", RECIPE, 64) is None
 
 
-def test_the_split_keeps_the_lines_order_and_an_unpriced_entry_stays_on_it() -> None:
-    unsized = _entry("own-model", "write torch code for a network nobody has sized")
+def test_the_split_keeps_the_lines_order_and_only_an_unpriced_own_model_leaves_it() -> None:
+    unsized = _entry("own-model", "write torch code for google/vit-base-patch16-224 at 64 px")
+    headless = _entry("custom-head", "fine-tune with a head nobody wrote")
 
     def pricer(recipe: Any) -> Priced:
-        if recipe is None:
+        if recipe is None or recipe.get("model"):
             return Priced(None, True)
         if recipe.get("backbone") == "convnext_tiny":
             return Priced(98.0, False, host="aws t4g.small x8")
         return Priced(12.26, True, host="aws t4g.small")
 
-    line, over = vl.split_by_budget([_SWAP, _BIGGER, _MORE, unsized], RECIPE, 64, pricer)
-    assert line == [_BIGGER, _MORE, unsized]
-    assert over == [(_SWAP, 98.0)]
-    assert (
-        vl.ready_line([], all_over_budget=True)
-        == "Levers ready now: none; every open entry is over the serving budget."
-    )
+    line, over = vl.split_by_budget([_SWAP, _BIGGER, _MORE, unsized, headless], RECIPE, 64, pricer)
+    assert line == [_BIGGER, _MORE, headless]
+    assert over == [(_SWAP, 98.0), (unsized, None)]
     assert (
         vl.ready_line([])
         == "Levers ready now: none; no lever's evidence fires on this run's numbers."
@@ -2270,23 +2267,70 @@ def test_the_wall_takes_an_over_budget_entry_off_the_line_and_prices_it_under_a_
     )
     assert "never prefer one for being cheaper" in heading
     assert len(client.seen) == 1  # an affordable brief is not nudged
-    # The split is a refusal too, remembered for the end of the run and for Day 4.
-    assert [(r.what, round(r.usd_per_month, 2), r.kind) for r in wall.refused] == [
-        ("keep the recipe and swap the backbone to convnext_tiny", 14.6, "off the line")
+    # The split is a refusal too, remembered for the end of the run and for the Researcher.
+    assert [(r.what, round(r.usd_per_month, 2), r.kind, r.network) for r in wall.refused] == [
+        (
+            "keep the recipe and swap the backbone to convnext_tiny",
+            14.6,
+            "off the line",
+            "convnext_tiny",
+        )
+    ]
+    assert wall.ruled_out() == ["convnext_tiny"]
+
+
+_B0_FINDING = "- fine-tune efficientnet_b0 on all layers <doi:10.3390/rs71114680>"
+_VIT_FINDING = "- google/vit-base-patch16-224 on remote sensing scenes <doi:10.3390/rs13030516>"
+_OWN_B0_BRIEF = (
+    "next: own-model: write torch code for efficientnet_b0 with pretrained weights, all "
+    "layers, at 64 px (because a literature finding names efficientnet_b0)"
+)
+_OWN_VIT_BRIEF = (
+    "next: own-model: write torch code for google/vit-base-patch16-224 with pretrained "
+    "weights, all layers, at 64 px (because a literature finding names it)"
+)
+
+
+def _decide_found(
+    client: Scripted, wall: serving.Wall, best: Experiment | None, findings: str
+) -> sup.SupervisorDecision:
+    return vision_supervisor(client, wall=wall).decide(
+        data_summary="Images: 10",
+        baseline=baseline_result(),
+        history=[best] if best is not None else [],
+        carried_best=best,
+        known_findings=findings,
+    )
+
+
+def test_on_the_first_iteration_an_emptied_line_stops_before_any_model_call() -> None:
+    client = Scripted()
+    wall = _wall(5.0)  # $5 is under even the first pretrained try
+    decision = vision_supervisor(client, wall=wall).decide(
+        data_summary="Images: 10", baseline=baseline_result(), history=[]
+    )
+    assert client.seen == []
+    assert decision == sup.SupervisorDecision(
+        stop=True, title="over the serving budget", brief="", stopped_because="over_budget"
+    )
+    assert [(r.kind, r.network, round(r.usd_per_month, 2)) for r in wall.refused] == [
+        ("off the line", "resnet18", 7.3)
     ]
 
 
 def test_on_the_first_iteration_the_block_follows_the_line_under_no_experiments_yet() -> None:
-    client = Scripted("next: backbone: fine-tune resnet18 through fit(), all layers, 3 epochs")
-    with pytest.raises(sup.SupervisorError):  # $5 is under even the first pretrained try
-        vision_supervisor(client, wall=_wall(5.0)).decide(
-            data_summary="Images: 10", baseline=baseline_result(), history=[]
-        )
-    user = client.seen[0][0][1].content
-    after = user.split("No experiments yet")[1]
-    assert "Levers ready now: none; every open entry is over the serving budget." in after
-    assert "Over the serving budget ($5 a month at 50,000 requests an hour): backbone:" in after
-    assert "($7 a month)" in after
+    """At 400,000 requests an hour the first pretrained try costs $15 and efficientnet_b0 at
+    the session's 64 px $7, so the finding stays on the line and the try goes under it."""
+    client = Scripted(_OWN_B0_BRIEF)
+    decision = _decide_found(client, _wall(10.0, rate=400_000), None, _B0_FINDING)
+    after = client.seen[0][0][1].content.split("No experiments yet")[1]
+    line, heading = after.split("Over the serving budget", maxsplit=1)
+    assert "Levers ready now: own-model: write torch code for efficientnet_b0" in line
+    assert heading.startswith(
+        " ($10 a month at 400,000 requests an hour): backbone: fine-tune resnet18"
+    )
+    assert "($15 a month)" in heading
+    assert "efficientnet_b0" in decision.brief
 
 
 def test_a_brief_naming_an_over_budget_network_is_refused_with_the_first_affordable_entry_named() -> (
@@ -2307,9 +2351,10 @@ def test_a_brief_naming_an_over_budget_network_is_refused_with_the_first_afforda
     )
     assert not decision.stop
     assert "128 px" in decision.brief
-    assert [(r.what, r.kind) for r in wall.refused] == [
-        ("keep the recipe and swap the backbone to convnext_tiny", "off the line"),
-        ("keep the recipe and swap the backbone to convnext_tiny", "brief refused"),
+    swap = "keep the recipe and swap the backbone to convnext_tiny"
+    assert [(r.what, r.kind, r.network) for r in wall.refused] == [
+        (swap, "off the line", "convnext_tiny"),
+        (swap, "brief refused", "convnext_tiny"),
     ]
 
 
@@ -2322,34 +2367,166 @@ def test_a_persisted_over_budget_brief_falls_back_to_the_first_affordable_entry(
     assert "convnext_tiny" not in decision.brief
 
 
-def test_with_everything_over_the_budget_the_line_says_so_and_a_persisted_brief_is_a_failure() -> (
-    None
-):
+def test_with_everything_over_the_budget_the_supervisor_stops_and_asks_the_model_nothing() -> None:
+    """Seen live on the $20 run: with every entry off the line, the model briefed an own
+    model with no loadable name twice, and the path meant for an empty line accepted it. A
+    line the wall emptied never reaches the model now; the loop takes the stop from here."""
     best = first_try(trains=(0.98, 0.98, 0.98))  # not rising, so no epochs entry opens
+    client = Scripted()
+    wall = _wall(5.0)
+    decision = _decide(client, wall, best)
+    assert client.seen == []
+    assert decision.stop
+    assert decision.stopped_because == "over_budget"
+    assert (decision.title, decision.brief) == ("over the serving budget", "")
+    assert [(r.what, r.kind, r.network) for r in wall.refused] == [
+        (
+            "keep the recipe and swap the backbone to convnext_tiny",
+            "off the line",
+            "convnext_tiny",
+        ),
+        ("keep the best and train at 128 px", "off the line", ""),
+    ]
+    # resnet18 was refused only at 128 px, above the 64 px it is offered at: not ruled out.
+    assert wall.ruled_out() == ["convnext_tiny"]
+
+
+def test_an_own_model_with_no_price_does_not_hold_an_emptied_line_open() -> None:
+    """Day 3 left an unpriced entry on the line, so a Hugging Face name outside timm's table
+    kept a $5 line open, and a network nobody could price was the one left to brief."""
+    best = first_try(trains=(0.98, 0.98, 0.98))
+    client = Scripted()
+    decision = _decide_found(client, _wall(5.0), best, _VIT_FINDING)
+    assert client.seen == []
+    assert decision.stopped_because == "over_budget"
+
+
+def test_an_own_model_with_no_price_goes_under_the_heading_as_not_priced() -> None:
+    best = first_try()
+    client = Scripted(_OWN_B0_BRIEF)
+    decision = _decide_found(
+        client, _wall(10.0, rate=400_000), best, f"{_B0_FINDING}\n{_VIT_FINDING}"
+    )
+    line, heading = client.seen[0][0][1].content.split("Over the serving budget", maxsplit=1)
+    assert "Levers ready now: own-model: write torch code for efficientnet_b0" in line
+    assert "google/vit-base-patch16-224" not in line
+    assert "google/vit-base-patch16-224" in heading
+    assert "at 64 px (not priced)" in heading
+    assert "An own model marked not priced has no size to price it from" in heading
+    assert len(client.seen) == 1
+    assert "efficientnet_b0" in decision.brief
+
+
+def test_a_brief_naming_an_own_model_with_no_price_is_refused_only_under_a_budget() -> None:
+    best = first_try()
+    found = f"{_B0_FINDING}\n{_VIT_FINDING}"
+    client = Scripted(_OWN_VIT_BRIEF, _OWN_B0_BRIEF)
+    decision = _decide_found(client, _wall(10.0, rate=400_000), best, found)
+    assert len(client.seen) == 2
+    nudge = client.seen[1][0][-1].content
+    assert nudge.startswith(
+        "Rejected: the serving cost of google/vit-base-patch16-224 cannot be priced, and "
+        "under the $10 a month serving budget an own model with no price is off the line. "
+        "The serving budget is a wall on what is in the running"
+    )
+    assert "as it is written there: own-model: write torch code for efficientnet_b0" in nudge
+    assert "efficientnet_b0" in decision.brief
+    persisted = Scripted(_OWN_VIT_BRIEF, _OWN_VIT_BRIEF)
+    decision = _decide_found(persisted, _wall(10.0, rate=400_000), best, found)
+    assert decision.title == "evidence: own-model"
+    assert "efficientnet_b0" in decision.brief
+    # With no budget the Day 3 rule holds: the wall acts on numbers it has.
+    free = Scripted(_OWN_VIT_BRIEF)
+    decision = _decide_found(free, _wall(None, rate=400_000), best, found)
+    assert len(free.seen) == 1
+    assert "google/vit-base-patch16-224" in decision.brief
+
+
+def test_every_model_a_finding_names_is_its_own_entry_so_a_refused_one_hides_nothing() -> None:
+    """Day 3 opened one own-model entry, the alphabetical first: with convnext_large over
+    the budget, the affordable efficientnet_b0 never reached the line, and the refused
+    name re-opened every iteration."""
+    best = first_try()
+    found = "- fine-tune convnext_large on all layers <doi:10.1000/a>\n" + _B0_FINDING
+    wall = _wall(10.0, rate=400_000)
+    client = Scripted(_OWN_B0_BRIEF)
+    _decide_found(client, wall, best, found)
+    line, heading = client.seen[0][0][1].content.split("Over the serving budget", maxsplit=1)
+    assert "own-model: write torch code for efficientnet_b0" in line
+    assert "own-model: write torch code for convnext_large" in heading
+    assert "($22 a month)" in heading
+    assert "convnext_large" in wall.ruled_out()
+    again = Scripted(_OWN_B0_BRIEF)
+    _decide_found(again, wall, best, found)
+    assert "convnext_large" not in again.seen[0][0][1].content
+
+
+def test_the_ladder_gets_the_ruled_out_names_and_one_entry_per_model_only_under_a_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+    real = vl.ready
+
+    def spy(*args: Any, **kw: Any) -> list[vl.Ready]:
+        seen.append(kw)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(vl, "ready", spy)
+    best = first_try()
+    wall = _wall(10.0)
+    wall.record_refusal("convnext_large", 21.9, "off the line", network="convnext_large")
+    wall.record_refusal("resnet50", 40.0, "brief refused", budget=20.0, network="resnet50")
+    _decide(Scripted(_BIGGER_BRIEF), wall, best)
+    _decide(Scripted(_SWAP_BRIEF), _wall(None), best)
+    assert [(kw["per_model"], list(kw["ruled_out"])) for kw in seen] == [
+        (True, ["convnext_large"]),
+        (False, []),
+    ]
+
+
+def test_with_nothing_open_a_brief_over_the_budget_is_told_only_the_user_moves_it() -> None:
+    payload = {
+        "model": "efficientnet_b0",
+        "image_size": 224,
+        "epochs": 12,
+        "seconds": 3000,
+        "val": 0.983,
+        "val_accuracy": 0.983,
+    }
+    own = experiment(
+        [model_cell(payload), submit_cell(payload, code="submit_probabilities(h, model='e')")],
+        "next: own-model: write torch code for efficientnet_b0",
+        0.9830,
+        carried=RECIPE,
+    )
     client = Scripted(_SWAP_BRIEF, _SWAP_BRIEF)
     with pytest.raises(sup.SupervisorError, match="over-budget brief refused"):
-        _decide(client, _wall(5.0), best)
-    user = client.seen[0][0][1].content
-    assert "Levers ready now: none; every open entry is over the serving budget." in user
-    assert (
-        "backbone: keep the recipe and swap the backbone to convnext_tiny ($15 a month); "
-        "image-size: keep the best and train at 128 px ($7 a month)."
-    ) in user
+        _decide(client, _wall(5.0), own)
     nudge = client.seen[1][0][-1].content
-    assert "Every entry this run's numbers opened is over the serving budget" in nudge
-    assert "call plan_next with stop=true and say so" in nudge
+    assert nudge.startswith("Rejected: keep the recipe and swap the backbone to convnext_tiny")
+    assert "Only the user moves the serving budget. Brief ONE change that trains" in nudge
+    assert nudge.endswith(
+        "Levers ready now: none; no lever's evidence fires on this run's numbers."
+    )
+    assert "vision_all_over_budget_nudge" not in sup._PROMPTS
 
 
-def test_off_an_emptied_line_no_brief_of_any_kind_is_accepted() -> None:
-    """Seen live on the $20 run: with the wall having taken every entry off the line, the
-    model briefed an own model with no loadable name twice, and the older "nothing ready,
-    research" path accepted it. Off a line the wall emptied, nothing is accepted."""
-    best = first_try(trains=(0.98, 0.98, 0.98))
-    vague = "next: own-model: write torch code for a mystery network (because a paper says so)"
-    client = Scripted(vague, vague)
-    with pytest.raises(sup.SupervisorError, match="the serving budget emptied the line"):
-        _decide(client, _wall(5.0), best)
-    assert len(client.seen) == 2
+def test_a_stop_the_model_chose_carries_no_reason_of_the_harness() -> None:
+    assert sup.SupervisorDecision(False, "a", "b").stopped_because == ""
+    client = Scripted()
+    client.replies = [
+        ChatResponse(
+            model="m",
+            tool_calls=[
+                ToolCall(
+                    id="0", name="plan_next", arguments={"stop": True, "brief": "", "title": "t"}
+                )
+            ],
+        )
+    ]
+    decision = _decide(client, _wall(1000.0), first_try())
+    assert decision.stop
+    assert decision.stopped_because == ""
 
 
 def test_a_budget_typed_under_the_best_closes_the_levers_that_keep_its_network_too() -> None:
@@ -2388,3 +2565,493 @@ def test_the_history_row_says_when_a_score_was_over_the_budget() -> None:
         "accuracy=0.9785 [over the serving budget at $37 a month: a real score, but never "
         "the winner]"
     ) in row
+
+
+# ─── the Researcher and the Pricer go back and forth (v0.7 Day 4) ─────────────
+
+
+_TWO_MODELS = (
+    "- fine-tune timm convnext_large at 224 px — a large network <doi:10.1/a>\n"
+    "- efficientnet_b0 — small and quick <doi:10.1/b>"
+)
+_OWN_MOVE = "write torch code for {} with pretrained weights, all layers, at {} px"
+
+
+def _own_entries(
+    history: list[Experiment], carried: Experiment | None, **kw: Any
+) -> list[vl.Ready]:
+    return [r for r in ready_for(history, carried, per_model=True, **kw) if r.lever == "own-model"]
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "timm/efficientnet_b0",
+        "timm/efficientnet_b0.ra_in1k",
+        "hf_hub:timm/efficientnet_b0",
+        "hf-hub:timm/efficientnet_b0.ra_in1k",
+        "TIMM/EfficientNet_B0",
+    ],
+)
+def test_a_timm_hub_id_is_the_one_architecture_it_loads(written: str) -> None:
+    move = f"write torch code for {written} with pretrained weights, all layers, at 64 px"
+    assert vl.models_named(move) == ["efficientnet_b0"]
+    assert vl.missing_value(f"next: own-model: {move}") is None
+    assert vl.model_name({"model": written}) == "efficientnet_b0"
+
+
+def test_a_hub_id_for_a_network_fit_trains_or_for_a_plain_word_names_no_model() -> None:
+    assert vl.models_named("use timm/convnext_tiny.fb_in1k") == []
+    assert vl.models_named("hf_hub:timm/resnet50.a1_in1k") == []
+    assert vl.models_named("the timm/models folder") == []
+    assert vl.models_named("write torch code for facebook/convnextv2-tiny-1k-224") == [
+        "facebook/convnextv2-tiny-1k-224"
+    ]
+
+
+def test_an_own_model_tried_under_its_hub_id_is_not_offered_again() -> None:
+    own = own_try("hf_hub:timm/efficientnet_b0.ra_in1k")
+    finding = "- fine-tune timm/efficientnet_b0 on all layers <doi:10.1/b>"
+    assert "own-model" not in [r.lever for r in ready_for([own], own, findings=finding)]
+    assert _own_entries([own], own, findings=finding) == []
+
+
+# The shape Day 3's probe recorded: 18 of 20 first briefs from gemma4:12b wrote the value
+# as a bare number, and the no-value guard sent each back until the fallback carried.
+_BARE_224 = (
+    "next: image-size: 224 (because a pretrained network sees more detail above 128 px, and "
+    "224 px fits the budget at about 144s)"
+)
+
+
+@pytest.mark.parametrize(
+    ("brief", "lever", "value"),
+    [
+        (_BARE_224, "image-size", 224),
+        ("next: image-size: 224", "image-size", 224),
+        ("next: image-size: 128.", "image-size", 128),
+        (
+            "next: epochs: 6 (because training was still rising at the last epoch "
+            "(0.912 -> 0.981))",
+            "epochs",
+            6,
+        ),
+    ],
+)
+def test_a_value_written_as_a_bare_number_is_the_value(brief: str, lever: str, value: int) -> None:
+    assert vl.lever_class(brief) == lever
+    assert vl.proposed_value(lever, vl.change_clause(brief)) == value
+    assert vl.missing_value(brief) is None
+
+
+@pytest.mark.parametrize(
+    "brief",
+    [
+        "next: image-size: keep the best (because 224 px fits the budget at about 144s)",
+        "next: epochs: train longer (because 6 epochs was still rising)",
+        "next: image-size: 16",
+        "next: image-size: 512 (because the images are large)",
+        "next: epochs: 64",
+        "next: image-size: 128 or 224",
+        "next: image-size: go to 224",
+    ],
+)
+def test_a_bare_number_is_a_value_only_as_the_whole_clause_and_in_range(brief: str) -> None:
+    lever = vl.lever_class(brief)
+    assert vl.missing_value(brief) == f"the {lever} move states exactly ONE new value"
+
+
+def test_a_bare_number_brief_is_priced_banked_and_run_as_the_model_wrote_it() -> None:
+    best = first_try()
+    assert vl.brief_recipe(_BARE_224, RECIPE, 64) == {"backbone": "resnet18", "image_size": 224}
+    assert vl.banked("next: image-size: 64", best) == (
+        "the carried best already trains with image_size=64"
+    )
+    brief = "next: image-size: 128 (because a pretrained network sees more detail above 64 px)"
+    client = Scripted(brief)
+    decision = vision_supervisor(client).decide(
+        data_summary="Images: 10", baseline=baseline_result(), history=[best], carried_best=best
+    )
+    assert len(client.seen) == 1  # the model's own brief, not the fallback
+    assert "128" in decision.brief
+
+
+def test_under_a_budget_every_named_model_is_an_entry_of_its_own_in_the_findings_order() -> None:
+    best = first_try()
+    assert [(r.move, r.reason) for r in _own_entries([best], best, findings=_TWO_MODELS)] == [
+        (_OWN_MOVE.format("convnext_large", 224), "a literature finding names convnext_large"),
+        (_OWN_MOVE.format("efficientnet_b0", 64), "a literature finding names efficientnet_b0"),
+    ]
+    # A name the wall refused stays out, however the refusal wrote it, and a tried one too.
+    left = _own_entries([best], best, findings=_TWO_MODELS, ruled_out=["timm/convnext_large"])
+    assert [r.move for r in left] == [_OWN_MOVE.format("efficientnet_b0", 64)]
+    own = own_try("efficientnet_b0")
+    assert _own_entries([own], own, findings=_TWO_MODELS, ruled_out=["convnext_large"]) == []
+
+
+def test_an_own_model_entry_trains_at_the_stated_size_else_the_incumbents_else_the_sessions() -> (
+    None
+):
+    plain = "- efficientnet_b0 — small and quick <doi:10.1/b>"
+    (first,) = _own_entries([], None, findings=plain, default_size=96)
+    assert first.move == _OWN_MOVE.format("efficientnet_b0", 96)
+    cell, payload = fit_cell({**RECIPE, "image_size": 128}, [0.9, 0.95, 0.97], 0.97, start=RECIPE)
+    at_128 = experiment([cell, submit_cell(payload)], "next: image-size: 128", 0.97, carried=RECIPE)
+    (carried,) = _own_entries([at_128], at_128, findings=plain, default_size=96)
+    assert carried.move == _OWN_MOVE.format("efficientnet_b0", 128)
+    stated = "- efficientnet_b0 at 160 px — small and quick <doi:10.1/b>"
+    (sized,) = _own_entries([at_128], at_128, findings=stated, default_size=96)
+    assert sized.move == _OWN_MOVE.format("efficientnet_b0", 160)
+    # A line that states two sizes states neither.
+    two = "- efficientnet_b0 at 160 px beats resnet50 at 224 px <doi:10.1/b>"
+    (unsure,) = _own_entries([at_128], at_128, findings=two, default_size=96)
+    assert unsure.move == _OWN_MOVE.format("efficientnet_b0", 128)
+
+
+def test_a_model_the_catalog_pass_named_says_where_it_came_from() -> None:
+    best = first_try()
+    finding = "- mobilenetv3_small_100 — a small ImageNet network <catalog:timm_models.txt>"
+    (entry,) = _own_entries([best], best, findings=finding)
+    assert entry.reason == "the Researcher picked mobilenetv3_small_100 from the timm catalog"
+    assert entry.move == _OWN_MOVE.format("mobilenetv3_small_100", 64)
+
+
+def test_every_per_model_entry_passes_the_guard_and_is_priced_where_it_trains() -> None:
+    best = first_try()
+    findings = (
+        f"{_TWO_MODELS}\n"
+        "- mobilenetv3_small_100 — tiny <catalog:timm_models.txt>\n"
+        "- facebook/convnextv2-tiny-1k-224 — a hub model <doi:10.1/c>"
+    )
+    own = _own_entries([best], best, findings=findings)
+    assert [vl.entry_recipe(r, RECIPE, 64) for r in own] == [
+        {"model": "convnext_large", "image_size": 224},
+        {"model": "efficientnet_b0", "image_size": 64},
+        {"model": "mobilenetv3_small_100", "image_size": 64},
+        {"model": "facebook/convnextv2-tiny-1k-224", "image_size": 64},
+    ]
+    for entry in own:
+        brief = f"next: own-model: {entry.move} (because {entry.reason})."
+        assert vl.missing_value(brief) is None, brief
+        assert vl.brief_recipe(brief, RECIPE, 64) == vl.entry_recipe(entry, RECIPE, 64)
+
+
+def test_an_own_model_brief_is_priced_at_the_size_it_states_else_the_sessions() -> None:
+    assert vl.brief_recipe(LIVE_BRIEF_OWN, RECIPE, 128) == {
+        "model": "efficientnet_b0",
+        "image_size": 64,
+    }
+    unsized = "next: own-model: write torch code for efficientnet_b0 with pretrained weights"
+    assert vl.brief_recipe(unsized, RECIPE, 64) == {"model": "efficientnet_b0", "image_size": 64}
+    assert vl.brief_recipe(unsized, {}, 96) == {"model": "efficientnet_b0", "image_size": 96}
+
+
+def test_without_a_budget_the_own_model_entry_reads_exactly_as_main_read_it() -> None:
+    best = first_try()
+    assert vl.ready_line(ready_for([best], best, findings=FINDINGS)).endswith(
+        "own-model: write torch code for efficientnet_b0 with pretrained weights, all layers, "
+        "at the input size its pretrained_cfg names (because a literature finding names "
+        "efficientnet_b0 and vit_base_patch16_224)."
+    )
+    # With no findings there is no own-model entry to split, so per_model changes nothing.
+    assert ready_for([best], best, per_model=True) == ready_for([best], best)
+
+
+def test_the_network_an_entry_would_train_is_what_the_wall_rules_out() -> None:
+    stack = _entry(
+        "layer-stack", f"train a network from zero through fit(), with layers {STACK}", STACK
+    )
+    hub = _entry("own-model", "write torch code for hf_hub:timm/convnext_large.fb_in22k at 64 px")
+    assert [vl.entry_network(e, RECIPE, 64) for e in (_SWAP, _BIGGER, _MORE, hub, stack)] == [
+        "convnext_tiny",
+        "resnet18",
+        "resnet18",
+        "convnext_large",
+        "",
+    ]
+    own = {"model": "efficientnet_b0", "image_size": 64}
+    assert vl.entry_network(_BIGGER, own, 64) == "efficientnet_b0"
+    assert vl.entry_network(_MORE, {}, 64) == ""  # nothing carried, nothing named
+
+
+def test_under_a_budget_an_own_model_the_pricer_cannot_size_goes_under_the_heading() -> None:
+    sized = _entry("own-model", _OWN_MOVE.format("efficientnet_b0", 64))
+    unsized = _entry("own-model", _OWN_MOVE.format("facebook/convnextv2-tiny-1k-224", 64))
+    headless = _entry("custom-head", "fine-tune resnet18 with a head nobody wrote")
+
+    def pricer(recipe: Any) -> Priced:
+        if recipe is None or "/" in str(recipe.get("model", "")):
+            return Priced(None, True, unpriced_because="not in timm's table")
+        return Priced(12.26, True, host="aws t4g.small")
+
+    line, over = vl.split_by_budget([unsized, sized, headless], RECIPE, 64, pricer)
+    assert line == [sized, headless]  # any other unpriced entry stays on the line
+    assert over == [(unsized, None)]
+    real = vl.split_by_budget([unsized], RECIPE, 64, _wall(20.0).price_recipe)
+    assert real == ([], [(unsized, None)])
+
+
+def test_new_models_are_the_named_ones_the_wall_has_not_ruled_out() -> None:
+    findings = (
+        f"{_TWO_MODELS}\n"
+        "- hf_hub:timm/mobilenetv3_small_100.lamb_in1k — tiny <catalog:timm_models.txt>"
+    )
+    assert vl.new_models(findings, []) == [
+        "convnext_large",
+        "efficientnet_b0",
+        "mobilenetv3_small_100",
+    ]
+    assert vl.new_models(findings, ["convnext_large", "timm/efficientnet_b0"]) == [
+        "mobilenetv3_small_100"
+    ]
+    assert vl.new_models("- fine-tune resnet18, then convnext_tiny <doi:10.1/a>", []) == []
+
+
+# ─── what the integration check added (v0.7 Day 4) ───────────────────────────
+
+
+def test_a_line_emptied_only_by_models_ruled_out_earlier_stops_with_no_model_call() -> None:
+    """Nothing this run's numbers open, and the one model the findings name was refused
+    under this budget before: the ladder leaves it off, so the line is empty with nothing
+    over it, and asking the model would only re-brief the refused network."""
+    best = first_try(secs=200, trains=(0.98, 0.98, 0.98))
+    wall = _wall(1000.0)
+    wall.record_refusal(
+        "write torch code for convnext_large", 90.0, "off the line", network="convnext_large"
+    )
+    client = Scripted()
+    decision = _decide_found(
+        client, wall, best, "- fine-tune convnext_large on all layers <doi:10.1/a>"
+    )
+    assert client.seen == []
+    assert decision.stopped_because == "over_budget"
+
+
+def test_an_unpriced_model_is_ruled_out_so_the_researcher_is_never_handed_it_back() -> None:
+    best = first_try(trains=(0.98, 0.98, 0.98))
+    wall = _wall(5.0)
+    _decide_found(Scripted(), wall, best, _VIT_FINDING)
+    assert "google/vit-base-patch16-224" in wall.ruled_out()
+    assert vl.new_models(_VIT_FINDING, wall.ruled_out()) == []
+    (refused,) = [r for r in wall.refused if r.network == "google/vit-base-patch16-224"]
+    assert refused.usd_per_month is None
+
+
+def test_under_a_budget_a_vague_own_model_brief_is_refused_not_trained() -> None:
+    """With nothing open, the older path accepted a persisted brief and asked for papers,
+    which would train a network no one could price. Under a budget it runs out instead."""
+    payload = {
+        "model": "efficientnet_b0",
+        "image_size": 224,
+        "epochs": 12,
+        "seconds": 3000,
+        "val": 0.983,
+        "val_accuracy": 0.983,
+    }
+    own = experiment(
+        [model_cell(payload), submit_cell(payload, code="submit_probabilities(h, model='e')")],
+        "next: own-model: write torch code for efficientnet_b0",
+        0.9830,
+        carried=RECIPE,
+    )
+    vague = "next: own-model: write torch code for a mystery network (because a paper says so)"
+    with pytest.raises(sup.SupervisorError, match="own-model brief with no price refused"):
+        _decide(Scripted(vague, vague), _wall(1000.0), own)
+    decision = _decide(Scripted(vague, vague), _wall(None), own)
+    assert decision.want_research  # without a budget the old research path stands
+
+
+def test_a_refused_brief_names_its_network_the_way_the_ladder_does() -> None:
+    best = first_try()
+    wall = _wall(10.0)
+    _decide(Scripted(_SWAP_BRIEF, _BIGGER_BRIEF), wall, best)
+    kinds = {r.kind: r.network for r in wall.refused}
+    assert kinds == {"off the line": "convnext_tiny", "brief refused": "convnext_tiny"}
+    assert vl.recipe_network({"backbone": "layers_net", "layers": STACK}) == ""
+    assert vl.recipe_network({"model": "hf_hub:timm/efficientnet_b0.ra_in1k"}) == (
+        "efficientnet_b0"
+    )
+
+
+def test_a_hugging_face_id_keeps_its_spelling_and_a_timm_name_loses_its_tag() -> None:
+    assert vl.model_name({"model": "google/vit-base-patch16-224"}) == (
+        "google/vit-base-patch16-224"
+    )
+    assert vl.model_name({"model": "timm/efficientnet_b0.ra_in1k"}) == "efficientnet_b0"
+    assert vl.model_name({"model": "EfficientNet-B0"}) == "efficientnet_b0"
+
+
+def test_new_models_skip_what_this_run_already_tried() -> None:
+    tried = own_try("efficientnet_b0")
+    assert vl.tried_models([tried]) >= {"efficientnet_b0"}
+    findings = "- fine-tune efficientnet_b0 on all layers <doi:10.1/a>"
+    assert vl.new_models(findings, []) == ["efficientnet_b0"]
+    assert vl.new_models(findings, [], vl.tried_models([tried])) == []
+
+
+def test_the_round_trip_through_the_real_supervisor_finds_a_model_that_fits() -> None:
+    """The seams between the pieces in one run: the real Supervisor on a scripted client,
+    a Researcher whose second pass names a model, and the loop's round trip. The first
+    decide stops over the budget with no model call; the Researcher is told what was ruled
+    out and nothing about money; the second decide briefs the model it named."""
+    from iterate.core.agent_loop import _decide_within_the_wall
+    from iterate.core.researcher import Findings, Suggestion
+
+    class _Researcher:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def research(self, **kw: Any) -> Findings:
+            self.calls.append(kw)
+            return Findings(
+                suggestions=[
+                    Suggestion(
+                        "fine-tune mobilenetv3_small_100 on all layers at 64 px",
+                        "small and quick on 64 px tiles",
+                        "doi:10.1/m",
+                    )
+                ],
+                papers_seen=8,
+            )
+
+    # Nothing this run's numbers open (200 s epochs leave no room), the one model the
+    # papers named costs $87.60 at 224 px and 400,000 requests an hour on the test table,
+    # and the second pass names one that serves at 64 px on one $7.30 box.
+    best = first_try(secs=200, trains=(0.98, 0.98, 0.98))
+    wall = _wall(10.0, rate=400_000)
+    brief = (
+        "next: own-model: write torch code for mobilenetv3_small_100 with pretrained weights, "
+        "all layers, at 64 px (because a literature finding names mobilenetv3_small_100)"
+    )
+    client = Scripted(brief)
+    supervisor = vision_supervisor(client, wall=wall)
+    researcher = _Researcher()
+    extra: dict[str, Any] = {
+        "this_run": [best],
+        "known_findings": "- fine-tune vit_base_patch16_224 at 224 px <doi:10.1/v>",
+    }
+
+    def decide(**kw: Any) -> sup.SupervisorDecision:
+        return supervisor.decide(
+            data_summary="Images: 10",
+            baseline=baseline_result(),
+            history=[best],
+            carried_best=best,
+            **kw,
+        )
+
+    decision, rounds, findings = _decide_within_the_wall(
+        decide,
+        extra,
+        [],
+        wall=wall,
+        researcher=researcher,  # type: ignore[arg-type]
+        controller=None,
+        profile="Images: 10",
+        this_run=[best],
+        findings=None,
+        max_rounds=2,
+        iteration=2,
+    )
+    assert rounds == 1
+    assert researcher.calls[0]["ruled_out"] == ["vit_base_patch16_224"]
+    assert "$" not in repr(researcher.calls)
+    assert len(client.seen) == 1  # the first decide asked the model nothing
+    assert not decision.stop
+    assert "mobilenetv3_small_100" in decision.brief
+    assert findings is not None
+    assert "mobilenetv3_small_100" in extra["known_findings"]
+
+
+def test_a_phrase_with_a_slash_is_not_a_hugging_face_model() -> None:
+    for phrase in [
+        "k-fold/out-of-fold target encoding",
+        "compare one-hot/target-encoding",
+        "RandAugment/TrivialAugment-Wide policies at 64 px",
+        "a train/val-split of the tiles",
+    ]:
+        assert vl.models_named(phrase) == []
+    for model_id in ["google/vit-base-patch16-224", "microsoft/resnet-50", "facebook/dinov2-small"]:
+        assert vl.models_named(model_id) == [model_id]
+
+
+def test_under_a_budget_the_models_a_round_found_stay_on_the_line_behind_a_repair() -> None:
+    """A failure opens only its repair, and the wall may refuse the repair: the models the
+    Researcher just named must still be on the line, or the round was spent for nothing."""
+    best = first_try()
+    oom = experiment(
+        [
+            {
+                "code": "f = fit(backbone='convnext_tiny')",
+                "stdout": "",
+                "source": "agent",
+                "error": "out of memory on mps at batch_size=128, image_size=384: halve one of them",
+            }
+        ],
+        "next: backbone: keep the recipe and swap the backbone to convnext_tiny",
+        None,
+        carried=RECIPE,
+        error="no predictions were written",
+    )
+    findings = "- fine-tune efficientnet_b0 on all layers <doi:10.1/a>"
+    (repair,) = ready_for([best, oom], best, findings=findings)
+    line = ready_for([best, oom], best, findings=findings, per_model=True)
+    assert [r.lever for r in line] == ["backbone", "own-model"]
+    assert line[0] == repair
+    assert "efficientnet_b0" in line[1].move
+
+
+def test_a_timm_id_the_catalog_does_not_list_keeps_its_prefix_so_it_reads_back() -> None:
+    findings = "- fine-tune timm/vit_base_patch16_224_in21k on all layers <doi:10.1/a>"
+    (entry,) = [
+        r
+        for r in ready_for([first_try()], first_try(), findings=findings, per_model=True)
+        if r.lever == "own-model"
+    ]
+    assert "timm/vit_base_patch16_224_in21k" in entry.move
+    assert vl.entry_network(entry, RECIPE, 64) == "vit_base_patch16_224_in21k"
+
+
+def test_a_network_fixed_to_its_input_size_is_priced_and_trained_there() -> None:
+    """The coder trains a ViT at its pretrained size whatever the brief says, so pricing it
+    at the session's 64 px would pass it about twelve times too cheap."""
+    findings = "- fine-tune vit_base_patch16_224 on all layers <doi:10.1/a>"
+    (entry,) = [
+        r
+        for r in ready_for([first_try()], first_try(), findings=findings, per_model=True)
+        if r.lever == "own-model"
+    ]
+    assert entry.move.endswith("at 224 px")
+    assert vl.entry_recipe(entry, RECIPE, 64) == {
+        "model": "vit_base_patch16_224",
+        "image_size": 224,
+    }
+    assert vl.native_size("mobilenetv3_small_100") is None  # a width, not a size
+
+
+def test_a_size_stated_for_another_model_on_the_line_is_not_read_as_this_ones() -> None:
+    findings = "- efficientnet_b0 beats vit_small_patch16_384 when both train at 384 px <doi:1>"
+    entries = {
+        vl.models_named(r.move)[0]: r.move
+        for r in ready_for([first_try()], first_try(), findings=findings, per_model=True)
+        if r.lever == "own-model"
+    }
+    assert entries["efficientnet_b0"].endswith("at 64 px")
+    assert entries["vit_small_patch16_384"].endswith("at 384 px")
+
+
+def test_a_network_refused_above_the_size_the_ladder_offers_is_not_ruled_out() -> None:
+    assert vl.at_its_floor({"model": "efficientnet_b0", "image_size": 384}, 64) is False
+    assert vl.at_its_floor({"model": "efficientnet_b0", "image_size": 64}, 64) is True
+    assert vl.at_its_floor({"model": "vit_base_patch16_224", "image_size": 224}, 64) is True
+    best = first_try(trains=(0.98, 0.98, 0.98))
+    findings = "- fine-tune efficientnet_b0 on all layers <doi:10.1/a>"
+    big = (
+        "next: own-model: write torch code for efficientnet_b0 with pretrained weights, all "
+        "layers, at 384 px (because a literature finding names efficientnet_b0)"
+    )
+    wall = _wall(10.0, rate=400_000)
+    _decide_found(Scripted(big, _OWN_B0_BRIEF), wall, best, findings)
+    (brief,) = [r for r in wall.refused if r.kind == "brief refused"]
+    assert brief.network == ""
+    assert "efficientnet_b0" not in wall.ruled_out()

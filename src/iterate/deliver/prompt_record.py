@@ -1,6 +1,7 @@
 """`prompts.yaml`: the deliverable of a prompt run, written by the harness and
-never by the agent. `best: true` respects the Critic: a version rejected for a
-proven leak still appears, with its reason, and is never marked best.
+never by the agent. `best: true` respects the Critic and the serving budget: a
+version rejected for a proven leak, or stamped over the budget, still appears with
+its reason or its price, and is never marked best.
 """
 
 from __future__ import annotations
@@ -73,11 +74,20 @@ def _rejection(experiment: Experiment) -> str:
     return str(experiment.candidate.changes.get(REJECTED) or "")
 
 
+def _over_budget(experiment: Experiment) -> str:
+    over = experiment.candidate.changes.get("over_budget")
+    if over is None:
+        return ""
+    return f"costs about ${float(over):,.0f} a month to serve, over the serving budget"
+
+
 def _best_index(entries: list[dict[str, Any]], direction: str) -> int | None:
     scored = [
         (index, entry["score"])
         for index, entry in enumerate(entries)
-        if entry.get("score") is not None and not entry.get("rejected")
+        if entry.get("score") is not None
+        and not entry.get("rejected")
+        and not entry.get("over_budget")
     ]
     if not scored:
         return None
@@ -122,6 +132,7 @@ def build(
         if prompt is None:
             continue
         rejected = _rejection(experiment)
+        over = _over_budget(experiment)
         entry: dict[str, Any] = {
             "version": f"v{position}",
             "score": _score_of(experiment),
@@ -131,6 +142,8 @@ def build(
         }
         if rejected:
             entry["rejected"] = rejected
+        if over:
+            entry["over_budget"] = over
         entries.append(entry)
 
     best = _best_index(entries, direction)

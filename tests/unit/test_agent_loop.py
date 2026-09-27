@@ -11,6 +11,8 @@ from iterate.core.supervisor import SupervisorDecision
 from iterate.core.terminator import MaxIterations
 from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult, Metrics
 
+pytestmark = pytest.mark.unit
+
 
 def _result(score: float) -> ExperimentResult:
     return ExperimentResult(
@@ -878,3 +880,467 @@ def test_a_line_that_is_not_a_budget_leaves_the_wall_and_goes_to_the_supervisor(
     wall, _ = _linear_wall(50.0)
     assert _move_the_wall(line, wall) is None
     assert wall.budget == 50.0
+
+
+# ─── the Researcher and the Pricer go back and forth (v0.7 Day 4) ────────────
+
+
+_OVER = SupervisorDecision(
+    stop=True, title="over the serving budget", brief="", stopped_because="over_budget"
+)
+_OWN = SupervisorDecision(False, "efficientnet_b0", "next: own-model: write torch code for efficientnet_b0")
+
+
+class _WalledSupervisor(_FakeSupervisor):
+    """Plays the real Supervisor's side of the wall: its over-budget stop leaves the
+    network the split refused on the wall, and every decide records the extras it saw."""
+
+    def __init__(
+        self, decisions: list[SupervisorDecision], wall: object, network: str = "convnext_tiny"
+    ) -> None:
+        super().__init__(decisions)
+        self._wall = wall
+        self._network = network
+        self.seen_extra: list[dict[str, object]] = []
+
+    def decide(  # type: ignore[override]
+        self, *, data_summary: str, baseline: object, history: list,
+        carried_best: object = None, **extra: object,
+    ) -> SupervisorDecision:
+        self.seen_extra.append(dict(extra))
+        decision = super().decide(
+            data_summary=data_summary, baseline=baseline, history=history,
+            carried_best=carried_best,
+        )
+        if decision.stopped_because == "over_budget":
+            self._wall.record_refusal(  # type: ignore[attr-defined]
+                f"keep the recipe and swap the backbone to {self._network}",
+                37.0,
+                "off the line",
+                network=self._network,
+            )
+        return decision
+
+
+class _RoundTripResearcher:
+    """The iteration's own pass finds nothing; each budget round answers from a script,
+    an empty string being a round that names nothing."""
+
+    def __init__(self, rounds: list[str]) -> None:
+        self._rounds = list(rounds)
+        self.calls: list[dict[str, object]] = []
+
+    def research(
+        self, *, profile: str, tried: list[str] | tuple[str, ...] = (),
+        ruled_out: list[str] | tuple[str, ...] = (), round: int = 1, **kwargs: object,
+    ) -> object:
+        from iterate.core.researcher import Findings, Suggestion
+
+        self.calls.append(
+            {"profile": profile, "tried": list(tried), "ruled_out": list(ruled_out), "round": round}
+        )
+        if round == 1 or not self._rounds:
+            return Findings()
+        technique = self._rounds.pop(0)
+        if not technique:
+            return Findings(papers_seen=8)
+        return Findings(
+            suggestions=[Suggestion(technique, "small and strong on satellite tiles", "doi:10.1/x")],
+            papers_seen=8,
+        )
+
+
+def _walled_loop(
+    supervisor: object, coders: list[_FakeCoder], terminator: object, *, wall: object,
+    researcher: object = None, controller: object = None, memory: object = None,
+    max_budget_rounds: int = 2, max_research_calls: int = 3,
+):
+    it = iter(coders)
+    return run_supervised(
+        target=_FakeTarget(),  # type: ignore[arg-type]
+        dataset=object(),  # type: ignore[arg-type]
+        supervisor=supervisor,  # type: ignore[arg-type]
+        make_coder=lambda: next(it),  # type: ignore[arg-type,return-value]
+        terminator=terminator,  # type: ignore[arg-type]
+        memory=memory if memory is not None else InMemoryMemory(),  # type: ignore[arg-type]
+        data_summary="d",
+        researcher=researcher,  # type: ignore[arg-type]
+        controller=controller,  # type: ignore[arg-type]
+        wall=wall,  # type: ignore[arg-type]
+        max_budget_rounds=max_budget_rounds,
+        max_research_calls=max_research_calls,
+    )
+
+
+def _answering(*lines: str):
+    """A controller whose user types ``lines`` the moment the run asks for a budget."""
+    from iterate.core.interactive import RunController
+
+    said: list[str] = []
+    ctrl = RunController()
+
+    def reply(text: str) -> None:
+        said.append(text)
+        if text.startswith("over the serving budget"):
+            for line in lines:
+                ctrl.submit_line(line)
+
+    ctrl.bind_reply(reply)
+    return ctrl, said
+
+
+def _asks(said: list[str]) -> list[str]:
+    return [s for s in said if s.startswith("over the serving budget")]
+
+
+def test_a_round_that_names_a_new_model_re_decides_the_same_iteration() -> None:
+    from iterate.core.terminator import Composite, Patience
+
+    wall, _ = _linear_wall(20.0)
+    mem = InMemoryMemory()
+    sup = _WalledSupervisor([_OVER, _OWN], wall)
+    researcher = _RoundTripResearcher(["fine-tune efficientnet_b0 with pretrained weights"])
+    result = _walled_loop(
+        sup, [_FakeCoder(_result(0.60))], Composite(MaxIterations(1), Patience(1)),
+        wall=wall, researcher=researcher, memory=mem,
+    )
+    assert result.stopped_because == "max_iterations"
+    (experiment,) = result.history
+    assert experiment.iteration == 1
+    assert sup.seen_history_lens == [0, 0]  # decided twice inside iteration 1
+    assert experiment.candidate.changes["research_rounds"] == 1
+    assert [c["round"] for c in researcher.calls] == [1, 2]
+    assert researcher.calls[1]["ruled_out"] == ["convnext_tiny"]
+    assert "$" not in repr(researcher.calls)
+    assert "efficientnet_b0" in str(sup.seen_extra[1]["research"])
+    assert sup.seen_extra[1]["known_findings"] == sup.seen_extra[1]["research"]
+    assert mem.proposer_failures("tabular-model") == []
+
+
+def test_a_scripted_run_stops_over_budget_when_the_researcher_runs_dry() -> None:
+    wall, _ = _linear_wall(20.0)
+    mem = InMemoryMemory()
+    sup = _WalledSupervisor([_OVER], wall)
+    researcher = _RoundTripResearcher(["", ""])
+    result = _walled_loop(
+        sup, [], MaxIterations(5), wall=wall, researcher=researcher, memory=mem
+    )
+    assert result.stopped_because == "over_budget"
+    assert result.history == []
+    assert [c["round"] for c in researcher.calls] == [1, 2, 3]
+    assert sup.seen_history_lens == [0]  # a dry round never re-decides
+    assert mem._runs[result.run_id]["stopped_because"] == "over_budget"
+    assert mem.proposer_failures("tabular-model") == []
+
+
+def test_a_round_naming_only_a_refused_network_is_dry() -> None:
+    wall, _ = _linear_wall(20.0)
+    sup = _WalledSupervisor([_OVER], wall, network="efficientnet_b0")
+    researcher = _RoundTripResearcher(["efficientnet_b0", "efficientnet_b0 again"])
+    result = _walled_loop(sup, [], MaxIterations(5), wall=wall, researcher=researcher)
+    assert result.stopped_because == "over_budget"
+    assert [c["ruled_out"] for c in researcher.calls[1:]] == [["efficientnet_b0"]] * 2
+    assert sup.seen_history_lens == [0]
+
+
+def test_the_budget_rounds_are_capped_apart_from_the_research_calls() -> None:
+    wall, _ = _linear_wall(20.0)
+    researcher = _RoundTripResearcher(["", "", ""])
+    _walled_loop(
+        _WalledSupervisor([_OVER], wall), [], MaxIterations(5), wall=wall,
+        researcher=researcher, max_research_calls=1,
+    )
+    assert [c["round"] for c in researcher.calls] == [1, 2, 3]  # the one pass, then two rounds
+
+    researcher = _RoundTripResearcher(["", "", ""])
+    _walled_loop(
+        _WalledSupervisor([_OVER], wall), [], MaxIterations(5), wall=wall,
+        researcher=researcher, max_budget_rounds=1,
+    )
+    assert [c["round"] for c in researcher.calls] == [1, 2]
+
+
+def test_the_models_own_stop_never_starts_a_round_trip() -> None:
+    wall, _ = _linear_wall(20.0)
+    researcher = _RoundTripResearcher(["efficientnet_b0"])
+    result = _walled_loop(
+        _WalledSupervisor([SupervisorDecision(True, "", "")], wall), [], MaxIterations(5),
+        wall=wall, researcher=researcher,
+    )
+    assert result.stopped_because == "supervisor"
+    assert [c["round"] for c in researcher.calls] == [1]
+
+
+@pytest.mark.parametrize(
+    ("line", "budget"),
+    [("budget $80", 80.0), ("no budget", None), ("budget $20", 20.0)],
+)
+def test_a_dry_interactive_run_waits_for_the_user_to_move_the_wall(
+    line: str, budget: float | None
+) -> None:
+    wall, _ = _linear_wall(20.0)
+    ctrl, said = _answering(line)
+    mem = InMemoryMemory()
+    sup = _WalledSupervisor([_OVER, SupervisorDecision(False, "a", "try a")], wall)
+    result = _walled_loop(
+        sup, [_FakeCoder(_result(0.60))], MaxIterations(1), wall=wall, controller=ctrl,
+        memory=mem,
+    )
+    assert len(_asks(said)) == 1
+    assert wall.budget == budget
+    assert wall.moves == 1  # the same number still moves it, and ends the wait
+    assert result.stopped_because == "max_iterations"
+    assert [e.iteration for e in result.history] == [1]
+    assert sup.seen_history_lens == [0, 0]
+    assert "research_rounds" not in result.history[0].candidate.changes
+    assert mem.proposer_failures("tabular-model") == []
+
+
+def test_stop_typed_at_the_budget_ask_ends_the_run_as_the_users() -> None:
+    wall, _ = _linear_wall(20.0)
+    ctrl, said = _answering("stop")
+    mem = InMemoryMemory()
+    result = _walled_loop(
+        _WalledSupervisor([_OVER], wall), [], MaxIterations(3), wall=wall, controller=ctrl,
+        memory=mem,
+    )
+    assert len(_asks(said)) == 1
+    assert result.stopped_because == "stopped-by-user"
+    assert result.history == []
+    assert wall.budget == 20.0
+    assert mem._runs[result.run_id]["stopped_because"] == "stopped-by-user"
+
+
+def test_the_wait_for_a_budget_never_burns_the_deadline() -> None:
+    import threading
+
+    from iterate.core.interactive import RunController
+    from iterate.core.terminator import Composite, Deadline
+
+    wall, _ = _linear_wall(20.0)
+    ctrl = RunController()
+
+    def reply(text: str) -> None:
+        if text.startswith("over the serving budget"):
+            threading.Timer(0.5, lambda: ctrl.submit_line("budget $80")).start()
+
+    ctrl.bind_reply(reply)
+    sup = _WalledSupervisor([_OVER, SupervisorDecision(False, "a", "try a")], wall)
+    result = _walled_loop(
+        sup, [_FakeCoder(_result(0.60))], Composite(Deadline(0.3), MaxIterations(1)),
+        wall=wall, controller=ctrl,
+    )
+    assert ctrl.paused_seconds_total >= 0.4
+    assert result.stopped_because == "max_iterations"  # "deadline" had the wait counted
+
+
+def test_what_the_user_types_during_the_wait_reaches_the_brief_it_ends_in() -> None:
+    wall, _ = _linear_wall(20.0)
+    ctrl, _ = _answering("prefer a small network", "budget $80")
+    sup = _WalledSupervisor([_OVER, SupervisorDecision(False, "a", "try a")], wall)
+    result = _walled_loop(
+        sup, [_FakeCoder(_result(0.60))], MaxIterations(1), wall=wall, controller=ctrl
+    )
+    assert "user_guidance" not in sup.seen_extra[0]
+    assert sup.seen_extra[1]["user_guidance"] == "prefer a small network"
+    assert result.history[0].candidate.changes["user_guidance"] == "prefer a small network"
+
+
+def test_the_budget_typed_at_the_ask_is_the_one_the_next_experiment_is_held_to() -> None:
+    wall, price = _linear_wall(20.0)
+    ctrl, _ = _answering("budget $5")  # under the linear pipeline's price
+    sup = _WalledSupervisor([_OVER, SupervisorDecision(False, "a", "try a")], wall)
+    result = _walled_loop(
+        sup, [_FakeCoder(_result(0.60))], MaxIterations(1), wall=wall, controller=ctrl
+    )
+    assert result.history[0].candidate.changes["over_budget"] == round(price, 2)
+    assert result.best is None
+
+
+def test_dry_rounds_come_before_the_wait_and_start_again_once_the_wall_moves() -> None:
+    wall, _ = _linear_wall(20.0)
+    ctrl, said = _answering("budget $25")
+    sup = _WalledSupervisor([_OVER, _OVER, SupervisorDecision(False, "a", "try a")], wall)
+    researcher = _RoundTripResearcher(["", "", "", "fine-tune efficientnet_b0"])
+    result = _walled_loop(
+        sup, [_FakeCoder(_result(0.60))], MaxIterations(1), wall=wall, controller=ctrl,
+        researcher=researcher,
+    )
+    (ask,) = _asks(said)
+    assert "The Researcher was asked twice more, and nothing it named fits." in ask
+    # two dry rounds under $20; then, under $25, a dry round and one that names a model
+    assert [c["round"] for c in researcher.calls] == [1, 2, 3, 2, 3]
+    assert result.history[0].candidate.changes["research_rounds"] == 2
+    assert sup.seen_history_lens == [0, 0, 0]
+
+
+def test_the_ask_lists_what_this_budget_refused_cheapest_first_in_one_plain_paragraph() -> None:
+    from iterate.core import serving
+    from iterate.core.agent_loop import _over_budget_ask
+
+    wall = serving.Wall(requests_per_hour=400_000, prices=serving.load_prices(), budget=20.0)
+    wall.record_refusal("keep the recipe and swap the backbone to convnext_tiny", 37.0, "off the line")
+    wall.record_refusal("keep the best and train at 128 px", 24.53, "off the line")
+    wall.record_refusal("an older refusal", 12.0, "trained", budget=10.0)
+    ask = _over_budget_ask(wall, 2)
+    assert ask == (
+        "over the serving budget ($20 a month at 400,000 requests an hour): keep the best "
+        "and train at 128 px ($25); keep the recipe and swap the backbone to convnext_tiny "
+        "($37). The Researcher was asked twice more, and nothing it named fits. Type "
+        '"budget $N" to raise it, "no budget" to lift it, or "stop" to end the run; the '
+        "clocks are suspended while this waits."
+    )
+    assert "\n" not in ask
+    assert "[" not in ask
+
+
+def test_the_ask_caps_its_list_and_says_when_nothing_was_looked_for() -> None:
+    from iterate.core import serving
+    from iterate.core.agent_loop import _over_budget_ask
+
+    wall = serving.Wall(requests_per_hour=1_000, prices=serving.load_prices(), budget=36.8)
+    for i in range(7):
+        wall.record_refusal(f"entry {i}", 40.0 + i, "off the line")
+    ask = _over_budget_ask(wall, 0)
+    assert ask.startswith("over the serving budget ($36.80 a month at 1,000 requests an hour)")
+    assert "entry 4 ($44); and 2 more." in ask
+    assert "entry 5" not in ask
+    assert "No other models were looked for." in ask
+
+
+def test_every_typed_budget_moves_the_wall_even_to_the_number_it_had() -> None:
+    from iterate.core.agent_loop import _move_the_wall
+
+    wall, _ = _linear_wall(20.0)
+    _move_the_wall("budget $20", wall)
+    assert (wall.budget, wall.moves) == (20.0, 1)
+    _move_the_wall("no budget", wall)
+    assert (wall.budget, wall.moves) == (None, 2)
+    _move_the_wall("budget 0", wall)  # refused: the wall is where it was
+    _move_the_wall("prefer smaller models", wall)
+    assert (wall.budget, wall.moves) == (None, 2)
+
+
+def test_a_price_the_pricer_could_not_finish_never_crashes_the_ask() -> None:
+    from iterate.core import serving
+    from iterate.core.agent_loop import _over_budget_ask
+
+    wall = serving.Wall(requests_per_hour=1_000, prices=serving.load_prices(), budget=20.0)
+    wall.record_refusal("write torch code for vit_base_patch16_224", float("nan"), "off the line")
+    wall.record_refusal("keep the best and train at 128 px", 24.53, "off the line")
+    ask = _over_budget_ask(wall, 1)
+    assert (
+        ": keep the best and train at 128 px ($25); write torch code for vit_base_patch16_224 "
+        "(not priced). The Researcher was asked once more, and nothing it named fits."
+    ) in ask
+
+
+
+# ─── what the integration check added (v0.7 Day 4) ───────────────────────────
+
+
+def test_a_round_naming_only_a_model_already_tried_is_dry() -> None:
+    wall, _ = _linear_wall(20.0)
+    sup = _WalledSupervisor([_OWN, _OVER], wall)
+    researcher = _RoundTripResearcher(["", "fine-tune efficientnet_b0", "efficientnet_b0 again"])
+    result = _walled_loop(
+        sup, [_FakeCoder(_result(0.60))], MaxIterations(5), wall=wall, researcher=researcher
+    )
+    assert result.stopped_because == "over_budget"
+    assert len(result.history) == 1
+    assert sup.seen_history_lens == [0, 1]  # iteration 2 never re-decided
+
+
+def test_the_supervisor_reads_this_rounds_findings_and_the_ladder_reads_them_all() -> None:
+    from iterate.core.researcher import Findings, Suggestion
+
+    class _Earlier(_RoundTripResearcher):
+        def research(self, **kw: object) -> object:  # type: ignore[override]
+            if kw.get("round", 1) == 1:
+                self.calls.append(dict(kw))
+                return Findings(
+                    suggestions=[Suggestion("fine-tune convnext_large", "big", "doi:10.1/b")],
+                    papers_seen=4,
+                )
+            return super().research(**kw)  # type: ignore[arg-type]
+
+    wall, _ = _linear_wall(20.0)
+    sup = _WalledSupervisor([_OVER, _OWN], wall)
+    researcher = _Earlier(["fine-tune efficientnet_b0 with pretrained weights"])
+    _walled_loop(
+        sup, [_FakeCoder(_result(0.60))], MaxIterations(1), wall=wall, researcher=researcher
+    )
+    redecided = sup.seen_extra[1]
+    assert "efficientnet_b0" in str(redecided["research"])
+    assert "convnext_large" not in str(redecided["research"])
+    assert "convnext_large" in str(redecided["known_findings"])
+    assert "efficientnet_b0" in str(redecided["known_findings"])
+
+
+def test_the_ask_rounds_to_the_dollar_and_lists_an_unpriced_refusal_last() -> None:
+    from iterate.core.agent_loop import _over_budget_ask
+
+    wall, _ = _linear_wall(20.0)
+    wall.record_refusal("own model: google/vit-base-patch16-224", None, "off the line")
+    wall.record_refusal("swap the backbone to convnext_tiny", 36.79, "off the line")
+    wall.record_refusal("train at 128 px", 24.4, "off the line")
+    ask = _over_budget_ask(wall, 2)
+    assert (
+        "train at 128 px ($24); swap the backbone to convnext_tiny ($37); "
+        "own model: google/vit-base-patch16-224 (not priced)"
+    ) in ask
+
+
+def test_a_failed_re_decide_keeps_the_findings_the_round_found() -> None:
+    from iterate.core.agent_loop import _decide_within_the_wall
+    from iterate.core.supervisor import SupervisorError
+
+    wall, _ = _linear_wall(20.0)
+    calls = {"n": 0}
+
+    def decide(**extra: object) -> SupervisorDecision:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            wall.record_refusal("swap to convnext_tiny", 37.0, "off the line", network="convnext_tiny")
+            return _OVER
+        raise SupervisorError("model replied without calling plan_next")
+
+    researcher = _RoundTripResearcher(["fine-tune efficientnet_b0 with pretrained weights"])
+    with pytest.raises(SupervisorError) as raised:
+        _decide_within_the_wall(
+            decide, {}, [], wall=wall, researcher=researcher, controller=None,  # type: ignore[arg-type]
+            profile="d", this_run=[], findings=None, max_rounds=2, iteration=1,
+        )
+    assert raised.value.findings is not None
+    assert "efficientnet_b0" in raised.value.findings.render()
+
+
+def test_a_run_whose_input_has_closed_stops_instead_of_waiting_for_ever() -> None:
+    from iterate.core.agent_loop import _decide_within_the_wall
+    from iterate.core.interactive import RunController
+
+    wall, _ = _linear_wall(20.0)
+    ctrl = RunController()
+    ctrl.close_input()
+    decision, _, _ = _decide_within_the_wall(
+        lambda **extra: _OVER, {}, [], wall=wall, researcher=None, controller=ctrl,
+        profile="d", this_run=[], findings=None, max_rounds=2, iteration=1,
+    )
+    assert decision.stopped_because == "over_budget"
+    assert ctrl.wait_until(lambda: False, ask="?") == 0.0
+
+
+def test_a_stop_typed_during_the_rounds_ends_them_before_the_next_ask() -> None:
+    from iterate.core.agent_loop import _decide_within_the_wall
+    from iterate.core.interactive import RunController
+
+    wall, _ = _linear_wall(20.0)
+    ctrl = RunController()
+    ctrl.request_graceful_stop()
+    researcher = _RoundTripResearcher(["fine-tune efficientnet_b0"])
+    decision, _, _ = _decide_within_the_wall(
+        lambda **extra: _OVER, {}, [], wall=wall, researcher=researcher, controller=ctrl,  # type: ignore[arg-type]
+        profile="d", this_run=[], findings=None, max_rounds=2, iteration=1,
+    )
+    assert decision.stopped_because == "stopped-by-user"
+    assert researcher.calls == []

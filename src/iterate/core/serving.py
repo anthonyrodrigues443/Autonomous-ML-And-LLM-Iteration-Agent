@@ -234,7 +234,7 @@ def facts_from_model_name(
 
     sizes, source = prices.timm_sizes()
     plain = name.lower()
-    for prefix in ("timm/", "hf-hub:timm/", "hf_hub:timm/", "torchvision.models."):
+    for prefix in ("hf-hub:timm/", "hf_hub:timm/", "timm/", "timm_", "torchvision.models."):
         plain = plain.removeprefix(prefix)
     # A pretrained tag (`resnet50.a1_in1k`) names weights, not a different network.
     plain = plain.split(".")[0]
@@ -417,12 +417,14 @@ class Priced:
 
 class Refused(NamedTuple):
     """One thing the wall turned away: what it was, its monthly price, the budget it was
-    held against, and how far it got (`off the line`, `brief refused`, `trained`)."""
+    held against, how far it got (`off the line`, `brief refused`, `trained`), and the
+    network it would have served, "" when it names none."""
 
     what: str
-    usd_per_month: float
+    usd_per_month: float | None
     budget: float
     kind: str
+    network: str = ""
 
 
 @dataclass
@@ -440,6 +442,9 @@ class Wall:
     budget: float | None = None
     facts_of: Callable[[Experiment], ServingFacts] | None = None
     refused: list[Refused] = field(default_factory=list)
+    # Bumped by every typed budget and "no budget", one that repeats the standing number
+    # included: a wait on the wall ends when the user answers, not when the number changes.
+    moves: int = 0
 
     def price(self, facts: ServingFacts, *, budget: float | None = None) -> Priced:
         """`budget` overrides the wall's own, for work briefed under an earlier one."""
@@ -497,14 +502,24 @@ class Wall:
         return priced
 
     def record_refusal(
-        self, what: str, usd_per_month: float, kind: str, budget: float | None = None
+        self,
+        what: str,
+        usd_per_month: float | None,
+        kind: str,
+        budget: float | None = None,
+        network: str = "",
     ) -> None:
         limit = self.budget if budget is None else budget
         if limit is None:
             return
-        entry = Refused(what, usd_per_month, limit, kind)
+        entry = Refused(what, usd_per_month, limit, kind, network)
         if entry not in self.refused:
             self.refused.append(entry)
+
+    def ruled_out(self) -> list[str]:
+        """The networks refused under the budget standing now. One refused under another
+        budget is not: the user has moved the wall since."""
+        return sorted({r.network for r in self.refused if r.network and r.budget == self.budget})
 
     def cheapest_machine(self, facts: ServingFacts) -> tuple[str, float] | None:
         """The cheapest machine in the table that could hold these facts at all, for a

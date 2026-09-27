@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from iterate.adapters.research import ArxivClient, OpenAlexClient, search_all
@@ -20,7 +20,7 @@ from iterate.schemas.llm import Message, ToolSpec
 from iterate.targets import layers as arch
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from iterate.adapters.research import Paper, PaperSource
     from iterate.llm.base import LLMClient
@@ -32,6 +32,13 @@ _MAX_QUERIES = 3
 _MAX_SUGGESTIONS = 3
 _PAPERS_PER_QUERY = 4
 _PAPERS_SHOWN = 10
+# Two networks a family is 4 to 5 kB of catalog, where all 1,101 names are 20 kB of a
+# 12B's context.
+_CATALOG_PER_FAMILY = 2
+_FAMILY = re.compile(r"[a-z]+?v\d|[a-z]+")
+# timm's own test networks: toys for its test suite, never worth fine-tuning.
+_TOY = "test_"
+CATALOG_CITATION = "catalog:timm_models.txt"
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,23 @@ class Findings:
         research pass costs the planning prompt three lines, not three pages."""
         return "\n".join(
             f"- {s.technique} — {s.rationale} <{s.citation}>" for s in self.suggestions
+        )
+
+    def merge(self, other: Findings) -> Findings:
+        """This pass and a later one as one: what was found first keeps its place, and a
+        later suggestion joins only when its technique and citation are new."""
+        seen = {(s.technique.casefold(), s.citation) for s in self.suggestions}
+        added: list[Suggestion] = []
+        for s in other.suggestions:
+            key = (s.technique.casefold(), s.citation)
+            if key not in seen:
+                seen.add(key)
+                added.append(s)
+        return Findings(
+            suggestions=[*self.suggestions, *added],
+            queries=[*self.queries, *(q for q in other.queries if q not in self.queries)],
+            papers_seen=self.papers_seen + other.papers_seen,
+            setup=self.setup or other.setup,
         )
 
 
@@ -141,6 +165,25 @@ def _setup_tool() -> ToolSpec:
     )
 
 
+def _catalog_tool() -> ToolSpec:
+    spec = _PROMPTS["catalog_tool"]
+    return ToolSpec(
+        name=spec["name"],
+        description=spec["description"],
+        parameters={
+            "type": "object",
+            "properties": {
+                "models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": spec["fields"]["models"],
+                }
+            },
+            "required": ["models"],
+        },
+    )
+
+
 def _vision_setup_tool(allowed: Sequence[str]) -> ToolSpec:
     """The image metric choice, as an enum: the model can only name a metric that
     scores these labels."""
@@ -169,6 +212,7 @@ PLAN_QUERIES = _queries_tool()
 SUGGEST_TECHNIQUES = _suggest_tool()
 VISION_SUGGEST = _suggest_tool("vision_suggest_tool")
 PROMPT_SUGGEST = _suggest_tool("prompt_suggest_tool")
+NAME_MODELS = _catalog_tool()
 _SUGGEST_BY_FAMILY = {
     "vision": ("vision_suggest_system", VISION_SUGGEST),
     "prompt": ("prompt_suggest_system", PROMPT_SUGGEST),
@@ -201,6 +245,7 @@ class Researcher:
         )
         self._temperature = temperature
         self._max_tokens = max_tokens
+        self._shown: set[str] = set()
 
     def research(
         self,
@@ -211,10 +256,74 @@ class Researcher:
         allowed_metrics: Sequence[str] = (),
         suggest: bool = True,
         allow_without_papers: bool = False,
+        ruled_out: Sequence[str] = (),
+        round: int = 1,
+        tried_models: Collection[str] = (),
     ) -> Findings:
         """One research pass. Never raises; empty findings mean the run proceeds
-        without literature grounding, exactly like a failed digest."""
+        without literature grounding, exactly like a failed digest.
+
+        ``ruled_out`` names the networks this run may not use, and the question says no
+        more than that: what they would cost is the wall's business, never the search's.
+        A later ``round`` fetches more papers a query and shows the ones no earlier pass
+        showed first; on an image run whose papers then name no network a library loads,
+        it names up to three from the catalog the package ships. ``tried_models`` are the
+        models this run already spent an experiment on, a failed one included, which a
+        later round tells the model and never keeps."""
         tried_text = ", ".join(tried) or "nothing yet"
+        # Only a network a library loads is worth naming here: a stack fit() builds from
+        # zero is the harness's own, and anything else is not a model at all.
+        named_out = [name for name in ruled_out if _is_network(_bare(name))]
+        later = round >= 2
+        if later:
+            named_out += [
+                name for name in sorted(tried_models) if _bare(name) not in map(_bare, named_out)
+            ]
+        if named_out:
+            tried_text += _PROMPTS["ruled_out_label"].format(names=", ".join(named_out))
+        found = self._from_papers(
+            profile,
+            tried_text,
+            choose_setup=choose_setup,
+            allowed_metrics=allowed_metrics,
+            suggest=suggest,
+            allow_without_papers=allow_without_papers,
+            limit=_PAPERS_PER_QUERY * max(round, 1),
+            unseen_first=later,
+        )
+        if not (later and suggest and self._family == "vision"):
+            return found
+        exclude = {_bare(name) for name in [*ruled_out, *tried_models]} | _words(tried_text)
+        # A paper that names only networks the wall cannot price, or has refused, leaves
+        # the round as dry as one that names none, so the catalog still fills it.
+        if any((_loadable(s.technique) & _priceable()) - exclude for s in found.suggestions):
+            return found
+        try:
+            named = self._name_models(profile, tried_text, exclude=exclude)
+        except Exception as exc:
+            log.info("researcher: the catalog pass failed (%s: %s)", type(exc).__name__, exc)
+            return found
+        if named:
+            log.info(
+                "researcher: no paper named a network a library loads; from the catalog: %s",
+                "; ".join(s.technique for s in named),
+            )
+        # First, because the Supervisor reads findings cut short and these are the lines
+        # the round was spent for.
+        return replace(found, suggestions=[*named, *found.suggestions])
+
+    def _from_papers(
+        self,
+        profile: str,
+        tried_text: str,
+        *,
+        choose_setup: bool,
+        allowed_metrics: Sequence[str],
+        suggest: bool,
+        allow_without_papers: bool,
+        limit: int,
+        unseen_first: bool,
+    ) -> Findings:
         try:
             queries = self._plan_queries(profile, tried_text)
         except Exception as exc:
@@ -231,13 +340,18 @@ class Researcher:
 
         papers: list[Paper] = []
         for query in queries:
-            papers.extend(search_all(self._sources, query, limit=_PAPERS_PER_QUERY))
+            papers.extend(search_all(self._sources, query, limit=limit))
         # search_all dedupes per call; a second pass dedupes ACROSS queries, which
         # overlap by design since they attack one problem from several angles.
         unique: dict[str, Paper] = {}
         for paper in papers:
             unique.setdefault(paper.identifier, paper)
-        shortlist = sorted(unique.values(), key=lambda p: -p.cited_by)[:_PAPERS_SHOWN]
+        # Ranked by citations alone, a bigger fetch hands the most-cited papers of the
+        # first pass straight back, so a later round puts the ones never shown first.
+        shortlist = sorted(
+            unique.values(),
+            key=lambda p: (unseen_first and p.identifier in self._shown, -p.cited_by),
+        )[:_PAPERS_SHOWN]
         if not shortlist and not ungrounded:
             return Findings(queries=queries)
 
@@ -254,6 +368,7 @@ class Researcher:
 
         suggestions: list[Suggestion] = []
         if suggest and shortlist:
+            self._shown.update(p.identifier for p in shortlist)
             try:
                 suggestions = self._suggest(profile, tried_text, shortlist)
             except Exception as exc:
@@ -373,6 +488,59 @@ class Researcher:
             why=str(args.get("why") or "").strip(),
         )
 
+    def _name_models(
+        self, profile: str, tried: str, *, exclude: Collection[str] = ()
+    ) -> list[Suggestion]:
+        """Up to three pretrained networks named from the catalog the package ships. A
+        name the catalog does not list, or one excluded, is dropped. The words of what is
+        kept are the harness's and it cites the catalog: the model wrote no finding, so a
+        name or a size in a reason of its own must not reach the lever line."""
+        listing = _catalog_listing(exclude)
+        if not listing:
+            return []
+        messages = [
+            Message(
+                role="system",
+                content=_PROMPTS["catalog_system"].format(
+                    metric=self._metric, direction=self._direction
+                ),
+            ),
+            Message(
+                role="user",
+                content=_PROMPTS["catalog_user"].format(
+                    profile=profile.strip(), tried=tried, catalog=listing
+                ),
+            ),
+        ]
+        args = self._call(messages, NAME_MODELS)
+        raw = args.get("models") if args else None
+        if not isinstance(raw, list):
+            return []
+        out: list[Suggestion] = []
+        for item in raw:
+            name = _bare(str((item.get("model") if isinstance(item, dict) else item) or ""))
+            if (
+                name not in vl.CATALOG
+                or vl.models_named(name) != [name]
+                or name not in _priceable()
+                or name in exclude
+                or name.startswith(_TOY)
+            ):
+                continue
+            technique = _PROMPTS["catalog_technique"].format(name=name)
+            if any(s.technique == technique for s in out):
+                continue
+            out.append(
+                Suggestion(
+                    technique=technique,
+                    rationale=_PROMPTS["catalog_rationale"],
+                    citation=CATALOG_CITATION,
+                )
+            )
+            if len(out) == _MAX_SUGGESTIONS:
+                break
+        return out
+
     def _call(self, messages: list[Message], tool: ToolSpec) -> dict[str, Any] | None:
         """One structured call with a single retry nudge, mirroring the Summarizer."""
         for attempt in range(2):
@@ -433,6 +601,58 @@ def _without_the_stack(technique: str) -> str | None:
     return None if arch.found_strict(stripped) is not None else stripped
 
 
+def _bare(name: str) -> str:
+    """A network name as the ladder and the wall spell it, so a name ruled out here is
+    the same name the ladder leaves off the line."""
+    return vl.model_name({"model": name})
+
+
+def _loadable(technique: str) -> set[str]:
+    return {_bare(name) for name in vl.models_named(technique)}
+
+
+def _priceable() -> set[str]:
+    """The networks timm's table sizes, the only ones the wall can price."""
+    from iterate.core import prices
+
+    return set(prices.timm_sizes()[0])
+
+
+def _is_network(name: str) -> bool:
+    return name not in vl.FROM_ZERO and (name in vl.CATALOG or bool(vl.models_named(name)))
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z][a-z0-9_]*[a-z0-9]", text.lower()))
+
+
+def _catalog_listing(exclude: Collection[str] = ()) -> str:
+    """The catalog as a 12B can read it: one line a family, its lightest networks by
+    timm's published weight count first, and only networks that table sizes, so every
+    name offered is one the wall can price."""
+    from iterate.core import prices
+
+    sizes, _ = prices.timm_sizes()
+    families: dict[str, list[tuple[float, str]]] = {}
+    for name in vl.CATALOG:
+        rows = sizes.get(name)
+        family = _FAMILY.match(name)
+        if (
+            not rows
+            or family is None
+            or name in exclude
+            or name in vl.FIT_BACKBONES
+            or name.startswith(_TOY)
+        ):
+            continue
+        weights = min(row.param_count_m for row in rows)
+        families.setdefault(family.group(0), []).append((weights, name))
+    return "\n".join(
+        ", ".join(name for _, name in sorted(members)[:_CATALOG_PER_FAMILY])
+        for _, members in sorted(families.items())
+    )
+
+
 def _resolve(index: Any, papers: list[Paper]) -> Paper | None:
     """Map the model's 1-based paper number onto a fetched paper.
 
@@ -448,7 +668,7 @@ def _resolve(index: Any, papers: list[Paper]) -> Paper | None:
     return None
 
 
-__all__ = ["Findings", "Researcher", "Setup", "Suggestion", "credited"]
+__all__ = ["CATALOG_CITATION", "Findings", "Researcher", "Setup", "Suggestion", "credited"]
 
 
 _STOPWORDS = frozenset(
@@ -461,7 +681,7 @@ def _content_words(text: str) -> set[str]:
     return {w for w in cleaned.split() if len(w) > 3 and w not in _STOPWORDS}
 
 
-def credited(findings: Findings | None, brief: str) -> list[str]:
+def credited(findings: Findings | None, brief: str, *, networks: bool = False) -> list[str]:
     """Citations for the suggestions this brief actually took up.
 
     Deliberately conservative. Stamping every citation from the pass onto every
@@ -469,16 +689,25 @@ def credited(findings: Findings | None, brief: str) -> list[str]:
     unearned citation is no better than an invented one — the whole point of this
     specialist is that its provenance can be trusted. So a suggestion is credited
     only when the brief and the technique share at least two content words, or the
-    technique phrase appears outright. Under-attribution is the safe failure.
+    technique phrase appears outright. A technique that names a network a library
+    loads is credited only to a brief naming that same network, because "fine-tune
+    ... with pretrained weights on all layers" shares its words with every such brief.
+    That rule is for image runs (``networks``); a table or prompt technique names no
+    network, and its credit is read as it always was. Under-attribution is the safe
+    failure.
     """
     if findings is None or not brief.strip():
         return []
     brief_words = _content_words(brief)
+    brief_models = _loadable(brief) if networks else set()
     lowered = brief.lower()
     out: list[str] = []
     for suggestion in findings.suggestions:
         technique = suggestion.technique.strip()
         if not technique:
+            continue
+        named = _loadable(technique) if networks else set()
+        if named and not named & brief_models:
             continue
         overlap = _content_words(technique) & brief_words
         matched = technique.lower() in lowered or len(overlap) >= 2
