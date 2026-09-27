@@ -43,7 +43,9 @@ class RunResult:
     baseline: ExperimentResult
     history: list[Experiment]
     best: Experiment | None
-    stopped_because: str  # "max_iterations" | "patience" | "plateau" | "baseline_failed"
+    # "max_iterations" | "patience" | "plateau" | "deadline" | "baseline_failed" |
+    # "supervisor" | "over_budget" | "stopped-by-user" | "interrupted"
+    stopped_because: str
     run_id: str = ""  # the Memory run id; "" when the baseline failed before a run started
 
 

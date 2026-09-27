@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
+from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -35,7 +38,7 @@ from iterate.core.terminator import AttemptOutcome, LoopState
 from iterate.schemas.experiment import Candidate, Experiment
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.core.coder import CodingAgent
@@ -65,6 +68,7 @@ _NO_BUDGET_LINE = re.compile(
     r"^\s*(?:no|drop|lift|remove|clear)\s+(?:the\s+)?(?:serving\s+)?budget\s*[.!]?\s*$",
     re.IGNORECASE,
 )
+_ASK_SHOWN = 5
 
 
 def _now() -> datetime:
@@ -101,6 +105,7 @@ def run_supervised(
     critic: Critic | None = None,
     max_research_calls: int = 3,
     max_inspect_calls: int = 2,
+    max_budget_rounds: int = 2,
     on_experiment: Callable[..., None] | None = None,
     controller: RunController | None = None,
     # Which family's arm each iteration takes. "vision" carries the recipe the coder
@@ -118,6 +123,10 @@ def run_supervised(
     supervisor asks via ``want_research``, always on iteration 1, and at most
     ``max_research_calls`` times. ``want_inspect`` runs an unscored session that
     records no experiment and spends no patience, capped by ``max_inspect_calls``.
+    When the serving budget empties the line, the same iteration goes back to the
+    Researcher for models the wall has not refused, up to ``max_budget_rounds`` times and
+    apart from ``max_research_calls``; when it runs dry, an interactive run waits for a
+    typed budget and a scripted one stops with ``over_budget``.
     ``on_experiment`` is called after EVERY completed experiment with
     ``experiment=, baseline=, is_best=, run_id=``. ``controller`` is the interactive
     seam: checkpoints at every iteration boundary, deadline suspended while paused,
@@ -252,7 +261,8 @@ def run_supervised(
                         extra["known_findings"] = last_findings.render()
                 # Memory already holds every recorded experiment (line below records each
                 # one) — adding current_run would feed this run's experiments in twice.
-                decision = supervisor.decide(
+                decide = partial(
+                    supervisor.decide,
                     data_summary=data_summary,
                     baseline=baseline,
                     history=memory.history(target.name),
@@ -260,15 +270,32 @@ def run_supervised(
                     # grounded on this so it describes the code the coder receives,
                     # never a cross-run best the coder does not hold.
                     carried_best=best,
-                    **extra,
                 )
-                # The budget this brief was judged under. A budget typed while the
-                # session runs holds from the NEXT brief, as the reply promised.
+                decision, budget_rounds, last_findings = _decide_within_the_wall(
+                    decide,
+                    extra,
+                    guidance,
+                    wall=wall,
+                    researcher=researcher,
+                    controller=controller,
+                    profile=data_summary,
+                    this_run=current_run,
+                    findings=last_findings,
+                    max_rounds=max_budget_rounds,
+                    iteration=iteration,
+                )
+                if controller is not None:
+                    rules = controller.rules
+                # The budget this brief was judged under, read after the last decide. A
+                # budget typed while the session runs holds from the NEXT brief, as the
+                # reply promised.
                 briefed_budget = wall.budget if wall is not None else None
                 wants_research = decision.want_research
                 wants_inspect = decision.want_inspect
                 last_brief = decision.brief
             except SupervisorError as exc:
+                if exc.findings is not None:
+                    last_findings = exc.findings
                 log.warning("agent loop: iteration %d supervisor failed: %s", iteration, exc)
                 memory.record_proposer_failure(run_id, iteration, "supervisor", str(exc))
                 outcome = "proposer_error"
@@ -277,7 +304,7 @@ def run_supervised(
                         controller.requeue_brief_note(note)
             else:
                 if decision.stop:
-                    stopped_because = "supervisor"
+                    stopped_because = decision.stopped_because or "supervisor"
                     break
                 if controller is not None:
                     controller.emit(
@@ -330,6 +357,8 @@ def run_supervised(
                         experiment.candidate.changes["user_guidance"] = "; ".join(guidance)
                     if rules:
                         experiment.candidate.changes["user_rules"] = list(rules)
+                    if budget_rounds:
+                        experiment.candidate.changes["research_rounds"] = budget_rounds
                     _hold_against_the_wall(experiment, wall, iteration, briefed_budget)
                     if summarizer is not None:
                         experiment = _digest(summarizer, experiment, iteration)
@@ -515,6 +544,7 @@ def _move_the_wall(text: str, wall: Wall) -> str | None:
 
     if _NO_BUDGET_LINE.match(text):
         wall.budget = None
+        wall.moves += 1
         return "the serving budget is lifted; from here on nothing is refused for its price"
     found = _BUDGET_LINE.match(text)
     if found is None:
@@ -523,10 +553,146 @@ def _move_the_wall(text: str, wall: Wall) -> str | None:
     if budget <= 0:
         return 'a budget is dollars a month above zero, e.g. "budget $80"; the wall is unchanged'
     wall.budget = budget
+    wall.moves += 1
     return (
         f"serving budget is now {money(budget)} a month at {wall.requests_per_hour:,} requests "
         "an hour; it holds from the next brief on, and nothing already recorded is re-judged"
     )
+
+
+def _decide_within_the_wall(
+    decide: Callable[..., SupervisorDecision],
+    extra: dict[str, Any],
+    guidance: list[str],
+    *,
+    wall: Wall | None,
+    researcher: Researcher | None,
+    controller: RunController | None,
+    profile: str,
+    this_run: Sequence[Experiment],
+    findings: Findings | None,
+    max_rounds: int,
+    iteration: int,
+) -> tuple[SupervisorDecision, int, Findings | None]:
+    """Decide, and when the serving budget has emptied the line, go back and forth with
+    the Researcher inside this one iteration. Each round hands it the networks the wall
+    refused under this budget as ruled out, never a price; a round that names a model
+    not among them re-decides. After ``max_rounds`` rounds with nothing new, an
+    interactive run waits, clocks suspended, for the user to move the wall or stop, and
+    a run with no one to ask keeps the over-budget stop. ``extra`` and ``guidance`` take
+    what the rounds and the wait added, in place. Returns the decision, the rounds since
+    the wall last moved, and the findings the run now holds. No iteration, no patience
+    and no proposer failure is spent here."""
+    rounds = 0
+    while True:
+        try:
+            decision = decide(**extra)
+        except SupervisorError as exc:
+            exc.findings = findings
+            raise
+        if wall is None or not (decision.stop and decision.stopped_because == "over_budget"):
+            return decision, rounds, findings
+        fresh: list[str] = []
+        while researcher is not None and rounds < max_rounds and not fresh:
+            if controller is not None and controller.abort_requested:
+                return replace(decision, stopped_because="stopped-by-user"), rounds, findings
+            ruled_out = wall.ruled_out()
+            log.info(
+                "agent loop: iteration %d: the serving budget emptied the line; asking the "
+                "Researcher for models not among %s",
+                iteration,
+                ", ".join(ruled_out) or "the ones already refused",
+            )
+            found = researcher.research(
+                profile=profile,
+                tried=vl.tried_components(this_run),
+                ruled_out=ruled_out,
+                round=rounds + 2,
+                tried_models=vl.tried_models(this_run),
+            )
+            rounds += 1
+            fresh = vl.new_models(found.render(), ruled_out, vl.tried_models(this_run))
+            log.info(
+                "agent loop: researched %d papers -> %d suggestions, new models: %s",
+                found.papers_seen,
+                len(found.suggestions),
+                ", ".join(fresh) or "none",
+            )
+            if fresh:
+                findings = findings.merge(found) if findings is not None else found
+                # The Supervisor cuts the literature block short, so it gets this round
+                # alone; the ladder reads the whole set uncut.
+                extra["research"] = found.render()
+                extra["known_findings"] = findings.render()
+        if fresh:
+            if controller is not None and controller.abort_requested:
+                return replace(decision, stopped_because="stopped-by-user"), rounds, findings
+            continue
+        if controller is None or not controller.input_open:
+            log.info(
+                "agent loop: iteration %d: nothing fits the serving budget and no one is "
+                "at the terminal to move it; stopping",
+                iteration,
+            )
+            return decision, rounds, findings
+        before = wall.moves
+        controller.wait_until(_wall_moved(wall, before), ask=_over_budget_ask(wall, rounds))
+        if controller.abort_requested:
+            return replace(decision, stopped_because="stopped-by-user"), rounds, findings
+        if wall.moves == before:
+            # The input closed while the run waited, and no one is left to move the wall.
+            return decision, rounds, findings
+        guidance.extend(controller.take_brief_notes())
+        if guidance:
+            extra["user_guidance"] = "; ".join(guidance)
+        if controller.rules:
+            extra["standing_rules"] = controller.rules
+        rounds = 0
+
+
+def _wall_moved(wall: Wall, since: int) -> Callable[[], bool]:
+    return lambda: wall.moves != since
+
+
+def _over_budget_ask(wall: Wall, rounds: int) -> str:
+    """The one paragraph an interactive run says when nothing fits the serving budget and
+    it waits: what the wall refused under this budget, cheapest first and unpriced last,
+    rounded to the dollar as the heading and the summary round; how far the Researcher
+    got; and the three ways on. It carries no markup of its own."""
+    from iterate.schemas.serving import money
+
+    shut: dict[str, float | None] = {}
+    for refused in wall.refused:
+        if refused.budget == wall.budget:
+            shut.setdefault(refused.what, refused.usd_per_month)
+    cheapest = sorted(shut.items(), key=lambda item: _sortable(item[1]))
+    listed = "; ".join(
+        f"{what} (${usd:,.0f})" if _sortable(usd) != math.inf else f"{what} (not priced)"
+        for what, usd in cheapest[:_ASK_SHOWN]
+    )
+    if len(cheapest) > _ASK_SHOWN:
+        listed += f"; and {len(cheapest) - _ASK_SHOWN} more"
+    where = f"{wall.requests_per_hour:,} requests an hour"
+    if wall.budget is not None:
+        where = f"{money(wall.budget)} a month at {where}"
+    asked = (
+        "No other models were looked for."
+        if rounds == 0
+        else "The Researcher was asked "
+        + {1: "once more", 2: "twice more"}.get(rounds, f"{rounds} more times")
+        + ", and nothing it named fits."
+    )
+    return (
+        f"over the serving budget ({where}){': ' + listed if listed else ''}. {asked} "
+        'Type "budget $N" to raise it, "no budget" to lift it, or "stop" to end the run; '
+        "the clocks are suspended while this waits."
+    )
+
+
+def _sortable(usd: float | None) -> float:
+    # A price the Pricer could not make, or could not finish, must not crash the run at
+    # the one moment it waits on a person; it is listed last, as not priced.
+    return usd if usd is not None and math.isfinite(usd) else math.inf
 
 
 def _hold_against_the_wall(
@@ -734,7 +900,7 @@ def _run_experiment(
         # The commissioned lever never ran successfully — the score is the carried
         # pipeline's, not the lever's, and the supervisor must not credit it.
         changes["lever_unmeasured"] = True
-    citations = credited(findings, decision.brief)
+    citations = credited(findings, decision.brief, networks=vision is not None)
     candidate = Candidate(
         description=decision.title,
         changes=changes,

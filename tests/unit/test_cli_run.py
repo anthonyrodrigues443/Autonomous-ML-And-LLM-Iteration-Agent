@@ -450,13 +450,18 @@ def test_run_saves_best_model_and_sidecar(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def _stub_run_supervised(
-    monkeypatch: pytest.MonkeyPatch, *, invoke_hook: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    invoke_hook: bool = False,
+    stopped_because: str = "max_iterations",
+    refusals: tuple[tuple[str, float, str], ...] = (),
 ) -> dict[str, Any]:
     """Stub the code path's heavy bits; capture which client each agent received.
 
     With ``invoke_hook``, the fake loop calls ``on_experiment`` once with a finished
     cells-experiment and returns an EMPTY history — so any notebook on disk can only
-    have come from the incremental hook, never the end-of-run writer."""
+    have come from the incremental hook, never the end-of-run writer. ``refusals`` are
+    recorded on the wall the CLI handed the loop, as the Supervisor would."""
     captured: dict[str, Any] = {}
 
     class _FakeClient:
@@ -500,6 +505,9 @@ def _stub_run_supervised(
         captured["coder_client"] = coder._client
         captured["controller"] = controller
         captured["researcher"] = kwargs.get("researcher")
+        captured["wall"] = kwargs.get("wall")
+        for what, usd, kind in refusals:
+            captured["wall"].record_refusal(what, usd, kind)
         baseline = ExperimentResult(
             experiment_id="b",
             metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize", n_samples=100),
@@ -538,7 +546,7 @@ def _stub_run_supervised(
             baseline=baseline,
             history=[],
             best=None,
-            stopped_because="max_iterations",
+            stopped_because=stopped_because,
             run_id="t",
         )
 
@@ -1573,3 +1581,169 @@ def test_the_summary_names_what_the_wall_turned_away_and_how_far_each_got(
         "over the serving budget this run, trained, over the budget, never the winner: a wide "
         "forest ($37 against $30)"
     ) in text
+
+
+# ─── the Researcher and the Pricer go back and forth (Sprint 5 Day 4) ──────
+
+
+def _over_budget_result(stopped_because: str) -> Any:
+    from iterate.core.orchestrator import RunResult
+
+    baseline = ExperimentResult(
+        experiment_id="b",
+        metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize", n_samples=100),
+    )
+    return RunResult(baseline=baseline, history=[], best=None, stopped_because=stopped_because)
+
+
+def test_a_run_the_wall_stopped_says_what_nothing_fitted_and_how_to_open_it() -> None:
+    from iterate.core import serving
+
+    wall = serving.Wall(requests_per_hour=400_000, prices=serving.load_prices(), budget=20.0)
+    wall.record_refusal("swap the backbone to convnext_tiny", 36.79, "off the line")
+    wall.record_refusal("train at 128 px", 24.53, "off the line")
+    with cli_module.console.capture() as captured:
+        cli_module._render_summary(_over_budget_result("over_budget"), "f1", wall=wall)
+    text = _plain(captured.get())
+
+    assert "stopped: over_budget" in text
+    assert (
+        "nothing the run could try next fits the serving budget, $20 a month at 400,000 "
+        "requests an hour. To open it, raise --serving-budget, lower --requests-per-hour, "
+        'or run it on a terminal and type "budget $N" when it asks.'
+    ) in text
+    assert (
+        "no candidate within the serving budget beat the baseline; what the wall held back "
+        "was never tried."
+    ) in text
+    assert (
+        "over the serving budget this run, taken off the line before a brief: swap the "
+        "backbone to convnext_tiny ($37 against $20), train at 128 px ($25 against $20)"
+    ) in text
+
+
+def test_a_run_refused_only_off_the_line_closes_on_the_budget_not_on_the_baseline() -> None:
+    """Nothing trained over the budget, yet the wall shaped the run: the closing line
+    says so instead of reading as a plain loss to the baseline."""
+    from iterate.core import serving
+
+    wall = serving.Wall(requests_per_hour=1000, prices=serving.load_prices(), budget=20.0)
+    wall.record_refusal("swap the backbone to convnext_tiny", 36.79, "off the line")
+    with cli_module.console.capture() as captured:
+        cli_module._render_summary(_over_budget_result("patience"), "f1", wall=wall)
+    text = _plain(captured.get())
+
+    assert "stopped: patience" in text
+    assert "what the wall held back was never tried" in text
+    assert "no candidate beat the baseline." not in text
+    assert "To open it" not in text
+
+
+def test_a_run_the_wall_never_touched_closes_as_before() -> None:
+    from iterate.core import serving
+
+    wall = serving.Wall(requests_per_hour=1000, prices=serving.load_prices(), budget=20.0)
+    with cli_module.console.capture() as captured:
+        cli_module._render_summary(_over_budget_result("patience"), "f1", wall=wall)
+    text = _plain(captured.get())
+
+    assert "no candidate beat the baseline." in text
+    assert "serving budget" not in text
+
+
+def test_the_over_budget_line_reads_the_wall_the_cli_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scripted run the wall emptied ends on the budget and rate it was given, with the
+    refusals the loop made on that same wall listed under it."""
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    captured = _stub_run_supervised(
+        monkeypatch,
+        stopped_because="over_budget",
+        refusals=(("swap the backbone to convnext_tiny", 36.79, "off the line"),),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--data",
+            str(data),
+            "--target",
+            "churn",
+            "--metric",
+            "f1",
+            "--code",
+            "--memory",
+            str(tmp_path / "m.db"),
+            "--serving-budget",
+            "20",
+        ],
+    )
+    text = _plain(result.output)
+
+    assert result.exit_code == 0, result.stdout
+    assert captured["controller"] is None
+    assert "stopped: over_budget" in text
+    assert "fits the serving budget, $20 a month at 1,000 requests an hour" in text
+    assert "swap the backbone to convnext_tiny ($37 against $20)" in text
+
+
+def test_an_entry_the_pricer_could_not_size_is_listed_as_not_priced() -> None:
+    from iterate.core import serving
+
+    wall = serving.Wall(requests_per_hour=400_000, prices=serving.load_prices(), budget=20.0)
+    wall.record_refusal("own model: google/vit-base-patch16-224", None, "off the line")
+    with cli_module.console.capture() as captured:
+        cli_module._render_summary(_over_budget_result("over_budget"), "f1", wall=wall)
+    text = _plain(captured.get())
+
+    assert "own model: google/vit-base-patch16-224 (not priced, under $20)" in text
+
+
+def _scored(changes: dict[str, Any], f1: float) -> Any:
+    return Experiment(
+        candidate=Candidate(description="a try", changes=changes, rationale="r"),
+        target="t",
+        hypothesis="h",
+        status="completed",
+        iteration=1,
+        result=ExperimentResult(
+            experiment_id="e",
+            metrics=Metrics(values={"f1": f1}, primary="f1", direction="maximize", n_samples=100),
+        ),
+    )
+
+
+def test_a_stamped_try_that_lost_to_the_baseline_is_not_said_to_have_beaten_it() -> None:
+    from dataclasses import replace
+
+    from iterate.core import serving
+
+    wall = serving.Wall(requests_per_hour=400_000, prices=serving.load_prices(), budget=20.0)
+    lost = _scored({"model": "x", "over_budget": 36.79}, 0.6)
+    wall.record_refusal("a try", 36.79, "trained")
+    result = replace(_over_budget_result("max_iterations"), history=[lost])
+    with cli_module.console.capture() as captured:
+        cli_module._render_summary(result, "f1", wall=wall)
+    text = _plain(captured.get())
+    assert "the ones that beat it" not in text
+    assert "no candidate beat the baseline." in text
+
+
+def test_a_network_held_back_then_trained_after_a_raise_is_not_called_never_tried() -> None:
+    from dataclasses import replace
+
+    from iterate.core import serving
+
+    wall = serving.Wall(requests_per_hour=400_000, prices=serving.load_prices(), budget=20.0)
+    wall.record_refusal("swap to convnext_tiny", 36.79, "off the line", network="convnext_tiny")
+    wall.budget, wall.moves = 80.0, 1
+    ran = _scored({"recipe": {"backbone": "convnext_tiny", "image_size": 64}}, 0.6)
+    result = replace(_over_budget_result("max_iterations"), history=[ran])
+    with cli_module.console.capture() as captured:
+        cli_module._render_summary(result, "f1", wall=wall)
+    text = _plain(captured.get())
+    assert "never tried" not in text
+    assert "no candidate beat the baseline." in text

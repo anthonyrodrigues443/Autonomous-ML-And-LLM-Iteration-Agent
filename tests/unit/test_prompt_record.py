@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -28,10 +29,13 @@ def _experiment(
     system: str,
     rejected: str = "",
     submitted: bool = True,
+    over_budget: float | None = None,
 ) -> Experiment:
     changes: dict[str, object] = {"code": "..."}
     if rejected:
         changes[REJECTED] = rejected
+    if over_budget is not None:
+        changes["over_budget"] = over_budget
     artifacts = {}
     if submitted:
         artifacts[codegen.PROMPT_JSON] = (
@@ -252,3 +256,67 @@ def test_the_serving_profile_sits_above_the_versions() -> None:
 
     assert document["serving"] == serving
     assert list(document).index("serving") < list(document).index("versions")
+
+
+def test_a_version_over_the_serving_budget_is_never_marked_best() -> None:
+    """The loop never banks it, so the file must not tell the user to ship it: a best
+    the user cannot afford to serve is the one thing the wall exists to prevent."""
+    document = _build(
+        [
+            _experiment(description="within the budget", score=0.70, system="A"),
+            _experiment(description="bigger few-shot", score=0.95, system="B", over_budget=147.17),
+        ]
+    )
+
+    assert [v["version"] for v in document["versions"] if v["best"]] == ["v1"]
+    assert document["versions"][2]["over_budget"] == (
+        "costs about $147 a month to serve, over the serving budget"
+    )
+    assert "over_budget" not in document["versions"][1]
+
+
+def test_when_every_version_is_over_the_budget_the_baseline_is_best() -> None:
+    document = _build([_experiment(description="x", score=0.95, system="B", over_budget=40.0)])
+
+    assert [v["version"] for v in document["versions"] if v["best"]] == ["v0"]
+    assert len(document["versions"]) == 2
+
+
+def test_the_wall_stamp_on_the_experiment_is_what_the_record_reads() -> None:
+    """The loop stamps each finished experiment and hands the same objects to the
+    record, so the flag needs no plumbing: priced here the way the loop prices them."""
+    from functools import partial
+
+    from iterate.core import serving
+
+    def measured(system: str, score: float, tokens_in: float) -> Experiment:
+        experiment = _experiment(description=system, score=score, system=system)
+        assert experiment.result is not None
+        experiment.result.artifacts[codegen.PROMPT_JSON] = json.dumps(
+            {
+                "system": system,
+                "user_template": "{input}",
+                "records_measured": 100,
+                "tokens_in_per_record": tokens_in,
+                "tokens_out_per_record": 8,
+            }
+        )
+        return experiment
+
+    wall = serving.Wall(
+        requests_per_hour=1000,
+        prices=serving.load_prices(),
+        budget=50.0,
+        facts_of=partial(
+            serving.experiment_facts, family="prompt", provider="openai", model="gpt-4o-mini"
+        ),
+    )
+    short, long = measured("short", 0.70, 100), measured("long", 0.95, 2000)
+    for experiment in (short, long):
+        wall.stamp(experiment)
+
+    document = _build([short, long])
+
+    assert "over_budget" not in short.candidate.changes
+    assert [v["version"] for v in document["versions"] if v["best"]] == ["v1"]
+    assert document["versions"][2]["over_budget"].startswith("costs about $")

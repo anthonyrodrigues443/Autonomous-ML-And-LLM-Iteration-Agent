@@ -1249,6 +1249,8 @@ def run(
                             ctrl.submit_line(line)
                     except Exception:  # a dying listener must never touch the run
                         pass
+                    finally:
+                        ctrl.close_input()
 
                 threading.Thread(target=_listen, daemon=True, name="iterate-chat").start()
                 console.print(
@@ -1267,7 +1269,7 @@ def run(
                     result = snap() if callable(snap) else None
                     if result is not None:
                         with contextlib.suppress(Exception):
-                            _render_summary(cast("RunResult", result), metric)
+                            _render_summary(cast("RunResult", result), metric, wall=wall)
                     console.print(
                         ">> stopped — everything already saved is under .iterate/",
                         style="cyan",
@@ -2625,6 +2627,8 @@ def _render_summary(
     console.print()
     console.print(table)
     console.print(f"\n[bold]stopped:[/bold] {result.stopped_because}")
+    if result.stopped_because == "over_budget":
+        console.print(_over_budget_stop(wall), markup=False, highlight=False)
     if result.best is not None and result.best.result and result.best.result.metrics:
         improvement = (
             result.best.result.metrics.primary_value - baseline_score
@@ -2639,10 +2643,15 @@ def _render_summary(
         if serving is not None:
             for line in serving.render():
                 console.print(line, markup=False, highlight=False)
-    elif wall is not None and any(r.kind == "trained" for r in wall.refused):
+    elif wall is not None and _over_budget_beat(result):
         console.print(
             "[dim]no candidate within the serving budget beat the baseline; the ones that "
             "beat it could not be served for the money.[/dim]"
+        )
+    elif wall is not None and _held_back_untried(result, wall):
+        console.print(
+            "[dim]no candidate within the serving budget beat the baseline; what the wall "
+            "held back was never tried.[/dim]"
         )
     else:
         console.print("[dim]no candidate beat the baseline.[/dim]")
@@ -2663,7 +2672,10 @@ def _render_summary(
             if not rows:
                 continue
             named = ", ".join(
-                f"{r.what} (${r.usd_per_month:,.0f} against {money(r.budget)})" for r in rows[:6]
+                f"{r.what} (${r.usd_per_month:,.0f} against {money(r.budget)})"
+                if r.usd_per_month is not None
+                else f"{r.what} (not priced, under {money(r.budget)})"
+                for r in rows[:6]
             )
             more = f", and {len(rows) - 6} more" if len(rows) > 6 else ""
             console.print(
@@ -2672,6 +2684,51 @@ def _render_summary(
                 markup=False,
                 highlight=False,
             )
+
+
+def _over_budget_beat(result: RunResult) -> bool:
+    """Whether an experiment stamped over the budget beat the baseline."""
+    base = result.baseline.metrics
+    if base is None:
+        return False
+    for exp in result.history:
+        metrics = exp.result.metrics if exp.result is not None else None
+        if metrics is None or exp.candidate.changes.get("over_budget") is None:
+            continue
+        better = (
+            metrics.primary_value > base.primary_value
+            if base.direction == "maximize"
+            else metrics.primary_value < base.primary_value
+        )
+        if better:
+            return True
+    return False
+
+
+def _held_back_untried(result: RunResult, wall: Wall) -> bool:
+    """Whether the wall held networks back that no experiment of this run then trained,
+    as it can after the user raised the budget and a refused network ran."""
+    from iterate.core import vision_levers as vl
+
+    trained = {vl.recipe_network(vl.recipe_of(exp)) for exp in result.history}
+    # A refusal that names no network (a stack built from zero) cannot be matched, so it
+    # counts as held back.
+    return any(
+        not r.network or r.network not in trained for r in wall.refused if r.kind != "trained"
+    )
+
+
+def _over_budget_stop(wall: Wall | None) -> str:
+    """Why a run the wall emptied stopped, and the three ways to open it."""
+    from iterate.schemas.serving import money
+
+    fits = "fits the serving budget"
+    if wall is not None and wall.budget is not None:
+        fits += f", {money(wall.budget)} a month at {wall.requests_per_hour:,} requests an hour"
+    return (
+        f"nothing the run could try next {fits}. To open it, raise --serving-budget, lower "
+        '--requests-per-hour, or run it on a terminal and type "budget $N" when it asks.'
+    )
 
 
 if __name__ == "__main__":

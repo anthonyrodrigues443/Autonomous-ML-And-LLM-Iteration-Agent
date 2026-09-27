@@ -28,6 +28,7 @@ Interpreter = Callable[[list[str], bool], None]
 _RULES_LIMIT = 3  # standing rules shown to the supervisor — lean context, dead-ends style
 _NOTE_CHARS = 200  # cap on one steer note; what is stored is exactly what the model sees
 _RULE_CHARS = 90  # cap on one standing rule (dead-ends style) — stored = stamped = shown
+_WAIT_SLICE = 1.0  # a wait re-checks this often even when no typed line pokes it
 
 
 class _Keepalive(Protocol):
@@ -57,6 +58,10 @@ class RunController:
         self._lines: queue.Queue[str] = queue.Queue()
         self._running = threading.Event()  # set = running; cleared = pause requested
         self._running.set()
+        self._poke = threading.Event()
+        # Set when the stdin listener ends (EOF, or the run was backgrounded): nobody can
+        # answer a question any more, so a wait must not start or go on.
+        self._input_closed = False  # set by every typed line and stop; a wait re-checks
         self._lock = threading.Lock()
         self._abort = False
         self._session_notes: list[str] = []  # for the LIVE coding session
@@ -91,7 +96,14 @@ class RunController:
 
     def submit_line(self, line: str) -> None:
         """Accept one typed line. Control words act immediately; anything else
-        queues for the next boundary with a timing-only ack."""
+        queues for the next boundary with a timing-only ack. Every line, whatever it
+        does, wakes a wait so it re-checks at once."""
+        try:
+            self._submit(line)
+        finally:
+            self._poke.set()
+
+    def _submit(self, line: str) -> None:
         text = line.strip()
         if not text:
             return
@@ -138,6 +150,7 @@ class RunController:
         with self._lock:
             self._abort = True
         self._running.set()
+        self._poke.set()
         self.reply(
             "stopping gracefully — winding down at the next safe point "
             "(Ctrl-C again, or /stop, quits immediately)"
@@ -256,6 +269,40 @@ class RunController:
         if not self.abort_requested:
             self.reply(f"resumed after {paused:.0f}s (clocks were suspended)")
         return paused
+
+    @property
+    def input_open(self) -> bool:
+        return not self._input_closed
+
+    def close_input(self) -> None:
+        """The listener's last word: no more lines will come."""
+        self._input_closed = True
+        self._poke.set()
+
+    def wait_until(self, done: Callable[[], bool], *, ask: str) -> float:
+        """Hold the loop between experiments until ``done()`` holds or the user stops,
+        for the one thing the run cannot go on without (a serving budget that lets
+        something through). What was typed before is routed first, and ``ask`` is said
+        only when that did not settle it. Lines typed meanwhile are routed as they land,
+        and the seconds spent here count as paused, so no deadline burns while the run
+        waits on a person. Returns those seconds."""
+        self._poke.clear()
+        self._drain(live_session=False)
+        if done() or self.abort_requested or self._input_closed:
+            return 0.0
+        prior_status, self.status = self.status, "waiting for a serving budget"
+        started = time.monotonic()
+        try:
+            self.reply(ask)
+            while not (done() or self.abort_requested or self._input_closed):
+                self._poke.wait(timeout=_WAIT_SLICE)
+                self._poke.clear()
+                self._drain(live_session=False)
+        finally:
+            waited = time.monotonic() - started
+            self.paused_seconds_total += waited
+            self.status = prior_status
+        return waited
 
     @staticmethod
     def _tick(kernel: _Keepalive | None) -> None:

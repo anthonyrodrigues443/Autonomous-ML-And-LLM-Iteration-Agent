@@ -765,3 +765,58 @@ def test_a_finished_experiment_over_the_budget_it_was_briefed_under_is_stamped()
     failed = exp.model_copy(update={"result": ExperimentResult(experiment_id="f", error="boom")})
     wall.budget = price - 1
     assert wall.stamp(failed) is None
+
+
+# ─── the wall remembers what it refused (v0.7 Day 4) ─────────────────────
+
+
+def test_the_wall_rules_out_the_networks_it_refused_under_the_budget_standing_now() -> None:
+    wall = serving.Wall(requests_per_hour=1000, prices=_prices(), budget=20.0)
+    assert (wall.moves, wall.ruled_out()) == (0, [])
+    wall.record_refusal("swap to convnext_tiny", 37.0, "off the line", network="convnext_tiny")
+    wall.record_refusal("train at 128 px", 25.0, "off the line", network="resnet18")
+    wall.record_refusal("convnext_tiny at 128 px", 49.0, "brief refused", network="convnext_tiny")
+    wall.record_refusal("a stack from zero", 30.0, "off the line")
+    wall.record_refusal("resnet50", 40.0, "brief refused", budget=10.0, network="resnet50")
+    assert wall.refused[0] == serving.Refused(
+        "swap to convnext_tiny", 37.0, 20.0, "off the line", "convnext_tiny"
+    )
+    assert wall.refused[3].network == ""
+    assert wall.ruled_out() == ["convnext_tiny", "resnet18"]
+    # A moved wall has refused nothing yet; a lifted one refuses nothing at all.
+    wall.budget = 80.0
+    assert wall.ruled_out() == []
+    wall.budget = 10.0
+    assert wall.ruled_out() == ["resnet50"]
+    wall.budget = None
+    assert wall.ruled_out() == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "timm_efficientnet_b0",
+        "TIMM_EfficientNet_B0",
+        "timm/efficientnet_b0",
+        "hf_hub:timm/efficientnet_b0.ra_in1k",
+        "hf-hub:timm/efficientnet_b0",
+    ],
+)
+def test_every_way_a_timm_name_is_written_sizes_the_same_network(name: str) -> None:
+    plain = serving.facts_from_model_name("efficientnet_b0", 64)
+    facts = serving.facts_from_model_name(name, 64)
+    assert facts.unpriced_because is None
+    assert (facts.backbone, facts.weights, facts.multiply_adds) == (
+        "efficientnet_b0",
+        plain.weights,
+        plain.multiply_adds,
+    )
+
+
+def test_an_own_network_is_sized_at_the_size_its_recipe_trains_at() -> None:
+    at_64 = serving.facts_from_recipe({"model": "timm_efficientnet_b0", "image_size": 64})
+    at_224 = serving.facts_from_recipe({"model": "efficientnet_b0"})
+    assert (at_64.image_size, at_224.image_size) == (64, 224)
+    assert at_64.multiply_adds is not None
+    assert at_224.multiply_adds is not None
+    assert at_64.multiply_adds < at_224.multiply_adds
