@@ -139,6 +139,7 @@ class PromptTarget:
         target_backend: str,
         target_model: str,
         target_base_url: str | None = None,
+        target_api_key: str | None = None,
         average: str | None = None,
         name: str = "prompt",
         cache_path: Path | str | None = None,
@@ -160,6 +161,8 @@ class PromptTarget:
         self._target_backend = target_backend
         self._target_model = target_model
         self._target_base_url = target_base_url
+        # Held in memory for the host's own calls. Never written to meta.json.
+        self._target_api_key = target_api_key
         self._cache_path = cache_path
         self._max_workers = max_workers
         # The user's production prompt when they have one, otherwise the minimal
@@ -292,8 +295,10 @@ class PromptTarget:
             backend=self._target_backend,
             model=self._target_model,
             base_url=self._target_base_url,
+            api_key=self._target_api_key,
             cache_path=self._cache_path,
             max_workers=self._max_workers,
+            scoped=True,
         )
         rows = self._dataset.test_features.to_dict(orient="records")
         log.info(

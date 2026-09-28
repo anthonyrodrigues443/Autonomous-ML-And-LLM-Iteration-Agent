@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from iterate.core.memory import Memory
     from iterate.core.orchestrator import RunResult
     from iterate.core.serving import Wall
+    from iterate.llm.factory import Provider, UnderTest
     from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult
     from iterate.schemas.link import LinkPlan
     from iterate.schemas.monitor import DataReport
@@ -82,43 +83,150 @@ def version() -> None:
 
 @app.command()
 def config() -> None:
-    """Show the resolved configuration (the backend api-key is masked)."""
+    """Show what a run will use: the harness, and the providers a prompt run may call.
+    Every key is masked."""
+    from iterate.llm import factory
+
     settings = get_settings()
-    typer.echo(f"model:        {settings.iterate_model}")
-    typer.echo(f"backend_url:  {settings.iterate_backend_url}")
-    typer.echo(f"api_key:      {_mask(settings.iterate_backend_api_key)}")
-    typer.echo(f"timeout:      {settings.iterate_backend_timeout}s")
-    typer.echo(f"ollama_host:  {settings.ollama_host}")
-    typer.echo(f"memory_db:    {settings.iterate_memory_db}")
+    try:
+        cfg = userconfig.load_user_config()
+        saved = userconfig.load_prompt_settings()
+    except userconfig.ConfigError as exc:
+        typer.echo(f"the saved config cannot be read: {exc}")
+        raise typer.Exit(1) from exc
+    backend = str(cfg.get("backend") or "ollama")
+    url = _harness_address(backend, cfg.get("base_url"), settings)
+    key, key_from = _harness_key(backend, url, cfg, settings) if backend != "ollama" else (None, "")
+    typer.echo("harness (the model that runs the loop)")
+    typer.echo(f"  backend:     {backend}")
+    typer.echo(f"  model:       {cfg.get('model') or settings.iterate_model}")
+    if url and backend != "ollama":
+        typer.echo(f"  base_url:    {factory.shown(url)}")
+    if backend != "ollama":
+        typer.echo(f"  api_key:     {_mask(key) + ' from ' + key_from if key else 'none'}")
+    typer.echo(f"  timeout:     {settings.iterate_backend_timeout}s")
+    typer.echo(f"  ollama_host: {settings.ollama_host}")
+    typer.echo(f"  memory_db:   {settings.iterate_memory_db}")
+    typer.echo("")
+    if saved.allowed is None:
+        typer.echo(
+            "prompt providers: no list saved, so a prompt run calls the one provider its flags name"
+        )
+    else:
+        typer.echo(f"prompt providers allowed: {', '.join(saved.allowed) or 'none'}")
+        for name in saved.allowed:
+            harness = name == backend and bool(key)
+            typer.echo(f"  {_provider_line(name, saved.providers, settings, harness=harness)}")
+    if saved.held_back and saved.allowed is None:
+        typer.echo(f"saved, used when a run names it: {', '.join(saved.held_back)}")
+    elif saved.held_back:
+        typer.echo(f"saved but not allowed, never called: {', '.join(saved.held_back)}")
+    if exported := (os.environ.get(factory.TARGET_KEY_ENV) or "").strip():
+        typer.echo(
+            f"{factory.TARGET_KEY_ENV} is exported ({_mask(exported)}): the next prompt run "
+            "sends it as the key of the model under test, in place of the ones above"
+        )
+    path = userconfig.config_path()
+    typer.echo(
+        f"\nsaved in {path}" if path.exists() else "\nnothing saved yet: run `iterate setup`"
+    )
+
+
+def _provider_line(name: str, saved: Any, settings: Any, *, harness: bool = False) -> str:
+    from iterate.llm import factory
+
+    try:
+        found = factory.prompt_provider(name, saved=saved, settings=settings, environ={})
+    except factory.ProviderError as exc:
+        return f"{name}: {exc}"
+    parts = [f"{name}:"]
+    if found.base_url:
+        parts.append(factory.shown(found.base_url))
+    if found.api_key:
+        parts.append(f"key {_mask(found.api_key)} from {found.key_from}")
+    why = factory.not_ready(found)
+    if why is not None and harness and found.needs_key and not found.api_key:
+        parts.append("no key of its own; the harness's key when it is the harness model")
+    elif why is not None:
+        parts.append(f"NOT READY, {why}")
+    return " ".join(parts)
 
 
 @app.command()
 def setup() -> None:
-    """Save your default backend, model, keys, compute venue, and install consent.
+    """Save your defaults: the harness, the providers a prompt run may call, the
+    compute venue and install consent.
 
-    Writes ~/.config/iterate/config.toml. Override any of it per run with a flag.
+    Writes ~/.config/iterate/config.toml, readable by you only. Override any of it per
+    run with a flag.
     """
+    from iterate.llm import factory
+
+    broken = False
     console.print(
         "[bold]iterate setup[/bold] — your saved defaults "
         "(override any of these per run with a flag).\n"
     )
-    backend = typer.prompt(
-        "LLM backend (ollama / openai / groq / together / deepseek)", default="ollama"
-    ).strip()
-    model = typer.prompt("Model name (blank = backend default)", default="", show_default=False)
+    try:
+        before = userconfig.load_user_config()
+        userconfig.load_saved_providers()
+        userconfig.load_prompt_settings()
+    except userconfig.ConfigError as exc:
+        # Setup is how a file that cannot be read is put right. The file stays where it
+        # is until the answers are in, and a copy of it stays after.
+        console.print(f"[yellow]{escape(str(exc))}[/yellow]")
+        console.print(
+            "[yellow]Starting from nothing. What you answer replaces it, and the file as "
+            "it is now is kept beside it as config.toml.broken.[/yellow]\n"
+        )
+        before, broken = {}, True
+    known = factory.known_providers()
+    harness = factory.harness_backends()
+    backend = _ask_name(
+        f"Harness backend, which serves the model that runs the loop ({' / '.join(harness)})",
+        default=str(before.get("backend") or "ollama"),
+        known=harness,
+    )
+    same = backend == before.get("backend")
+    model = typer.prompt(
+        "Model name (blank = backend default)",
+        default=str(before.get("model") or "") if same else "",
+        show_default=same and bool(before.get("model")),
+    )
     api_key = ""
     if backend != "ollama":
-        api_key = typer.prompt(
-            f"API key for {backend}", default="", hide_input=True, show_default=False
+        kept = str(before.get("api_key") or "") if same else ""
+        api_key = (
+            typer.prompt(
+                f"API key for {backend}" + (" (blank = keep the saved one)" if kept else ""),
+                default="",
+                hide_input=True,
+                show_default=False,
+            ).strip()
+            or kept
+        )
+    base_url = ""
+    while factory.is_self_hosted(backend):
+        base_url = typer.prompt(
+            f"Base URL of your {backend} server",
+            default=str(before.get("base_url") or "") if same else "",
+            show_default=same and bool(before.get("base_url")),
         ).strip()
+        why = factory.not_ready(factory.Provider(backend, base_url or None))
+        if why is None:
+            break
+        console.print(
+            f"[yellow]{backend}: {why}. Give it as http:// or https://, a host and a path[/yellow]"
+        )
 
     compute = typer.prompt("Run generated code on (local / e2b)", default="local").strip().lower()
-    e2b_api_key = ""
+    e2b_api_key = str(before.get("e2b_api_key") or "")
     install = False
     if compute == "e2b":
-        e2b_api_key = typer.prompt(
-            "E2B API key", default="", hide_input=True, show_default=False
-        ).strip()
+        e2b_api_key = (
+            typer.prompt("E2B API key", default="", hide_input=True, show_default=False).strip()
+            or e2b_api_key
+        )
     else:
         console.print(
             "[dim]On local, generated code runs on THIS machine with your permissions.[/dim]"
@@ -130,15 +238,108 @@ def setup() -> None:
             default=False,
         )
 
+    allowed: Any
+    providers: Any
+    try:
+        allowed, providers = _ask_prompt_providers(known, fresh=broken)
+    except typer.Abort:
+        if sys.stdin.isatty():
+            raise
+        # Answers piped in end where the questions of before v0.7 ended: what is saved
+        # for prompt runs stays as it is.
+        allowed, providers = (None, {}) if broken else (userconfig.KEEP, userconfig.KEEP)
+
     values: dict[str, object] = {"backend": backend, "compute": compute, "install": install}
     if model.strip():
         values["model"] = model.strip()
     if api_key:
         values["api_key"] = api_key
+    if base_url:
+        values["base_url"] = base_url
     if e2b_api_key:
         values["e2b_api_key"] = e2b_api_key
-    path = userconfig.save_user_config(values)
-    console.print(f"\n[green]saved[/green] → {path}")
+    if broken:
+        userconfig.keep_beside(userconfig.config_path(), "broken")
+    path = userconfig.save_user_config(values, allowed=allowed, providers=providers)
+    console.print(f"\n[green]saved[/green] → {path} [dim](readable by you only)[/dim]")
+
+
+def _ask_name(question: str, *, default: str, known: tuple[str, ...]) -> str:
+    """One provider name, asked again until it is one iterate knows."""
+    while True:
+        answer = str(typer.prompt(question, default=default)).strip().lower()
+        if answer in known:
+            return answer
+        console.print(f"[yellow]{escape(answer)} is not one of {', '.join(known)}[/yellow]")
+
+
+def _ask_prompt_providers(
+    known: tuple[str, ...], *, fresh: bool = False
+) -> tuple[tuple[str, ...] | None, dict[str, userconfig.SavedProvider]]:
+    """The providers a prompt run may call, and a key for each. A provider saved before
+    and left out now keeps its key in the file and is never called. ``fresh`` starts
+    from nothing, for a saved file that cannot be read."""
+    from iterate.llm import factory
+
+    saved = {} if fresh else userconfig.load_saved_providers()
+    before = None if fresh else userconfig.load_prompt_settings().allowed
+    console.print(
+        "\n[dim]A prompt run sends your records to the model under test. Name the "
+        "providers it may call; any other is refused, and its key is never read.[/dim]"
+    )
+    while True:
+        answer = str(
+            typer.prompt(
+                f"Prompt providers allowed, comma separated ({' / '.join(known)}), "
+                "or any to let each run name its own",
+                default=", ".join(before) if before else "any",
+            )
+        ).strip()
+        if answer.lower() == "any":
+            return None, saved
+        try:
+            names = factory.allowed_names(answer.split(","))
+        except factory.ProviderError as exc:
+            console.print(f"[yellow]{escape(str(exc))}[/yellow]")
+            continue
+        if names:
+            break
+        console.print("[yellow]Name at least one provider, or answer any[/yellow]")
+    providers = dict(saved)
+    for name in names:
+        old = saved.get(name) or userconfig.SavedProvider(name)
+        base_url, key = old.base_url, old.api_key
+        while factory.is_self_hosted(name):
+            base_url = (
+                typer.prompt(
+                    f"Base URL of your {name} server",
+                    default=old.base_url or "",
+                    show_default=bool(old.base_url),
+                ).strip()
+                or None
+            )
+            why = factory.not_ready(factory.Provider(name, base_url))
+            if why is None:
+                break
+            console.print(
+                f"[yellow]{name}: {why}. Give it as http:// or https://, a host and a path[/yellow]"
+            )
+        if factory.takes_a_key(name):
+            variable = factory.own_key_env(name)
+            blank = "keep the saved one" if old.api_key else f"read {variable} at run time"
+            if variable is None and not old.api_key:
+                blank = "it asks for none"
+            key = (
+                typer.prompt(
+                    f"API key for {name} (blank = {blank})",
+                    default="",
+                    hide_input=True,
+                    show_default=False,
+                ).strip()
+                or old.api_key
+            )
+        providers[name] = userconfig.SavedProvider(name, api_key=key, base_url=base_url)
+    return names, providers
 
 
 class _NoPlanError(Exception):
@@ -551,10 +752,18 @@ def _link_folder(
     return ws
 
 
+def _saved_config() -> dict[str, Any]:
+    """The saved file, or a refusal that names it when it cannot be read."""
+    try:
+        return userconfig.load_user_config()
+    except userconfig.ConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
 def _install_saved_packages(*, install: bool | None, compute: str | None) -> None:
     from iterate.adapters.compute import deps
 
-    cfg = userconfig.load_user_config()
+    cfg = _saved_config()
     venue = (compute or cfg.get("compute") or "local").lower()
     if venue != "local":
         return
@@ -646,10 +855,29 @@ def run(
         None,
         "--target-model",
         help="The model whose prompt is being tuned. Separate from the model DRIVING "
-        "the run (--model). Defaults to the same one.",
+        "the run (--model). Defaults to --model when the model under test is on the "
+        "harness's backend; needed with a --target-backend that differs from --backend.",
     ),
     target_backend: str | None = typer.Option(
-        None, "--target-backend", help="Backend for the model under test. Defaults to --backend."
+        None,
+        "--target-backend",
+        help="The provider of the model under test: ollama, openai, groq, together, "
+        "deepseek, or a server you run (openai-compatible, vllm). Defaults to --backend, "
+        "and then the model under test is served where the harness is, with its key.",
+    ),
+    target_base_url: str | None = typer.Option(
+        None,
+        "--target-base-url",
+        help="Where the model under test is served, for a server you run or a gateway. "
+        "Named apart with --target-backend, the model under test never takes --base-url.",
+    ),
+    providers: str | None = typer.Option(
+        None,
+        "--providers",
+        help="Prompt runs only: the providers this run may call as the model under test, "
+        "comma separated (openai,groq). Replaces the list saved by `iterate setup` for "
+        "this run. A provider outside the list is never called, and its key is never "
+        "looked up.",
     ),
     allow_free_text: bool = typer.Option(
         False,
@@ -700,9 +928,11 @@ def run(
     ),
     model: str | None = typer.Option(None, "--model", help="Override the backend's default model."),
     base_url: str | None = typer.Option(
-        None, "--base-url", help="Override the backend's base URL."
+        None, "--base-url", help="Override the harness backend's base URL."
     ),
-    api_key: str | None = typer.Option(None, "--api-key", help="Override the backend's API key."),
+    api_key: str | None = typer.Option(
+        None, "--api-key", help="Override the harness backend's API key."
+    ),
     think: bool = typer.Option(
         False,
         "--think/--no-think",
@@ -817,7 +1047,7 @@ def run(
     from iterate.core.summarizer import Summarizer
     from iterate.core.supervisor import Supervisor
     from iterate.core.terminator import default_terminator
-    from iterate.llm.factory import api_key_for, build_client
+    from iterate.llm.factory import NO_KEY, build_client
     from iterate.targets.model import ModelTarget
 
     # ─── One input split here, or two inputs the user split ────────────────
@@ -865,11 +1095,13 @@ def run(
         setup()
         console.print()
 
-    cfg = userconfig.load_user_config()
+    cfg = _saved_config()
 
     # ─── Resolve: explicit flag > saved config > built-in default ──────────
     backend = backend or cfg.get("backend") or "ollama"
-    model = model or cfg.get("model")
+    saved_harness = _saved_for(backend, base_url, cfg)
+    model = model or saved_harness.get("model")
+    base_url = base_url or saved_harness.get("base_url")
     compute = (compute or cfg.get("compute") or "local").lower()
     install = install if install is not None else bool(cfg.get("install", False))
     if compute not in ("local", "e2b"):
@@ -880,15 +1112,14 @@ def run(
 
     # ─── Cloud backend? API key required wherever a client is built. ───────
     settings = get_settings()
-    if backend != "ollama":
-        api_key = api_key or cfg.get("api_key") or _resolved_api_key_from_env(settings, backend)
+    harness_key_from = "--api-key"
+    harness_address = _harness_address(backend, base_url, settings)
+    if backend != "ollama" and not api_key:
+        api_key, harness_key_from = _harness_key(backend, harness_address, saved_harness, settings)
 
     def _need_key() -> None:
         if backend != "ollama" and not api_key:
-            raise typer.BadParameter(
-                f"backend {backend!r} requires --api-key or a corresponding env var "
-                f"(ITERATE_BACKEND_API_KEY / OPENAI_API_KEY / GROQ_API_KEY / …)"
-            )
+            raise typer.BadParameter(_no_harness_key(backend, harness_address, cfg, saved_harness))
 
     # ─── Everything that needs no data, before anything is written ─────────
     # A folder is known to be images from its shape alone, so its refusals come
@@ -899,6 +1130,29 @@ def run(
         raise typer.BadParameter("--baseline requires --source")
     metric, average = _checked_names(metric, average)
     _need_key()
+    under_test: Provider | None = None
+    under_test_model = ""
+    if task is not None:
+        settled = _model_under_test(
+            backend=backend,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            api_key_from=harness_key_from,
+            target_backend=target_backend,
+            target_model=target_model,
+            target_base_url=target_base_url,
+            providers=providers,
+            compute=compute,
+            settings=settings,
+        )
+        under_test, under_test_model = settled.provider, settled.model
+        target_backend = settled.backend if target_backend is not None else None
+    elif providers is not None or target_base_url is not None:
+        raise typer.BadParameter(
+            "--providers and --target-base-url describe the model under test of a prompt "
+            "run; this run has no --task"
+        )
     linked_task: str | None = None
 
     # ─── A folder of images is linked first and shown before anything runs ──
@@ -1004,11 +1258,10 @@ def run(
     from iterate.core import serving as serving_mod
 
     wall_family = "vision" if prepared is not None else "prompt" if task is not None else "tabular"
-    wall_provider = serving_mod.provider_for(
-        backend if task is None else (target_backend or backend), base_url
+    wall_provider = (
+        under_test.name if under_test is not None else serving_mod.provider_for(backend, base_url)
     )
-    # The model under test, resolved the way the prompt target resolves it.
-    wall_model = (target_model or model or settings.iterate_model) if task is not None else ""
+    wall_model = under_test_model
     wall_prompt_chars = _prompt_chars(task, prompt_file)
     wall = _build_wall(
         family=wall_family,
@@ -1033,6 +1286,14 @@ def run(
             prompt_chars=wall_prompt_chars,
         )
 
+    # ─── e2b compute? API key required. ────────────────────────────────────
+    e2b_api_key = cfg.get("e2b_api_key") or settings.e2b_api_key
+    if compute == "e2b" and not e2b_api_key:
+        raise typer.BadParameter(
+            "--compute e2b needs an E2B API key: run 'iterate setup' or set E2B_API_KEY "
+            "(get a free key at e2b.dev)."
+        )
+
     # ─── New chapter? Archive the existing db. ─────────────────────────────
     # Any of --fresh, --source, --baseline+--source means "new chapter." Below every
     # refusal, so a run that cannot start leaves the memory it had.
@@ -1044,14 +1305,6 @@ def run(
                 f"[dim]memory: archived [/dim]{resolved_memory_path}[dim] → "
                 f"[/dim]{archived.name}[dim]; starting fresh[/dim]"
             )
-
-    # ─── e2b compute? API key required. ────────────────────────────────────
-    e2b_api_key = cfg.get("e2b_api_key") or settings.e2b_api_key
-    if compute == "e2b" and not e2b_api_key:
-        raise typer.BadParameter(
-            "--compute e2b needs an E2B API key — run 'iterate setup' or set E2B_API_KEY "
-            "(get a free key at e2b.dev)."
-        )
 
     # ─── The run folder, from here on ──────────────────────────────────────
     # Below every refusal, like the archive: a run that cannot start makes no folder.
@@ -1115,8 +1368,11 @@ def run(
             task=str(task),
             prompt_file=prompt_file,
             backend=target_backend or backend,
-            model=target_model or model,
-            base_url=base_url,
+            model=under_test_model,
+            base_url=under_test.base_url if under_test is not None else None,
+            # Always a key or the word for none, so the host's calls never reach into
+            # the environment for one.
+            api_key=(under_test.api_key or NO_KEY) if under_test is not None else None,
             cache_path=answer_cache,
             allow_free_text=allow_free_text,
         )
@@ -1305,11 +1561,7 @@ def run(
                 *((labels.resolve(),) if labels is not None else ()),
             ),
         )
-        target_key = (
-            os.environ.get("ITERATE_TARGET_API_KEY") or api_key_for(target_backend or backend)
-            if is_prompt_run
-            else None
-        )
+        target_key = under_test.api_key if under_test is not None else None
         if compute == "local":
             if confine.sandbox_available():
                 console.print(
@@ -1812,6 +2064,7 @@ def _rescore_winner_on_full_holdout(
         target_backend=loop_target._target_backend,
         target_model=loop_target._target_model,
         target_base_url=loop_target._target_base_url,
+        target_api_key=loop_target._target_api_key,
         cache_path=loop_target._cache_path,
         starting_prompt=winner,
     )
@@ -1855,6 +2108,221 @@ def _read_starting_prompt(path: Path) -> Any:
     return Prompt(system=raw.strip(), user_template="{input}")
 
 
+def _saved_for(backend: str, base_url: str | None, cfg: dict[str, Any]) -> dict[str, Any]:
+    """What was saved for the harness, if this run's harness is the saved one. Its model
+    name, its address and its key mean nothing to another backend, and the key saved
+    for a server you run is that server's: another address does not get it."""
+    from iterate.llm import factory
+
+    # A file that names no backend says nothing of whose its key is: it is this run's.
+    if "backend" in cfg and backend != cfg["backend"]:
+        return {}
+    kept = cfg.get("base_url")
+    if base_url and kept and factory.is_self_hosted(backend):
+        return cfg if factory.same_place(base_url, str(kept)) else {}
+    return cfg
+
+
+def _harness_address(backend: str, base_url: str | None, settings: Any) -> str | None:
+    """Where the harness is called: the flag or the saved address, else the company's
+    own, else what the environment holds for a server you run or for Ollama."""
+    from iterate.llm import factory
+
+    address = base_url or factory.resolve_base_url(backend, None)
+    if address is None and factory.is_self_hosted(backend):
+        return str(settings.iterate_backend_url)
+    if address is None and backend == "ollama":
+        return str(settings.ollama_host)
+    return address
+
+
+def _no_harness_key(
+    backend: str, base_url: str | None, cfg: dict[str, Any], saved: dict[str, Any]
+) -> str:
+    """The refusal for a harness with no key: the variables this backend reads, and why
+    a key that is saved was not used."""
+    from iterate.llm import factory
+
+    own = factory.own_key_env(factory.provider_name(backend, base_url))
+    variables = f"{own} or ITERATE_BACKEND_API_KEY" if own else "ITERATE_BACKEND_API_KEY"
+    text = f"backend {backend!r} requires --api-key, or {variables} in the environment"
+    if own is None and factory.is_self_hosted(backend):
+        text += " (OPENAI_API_KEY is not read for a server you run)"
+    if cfg.get("api_key") and not saved.get("api_key"):
+        whose = cfg.get("backend") or "another backend"
+        where = f" at {factory.shown(str(cfg['base_url']))}" if cfg.get("base_url") else ""
+        text += f". The key saved is for {whose}{where}, so it is not sent here"
+    return text
+
+
+def _harness_key(
+    backend: str, base_url: str | None, saved: dict[str, Any], settings: Any
+) -> tuple[str | None, str]:
+    """The harness's key and where it came from: the key saved for this backend, else
+    the variable of the company the address belongs to, else the generic slot."""
+    from iterate.llm import factory
+
+    if saved.get("api_key"):
+        return str(saved["api_key"]), "the saved config"
+    company = factory.provider_name(backend, base_url)
+    key = _resolved_api_key_from_env(settings, company)
+    own = factory.own_key_for(company, settings)
+    return key, str(
+        factory.own_key_env(company)
+    ) if own and key == own else "ITERATE_BACKEND_API_KEY"
+
+
+def _model_under_test(
+    *,
+    backend: str,
+    model: str | None,
+    base_url: str | None,
+    api_key: str | None,
+    api_key_from: str = "--api-key",
+    target_backend: str | None,
+    target_model: str | None,
+    target_base_url: str | None,
+    providers: str | None,
+    compute: str,
+    settings: Any,
+) -> UnderTest:
+    """The model a prompt run tunes its prompt for: who serves it, where, and with
+    whose key. Every refusal a prompt run's model settings can earn is raised here,
+    before anything is written."""
+    from iterate.llm import factory
+
+    if compute == "e2b":
+        raise typer.BadParameter(
+            "a prompt run cannot use --compute e2b: its cells call the model under test, "
+            "and the sandbox is handed no key for it. Pass --compute local"
+        )
+    if target_backend is not None:
+        target_backend = target_backend.strip().lower()
+    asked = target_backend or backend
+    harness_address = _harness_address(backend, base_url, settings)
+    # Named apart, or moved to another address, it is no longer the harness model, and
+    # the harness's address and key stay with the harness.
+    own = target_backend is None and (
+        target_base_url is None or factory.same_place(target_base_url, harness_address)
+    )
+    if target_model is None and target_backend not in (None, backend):
+        raise typer.BadParameter(
+            f"--target-backend {target_backend} needs --target-model: the harness runs "
+            f"on {backend}, and its model name means nothing to {target_backend}"
+        )
+    address = target_base_url or (harness_address if own else None)
+    given_as = (
+        f"--target-base-url {factory.shown(target_base_url)}"
+        if target_base_url
+        else f"--base-url {factory.shown(base_url)}"
+        if own and base_url
+        else ""
+    )
+    try:
+        if asked not in factory.known_providers():
+            flag = "--target-backend" if target_backend is not None else "--backend"
+            raise factory.ProviderError(factory.unknown(asked, flag=flag))
+        listed = None
+        if providers is not None:
+            try:
+                listed = factory.allowed_names(providers.split(","))
+            except factory.ProviderError as exc:
+                raise factory.ProviderError(f"--providers {exc}") from exc
+        saved = userconfig.load_prompt_settings(listed)
+        allowed = factory.allowed_names(saved.allowed) if saved.allowed is not None else None
+        entries = saved.providers if allowed is not None else _saved_entries(asked, address)
+        named = entries.get(asked)
+        kept = named.base_url if named is not None else None
+        if target_backend == backend and base_url and not (target_base_url or kept):
+            raise factory.ProviderError(
+                "named apart with --target-backend, the model under test does not take the "
+                f"harness's address. Pass --target-base-url {factory.shown(base_url)}, or "
+                "drop --target-backend"
+            )
+        company = factory.provider_name(asked, address or kept)
+        if asked == "ollama" and company != asked:
+            raise factory.ProviderError(
+                f"{given_as or factory.shown(address or kept)} is {company}'s address, not an "
+                f"Ollama server. Pass --target-backend {company}"
+            )
+        # A name on the list covers a company's address only when that address is the
+        # one saved under the name. Settled before any key of the company is looked up.
+        covered = asked in (allowed or ()) and (
+            company == asked or factory.same_place(address or kept, kept)
+        )
+        if allowed is not None and company not in allowed and not covered:
+            raise factory.ProviderError(
+                f"the model under test is served by {company}, which is not among "
+                f"the prompt providers you allow ({', '.join(allowed) or 'none'}). Pass "
+                f"--providers {company} for this run, or allow it with `iterate setup`"
+            )
+        under_test = factory.prompt_provider(
+            asked,
+            base_url=address,
+            saved=entries,
+            settings=settings,
+            harness_key=api_key if own else None,
+            harness_key_from=f"{api_key_from} (the harness's key)",
+        )
+        others = [
+            factory.prompt_provider(n, saved=entries, settings=settings, environ={})
+            for n in allowed or ()
+            if n not in (asked, under_test.name)
+        ]
+    except (factory.ProviderError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if (why := factory.not_callable(under_test, given_as=given_as)) is not None:
+        raise typer.BadParameter(why)
+    if waiting := [f"{p.name} ({why})" for p in others if (why := factory.not_ready(p))]:
+        raise typer.BadParameter(
+            f"these allowed prompt providers are not ready: {', '.join(waiting)}. Save them "
+            f"with `iterate setup`, or pass --providers {asked} to allow only the model "
+            "under test"
+        )
+    if (why := factory.refused_key(under_test)) is not None:
+        raise typer.BadParameter(why)
+    settled = factory.UnderTest(
+        provider=under_test,
+        model=target_model or model or settings.iterate_model,
+        backend=asked,
+        allowed=(under_test, *others),
+        listed=allowed,
+    )
+    console.print(f"[dim]{escape(_under_test_line(settled))}[/dim]")
+    return settled
+
+
+def _saved_entries(asked: str, address: str | None) -> dict[str, Any]:
+    """With no list saved, a run is allowed the one provider its flags name, and reads
+    what was saved for that one: under the name given, and under the company's when the
+    address is a company's."""
+    from iterate.llm import factory
+
+    first = userconfig.load_prompt_settings([asked]).providers
+    named = first.get(asked)
+    company = factory.provider_name(asked, address or (named.base_url if named else None))
+    if company == asked:
+        return dict(first)
+    return dict(userconfig.load_prompt_settings([asked, company]).providers)
+
+
+def _under_test_line(settled: UnderTest) -> str:
+    """One line that says where every record of a prompt run is sent."""
+    from iterate.llm import factory
+
+    under_test = settled.provider
+    line = f"model under test: {under_test.name} {settled.model}"
+    if under_test.base_url:
+        line += f" at {factory.shown(under_test.base_url)}"
+    if under_test.api_key:
+        line += f", key from {under_test.key_from}"
+    elif factory.takes_a_key(under_test.name):
+        line += f", no key sent (export {factory.TARGET_KEY_ENV} if the server asks for one)"
+    if settled.listed is not None:
+        line += f"; prompt providers allowed: {', '.join(settled.listed)}"
+    return line
+
+
 def _build_prompt_target(
     dataset: Any,
     *,
@@ -1865,6 +2333,7 @@ def _build_prompt_target(
     backend: str,
     model: str | None,
     base_url: str | None,
+    api_key: str | None = None,
     cache_path: Path,
     allow_free_text: bool = False,
 ) -> Any:
@@ -1902,6 +2371,7 @@ def _build_prompt_target(
         target_backend=backend,
         target_model=model or get_settings().iterate_model,
         target_base_url=base_url,
+        target_api_key=api_key,
         cache_path=cache_path,
         starting_prompt=_read_starting_prompt(prompt_file) if prompt_file else None,
     )
@@ -1914,7 +2384,7 @@ def _home_tilde(path: Path | None) -> str:
 
 
 def _mask(secret: str) -> str:
-    if len(secret) <= 4:
+    if len(secret) <= 8:
         return "****"
     return f"{secret[:2]}…{secret[-2:]}"
 
@@ -2015,13 +2485,9 @@ def _archive_memory_db(path: Path) -> Path | None:
 
 
 def _resolved_api_key_from_env(settings: object, backend: str) -> str | None:
-    """Pull an api key from settings env-overrides for a cloud backend.
-
-    Delegates to the llm factory, which owns the backend -> key-field table. The
-    model under test on a prompt run resolves its key through the same function, so
-    a `--target-backend groq` picks up `GROQ_API_KEY` exactly as the driving model
-    does — one table, not two that agree until one changes.
-    """
+    """The harness's key from the environment: the backend's own variable, then the
+    generic `ITERATE_BACKEND_API_KEY`. The model under test never comes through here:
+    `factory.prompt_provider` looks its key up, and the generic slot is not its."""
     from iterate.llm.factory import api_key_for
 
     return api_key_for(backend, settings)

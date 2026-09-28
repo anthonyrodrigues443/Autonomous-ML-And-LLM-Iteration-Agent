@@ -65,7 +65,7 @@ class AskStats:
 
 
 class AnswerCache:
-    """Answers keyed by (model, prompt, rendered record).
+    """Answers keyed by (who answered, model, prompt, rendered record).
 
     File-backed so the cache survives across experiments in a run: the baseline
     prompt gets re-run, and a session re-tries a prompt it has already scored. Both
@@ -113,11 +113,12 @@ class AnswerCache:
                 pass
 
 
-def _key(model: str, prompt: Prompt, rendered: str) -> str:
-    blob = json.dumps(
-        {"model": model, "system": prompt.system, "user": rendered}, sort_keys=True
-    ).encode()
-    return hashlib.sha256(blob).hexdigest()
+def _key(scope: str, model: str, prompt: Prompt, rendered: str) -> str:
+    # With no scope the key is the one every answer before v0.7 was filed under.
+    fields = {"model": model, "system": prompt.system, "user": rendered}
+    if scope:
+        fields["scope"] = scope
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
 # A number the model wrote, possibly wrapped in prose: "4", "4.5", "I'd say 3".
@@ -287,6 +288,8 @@ def ask(
     labels: Sequence[str] | None = None,
     numeric_range: tuple[float | None, float | None] | None = None,
     cache: AnswerCache | None = None,
+    cache_scope: str = "",
+    model: str | None = None,
     max_workers: int = _DEFAULT_WORKERS,
     retries: int = _DEFAULT_RETRIES,
     stats: AskStats | None = None,
@@ -312,8 +315,9 @@ def ask(
 
     def handle(index: int) -> None:
         rendered = render(prompt.user_template, rows[index], columns)
-        model = client().model
-        key = _key(model, prompt, rendered)
+        # With the model's name in hand no client is built for an answer already
+        # cached, so a pass served whole from the cache needs no key.
+        key = _key(cache_scope, model if model is not None else client().model, prompt, rendered)
 
         if cache is not None and (hit := cache.get(key)) is not None:
             answers[index] = hit
@@ -386,29 +390,38 @@ def make_ask(
     backend: str,
     model: str,
     base_url: str | None = None,
+    api_key: str | None = None,
     cache_path: Path | str | None = None,
     max_workers: int = _DEFAULT_WORKERS,
+    scoped: bool = False,
 ) -> Callable[..., list[str]]:
     """Build the `ask` a session cell calls. Bound to ONE model, on purpose.
 
-    No URL is constructed here. Calls go through the same `build_client` factory the
-    agent itself runs on, so a backend alias resolves its own endpoint and whatever
-    the user configured with `iterate setup` applies unchanged.
+    The client is the model under test's own: its endpoint is the one given or the
+    provider's public address, and its key is the provider's. Neither ever comes from
+    the harness's settings.
 
-    The key resolves through the same table too: `api_key_for` reads `GROQ_API_KEY`,
-    `OPENAI_API_KEY` and the rest exactly as the driving model does, so
-    `--target-backend groq` picks up the key already in the environment. It is read
-    at call time and never written into meta.json, so it does not land on disk
-    beside data the generated code reads. `ITERATE_TARGET_API_KEY` overrides it for
-    the case where the model under test needs a different key from the same provider.
+    The host passes ``api_key``. A cell passes none: its kernel holds the one key it was
+    handed, as `ITERATE_TARGET_API_KEY`. A delivered notebook run by hand finds the
+    provider's own variable (`GROQ_API_KEY` for groq). The key is never written into
+    meta.json, so it does not land on disk beside data the generated code reads.
+
+    ``scoped`` files each answer under the provider and the host that gave it. A
+    notebook delivered before v0.7 passes nothing, and finds the answers it paid for
+    where it left them.
     """
-    from iterate.llm.factory import api_key_for, build_client
+    from iterate.llm import factory
 
     cache = AnswerCache(cache_path)
+    scope = factory.cache_scope(backend, base_url) if scoped else ""
 
     def client_factory() -> LLMClient:
-        key = os.environ.get("ITERATE_TARGET_API_KEY") or api_key_for(backend)
-        return build_client(backend, model=model, base_url=base_url, api_key=key)
+        key = (
+            api_key
+            or (os.environ.get(factory.TARGET_KEY_ENV) or "").strip()
+            or factory.own_key_for(factory.provider_name(backend, base_url))
+        )
+        return factory.build_target_client(backend, model=model, base_url=base_url, api_key=key)
 
     def bound(
         prompt: Prompt,
@@ -424,6 +437,8 @@ def make_ask(
             labels=labels,
             numeric_range=numeric_range,
             cache=cache,
+            cache_scope=scope,
+            model=model,
             max_workers=max_workers,
             stats=stats,
         )

@@ -3,44 +3,118 @@
 The CLI's ``--backend`` flag dispatches through here. Both `OllamaClient` and
 `OpenAICompatibleClient` implement the `LLMClient` protocol, so nothing
 downstream notices which one came back.
+
+Two kinds of caller. The harness, the model that runs the loop, comes through
+`build_client` and `api_key_for`. The model under test of a prompt run comes through
+`prompt_provider` and `build_target_client`: its address and its key are its
+provider's own, looked up by the provider's name, and never the harness's.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from iterate.llm.ollama_client import OllamaClient
-from iterate.llm.openai_compatible import OpenAICompatibleClient
+from iterate.llm.openai_compatible import OpenAICompatibleClient, headers_left_out
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Mapping
+
     from iterate.llm.base import LLMClient
+    from iterate.userconfig import SavedProvider
 
 logger = logging.getLogger(__name__)
 
+# The generic slot: whatever key the harness backend needs. Never a prompt provider's.
+_HARNESS_SLOT = "iterate_backend_api_key"
+
+
+@dataclass(frozen=True)
+class _Known:
+    """What iterate knows of a provider before anyone sets anything."""
+
+    # Which client speaks to it. A name is a company or a server, never a wire format.
+    wire: str
+    # Its public address. None for a server the user runs, who gives the address.
+    address: str | None = None
+    # The Settings field that holds its own key. None when no company's key is its own.
+    key_field: str | None = None
+
+
+# One row per provider. Every other table here, and the hosts the OpenAI client keeps
+# OpenAI's headers from, are read off it.
+_PROVIDERS: dict[str, _Known] = {
+    "ollama": _Known("ollama"),
+    "openai": _Known("openai", "https://api.openai.com/v1", "openai_api_key"),
+    "groq": _Known("openai", "https://api.groq.com/openai/v1", "groq_api_key"),
+    "together": _Known("openai", "https://api.together.xyz/v1", "together_api_key"),
+    "deepseek": _Known("openai", "https://api.deepseek.com/v1", "deepseek_api_key"),
+    "openai-compatible": _Known("openai"),
+    "vllm": _Known("openai"),
+}
 
 # Cloud aliases → their OpenAI-compatible base URL, so `--backend groq` (or a saved
 # config) needs only a model + key, never a hand-typed --base-url. An explicit
 # --base-url still overrides. "openai-compatible"/"vllm" have no canonical URL (the
 # user supplies one), so they're not mapped.
-_ALIAS_BASE_URLS = {
-    "openai": "https://api.openai.com/v1",
-    "groq": "https://api.groq.com/openai/v1",
-    "together": "https://api.together.xyz/v1",
-    "deepseek": "https://api.deepseek.com/v1",
-}
+_ALIAS_BASE_URLS = {name: known.address for name, known in _PROVIDERS.items() if known.address}
 
 # Names that route to the OpenAI-compatible client.
 _OPENAI_COMPATIBLE_ALIASES = frozenset(
-    {"openai-compatible", "openai", "groq", "together", "deepseek", "vllm"}
+    name for name, known in _PROVIDERS.items() if known.wire == "openai"
 )
 
 _KNOWN = ("ollama", "openai-compatible")
 
+# One key for the one model under test a run's flags name. Read from the exported
+# environment only, never from a project's .env.
+TARGET_KEY_ENV = "ITERATE_TARGET_API_KEY"
+# What a server that asks for no key is sent, so the client never reaches for the
+# harness's.
+NO_KEY = "not-needed"
+
 
 class UnknownBackendError(ValueError):
     """Raised when ``--backend`` names a backend we don't recognize."""
+
+
+class ProviderError(ValueError):
+    """A prompt provider that cannot be called as it stands. The message says why and
+    what to do."""
+
+
+@dataclass(frozen=True)
+class Provider:
+    """One provider a prompt run may call, resolved: where it is and the key it takes."""
+
+    name: str
+    base_url: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    # Where the key was found, in words a person can act on. Never the key.
+    key_from: str = ""
+
+    @property
+    def needs_key(self) -> bool:
+        return takes_a_key(self.name) and not is_self_hosted(self.name)
+
+
+@dataclass(frozen=True)
+class UnderTest:
+    """What a prompt run settled before it wrote anything: the model its prompt is
+    tuned for, and every provider it may call, each with its key in hand."""
+
+    provider: Provider
+    model: str
+    # The name the run's flags gave, which picks the client: `openai-compatible` aimed
+    # at OpenAI is the provider openai, called through the client of the name given.
+    backend: str
+    allowed: tuple[Provider, ...] = ()
+    # None when no list was saved or given: the run named its one provider itself.
+    listed: tuple[str, ...] | None = None
 
 
 def resolve_base_url(name: str, base_url: str | None) -> str | None:
@@ -48,13 +122,23 @@ def resolve_base_url(name: str, base_url: str | None) -> str | None:
     return base_url if base_url is not None else _ALIAS_BASE_URLS.get(name)
 
 
+def _host(url: str | None) -> str:
+    """The machine an address names, in one spelling: lower case, no closing dot, and
+    no port, so OpenAI's host with `:443` on it is still OpenAI's."""
+    try:
+        return (urlparse(url or "").hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+
+
 def alias_for_base_url(base_url: str | None) -> str | None:
     """The cloud alias whose endpoint an explicit base URL points at, or None."""
-    if not base_url:
+    host = _host(base_url)
+    if not host:
         return None
-    host = urlparse(base_url).netloc.lower()
     for alias, url in _ALIAS_BASE_URLS.items():
-        if urlparse(url).netloc.lower() == host:
+        # The company's host, or one under it: eu.api.openai.com is OpenAI's.
+        if host == _host(url) or host.endswith(f".{_host(url)}"):
             return alias
     return None
 
@@ -92,27 +176,22 @@ def build_client(
     raise UnknownBackendError(f"unknown backend {name!r}; choose one of {_KNOWN}")
 
 
-# Which settings field holds the key for each cloud backend. One table, because the
-# same fact computed in two places is this project's most repeated bug: sprint 2 hit
-# it three times (a stale metric list, two lever orderings, two
-# classification heuristics), and each one agreed with its twin right up until one
-# of them needed to change.
+# Which settings field holds the harness's key for each cloud backend.
 _KEY_FIELDS: dict[str, tuple[str, ...]] = {
-    "openai-compatible": ("openai_api_key", "iterate_backend_api_key"),
-    "openai": ("openai_api_key", "iterate_backend_api_key"),
-    "groq": ("groq_api_key", "iterate_backend_api_key"),
-    "together": ("together_api_key", "iterate_backend_api_key"),
-    "deepseek": ("deepseek_api_key", "iterate_backend_api_key"),
-    "vllm": ("iterate_backend_api_key",),
+    name: tuple(f for f in (known.key_field, _HARNESS_SLOT) if f)
+    for name, known in _PROVIDERS.items()
+    if known.wire != "ollama"
 }
 
 
 def api_key_for(backend: str, settings: object | None = None) -> str | None:
-    """The api key configured for a backend, or None.
+    """The harness's api key for a backend, or None.
 
     Reads the vendor-specific env var (`GROQ_API_KEY`, `OPENAI_API_KEY`, …) and
     falls back to the generic `ITERATE_BACKEND_API_KEY`. Ollama has no key, and its
-    placeholder default is treated as absent.
+    placeholder default is treated as absent. A server the user runs has the generic
+    slot alone: aimed at a company's address it is that company, so pass
+    ``provider_name(backend, base_url)``.
     """
     if settings is None:
         from iterate.config import get_settings
@@ -125,10 +204,328 @@ def api_key_for(backend: str, settings: object | None = None) -> str | None:
     return None
 
 
+def known_providers() -> tuple[str, ...]:
+    """Every name a prompt provider can have, the local one first."""
+    return ("ollama", *sorted(n for n in _PROVIDERS if n != "ollama"))
+
+
+def harness_backends() -> tuple[str, ...]:
+    """Every name `--backend` takes: the providers a client of the harness's speaks to."""
+    return tuple(n for n in known_providers() if _PROVIDERS[n].wire in ("ollama", "openai"))
+
+
+def is_self_hosted(name: str) -> bool:
+    """A server the user runs. It has no public address, so the user gives one, and its
+    name says nothing of who is called: a key saved for it goes with its address."""
+    known = _PROVIDERS.get(name)
+    return known is not None and known.wire != "ollama" and known.address is None
+
+
+def takes_a_key(name: str) -> bool:
+    known = _PROVIDERS.get(name)
+    return known is not None and known.wire != "ollama"
+
+
+def provider_name(backend: str, base_url: str | None) -> str:
+    """The provider a backend and a base URL add up to: `openai-compatible` aimed at
+    api.openai.com is openai, with openai's key and openai's prices."""
+    return alias_for_base_url(base_url) or backend
+
+
+def own_key_env(name: str) -> str | None:
+    """The environment variable that holds this provider's own key, or None."""
+    known = _PROVIDERS.get(name)
+    return known.key_field.upper() if known is not None and known.key_field else None
+
+
+def own_key_for(name: str, settings: object | None = None) -> str | None:
+    """This provider's own key from the environment or the project's .env, or None.
+    Never the generic slot and never another provider's."""
+    variable = own_key_env(name)
+    if variable is None:
+        return None
+    if settings is None:
+        from iterate.config import get_settings
+
+        settings = get_settings()
+    value = getattr(settings, variable.lower(), None)
+    return str(value) if value else None
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def same_place(one: str | None, other: str | None) -> bool:
+    """Whether two addresses name one server: the same host and the same port, where a
+    port left out is the scheme's own, so https and http to one host are two places."""
+
+    def place(url: str | None) -> tuple[str, int | None]:
+        parsed = urlparse(url or "")
+        return _host(url), parsed.port or _DEFAULT_PORTS.get(parsed.scheme)
+
+    try:
+        return bool(_host(one)) and place(one) == place(other)
+    except ValueError:
+        return False
+
+
+def shown(url: str | None) -> str:
+    """An address as it may be printed or delivered: no user name, no password, and
+    nothing after a `?` or a `#`, where a token can ride."""
+    try:
+        parsed = urlparse(url or "")
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return "an address that cannot be read"
+    if not parsed.hostname:
+        return url or ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}{parsed.path.rstrip('/')}"
+
+
+def prompt_provider(
+    backend: str,
+    *,
+    base_url: str | None = None,
+    saved: Mapping[str, SavedProvider] | None = None,
+    settings: object | None = None,
+    environ: Mapping[str, str] | None = None,
+    harness_key: str | None = None,
+    harness_key_from: str = "the harness key",
+) -> Provider:
+    """The provider a prompt run calls, with its endpoint and its key.
+
+    The endpoint is the one given, else the one saved for this provider, else the
+    provider's own public address: never the harness's. Ollama alone has no public
+    address and is found at `OLLAMA_HOST`. The key is the exported target key, else the
+    harness's when the model under test is the harness model itself, else the one saved
+    for this provider, else the provider's own variable. A key saved for a server the
+    user runs goes only to the address saved beside it.
+    """
+    if backend not in _PROVIDERS:
+        raise ProviderError(unknown(backend))
+    env = os.environ if environ is None else environ
+    entries = saved or {}
+    named = entries.get(backend)
+    url = base_url or (named.base_url if named is not None else None)
+    name = provider_name(backend, url)
+    # An Ollama host is settled here, so the cell calls the host the baseline called.
+    url = (url or _ollama_host(settings)) if backend == "ollama" else resolve_base_url(name, url)
+    entry = entries.get(name) or named
+    saved_key = entry.api_key if entry is not None else None
+    # By the name it was saved under: aimed at a company, the key of a server the user
+    # runs is still that server's.
+    if entry is not None and is_self_hosted(entry.name) and not same_place(url, entry.base_url):
+        saved_key = None
+    for key, source in (
+        ((env.get(TARGET_KEY_ENV) or "").strip(), TARGET_KEY_ENV),
+        (harness_key, harness_key_from),
+        (saved_key, "the saved config"),
+        (own_key_for(name, settings), own_key_env(name) or ""),
+    ):
+        if key and takes_a_key(name):
+            return Provider(name=name, base_url=url, api_key=key, key_from=source)
+    return Provider(name=name, base_url=url)
+
+
+def unknown(*names: str, flag: str = "") -> str:
+    """The one wording for a name that is no provider's, led by the flag it came from."""
+    return (
+        f"{flag + ' ' if flag else ''}{', '.join(names)}: not a provider iterate knows. "
+        f"Choose from {', '.join(known_providers())}"
+    )
+
+
+def _ollama_host(settings: object | None) -> str | None:
+    if settings is None:
+        from iterate.config import get_settings
+
+        settings = get_settings()
+    host = getattr(settings, "ollama_host", None)
+    return str(host) if host else None
+
+
+def _bad_address(provider: Provider, given_as: str) -> str | None:
+    """Why an address cannot be used, or None. It is written into meta.json, which is
+    delivered with the run, and a key is sent to it. ``given_as`` names where it came
+    from, the flag or the saved file, so the refusal says what to change."""
+    url = provider.base_url or ""
+    what = given_as or f"the base URL saved for {provider.name}"
+    try:
+        parsed = urlparse(url)
+        parsed.port  # noqa: B018  a port that is not a number raises here
+    except ValueError:
+        return f"{what} cannot be read: check its port"
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return f"{what} has to start with http:// or https:// and name a host"
+    if any(ch.isspace() or ord(ch) < 32 for ch in url):
+        return f"{what} holds a space or a character that cannot be sent"
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return (
+            f"{what} carries a user name, a password or a token. Give the address "
+            f"without it, and the key in {TARGET_KEY_ENV} or `iterate setup`"
+        )
+    if provider.api_key and parsed.scheme == "http" and alias_for_base_url(url) is not None:
+        return (
+            f"{provider.name} takes its key over https only: {shown(url)} would send it "
+            f"in the clear. Pass the https:// address"
+        )
+    return None
+
+
+def not_callable(provider: Provider, *, in_a_cell: bool = False, given_as: str = "") -> str | None:
+    """Why the model under test cannot be called, or None when it can. ``in_a_cell``
+    words the remedy for a kernel or a notebook run by hand, which reads the
+    environment alone. ``given_as`` is the flag its address came from, if one did."""
+    if is_self_hosted(provider.name) and not provider.base_url:
+        return (
+            f"{provider.name} is a server you run, so it has no address of its own: "
+            f"save its base URL with `iterate setup` or pass --target-base-url"
+        )
+    if provider.base_url and (why := _bad_address(provider, given_as)) is not None:
+        return why
+    if provider.needs_key and not provider.api_key:
+        variable = own_key_env(provider.name)
+        if in_a_cell:
+            return f"{provider.name} has no key here: set {variable} or {TARGET_KEY_ENV}"
+        return f"{provider.name} has no key: save one with `iterate setup` or set {variable}"
+    return None
+
+
+def not_ready(provider: Provider) -> str | None:
+    """Why a provider the list allows could not be called, in a few words, or None. No
+    flag of a run mends it: the run calls another provider."""
+    if is_self_hosted(provider.name) and not provider.base_url:
+        return "no base URL saved"
+    if provider.base_url and _bad_address(provider, "") is not None:
+        return "its saved address cannot be used"
+    if provider.needs_key and not provider.api_key:
+        return f"no key, set {own_key_env(provider.name)}"
+    return None
+
+
+def refused_key(
+    provider: Provider,
+    *,
+    timeout: float = 5.0,
+    lister: Callable[[Provider, float], None] | None = None,
+) -> str | None:
+    """Ask the provider for its model list, which costs nothing, and return why it
+    refused the key, or None. Only a plain no to the key is a refusal. A provider that
+    cannot be reached, a key that may chat and may not list models, a list that cannot
+    be read: the run goes on, and the first real call says so."""
+    if not provider.api_key or provider.name not in _PROVIDERS:
+        return None
+    ask = lister or _LISTERS.get(_PROVIDERS[provider.name].wire)
+    if ask is None:
+        return None
+    try:
+        ask(provider, timeout)
+    except Exception as exc:
+        # Read off the status, not the class: each wire's library has its own classes.
+        if getattr(exc, "status_code", None) == 401:
+            remedy = (
+                f"unset {TARGET_KEY_ENV} to use the key saved for {provider.name}"
+                if provider.key_from == TARGET_KEY_ENV
+                else f"export {TARGET_KEY_ENV} for this run"
+            )
+            return (
+                f"{_host(provider.base_url) or provider.name} refused the {provider.name} "
+                f"key from {provider.key_from}. Check the key, or {remedy}"
+            )
+        logger.info("could not check the %s key (%s)", provider.name, type(exc).__name__)
+    return None
+
+
+def _list_models(provider: Provider, timeout: float) -> None:
+    from openai import OpenAI
+
+    OpenAI(
+        base_url=provider.base_url,
+        api_key=provider.api_key,
+        timeout=timeout,
+        max_retries=0,
+        default_headers=headers_left_out(provider.base_url or "", provider.api_key),
+    ).models.list()
+
+
+# How each wire lists its models. The call is looked up when it is made.
+_LISTERS: dict[str, Callable[[Provider, float], None]] = {
+    "openai": lambda provider, timeout: _list_models(provider, timeout),
+}
+
+
+def build_target_client(
+    backend: str, *, model: str, base_url: str | None, api_key: str | None
+) -> LLMClient:
+    """The client for the model under test. Its endpoint and its key are always given
+    to it, so it never falls through to the harness's settings."""
+    if backend == "ollama":
+        return build_client(backend, model=model, base_url=base_url, api_key=None)
+    if base_url is None and is_self_hosted(backend):
+        # A run folder from before v0.7 wrote no address for a server the user runs:
+        # its notebook finds the server where that run did, in the environment.
+        from iterate.config import get_settings
+
+        base_url = get_settings().iterate_backend_url
+    provider = Provider(
+        name=provider_name(backend, base_url),
+        base_url=resolve_base_url(backend, base_url),
+        api_key=None if api_key == NO_KEY else api_key,
+    )
+    if (why := not_callable(provider, in_a_cell=True)) is not None:
+        raise ProviderError(why)
+    return build_client(
+        backend, model=model, base_url=provider.base_url, api_key=provider.api_key or NO_KEY
+    )
+
+
+def cache_scope(backend: str, base_url: str | None) -> str:
+    """Who answered: the provider and the host it was called at. Two providers that
+    serve a model under one name give different answers."""
+    url = base_url if backend == "ollama" else resolve_base_url(backend, base_url)
+    try:
+        parsed = urlparse(url or "")
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return f"{backend}|"
+    where = f"{_host(url)}{port}{parsed.path.rstrip('/')}" if parsed.hostname else ""
+    return f"{provider_name(backend, base_url)}|{where}"
+
+
+def allowed_names(names: Iterable[str]) -> tuple[str, ...]:
+    """A list of provider names checked against the ones iterate knows."""
+    cleaned = tuple(dict.fromkeys(n.strip().lower() for n in names if n and n.strip()))
+    if strangers := [n for n in cleaned if n not in _PROVIDERS]:
+        raise ProviderError(unknown(*strangers))
+    return cleaned
+
+
 __all__ = [
+    "NO_KEY",
+    "TARGET_KEY_ENV",
+    "Provider",
+    "ProviderError",
+    "UnderTest",
     "UnknownBackendError",
     "alias_for_base_url",
+    "allowed_names",
     "api_key_for",
     "build_client",
+    "build_target_client",
+    "cache_scope",
+    "harness_backends",
+    "is_self_hosted",
+    "known_providers",
+    "not_callable",
+    "not_ready",
+    "own_key_env",
+    "own_key_for",
+    "prompt_provider",
+    "provider_name",
+    "refused_key",
     "resolve_base_url",
+    "same_place",
+    "shown",
+    "takes_a_key",
+    "unknown",
 ]

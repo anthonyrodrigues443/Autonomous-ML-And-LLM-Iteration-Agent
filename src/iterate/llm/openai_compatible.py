@@ -10,12 +10,14 @@ shape and the response back to a normalized ``ChatResponse``.
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 from openai import (
     APIConnectionError,
     APITimeoutError,
     InternalServerError,
+    Omit,
     OpenAI,
     RateLimitError,
 )
@@ -31,6 +33,46 @@ if TYPE_CHECKING:
 
 # Transient failures worth retrying; bad requests / auth errors are not.
 _RETRYABLE = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
+
+
+_OPENAI_ONLY = ("OpenAI-Organization", "OpenAI-Project")
+
+
+def headers_left_out(base_url: str, api_key: str | None = None) -> dict[str, Any]:
+    """The headers the OpenAI library would add from the environment that this host is
+    not to be sent, each marked as left out.
+
+    The library reads OPENAI_ORG_ID, OPENAI_PROJECT_ID and OPENAI_CUSTOM_HEADERS for
+    every client it builds, wherever that client points. The first two are OpenAI's
+    alone. The custom headers are for OpenAI or for a gateway the user put in front of
+    it, so an address the user gave still gets them; the public address of another
+    company iterate knows does not.
+    """
+    # Imported here: the factory imports this module.
+    from iterate.llm.factory import alias_for_base_url
+
+    company = alias_for_base_url(base_url)
+    if company == "openai":
+        return {}
+    lines = os.environ.get("OPENAI_CUSTOM_HEADERS", "").split("\n")
+    pairs = [line.partition(":") for line in lines if ":" in line]
+    written = {name.strip(): value.strip() for name, _, value in pairs if name.strip()}
+    left_out: dict[str, Any] = {name: Omit() for name in _OPENAI_ONLY}
+    if company is None:
+        # A line the user wrote for this address goes through, under the library's
+        # spelling so it is sent once.
+        for theirs, value in written.items():
+            for ours in _OPENAI_ONLY:
+                if theirs.lower() == ours.lower():
+                    left_out[theirs] = Omit()
+                    left_out[ours] = value
+        return left_out
+    left_out |= {name: Omit() for name in written}
+    if "Authorization" in left_out:
+        # Left out under the library's own spelling, the client could not send the key
+        # it was given.
+        left_out["Authorization"] = f"Bearer {api_key}" if api_key else Omit()
+    return left_out
 
 
 def _parse_arguments(raw: str | None) -> dict[str, Any]:
@@ -63,10 +105,13 @@ class OpenAICompatibleClient:
     ) -> None:
         settings = get_settings()
         self._model = model if model is not None else settings.iterate_model
+        url = base_url if base_url is not None else settings.iterate_backend_url
+        key = api_key if api_key is not None else settings.iterate_backend_api_key
         self._client = OpenAI(
-            base_url=base_url if base_url is not None else settings.iterate_backend_url,
-            api_key=api_key if api_key is not None else settings.iterate_backend_api_key,
+            base_url=url,
+            api_key=key,
             timeout=timeout if timeout is not None else settings.iterate_backend_timeout,
+            default_headers=headers_left_out(url, key),
         )
 
     @property
@@ -172,4 +217,4 @@ class OpenAICompatibleClient:
         )
 
 
-__all__ = ["OpenAICompatibleClient"]
+__all__ = ["OpenAICompatibleClient", "headers_left_out"]

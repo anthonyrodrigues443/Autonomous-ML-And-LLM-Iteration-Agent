@@ -29,6 +29,8 @@ from iterate.cli import (
 from iterate.schemas.experiment import Candidate, Experiment, ExperimentResult, Metrics
 
 # Error panels wrap at the terminal width, which can split a phrase a test looks for.
+pytestmark = pytest.mark.unit
+
 runner = CliRunner(env={"COLUMNS": "1000"})
 
 
@@ -157,6 +159,7 @@ def test_run_rejects_cloud_backend_without_api_key(
         "groq_api_key",
         "together_api_key",
         "deepseek_api_key",
+        "iterate_backend_api_key",
     ):
         monkeypatch.setattr(cli_module.get_settings(), env_attr, None, raising=False)
 
@@ -1068,6 +1071,1062 @@ def test_a_table_run_and_a_prompt_run_hand_the_coder_no_network_slot(
         assert "keep_model" not in kw
         assert captured["coder"]._keep_model is None
     assert built[0]["family"] == "prompt"
+
+
+# ─── two sets of model settings: the harness and the model under test (v0.7 Day 5) ───
+
+_PROVIDER_KEYS = (
+    "OPENAI_API_KEY",
+    "GROQ_API_KEY",
+    "TOGETHER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "ITERATE_BACKEND_API_KEY",
+    "ITERATE_TARGET_API_KEY",
+)
+
+
+def _prompt_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    saved: dict[str, Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """A prompt run with no provider key in the environment but the ones given, in a
+    folder of its own. Returns the CLI result and what the prompt target was built
+    with; the run is stubbed, so nothing is called."""
+    from iterate import userconfig
+    from iterate.config import get_settings
+
+    lines = ["text,label"] + [
+        f"comment {i},{'toxic' if i % 3 == 0 else 'clean'}" for i in range(30)
+    ]
+    (tmp_path / "eval.csv").write_text("\n".join(lines), encoding="utf-8")
+    # Each call starts from a folder no run has touched, with a memory from a run before
+    # and --fresh: a refusal below the archive would move it.
+    import shutil
+
+    shutil.rmtree(tmp_path / ".iterate", ignore_errors=True)
+    for left in tmp_path.glob("m*"):
+        left.unlink()
+    (tmp_path / "m.db").write_bytes(_THE_RUN_BEFORE)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    for name in _PROVIDER_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
+    if saved is not None:
+        userconfig.save_user_config(
+            saved.get("harness", {"backend": "ollama"}),
+            allowed=saved.get("allowed"),
+            providers=saved.get("providers", {}),
+        )
+    built: dict[str, Any] = {}
+    real = cli_module._build_prompt_target
+
+    def spy(dataset: Any, **kwargs: Any) -> Any:
+        built.update(kwargs)
+        return real(dataset, **kwargs)
+
+    monkeypatch.setattr(cli_module, "_build_prompt_target", spy)
+    captured = _stub_run_supervised(monkeypatch)
+    get_settings.cache_clear()
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "run",
+                *["--data", "eval.csv", "--target", "label", "--metric", "f1"],
+                *["--task", "say whether the comment is toxic"],
+                *["--no-research", "--plain", "--fresh", "--memory", str(tmp_path / "m.db")],
+                *extra,
+            ],
+        )
+    finally:
+        get_settings.cache_clear()
+    built["kernel"] = captured.get("kernel")
+    return result, built
+
+
+_THE_RUN_BEFORE = b"the run before"
+
+
+def _refused(result: Any, tmp_path: Path) -> str:
+    """The refusal's text, from a run that wrote nothing and moved nothing."""
+    assert result.exit_code != 0, result.output
+    assert not (tmp_path / ".iterate").exists()
+    assert sorted(p.name for p in tmp_path.glob("m*")) == ["m.db"]
+    assert (tmp_path / "m.db").read_bytes() == _THE_RUN_BEFORE
+    return " ".join(_plain(result.output).split())
+
+
+def test_the_model_under_test_never_takes_the_harness_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--backend", "ollama", "--base-url", "http://gpu-box:11434"],
+            *["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+        ],
+        env={"GROQ_API_KEY": "gsk-env"},
+    )
+    assert result.exit_code == 0, result.output
+    assert built["base_url"] == "https://api.groq.com/openai/v1"
+    assert (built["api_key"], built["kernel"]._target_key) == ("gsk-env", "gsk-env")
+    assert (
+        "model under test: groq llama-3.3-70b at https://api.groq.com/openai/v1, "
+        "key from GROQ_API_KEY" in " ".join(_plain(result.output).split())
+    )
+
+
+def test_the_harness_model_as_its_own_model_under_test_keeps_its_address_and_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--backend", "openai-compatible", "--base-url", "http://gpu-box:8000/v1"],
+            *["--api-key", "box-key", "--model", "my-llama"],
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["backend"], built["model"]) == ("openai-compatible", "my-llama")
+    assert (built["base_url"], built["api_key"]) == ("http://gpu-box:8000/v1", "box-key")
+
+
+def test_a_harness_found_through_the_environment_is_its_own_model_under_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ITERATE_BACKEND_URL` is how `.env.example` points the harness at a server. The
+    same model as the model under test is called at the same place."""
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--backend", "openai-compatible", "--model", "my-llama"],
+        env={
+            "ITERATE_BACKEND_URL": "http://gpu-box:8000/v1",
+            "ITERATE_BACKEND_API_KEY": "box-key",
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["base_url"], built["api_key"]) == ("http://gpu-box:8000/v1", "box-key")
+
+
+def test_the_model_under_test_has_an_address_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--target-backend", "vllm", "--target-model", "my-llama"],
+            *["--target-base-url", "http://gpu-box:8000/v1"],
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # The host is told there is no key, so it never looks for one in the environment.
+    assert (built["base_url"], built["api_key"]) == ("http://gpu-box:8000/v1", "not-needed")
+    assert built["kernel"]._target_key is None
+    assert "at http://gpu-box:8000/v1, no key sent" in " ".join(_plain(result.output).split())
+
+
+def test_an_ollama_model_under_test_is_handed_its_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settled on the host and written into meta.json, so the cell calls the host the
+    baseline called whatever its own environment says."""
+    result, built = _prompt_run(
+        tmp_path, monkeypatch, ["--model", "gemma4:12b"], env={"OLLAMA_HOST": "http://box:11434"}
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["backend"], built["base_url"]) == ("ollama", "http://box:11434")
+
+
+def test_a_key_saved_for_a_provider_reaches_the_model_under_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "openai", "--target-model", "gpt-4o-mini"],
+        saved={
+            "allowed": ["openai"],
+            "providers": {"openai": SavedProvider("openai", api_key="sk-saved-for-prompts")},
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert built["kernel"]._target_key == "sk-saved-for-prompts"
+    text = " ".join(_plain(result.output).split())
+    assert "key from the saved config; prompt providers allowed: openai" in text
+    assert "sk-saved-for-prompts" not in text
+
+
+def test_a_provider_outside_the_list_is_refused_before_its_key_is_looked_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.llm import factory
+    from iterate.userconfig import SavedProvider
+
+    looked_up: list[str] = []
+    real = factory.own_key_for
+    monkeypatch.setattr(
+        factory,
+        "own_key_for",
+        lambda name, *a, **kw: looked_up.append(name) or real(name, *a, **kw),
+    )
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+        env={"GROQ_API_KEY": "gsk-env"},
+        saved={
+            "allowed": ["openai"],
+            "providers": {"openai": SavedProvider("openai", api_key="sk-saved")},
+        },
+    )
+    text = _refused(result, tmp_path)
+    assert "served by groq, which is not among the prompt providers you allow (openai)" in text
+    assert "Pass --providers groq for this run" in text
+    assert "groq" not in looked_up
+
+
+def test_a_runs_own_list_replaces_the_saved_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    saved = {
+        "allowed": ["openai"],
+        "providers": {"openai": SavedProvider("openai", api_key="sk-saved")},
+    }
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "groq", "--target-model", "llama-3.3-70b", "--providers", "groq"],
+        env={"GROQ_API_KEY": "gsk-env"},
+        saved=saved,
+    )
+    assert result.exit_code == 0, result.output
+    assert built["api_key"] == "gsk-env"
+
+    # It replaces the list, it does not add to it: what was saved is now outside.
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "openai", "--target-model", "gpt-4o-mini", "--providers", "groq"],
+        env={"GROQ_API_KEY": "gsk-env"},
+        saved=saved,
+    )
+    text = _refused(result, tmp_path)
+    assert "served by openai, which is not among the prompt providers you allow (groq)" in text
+
+
+def test_every_allowed_provider_needs_its_key_before_anything_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+            *["--providers", "groq,openai,vllm"],
+        ],
+        env={"GROQ_API_KEY": "gsk-env", "ITERATE_BACKEND_API_KEY": "the-harness-key"},
+    )
+    assert _refused(result, tmp_path).endswith(
+        "these allowed prompt providers are not ready: openai (no key, set OPENAI_API_KEY), "
+        "vllm (no base URL saved). Save them with `iterate setup`, or pass --providers groq "
+        "to allow only the model under test"
+    )
+
+
+def test_the_model_under_test_with_no_key_is_refused_and_never_takes_the_harness_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+        env={"ITERATE_BACKEND_API_KEY": "the-harness-key", "OPENAI_API_KEY": "sk-other"},
+    )
+    assert "groq has no key" in _refused(result, tmp_path)
+
+
+def test_the_exported_target_key_is_the_model_under_tests_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+            *["--providers", "groq,openai"],
+        ],
+        env={"ITERATE_TARGET_API_KEY": "gsk-for-this-run"},
+    )
+    text = _refused(result, tmp_path)
+    assert "are not ready: openai (no key, set OPENAI_API_KEY)." in text
+    assert "groq (" not in text
+
+
+def test_a_key_the_provider_refuses_stops_the_run_before_anything_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openai import AuthenticationError
+
+    def refuses(provider: Any, timeout: float) -> None:
+        response = type("R", (), {"request": None, "status_code": 401, "headers": {}})()
+        raise AuthenticationError("bad key", response=response, body=None)
+
+    monkeypatch.setattr("iterate.llm.factory._list_models", refuses)
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+        env={"GROQ_API_KEY": "gsk-wrong"},
+    )
+    text = _refused(result, tmp_path)
+    assert "api.groq.com refused the groq key from GROQ_API_KEY" in text
+    assert "gsk-wrong" not in text
+
+
+def test_a_prompt_run_on_e2b_is_refused_before_anything_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path, monkeypatch, ["--compute", "e2b"], env={"E2B_API_KEY": "e2b-key"}
+    )
+    text = _refused(result, tmp_path)
+    assert "a prompt run cannot use --compute e2b" in text
+    assert "Pass --compute local" in text
+
+
+def test_a_model_under_test_named_apart_needs_its_own_model_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--model", "gemma4:12b", "--target-backend", "groq"],
+        env={"GROQ_API_KEY": "gsk-env"},
+    )
+    assert "--target-backend groq needs --target-model" in _refused(result, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("extra", "said"),
+    [
+        (
+            ["--target-backend", "grok", "--target-model", "m"],
+            "grok: not a provider iterate knows. Choose from ollama, deepseek, groq",
+        ),
+        (["--providers", "openia"], "openia: not a provider iterate knows. Choose from"),
+        (
+            ["--target-backend", "vllm", "--target-model", "m"],
+            "vllm is a server you run, so it has no address of its own",
+        ),
+        (
+            [
+                *["--target-backend", "vllm", "--target-model", "m"],
+                *["--target-base-url", "http://me:pw@gpu:8000/v1"],
+            ],
+            "carries a user name, a password or a token",
+        ),
+        (
+            [
+                *["--target-backend", "vllm", "--target-model", "m"],
+                *["--target-base-url", "https://gpu.test/v1?api_key=pw@in-the-query"],
+            ],
+            "carries a user name, a password or a token",
+        ),
+        (
+            [
+                *["--target-backend", "vllm", "--target-model", "m"],
+                *["--target-base-url", "https://gpu.test:abc/v1"],
+            ],
+            "cannot be read: check its port",
+        ),
+        (
+            [
+                *["--target-backend", "vllm", "--target-model", "m"],
+                *["--target-base-url", "gpu.test/v1"],
+            ],
+            "has to start with http:// or https://",
+        ),
+    ],
+)
+def test_a_model_under_test_that_cannot_be_called_is_refused_up_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str], said: str
+) -> None:
+    result, _ = _prompt_run(tmp_path, monkeypatch, extra)
+    text = _refused(result, tmp_path)
+    assert said in text
+    assert "pw@" not in text
+
+
+def test_a_companys_address_with_a_port_on_it_is_still_that_company(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Named groq and aimed at OpenAI's host: it is openai, which the list leaves out,
+    and the Groq key stays where it is."""
+    from iterate.userconfig import SavedProvider
+
+    for address in ("https://api.openai.com:443/v1", "https://API.openai.com./v1"):
+        result, _ = _prompt_run(
+            tmp_path,
+            monkeypatch,
+            [
+                *["--target-backend", "openai-compatible", "--target-model", "gpt-4o-mini"],
+                *["--target-base-url", address],
+            ],
+            saved={
+                "allowed": ["groq"],
+                "providers": {"groq": SavedProvider("groq", api_key="gsk-saved-for-groq")},
+            },
+        )
+        text = _refused(result, tmp_path)
+        assert "served by openai, which is not among the prompt providers you allow" in text
+
+
+def test_a_company_reached_in_the_clear_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--target-backend", "openai", "--target-model", "gpt-4o-mini"],
+            *["--target-base-url", "http://api.openai.com/v1"],
+        ],
+        env={"OPENAI_API_KEY": "sk-env"},
+    )
+    assert "openai takes its key over https only" in _refused(result, tmp_path)
+
+
+def test_a_server_saved_under_its_own_name_at_a_companys_address_runs_under_either_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    saved = {
+        "allowed": ["openai-compatible"],
+        "providers": {
+            "openai-compatible": SavedProvider(
+                "openai-compatible", api_key="sk-saved", base_url="https://api.openai.com/v1"
+            )
+        },
+    }
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "openai-compatible", "--target-model", "gpt-4o-mini"],
+        saved=saved,
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["base_url"], built["api_key"]) == ("https://api.openai.com/v1", "sk-saved")
+    assert "model under test: openai gpt-4o-mini" in " ".join(_plain(result.output).split())
+
+
+def test_a_key_saved_for_a_server_you_run_goes_to_that_server_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    saved = {
+        "allowed": ["vllm"],
+        "providers": {
+            "vllm": SavedProvider("vllm", api_key="key-of-server-a", base_url="http://a.test/v1")
+        },
+    }
+    target = ["--target-backend", "vllm", "--target-model", "m"]
+    result, built = _prompt_run(tmp_path, monkeypatch, target, saved=saved)
+    assert result.exit_code == 0, result.output
+    assert (built["base_url"], built["api_key"]) == ("http://a.test/v1", "key-of-server-a")
+
+    result, built = _prompt_run(
+        tmp_path, monkeypatch, [*target, "--target-base-url", "http://b.test/v1"], saved=saved
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["base_url"], built["api_key"]) == ("http://b.test/v1", "not-needed")
+
+
+def test_with_no_list_saved_the_key_saved_for_the_provider_named_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+        saved={
+            "allowed": None,
+            "providers": {
+                "groq": SavedProvider("groq", api_key="gsk-saved"),
+                "openai": SavedProvider("openai", api_key="sk-never-read"),
+            },
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert built["api_key"] == "gsk-saved"
+    assert "prompt providers allowed" not in _plain(result.output)
+
+
+def test_the_harness_model_under_test_is_called_where_the_harness_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An address saved for the prompt provider of the same name is not the harness's."""
+    from iterate.userconfig import SavedProvider
+
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--model", "llama-3.3-70b"],
+        saved={
+            "harness": {"backend": "groq", "api_key": "gsk-saved-harness"},
+            "allowed": ["groq"],
+            "providers": {"groq": SavedProvider("groq", base_url="https://gateway.test/v1")},
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert built["base_url"] == "https://api.groq.com/openai/v1"
+    assert built["api_key"] == "gsk-saved-harness"
+    text = " ".join(_plain(result.output).split())
+    assert "key from the saved config (the harness's key)" in text
+
+
+def test_a_harness_aimed_at_a_company_takes_that_companys_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`openai-compatible` names a wire, not a company: aimed at Groq it reads Groq's
+    key, and OpenAI's stays home."""
+    harness = ["--backend", "openai-compatible", "--model", "llama-3.3-70b"]
+    harness += ["--base-url", "https://api.groq.com/openai/v1"]
+    result, _ = _prompt_run(tmp_path, monkeypatch, harness, env={"OPENAI_API_KEY": "sk-openai"})
+    assert "requires --api-key" in _refused(result, tmp_path)
+
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        harness,
+        env={"OPENAI_API_KEY": "sk-openai", "GROQ_API_KEY": "gsk-env"},
+    )
+    assert result.exit_code == 0, result.output
+    assert built["api_key"] == "gsk-env"
+    assert "key from GROQ_API_KEY" in " ".join(_plain(result.output).split())
+
+
+def test_every_allowed_provider_is_settled_with_its_key_in_hand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    settled: list[Any] = []
+    real = cli_module._model_under_test
+    monkeypatch.setattr(
+        cli_module, "_model_under_test", lambda **kw: settled.append(real(**kw)) or settled[-1]
+    )
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "groq", "--target-model", "llama-3.3-70b"],
+        env={"GROQ_API_KEY": "gsk-env", "ITERATE_TARGET_API_KEY": "gsk-this-run"},
+        saved={
+            "allowed": ["openai", "groq", "ollama"],
+            "providers": {"openai": SavedProvider("openai", api_key="sk-saved")},
+        },
+    )
+    assert result.exit_code == 0, result.output
+    (found,) = settled
+    assert (found.backend, found.model, found.listed) == (
+        "groq",
+        "llama-3.3-70b",
+        ("openai", "groq", "ollama"),
+    )
+    assert {p.name: p.api_key for p in found.allowed} == {
+        "groq": "gsk-this-run",
+        "openai": "sk-saved",
+        "ollama": None,
+    }
+
+
+def test_the_help_names_every_provider_iterate_knows() -> None:
+    from iterate.llm import factory
+
+    text = " ".join(_plain(runner.invoke(app, ["run", "--help"]).output).split())
+    for name in factory.known_providers():
+        assert name in text
+
+
+def test_moved_to_another_address_the_model_under_test_leaves_the_harness_key_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = ["--backend", "openai", "--api-key", "sk-the-harness-key", "--model", "gpt-4o-mini"]
+    result, _ = _prompt_run(
+        tmp_path, monkeypatch, [*harness, "--target-base-url", "https://gateway.test/v1"]
+    )
+    text = _refused(result, tmp_path)
+    assert "openai has no key" in text
+
+    result, built = _prompt_run(
+        tmp_path, monkeypatch, [*harness, "--target-base-url", "https://api.openai.com/v1/"]
+    )
+    assert result.exit_code == 0, result.output
+    assert built["api_key"] == "sk-the-harness-key"
+
+
+def test_a_provider_the_run_does_not_call_is_not_mended_by_a_flag_of_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path, monkeypatch, ["--model", "gemma4:12b", "--providers", "ollama,vllm"]
+    )
+    text = _refused(result, tmp_path)
+    assert "not ready: vllm (no base URL saved)" in text
+    assert "--target-base-url" not in text
+    assert "pass --providers ollama" in text
+
+
+def test_named_apart_on_the_harnesss_own_backend_it_still_takes_nothing_of_the_harnesss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model name is the backend's and carries over. The key and the address are the
+    harness's and do not: by the flag, or saved."""
+    from iterate.userconfig import SavedProvider
+
+    named = ["--backend", "groq", "--model", "llama-3.3-70b", "--target-backend", "groq"]
+    result, _ = _prompt_run(tmp_path, monkeypatch, [*named, "--api-key", "gsk-the-harness-key"])
+    assert "groq has no key" in _refused(result, tmp_path)
+
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--model", "llama-3.3-70b", "--target-backend", "groq"],
+        saved={"harness": {"backend": "groq", "api_key": "gsk-saved-harness-key"}},
+    )
+    assert "groq has no key" in _refused(result, tmp_path)
+
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [*named, "--api-key", "gsk-the-harness-key"],
+        saved={"allowed": None, "providers": {"groq": SavedProvider("groq", api_key="gsk-own")}},
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["model"], built["api_key"]) == ("llama-3.3-70b", "gsk-own")
+
+
+def test_named_apart_with_no_model_name_anywhere_it_takes_the_default_the_harness_takes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--backend", "groq", "--target-backend", "groq"],
+        env={"GROQ_API_KEY": "gsk-env", "ITERATE_MODEL": "model-from-the-environment"},
+    )
+    assert result.exit_code == 0, result.output
+    assert built["model"] == "model-from-the-environment"
+
+
+def test_named_apart_it_does_not_follow_the_harness_to_its_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before v0.7 it did, so the run that relied on it is told what to pass, not moved
+    to another server without a word."""
+    flags = ["--backend", "ollama", "--base-url", "http://gpu-box:11434", "--model", "gemma4:12b"]
+    result, _ = _prompt_run(tmp_path, monkeypatch, [*flags, "--target-backend", "ollama"])
+    text = _refused(result, tmp_path)
+    assert "Pass --target-base-url http://gpu-box:11434, or drop --target-backend" in text
+
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [*flags, "--target-backend", "ollama", "--target-base-url", "http://gpu-box:11434"],
+    )
+    assert result.exit_code == 0, result.output
+    assert built["base_url"] == "http://gpu-box:11434"
+
+
+def test_a_saved_list_that_cannot_be_read_refuses_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read as no list, it would let the run call a provider the user ruled out."""
+    from iterate import userconfig
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    path = userconfig.config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text("[prompt]\nallowed = 5\n", encoding="utf-8")
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "groq", "--target-model", "m"],
+        env={"GROQ_API_KEY": "gsk-env"},
+    )
+    assert "has to be a list of names" in _refused(result, tmp_path)
+
+
+def test_a_saved_file_that_is_not_toml_refuses_any_run_by_its_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate import userconfig
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    monkeypatch.chdir(tmp_path)
+    path = userconfig.config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text('backend = "groq\n', encoding="utf-8")
+    result = runner.invoke(
+        app, ["run", "--data", str(data), "--target", "churn", "--metric", "f1", "--plain"]
+    )
+    assert result.exit_code == 2
+    assert "is not valid TOML" in " ".join(_plain(result.output).split())
+    assert not (tmp_path / ".iterate").exists()
+
+
+def test_a_saved_key_with_no_backend_beside_it_is_the_runs_backends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--backend", "groq"],
+        saved={"harness": {"model": "saved-model", "api_key": "gsk-saved"}},
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["model"], built["api_key"]) == ("saved-model", "gsk-saved")
+
+
+def test_a_name_on_the_list_does_not_cover_a_company_it_is_aimed_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The list names where records may go. `vllm` on it is the server saved as vllm,
+    not OpenAI reached through the name."""
+    from iterate.llm import factory
+    from iterate.userconfig import SavedProvider
+
+    looked_up: list[str] = []
+    real = factory.own_key_for
+    monkeypatch.setattr(
+        factory,
+        "own_key_for",
+        lambda name, *a, **kw: looked_up.append(name) or real(name, *a, **kw),
+    )
+    saved = {
+        "allowed": ["vllm"],
+        "providers": {
+            "vllm": SavedProvider("vllm", api_key="key-of-server-a", base_url="http://a.test/v1")
+        },
+    }
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--target-backend", "vllm", "--target-model", "gpt-4o-mini"],
+            *["--target-base-url", "https://api.openai.com/v1"],
+        ],
+        env={"OPENAI_API_KEY": "sk-env"},
+        saved=saved,
+    )
+    text = _refused(result, tmp_path)
+    assert "served by openai, which is not among the prompt providers you allow (vllm)" in text
+    assert "Pass --providers openai for this run" in text
+    assert "openai" not in looked_up
+
+
+def test_aimed_at_a_company_by_a_flag_the_saved_key_of_your_server_is_not_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    saved = {
+        "allowed": None,
+        "providers": {
+            "vllm": SavedProvider("vllm", api_key="key-of-server-a", base_url="http://a.test/v1")
+        },
+    }
+    flags = ["--target-backend", "vllm", "--target-model", "gpt-4o-mini"]
+    flags += ["--target-base-url", "https://api.openai.com/v1"]
+    result, _ = _prompt_run(tmp_path, monkeypatch, flags, saved=saved)
+    assert "openai has no key" in _refused(result, tmp_path)
+
+    result, built = _prompt_run(
+        tmp_path, monkeypatch, flags, env={"OPENAI_API_KEY": "sk-env"}, saved=saved
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["api_key"], built["kernel"]._target_key) == ("sk-env", "sk-env")
+
+
+def test_an_ollama_model_under_test_aimed_at_a_company_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--target-backend", "ollama", "--target-model", "m"],
+            *["--target-base-url", "https://api.openai.com/v1"],
+        ],
+        env={"OPENAI_API_KEY": "sk-env"},
+    )
+    text = _refused(result, tmp_path)
+    assert "is openai's address, not an Ollama server. Pass --target-backend openai" in text
+
+
+def test_a_key_saved_over_https_is_not_sent_over_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    saved = {
+        "allowed": ["vllm"],
+        "providers": {
+            "vllm": SavedProvider("vllm", api_key="key-a", base_url="https://llm.corp.test/v1")
+        },
+    }
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--target-backend", "vllm", "--target-model", "m"],
+            *["--target-base-url", "http://llm.corp.test/v1"],
+        ],
+        saved=saved,
+    )
+    assert result.exit_code == 0, result.output
+    assert built["api_key"] == "not-needed"
+
+    harness = ["--backend", "vllm", "--base-url", "https://llm.corp.test/v1", "--model", "x"]
+    harness += ["--api-key", "the-harness-key"]
+    result, built = _prompt_run(
+        tmp_path, monkeypatch, [*harness, "--target-base-url", "http://llm.corp.test/v1"]
+    )
+    assert result.exit_code == 0, result.output
+    assert built["api_key"] == "not-needed"
+
+
+def test_named_apart_it_is_called_at_the_address_saved_for_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The harness has an address of its own and so has the provider: nothing was taken
+    from the harness, so nothing is refused."""
+    from iterate.userconfig import SavedProvider
+
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--backend", "ollama", "--base-url", "http://gpu-box:11434", "--model", "gemma4:12b"],
+            *["--target-backend", "ollama"],
+        ],
+        saved={
+            "allowed": None,
+            "providers": {"ollama": SavedProvider("ollama", base_url="http://under-test:11434")},
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert built["base_url"] == "http://under-test:11434"
+
+
+def test_the_harness_model_on_ollama_is_under_test_where_the_harness_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.userconfig import SavedProvider
+
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--model", "gemma4:12b"],
+        saved={
+            "allowed": None,
+            "providers": {"ollama": SavedProvider("ollama", base_url="http://saved-box:11434")},
+        },
+    )
+    assert result.exit_code == 0, result.output
+    assert built["base_url"] == "http://localhost:11434"
+
+
+def test_the_provider_of_the_model_under_test_is_read_whatever_its_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", " GROQ", "--target-model", "llama-3.3-70b"],
+        env={"GROQ_API_KEY": "gsk-env"},
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["backend"], built["api_key"]) == ("groq", "gsk-env")
+
+
+def test_a_refusal_names_the_flag_its_value_came_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for flags, said in (
+        (["--target-backend", "grok", "--target-model", "m"], "--target-backend grok: not a"),
+        (["--providers", "openia"], "--providers openia: not a provider"),
+        (
+            [
+                *["--target-backend", "vllm", "--target-model", "m"],
+                *["--target-base-url", "gpu.test/v1"],
+            ],
+            "--target-base-url gpu.test/v1 has to start with http:// or https://",
+        ),
+        (
+            [
+                *["--backend", "vllm", "--model", "m", "--api-key", "k"],
+                *["--base-url", "http://me:pw@gpu.test/v1"],
+            ],
+            "--base-url http://gpu.test/v1 carries a user name, a password or a token",
+        ),
+    ):
+        result, _ = _prompt_run(tmp_path, monkeypatch, flags)
+        text = _refused(result, tmp_path)
+        assert said in text
+        assert "pw@" not in text
+
+
+def test_a_harness_the_environment_aims_at_a_company_takes_that_companys_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ITERATE_BACKEND_URL` is the address the client calls when no flag gives one, so
+    it is the address the key is picked by."""
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--backend", "openai-compatible", "--model", "gpt-4o-mini"],
+        env={"ITERATE_BACKEND_URL": "https://api.openai.com/v1", "OPENAI_API_KEY": "sk-env"},
+    )
+    assert result.exit_code == 0, result.output
+    assert (built["base_url"], built["api_key"]) == ("https://api.openai.com/v1", "sk-env")
+    text = " ".join(_plain(result.output).split())
+    assert "model under test: openai gpt-4o-mini" in text
+    assert "key from OPENAI_API_KEY (the harness's key)" in text
+
+
+def test_a_harness_with_no_key_is_told_which_variables_it_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cases: tuple[tuple[list[str], dict[str, Any] | None, str], ...] = (
+        (["--backend", "groq"], None, "GROQ_API_KEY or ITERATE_BACKEND_API_KEY in the environment"),
+        (
+            ["--backend", "openai-compatible", "--base-url", "http://gpu.test/v1"],
+            None,
+            "requires --api-key, or ITERATE_BACKEND_API_KEY in the environment "
+            "(OPENAI_API_KEY is not read for a server you run)",
+        ),
+        (
+            ["--backend", "openai"],
+            {"harness": {"backend": "groq", "api_key": "gsk-saved"}},
+            "The key saved is for groq, so it is not sent here",
+        ),
+        (
+            ["--backend", "vllm", "--base-url", "http://b.test/v1"],
+            {"harness": {"backend": "vllm", "api_key": "k", "base_url": "http://a.test/v1"}},
+            "The key saved is for vllm at http://a.test/v1, so it is not sent here",
+        ),
+    )
+    for flags, saved, said in cases:
+        result, _ = _prompt_run(tmp_path, monkeypatch, [*flags, "--model", "m"], saved=saved)
+        assert said in _refused(result, tmp_path)
+
+
+def test_the_flags_of_a_prompt_run_are_refused_on_a_run_that_is_not_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    monkeypatch.chdir(tmp_path)
+    _stub_run_supervised(monkeypatch)
+    for flag in (["--providers", "openai"], ["--target-base-url", "http://gpu:8000/v1"]):
+        result = runner.invoke(
+            app, ["run", "--data", str(data), "--target", "churn", "--metric", "f1", *flag]
+        )
+        assert result.exit_code != 0
+        assert "this run has no --task" in " ".join(_plain(result.output).split())
+
+
+def test_a_key_saved_for_the_harness_is_not_sent_to_another_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The saved key is the saved backend's. `--backend groq` on a file saved for openai
+    finds groq's own key, or none."""
+    from iterate import userconfig
+    from iterate.config import get_settings
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    for name in _PROVIDER_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    userconfig.save_user_config(
+        {"backend": "openai", "model": "gpt-4o", "api_key": "sk-saved-for-openai"}
+    )
+    seen: list[dict[str, Any]] = []
+    captured = _stub_run_supervised(monkeypatch)
+    import iterate.llm.factory as factory_module
+
+    fake = factory_module.build_client
+    monkeypatch.setattr(
+        factory_module, "build_client", lambda name, **kw: seen.append(kw) or fake(name, **kw)
+    )
+    argv = ["run", "--data", str(data), "--target", "churn", "--metric", "f1", "--no-research"]
+    argv += ["--plain", "--memory", str(tmp_path / "m.db"), "--backend", "groq"]
+    get_settings.cache_clear()
+    try:
+        refused = runner.invoke(app, argv)
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-env")
+        get_settings.cache_clear()
+        ran = runner.invoke(app, argv)
+    finally:
+        get_settings.cache_clear()
+    assert refused.exit_code != 0
+    assert "requires --api-key" in _plain(refused.output)
+    assert ran.exit_code == 0, ran.output
+    assert captured["kernel"] is not None
+    assert {kw["api_key"] for kw in seen} == {"gsk-env"}
+    assert {kw["model"] for kw in seen} == {None}
+
+
+def test_an_e2b_run_with_no_key_keeps_the_memory_it_had(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal sits above the archive: `--fresh` on a run that cannot start moves
+    nothing."""
+    from iterate.config import get_settings
+
+    data = tmp_path / "d.csv"
+    _write_tiny_csv(data)
+    memory = tmp_path / "m.db"
+    memory.write_bytes(b"the run before")
+    monkeypatch.delenv("E2B_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+    try:
+        result = runner.invoke(
+            app,
+            [
+                *["run", "--data", str(data), "--target", "churn", "--metric", "f1"],
+                *["--compute", "e2b", "--fresh", "--plain", "--memory", str(memory)],
+            ],
+        )
+    finally:
+        get_settings.cache_clear()
+    assert result.exit_code != 0
+    assert "E2B API key" in result.output
+    assert memory.read_bytes() == b"the run before"
+    assert sorted(p.name for p in tmp_path.glob("m*")) == ["m.db"]
 
 
 # ─── cells never install; the harness installs for local runs with consent ───

@@ -19,8 +19,18 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from iterate.adapters.compute import confine
-from iterate.adapters.compute.kernel import KERNEL_SECRETS, Blocked, E2BKernel, LocalKernel
+from iterate.adapters.compute.kernel import (
+    KERNEL_SECRETS,
+    KEY_HIDDEN,
+    Blocked,
+    CellResult,
+    E2BKernel,
+    LocalKernel,
+    is_secret,
+)
 from iterate.config import Settings
+
+pytestmark = pytest.mark.unit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -279,16 +289,192 @@ def test_a_tabular_kernel_sees_no_provider_key(
 
 
 def test_a_prompt_kernel_sees_only_its_target_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Read back reversed: printed as it is, the key would come out hidden."""
     monkeypatch.setenv("GROQ_API_KEY", "gsk-driver")
     monkeypatch.setenv("ITERATE_TARGET_API_KEY", "inherited")
-    seen = _env_of(LocalKernel(target_key="gsk-target"), ("GROQ_API_KEY", "ITERATE_TARGET_API_KEY"))
-    assert seen == {"GROQ_API_KEY": None, "ITERATE_TARGET_API_KEY": "gsk-target"}
+    kernel = LocalKernel(target_key="gsk-target")
+    kernel.start({})
+    try:
+        result = kernel.run_cell(
+            "import os\n"
+            "print(os.environ.get('GROQ_API_KEY'), os.environ['ITERATE_TARGET_API_KEY'][::-1])",
+            timeout=60,
+        )
+    finally:
+        kernel.close()
+    assert result.ok, result.error
+    assert result.stdout.split() == ["None", "gsk-target"[::-1]]
 
 
 def test_every_settings_key_is_kept_from_the_kernel() -> None:
     keys = {name.upper() for name in Settings.model_fields if name.endswith("_key")}
     assert keys
     assert keys <= KERNEL_SECRETS
+
+
+def test_every_providers_own_key_is_kept_from_the_kernel() -> None:
+    """A provider added to the factory brings a key variable with it."""
+    from iterate.llm import factory
+
+    own = {factory.own_key_env(name) for name in factory.known_providers()} - {None}
+    assert {"OPENAI_API_KEY", "GROQ_API_KEY"} <= own
+    assert all(is_secret(str(name)) for name in own)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        *["MISTRAL_API_KEY", "openrouter_api_key", "GROQ_API_KEY_2", "API_KEY", "OPENAI_KEY"],
+        *["ANTHROPIC_AUTH_TOKEN", "GITHUB_TOKEN", "API_TOKEN_GITHUB", "AWS_BEARER_TOKEN_BEDROCK"],
+        *["AWS_SECRET_ACCESS_KEY", "AZURE_CLIENT_SECRET", "GITHUB_PAT", "MYSQL_PWD", "PASSWD"],
+        *["DISCORD_WEBHOOK_URL", "GOOGLE_APPLICATION_CREDENTIALS", "ITERATE_BACKEND_URL"],
+        *["KAGGLE_KEY", "STRIPE_KEY_LIVE"],
+    ],
+)
+def test_a_name_that_reads_as_a_secret_is_kept_from_the_kernel(name: str) -> None:
+    assert is_secret(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        *["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_HUB_DISABLE_IMPLICIT_TOKEN"],
+        *["TOKENIZERS_PARALLELISM", "KEYRING_BACKEND", "MONKEY", "PATH", "HOME", "TMPDIR"],
+        *["PYTHONPATH", "OLLAMA_HOST", "OLLAMA_NUM_PARALLEL", "TORCH_HOME", "HF_HOME"],
+        *["XDG_CACHE_HOME", "CUDA_VISIBLE_DEVICES", "PYTORCH_ENABLE_MPS_FALLBACK"],
+        *["OMP_NUM_THREADS", "KMP_DUPLICATE_LIB_OK", "SSH_AUTH_SOCK", "ITERATE_MODEL"],
+        *["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPS_PROXY", "NO_PROXY"],
+        # Read by the OpenAI client a cell's `ask` builds, which sends them where the
+        # host's client does.
+        *["OPENAI_ORG_ID", "OPENAI_PROJECT_ID", "OPENAI_CUSTOM_HEADERS"],
+    ],
+)
+def test_what_a_cell_needs_is_not_taken_for_a_secret(name: str) -> None:
+    assert not is_secret(name)
+
+
+def test_a_key_nobody_listed_does_not_reach_a_cell(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "secret")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "secret")
+    names = ("MISTRAL_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+    assert _env_of(LocalKernel(), names) == dict.fromkeys(names)
+
+
+def test_a_cell_that_prints_its_key_shows_it_hidden() -> None:
+    kernel = LocalKernel(target_key="gsk-the-target-key")
+    result = kernel._hidden(
+        CellResult(
+            stdout="key is gsk-the-target-key\n",
+            stderr="gsk-the-target-key",
+            error="AuthError: gsk-the-target-key was refused",
+            outputs=[{"type": "stream", "name": "stdout", "text": "key is gsk-the-target-key\n"}],
+            restarted=True,
+        )
+    )
+    assert "gsk-the-target-key" not in repr(result)
+    assert result.stdout == f"key is {KEY_HIDDEN}\n"
+    assert result.outputs[0]["text"] == f"key is {KEY_HIDDEN}\n"
+    assert result.restarted is True
+
+
+@pytest.mark.parametrize("key", ['sk-with"quote', "sk-with\\backslash", "sk-ünïcode-key"])
+def test_a_key_with_an_odd_character_is_hidden_too(key: str) -> None:
+    outputs = [
+        {"type": "display_data", "data": {"text/plain": f"<{key}>", "n": 3}, "metadata": {}},
+        {"type": "error", "traceback": [f"Bearer {key}", "line 2"], "evalue": key},
+    ]
+    result = LocalKernel(target_key=key)._hidden(CellResult(stdout=key, stderr="", outputs=outputs))
+    assert key not in repr(result)
+    assert result.outputs[0]["data"] == {"text/plain": f"<{KEY_HIDDEN}>", "n": 3}
+    assert result.outputs[1]["traceback"] == [f"Bearer {KEY_HIDDEN}", "line 2"]
+
+
+def test_a_key_printed_in_two_writes_is_hidden_as_the_notebook_shows_it() -> None:
+    from iterate.deliver.notebook import _settled
+
+    key = "gsk-the-target-key-0123456789"
+    outputs = [
+        {"type": "stream", "name": "stdout", "text": key[:12]},
+        {"type": "stream", "name": "stdout", "text": key[12:] + "\n"},
+        {"type": "stream", "name": "stderr", "text": "a warning\n"},
+    ]
+    result = LocalKernel(target_key=key)._hidden(
+        CellResult(stdout=key + "\n", stderr="a warning\n", outputs=outputs)
+    )
+    assert key not in repr(_settled(result.outputs))
+    assert [o["text"] for o in result.outputs] == [f"{KEY_HIDDEN}\n", "a warning\n"]
+    assert outputs[0]["text"] == key[:12]  # the captured record is not changed
+
+
+def test_a_file_a_cell_wrote_comes_back_with_the_key_hidden(tmp_path: Path) -> None:
+    key = "gsk-the-target-key-0123456789"
+    kernel = LocalKernel(target_key=key)
+    kernel._workdir = tmp_path
+    (tmp_path / "prompt.json").write_text(f'{{"system": "use {key}"}}', encoding="utf-8")
+    (tmp_path / "predictions.csv").write_bytes(b"prediction\ntoxic\n")
+    assert kernel.read_output("prompt.json") == f'{{"system": "use {KEY_HIDDEN}"}}'.encode()
+    assert kernel.read_output("predictions.csv") == b"prediction\ntoxic\n"
+    assert kernel.read_output("missing.csv") is None
+
+
+def test_a_key_cut_short_is_hidden_too() -> None:
+    """The harness's own summary of a cell's names cuts every value at 40 characters."""
+    key = "gsk_" + "a1B2c3D4e5" * 5
+    shown = f"k = '{key[:39]}\n"
+    result = LocalKernel(target_key=key)._hidden(CellResult(stdout=shown, stderr=""))
+    assert result.stdout == f"k = '{KEY_HIDDEN}\n"
+    untouched = "gsk_ is how a groq key starts\n"
+    assert LocalKernel(target_key=key)._hidden(CellResult(untouched, "")).stdout == untouched
+
+
+def test_a_key_in_pieces_under_a_name_or_under_colour_is_hidden_too() -> None:
+    key = "gsk-the-target-key-0123456789"
+    red = f"\x1b[31m{key[:10]}\x1b[0m{key[10:]}"
+    outputs = [
+        {"type": "stream", "name": "stdout", "text": key[:8]},
+        {"type": "stream", "name": "stderr", "text": "a warning\n"},
+        {"type": "stream", "name": "stdout", "text": key[8:20]},
+        {"type": "stream", "name": "stdout", "text": key[20:] + "\n"},
+        {"type": "display_data", "data": {"application/json": {key: 1}}, "metadata": {}},
+        {"type": "error", "ename": "E", "evalue": "x", "traceback": [red, "line 2"]},
+    ]
+    result = LocalKernel(target_key=key)._hidden(CellResult("", "", outputs=outputs))
+    assert key not in repr(result.outputs)
+    assert key[:10] not in repr(result.outputs)
+    assert [o.get("text") for o in result.outputs if o["type"] == "stream"] == [
+        f"{KEY_HIDDEN}\n",
+        "a warning\n",
+    ]
+    assert result.outputs[2]["data"] == {"application/json": {KEY_HIDDEN: 1}}
+    assert result.outputs[3]["traceback"] == [KEY_HIDDEN, "line 2"]
+
+
+def test_a_file_that_is_not_text_comes_back_byte_for_byte(tmp_path: Path) -> None:
+    key = "gsk-the-target-key-0123456789"
+    kernel = LocalKernel(target_key=key)
+    kernel._workdir = tmp_path
+    weights = b"\x80\x04\x95 weights " + key.encode() + b" \xff\xfe more"
+    (tmp_path / "best_model.pt").write_bytes(weights)
+    assert kernel.read_output("best_model.pt") == weights
+
+
+def test_a_cell_of_a_run_with_no_key_is_left_as_it_is() -> None:
+    result = CellResult(stdout="nothing to hide", stderr="", outputs=[{"text": "x"}])
+    assert LocalKernel()._hidden(result) is result
+    assert LocalKernel(target_key="short")._hidden(result) is result
+
+
+def test_the_key_a_live_cell_prints_is_hidden() -> None:
+    kernel = LocalKernel(target_key="gsk-the-target-key")
+    kernel.start({})
+    try:
+        result = kernel.run_cell(
+            "import os\nprint(os.environ['ITERATE_TARGET_API_KEY'])", timeout=60
+        )
+    finally:
+        kernel.close()
+    assert result.ok, result.error
+    assert result.stdout.strip() == KEY_HIDDEN
 
 
 # ─── sandboxed kernels (macOS) ─────────────────────────────────────────────

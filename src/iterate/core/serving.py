@@ -283,9 +283,9 @@ def provider_for(backend: str, base_url: str | None) -> str:
     """The provider whose price list applies: a cloud alias as given, or the alias whose
     endpoint an explicit base URL points at, so `--backend openai-compatible` aimed at
     OpenAI prices as OpenAI."""
-    from iterate.llm.factory import alias_for_base_url
+    from iterate.llm.factory import provider_name
 
-    return alias_for_base_url(base_url) or backend
+    return provider_name(backend, base_url)
 
 
 def facts_from_prompt(

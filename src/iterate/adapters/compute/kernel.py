@@ -37,6 +37,7 @@ INTERRUPT_SETTLE_SECONDS = 10.0
 # Cells get none of the harness's own keys. A prompt kernel gets only its target's key.
 KERNEL_SECRETS = frozenset(
     {
+        "ITERATE_BACKEND_URL",
         "ITERATE_BACKEND_API_KEY",
         "ITERATE_TARGET_API_KEY",
         "E2B_API_KEY",
@@ -53,6 +54,85 @@ KERNEL_SECRETS = frozenset(
         "LANGFUSE_SECRET_KEY",
     }
 )
+
+# A name reads as a secret when one of these is a whole word of it, between underscores:
+# TOKENIZERS_PARALLELISM holds no token.
+_SECRET_WORDS = frozenset(
+    {
+        *("KEY", "APIKEY", "TOKEN", "PAT", "SECRET", "SECRETS", "CREDENTIALS"),
+        *("PASSWORD", "PASSWD", "PWD", "WEBHOOK"),
+    }
+)
+# Gated weights download with the first two, and a cell downloads weights. The third is
+# a switch that keeps the token from being sent, not a token.
+_KEPT = frozenset({"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HF_HUB_DISABLE_IMPLICIT_TOKEN"})
+KEY_HIDDEN = "[key hidden]"
+# No provider's key is this short, and hiding a word of a few letters would eat the
+# output it happens to sit in.
+_SHORTEST_KEY = 8
+# What of a key is enough to know it by: a cut key is still most of a key.
+_KEY_HEAD = 12
+
+
+def is_secret(name: str) -> bool:
+    """Whether a variable of the host's is kept out of every kernel."""
+    upper = name.upper()
+    if upper in _KEPT:
+        return False
+    return upper in KERNEL_SECRETS or not _SECRET_WORDS.isdisjoint(upper.split("_"))
+
+
+def _shape_of(key: str) -> re.Pattern[str]:
+    """The key, whole or cut short after its first characters."""
+    if len(key) <= _KEY_HEAD:
+        return re.compile(re.escape(key))
+    return re.compile(re.escape(key[:_KEY_HEAD]) + r"[A-Za-z0-9_.\-]*")
+
+
+def _without(value: Any, key: re.Pattern[str]) -> Any:
+    """Every string inside a cell's outputs, names and values, with the key taken out."""
+    if isinstance(value, str):
+        return key.sub(KEY_HIDDEN, value)
+    if isinstance(value, list):
+        return [_without(item, key) for item in value]
+    if isinstance(value, dict):
+        return {_without(name, key): _without(item, key) for name, item in value.items()}
+    return value
+
+
+def _joined(outputs: list[dict[str, Any]], key: re.Pattern[str]) -> list[dict[str, Any]]:
+    """The outputs as the delivered notebook shows them, where a key could be put back
+    together: neighbouring stream outputs of one name as one output, a stream whose
+    pieces hold the key between them as one output, and a traceback without its colour
+    codes when the key sits under them."""
+    joined: list[dict[str, Any]] = []
+    for output in outputs:
+        last = joined[-1] if joined else None
+        if (
+            last is not None
+            and last.get("type") == output.get("type") == "stream"
+            and last.get("name", "stdout") == output.get("name", "stdout")
+        ):
+            last["text"] = f"{last.get('text', '')}{output.get('text', '')}"
+        else:
+            joined.append(dict(output))
+    for name in {o.get("name", "stdout") for o in joined if o.get("type") == "stream"}:
+        pieces = [
+            o for o in joined if o.get("type") == "stream" and o.get("name", "stdout") == name
+        ]
+        if len(pieces) > 1 and not any(key.search(str(o.get("text", ""))) for o in pieces):
+            whole = "".join(str(o.get("text", "")) for o in pieces)
+            if key.search(whole):
+                pieces[0]["text"] = whole
+                joined = [o for o in joined if not any(o is later for later in pieces[1:])]
+    for output in joined:
+        lines = output.get("traceback")
+        if output.get("type") == "error" and isinstance(lines, list):
+            plain = [_strip_ansi(str(line)) for line in lines]
+            if key.search("\n".join(plain)) and not key.search("\n".join(map(str, lines))):
+                output["traceback"] = plain
+    return joined
+
 
 # Introspects the live namespace so the agent can see what it has defined (and not
 # re-import / re-derive / mis-name). Defensive per-variable; skips modules/functions.
@@ -200,9 +280,7 @@ class LocalKernel:
         # torch_shm_manager binds a unix socket under TMPDIR, capped at 104 bytes.
         self._scratch = tempfile.TemporaryDirectory(prefix="itk-", dir="/tmp")
         scratch = Path(os.path.realpath(self._scratch.name))
-        env = {
-            k: v for k, v in os.environ.items() if k != "OLDPWD" and k.upper() not in KERNEL_SECRETS
-        }
+        env = {k: v for k, v in os.environ.items() if k != "OLDPWD" and not is_secret(k)}
         env |= {
             "PWD": os.path.realpath(self._workdir),
             "TMPDIR": str(scratch),
@@ -298,7 +376,23 @@ class LocalKernel:
                 )
             elif mtype == "status" and content.get("execution_state") == "idle":
                 break
-        return CellResult("".join(out), "".join(err), error=error, outputs=outputs)
+        return self._hidden(CellResult("".join(out), "".join(err), error=error, outputs=outputs))
+
+    def _hidden(self, result: CellResult) -> CellResult:
+        """The cell's result with the model under test's key taken out. A cell can read
+        the one key it was handed, and what a cell prints goes to the harness model and
+        into the delivered notebook."""
+        if not self._target_key or len(self._target_key) < _SHORTEST_KEY:
+            return result
+        key = _shape_of(self._target_key)
+        return CellResult(
+            stdout=_without(result.stdout, key),
+            stderr=_without(result.stderr, key),
+            error=_without(result.error, key),
+            timed_out=result.timed_out,
+            outputs=_without(_joined(result.outputs, key), key),
+            restarted=result.restarted,
+        )
 
     def _stopped(
         self, msg_id: str, out: list[str], err: list[str], outputs: list[dict[str, Any]]
@@ -311,8 +405,10 @@ class LocalKernel:
         restarted = not self._interrupt(msg_id)
         if restarted:
             self.restart()
-        return CellResult(
-            "".join(out), "".join(err), timed_out=True, outputs=outputs, restarted=restarted
+        return self._hidden(
+            CellResult(
+                "".join(out), "".join(err), timed_out=True, outputs=outputs, restarted=restarted
+            )
         )
 
     def _interrupt(self, msg_id: str) -> bool:
@@ -383,7 +479,19 @@ class LocalKernel:
         if self._workdir is None:
             return None
         path = self._workdir / name
-        return path.read_bytes() if path.exists() else None
+        if not path.exists():
+            return None
+        data = path.read_bytes()
+        key = self._target_key
+        if not key or len(key) < _SHORTEST_KEY:
+            return data
+        # What a cell wrote is delivered: a prompt, its answers. Text only: in a file
+        # that is not text the longer word would move every byte behind it.
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        return _shape_of(key).sub(KEY_HIDDEN, text).encode("utf-8")
 
     def keepalive(self) -> None:
         """No-op: a local kernel subprocess survives idle time indefinitely."""
