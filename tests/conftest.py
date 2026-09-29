@@ -26,6 +26,13 @@ def _isolate_user_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
 
 
+@pytest.fixture(autouse=True)
+def _no_key_is_checked_over_the_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A prompt run asks its provider for the model list to check the key. No test may
+    reach a provider; one that tests the check passes its own lister."""
+    monkeypatch.setattr("iterate.llm.factory._list_models", lambda provider, timeout: None)
+
+
 @pytest.fixture
 def repo_root() -> Path:
     """Path to the repository root (where pyproject.toml lives)."""

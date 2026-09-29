@@ -331,16 +331,16 @@ def test_no_rows_means_no_calls() -> None:
     assert client.calls == []
 
 
-def test_the_model_under_test_resolves_its_key_the_same_way_the_agent_does(
+def test_the_model_under_test_finds_its_providers_own_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`--target-backend groq` must pick up GROQ_API_KEY, which is already in the
-    environment for the driving model. One table, not two that agree until one
-    changes."""
+    """`--target-backend groq` picks up GROQ_API_KEY, which is how a delivered notebook
+    run by hand finds its key."""
     from iterate.config import get_settings
     from iterate.core.prompt_runtime import make_ask
 
     monkeypatch.setenv("GROQ_API_KEY", "gsk-from-the-environment")
+    monkeypatch.delenv("ITERATE_TARGET_API_KEY", raising=False)
     get_settings.cache_clear()
     seen: dict[str, object] = {}
 
@@ -358,7 +358,7 @@ def test_the_model_under_test_resolves_its_key_the_same_way_the_agent_does(
     assert seen["backend"] == "groq"
 
 
-def test_an_explicit_target_key_overrides_the_shared_resolution(
+def test_the_exported_target_key_beats_the_providers_own(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from iterate.core.prompt_runtime import make_ask
@@ -391,6 +391,154 @@ def test_ollama_gets_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
     make_ask(columns=["text"], labels=LABELS, backend="ollama", model="gemma4:12b")(PROMPT, ROWS)
 
     assert seen["api_key"] is None
+
+
+def test_the_key_the_host_settled_is_the_one_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    from iterate.core.prompt_runtime import make_ask
+
+    monkeypatch.setenv("ITERATE_TARGET_API_KEY", "from-the-environment")
+    seen: dict[str, object] = {}
+
+    def spy(name: str, **kwargs: object) -> FakeClient:
+        seen.update(kwargs)
+        return FakeClient([_tool_reply("toxic")])
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", spy)
+    make_ask(
+        columns=["text"], labels=LABELS, backend="groq", model="llama-70b", api_key="gsk-settled"
+    )(PROMPT, ROWS)
+
+    assert seen["api_key"] == "gsk-settled"
+    assert seen["base_url"] == "https://api.groq.com/openai/v1"
+
+
+def test_a_target_with_no_key_never_takes_the_harness_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generic slot holds the harness's key. A groq target with no key of its own
+    fails and says so; it is never sent that one."""
+    from iterate.config import get_settings
+    from iterate.core.prompt_runtime import make_ask
+    from iterate.llm.factory import ProviderError
+
+    monkeypatch.chdir(tmp_path)  # away from a project's .env, which holds keys of its own
+    monkeypatch.setenv("ITERATE_BACKEND_API_KEY", "the-harness-key")
+    for name in ("GROQ_API_KEY", "ITERATE_TARGET_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+    built: list[object] = []
+    monkeypatch.setattr(
+        "iterate.llm.factory.build_client", lambda name, **kw: built.append(kw) or FakeClient([])
+    )
+    try:
+        with pytest.raises(ProviderError, match="groq has no key"):
+            make_ask(columns=["text"], labels=LABELS, backend="groq", model="m")(PROMPT, ROWS)
+    finally:
+        get_settings.cache_clear()
+    assert built == []
+
+
+def test_two_providers_serving_one_model_name_do_not_share_answers(tmp_path: Path) -> None:
+    cache = AnswerCache(tmp_path / "answers.db")
+    first, second = FakeClient([_tool_reply("toxic")]), FakeClient([_tool_reply("not toxic")])
+    shared = {"columns": ["text"], "labels": LABELS, "cache": cache}
+
+    one = ask(PROMPT, ROWS[:1], client_factory=lambda: first, cache_scope="groq|a", **shared)
+    two = ask(PROMPT, ROWS[:1], client_factory=lambda: second, cache_scope="together|b", **shared)
+    again = AskStats()
+    ask(
+        PROMPT,
+        ROWS[:1],
+        client_factory=lambda: second,
+        cache_scope="groq|a",
+        stats=again,
+        **shared,
+    )
+
+    assert (one, two) == (["toxic"], ["not toxic"])
+    assert (again.calls, again.cached) == (0, 1)
+
+
+def test_the_ask_a_cell_builds_is_scoped_to_its_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from iterate.core.prompt_runtime import make_ask
+
+    replies = iter(["toxic", "not toxic"])
+    monkeypatch.setattr(
+        "iterate.llm.factory.build_client",
+        lambda name, **kw: FakeClient([_tool_reply(next(replies))], model="llama-70b"),
+    )
+    common = {"columns": ["text"], "labels": LABELS, "model": "llama-70b", "api_key": "k"}
+    path = tmp_path / "answers.db"
+    groq = make_ask(backend="groq", cache_path=path, scoped=True, **common)(PROMPT, ROWS[:1])
+    together = make_ask(backend="together", cache_path=path, scoped=True, **common)(
+        PROMPT, ROWS[:1]
+    )
+
+    assert (groq, together) == (["toxic"], ["not toxic"])
+
+
+def test_a_pass_served_whole_from_the_cache_needs_no_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delivered notebook run again beside its cache calls no one, so it is not asked
+    for a key it would not use. The first answer that is missing asks for it."""
+    from iterate.config import get_settings
+    from iterate.core.prompt_runtime import make_ask
+    from iterate.llm.factory import ProviderError
+
+    monkeypatch.chdir(tmp_path)  # away from a project's .env, which holds keys of its own
+    for name in ("GROQ_API_KEY", "ITERATE_TARGET_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+    common = {"columns": ["text"], "labels": LABELS, "backend": "groq", "model": "llama-70b"}
+    path = tmp_path / "answers.db"
+    monkeypatch.setattr(
+        "iterate.llm.factory.build_client",
+        lambda name, **kw: FakeClient([_tool_reply("toxic")], model="llama-70b"),
+    )
+    try:
+        make_ask(cache_path=path, scoped=True, api_key="gsk", **common)(PROMPT, ROWS[:1])
+        built: list[object] = []
+        monkeypatch.setattr("iterate.llm.factory.build_client", lambda name, **kw: built.append(kw))
+        stats = AskStats()
+        again = make_ask(cache_path=path, scoped=True, **common)(PROMPT, ROWS[:1], stats=stats)
+        with pytest.raises(ProviderError, match="groq has no key here"):
+            make_ask(cache_path=path, scoped=True, **common)(PROMPT, ROWS)
+    finally:
+        get_settings.cache_clear()
+    assert (again, stats.cached, stats.calls, built) == (["toxic"], 1, 0, [])
+
+
+def test_a_notebook_from_before_v07_finds_the_answers_it_paid_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its opening cell was written before there was a scope to pass. The key it looks
+    under is the one main filed this record under on 2026-09-27."""
+    import sqlite3
+
+    from iterate.core.prompt_runtime import make_ask
+
+    path = tmp_path / "answers.db"
+    AnswerCache(path).put(
+        "26aec45b8f568c22091e8f3fcea00f98d18f6026b9bba4a74cd35da24a842d6b", "toxic"
+    )
+    monkeypatch.setattr(
+        "iterate.llm.factory.build_client",
+        lambda name, **kw: FakeClient([_tool_reply("not toxic")], model="llama-70b"),
+    )
+    common = {"columns": ["text"], "labels": LABELS, "model": "llama-70b", "api_key": "k"}
+    old, new = AskStats(), AskStats()
+
+    before = make_ask(backend="groq", cache_path=path, **common)(PROMPT, ROWS[:1], stats=old)
+    after = make_ask(backend="groq", cache_path=path, scoped=True, **common)(
+        PROMPT, ROWS[:1], stats=new
+    )
+
+    assert (before, old.cached, old.calls) == (["toxic"], 1, 0)
+    assert (after, new.cached, new.calls) == (["not toxic"], 0, 1)
+    assert sqlite3.connect(path).execute("SELECT count(*) FROM answers").fetchone() == (2,)
 
 
 def test_a_contained_label_does_not_swallow_a_genuine_ambiguity() -> None:

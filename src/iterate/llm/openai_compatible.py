@@ -33,6 +33,50 @@ if TYPE_CHECKING:
 _RETRYABLE = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
 
 
+def keep_openais_own_at_home(client: OpenAI, base_url: str) -> OpenAI:
+    """The client, sending only this host what is this host's.
+
+    The OpenAI library reads OPENAI_ORG_ID, OPENAI_PROJECT_ID and OPENAI_CUSTOM_HEADERS
+    inside its constructor, for every client it builds, wherever that client points. The
+    two ids are OpenAI's alone. The custom headers are for OpenAI or for a gateway the
+    user put in front of it, so an address the user gave keeps them and the public
+    address of another company iterate knows is sent none.
+
+    Taken off the client once it is built, not marked as left out when it is built: what
+    a mark removes differs between versions of the library. A copy of the client
+    (`with_options`) reads the environment again, so iterate makes none.
+    """
+    # Imported here: the factory imports this module.
+    from iterate.llm.factory import alias_for_base_url
+
+    company = alias_for_base_url(base_url)
+    if company == "openai":
+        return client
+    if company is not None:
+        client.organization = None
+        client.project = None
+        client._custom_headers = {}
+        return client
+    # A gateway the user named: the two ids the library read from OPENAI_ORG_ID and
+    # OPENAI_PROJECT_ID stay home, and a line the user wrote for one of them in
+    # OPENAI_CUSTOM_HEADERS goes through. It is moved into the field the library sends
+    # it from, since the library's own mark for the field can outrank a line written
+    # in another case.
+    written = {name.lower(): name for name in client._custom_headers}
+    ids = {}
+    for field, header in (("organization", "openai-organization"), ("project", "openai-project")):
+        name = written.get(header)
+        ids[field] = str(client._custom_headers[name]) if name is not None else None
+    client._custom_headers = {
+        name: value
+        for name, value in client._custom_headers.items()
+        if name.lower() not in ("openai-organization", "openai-project")
+    }
+    client.organization = ids["organization"]
+    client.project = ids["project"]
+    return client
+
+
 def _parse_arguments(raw: str | None) -> dict[str, Any]:
     """Tool-call arguments as a dict, whatever the backend sent. Groq emits the
     string "null" for no-arg tools; weak models can emit malformed JSON — both
@@ -63,10 +107,15 @@ class OpenAICompatibleClient:
     ) -> None:
         settings = get_settings()
         self._model = model if model is not None else settings.iterate_model
-        self._client = OpenAI(
-            base_url=base_url if base_url is not None else settings.iterate_backend_url,
-            api_key=api_key if api_key is not None else settings.iterate_backend_api_key,
-            timeout=timeout if timeout is not None else settings.iterate_backend_timeout,
+        url = base_url if base_url is not None else settings.iterate_backend_url
+        key = api_key if api_key is not None else settings.iterate_backend_api_key
+        self._client = keep_openais_own_at_home(
+            OpenAI(
+                base_url=url,
+                api_key=key,
+                timeout=timeout if timeout is not None else settings.iterate_backend_timeout,
+            ),
+            url,
         )
 
     @property
@@ -172,4 +221,4 @@ class OpenAICompatibleClient:
         )
 
 
-__all__ = ["OpenAICompatibleClient"]
+__all__ = ["OpenAICompatibleClient", "keep_openais_own_at_home"]

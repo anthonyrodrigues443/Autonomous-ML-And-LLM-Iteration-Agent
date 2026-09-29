@@ -233,7 +233,7 @@ def prompt_session_preamble() -> str:
         "_ask = make_ask(columns=_columns, labels=_labels, numeric_range=_numeric, "
         "backend=_meta['target_backend'], model=_meta['target_model'], "
         "base_url=_meta.get('target_base_url'), cache_path=_meta.get('cache_path'), "
-        "max_workers=int(_meta.get('max_workers') or 8))\n"
+        "max_workers=int(_meta.get('max_workers') or 8), scoped=True)\n"
         "BASELINE_PROMPT = Prompt(**_meta['baseline_prompt'])\n"
         # Three sessions across two live runs died a cell each to NameError on
         # BASEL_PROMPT / BASELINES_PROMPT. The name is long and a 12B fumbles it; a
