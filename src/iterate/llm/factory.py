@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from iterate.llm.ollama_client import OllamaClient
-from iterate.llm.openai_compatible import OpenAICompatibleClient, headers_left_out
+from iterate.llm.openai_compatible import OpenAICompatibleClient, keep_openais_own_at_home
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -439,13 +439,10 @@ def refused_key(
 def _list_models(provider: Provider, timeout: float) -> None:
     from openai import OpenAI
 
-    OpenAI(
-        base_url=provider.base_url,
-        api_key=provider.api_key,
-        timeout=timeout,
-        max_retries=0,
-        default_headers=headers_left_out(provider.base_url or "", provider.api_key),
-    ).models.list()
+    client = OpenAI(
+        base_url=provider.base_url, api_key=provider.api_key, timeout=timeout, max_retries=0
+    )
+    keep_openais_own_at_home(client, provider.base_url or "").models.list()
 
 
 # How each wire lists its models. The call is looked up when it is made.

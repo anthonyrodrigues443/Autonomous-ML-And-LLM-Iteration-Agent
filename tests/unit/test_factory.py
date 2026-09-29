@@ -503,110 +503,143 @@ def test_a_refusal_is_read_off_the_status_whatever_the_library() -> None:
 _the_real_key_check = factory._list_models
 
 
-def test_the_key_check_sends_another_company_nothing_of_openais(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.fixture
+def sent_to(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """What a client built for an address sends there: the headers of one request, by
+    name in lower case. The transport is handed to the client as it is built, since a
+    copy of a client reads the environment again."""
     import httpx
     import openai
+
+    from iterate.llm import openai_compatible
 
     seen: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        seen.clear()
         seen.update({k.lower(): v for k, v in request.headers.items()})
         seen["url"] = str(request.url)
         return httpx.Response(200, json={"object": "list", "data": []})
 
     real = openai.OpenAI
-    monkeypatch.setattr(
-        openai,
-        "OpenAI",
-        lambda **kw: real(http_client=httpx.Client(transport=httpx.MockTransport(handler)), **kw),
-    )
+
+    def built(**kwargs: Any) -> Any:
+        return real(http_client=httpx.Client(transport=httpx.MockTransport(handler)), **kwargs)
+
+    monkeypatch.setattr(openai, "OpenAI", built)
+    monkeypatch.setattr(openai_compatible, "OpenAI", built)
+
+    def send(base_url: str) -> dict[str, str]:
+        OpenAICompatibleClient(base_url=base_url, model="m", api_key="k")._client.models.list()
+        return dict(seen)
+
+    send.seen = seen  # type: ignore[attr-defined]
+    return send
+
+
+_OPENAIS = ("openai-organization", "openai-project", "x-gateway-auth", "x-team")
+
+
+def _openais_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_ORG_ID", "org-mine")
-    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "X-Gateway-Auth: secret-token")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "proj-mine")
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "X-Gateway-Auth: secret-token\nX-Team: a")
+
+
+def test_the_key_check_sends_another_company_nothing_of_openais(
+    monkeypatch: pytest.MonkeyPatch, sent_to: Any
+) -> None:
+    _openais_environment(monkeypatch)
     found = _provider("groq", settings=_settings(groq_api_key="gsk-env"))
 
     _the_real_key_check(found, 5.0)
 
+    seen = sent_to.seen
     assert seen["url"] == "https://api.groq.com/openai/v1/models"
     assert seen["authorization"] == "Bearer gsk-env"
-    assert not {"openai-organization", "x-gateway-auth"} & set(seen)
-
-
-def _headers_sent_to(base_url: str) -> dict[str, str]:
-    import httpx
-
-    seen: dict[str, str] = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.update({k.lower(): v for k, v in request.headers.items()})
-        return httpx.Response(200, json={"object": "list", "data": []})
-
-    client = OpenAICompatibleClient(base_url=base_url, model="m", api_key="k")._client
-    client.with_options(
-        http_client=httpx.Client(transport=httpx.MockTransport(handler))
-    ).models.list()
-    return seen
+    assert not set(_OPENAIS) & set(seen)
 
 
 def test_what_the_environment_holds_for_openai_is_sent_to_openai_only(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, sent_to: Any
 ) -> None:
     """The OpenAI library reads these for every client it builds, wherever it points."""
-    monkeypatch.setenv("OPENAI_ORG_ID", "org-mine")
-    monkeypatch.setenv("OPENAI_PROJECT_ID", "proj-mine")
-    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "X-Gateway-Auth: secret-token\nX-Team: a")
-    ours = ("openai-organization", "openai-project", "x-gateway-auth", "x-team")
-
+    _openais_environment(monkeypatch)
     # Every company in the table but OpenAI, so one added later is covered.
     others = {k: v for k, v in factory._ALIAS_BASE_URLS.items() if k != "openai"}
     assert set(others) >= {"groq", "together", "deepseek"}
     for address in others.values():
-        sent = _headers_sent_to(address)
+        sent = sent_to(address)
         assert sent["authorization"] == "Bearer k"
-        assert not set(ours) & set(sent)
+        assert not set(_OPENAIS) & set(sent)
     for openai_itself in ("https://api.openai.com/v1", "https://API.openai.com:443/v1"):
-        sent = _headers_sent_to(openai_itself)
-        assert [sent[name] for name in ours] == ["org-mine", "proj-mine", "secret-token", "a"]
+        sent = sent_to(openai_itself)
+        assert [sent[name] for name in _OPENAIS] == ["org-mine", "proj-mine", "secret-token", "a"]
 
 
 def test_a_gateway_the_user_named_keeps_the_headers_it_was_given(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, sent_to: Any
 ) -> None:
     """An address the user typed or saved is theirs: the headers they set for it go
     with it. OpenAI's own two ids still go to OpenAI alone."""
-    monkeypatch.setenv("OPENAI_ORG_ID", "org-mine")
-    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "X-Gateway-Auth: secret-token")
+    _openais_environment(monkeypatch)
     for theirs in ("https://my-gateway.test/groq/v1", "http://localhost:11434/v1"):
-        sent = _headers_sent_to(theirs)
-        assert sent["x-gateway-auth"] == "secret-token"
-        assert "openai-organization" not in sent
+        sent = sent_to(theirs)
+        assert (sent["x-gateway-auth"], sent["x-team"]) == ("secret-token", "a")
+        assert not {"openai-organization", "openai-project"} & set(sent)
 
 
 @pytest.mark.parametrize("spelling", ["Authorization", "authorization", "AUTHORIZATION"])
 def test_a_key_in_the_custom_headers_never_replaces_the_key_given(
-    monkeypatch: pytest.MonkeyPatch, spelling: str
+    monkeypatch: pytest.MonkeyPatch, sent_to: Any, spelling: str
 ) -> None:
     monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", f"{spelling}: Bearer from-the-environment")
-    assert _headers_sent_to("https://api.groq.com/openai/v1")["authorization"] == "Bearer k"
+    assert sent_to("https://api.groq.com/openai/v1")["authorization"] == "Bearer k"
 
 
 @pytest.mark.parametrize("spelling", ["OpenAI-Organization", "openai-organization"])
 def test_a_line_the_user_wrote_for_a_gateway_goes_through(
-    monkeypatch: pytest.MonkeyPatch, spelling: str
+    monkeypatch: pytest.MonkeyPatch, sent_to: Any, spelling: str
 ) -> None:
     """The id from OPENAI_ORG_ID stays home. The same header written by hand for the
     address the user typed is theirs to send."""
     monkeypatch.setenv("OPENAI_ORG_ID", "org-from-the-variable")
     monkeypatch.setenv("OPENAI_PROJECT_ID", "proj-from-the-variable")
     monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", f"{spelling}: org-for-the-gateway")
-    sent = _headers_sent_to("https://my-gateway.test/v1")
+    sent = sent_to("https://my-gateway.test/v1")
     assert sent["openai-organization"] == "org-for-the-gateway"
     assert "openai-project" not in sent
 
 
-def test_a_host_under_a_companys_is_that_company(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_host_under_a_companys_is_that_company(
+    monkeypatch: pytest.MonkeyPatch, sent_to: Any
+) -> None:
     monkeypatch.setenv("OPENAI_ORG_ID", "org-mine")
     assert factory.alias_for_base_url("https://eu.api.openai.com/v1") == "openai"
-    assert _headers_sent_to("https://eu.api.openai.com/v1")["openai-organization"] == "org-mine"
+    assert sent_to("https://eu.api.openai.com/v1")["openai-organization"] == "org-mine"
     assert factory.alias_for_base_url("https://notapi.openai.com.test/v1") is None
+
+
+def test_a_client_that_was_cleaned_holds_nothing_of_the_environments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Read off the client, with no request made: what the library read in its
+    constructor is gone from it, whatever the library's version merges or drops."""
+    _openais_environment(monkeypatch)
+    monkeypatch.setenv(
+        "OPENAI_CUSTOM_HEADERS", "X-Gateway-Auth: secret-token\nauthorization: Bearer env"
+    )
+    groq = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1", model="m", api_key="k"
+    )._client
+    assert (groq.organization, groq.project, dict(groq._custom_headers)) == (None, None, {})
+    assert groq.api_key == "k"
+    gateway = OpenAICompatibleClient(
+        base_url="https://my-gateway.test/v1", model="m", api_key="k"
+    )._client
+    assert (gateway.organization, gateway.project) == (None, None)
+    assert {k.lower() for k in gateway._custom_headers} == {"x-gateway-auth", "authorization"}
+    openai_itself = OpenAICompatibleClient(
+        base_url="https://api.openai.com/v1", model="m", api_key="k"
+    )._client
+    assert (openai_itself.organization, openai_itself.project) == ("org-mine", "proj-mine")
