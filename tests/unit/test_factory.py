@@ -643,3 +643,43 @@ def test_a_client_that_was_cleaned_holds_nothing_of_the_environments(
         base_url="https://api.openai.com/v1", model="m", api_key="k"
     )._client
     assert (openai_itself.organization, openai_itself.project) == ("org-mine", "proj-mine")
+
+
+def _merged_as_openai_3_does(client: Any) -> dict[str, str]:
+    """The headers a client's defaults become under the OpenAI library 3.x, which CI
+    installs: names merged without regard to case, a later mark of left out removing
+    an earlier value. Replayed here so a machine on 2.x sees what CI sees."""
+    from openai import Omit
+
+    merged: dict[str, tuple[str, str]] = {}
+    for name, value in client.default_headers.items():
+        if isinstance(value, Omit):
+            merged.pop(name.lower(), None)
+        else:
+            merged[name.lower()] = (name, str(value))
+    return {name.lower(): value for name, value in merged.values()}
+
+
+@pytest.mark.parametrize(
+    "spelling", ["OpenAI-Organization", "openai-organization", "OPENAI-ORGANIZATION"]
+)
+def test_a_gateways_own_id_line_survives_the_merge_of_either_library(
+    monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    monkeypatch.setenv("OPENAI_ORG_ID", "org-from-the-variable")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "proj-from-the-variable")
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", f"{spelling}: org-for-the-gateway\nX-Team: a")
+    client = OpenAICompatibleClient(
+        base_url="https://my-gateway.test/v1", model="m", api_key="k"
+    )._client
+    assert (client.organization, client.project) == ("org-for-the-gateway", None)
+    sent = _merged_as_openai_3_does(client)
+    assert sent["openai-organization"] == "org-for-the-gateway"
+    assert "openai-project" not in sent
+    assert sent["x-team"] == "a"
+    groq = OpenAICompatibleClient(
+        base_url="https://api.groq.com/openai/v1", model="m", api_key="k"
+    )._client
+    assert not {"openai-organization", "openai-project", "x-team"} & set(
+        _merged_as_openai_3_does(groq)
+    )

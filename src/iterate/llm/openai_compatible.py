@@ -52,10 +52,28 @@ def keep_openais_own_at_home(client: OpenAI, base_url: str) -> OpenAI:
     company = alias_for_base_url(base_url)
     if company == "openai":
         return client
-    client.organization = None
-    client.project = None
     if company is not None:
+        client.organization = None
+        client.project = None
         client._custom_headers = {}
+        return client
+    # A gateway the user named: the two ids the library read from OPENAI_ORG_ID and
+    # OPENAI_PROJECT_ID stay home, and a line the user wrote for one of them in
+    # OPENAI_CUSTOM_HEADERS goes through. It is moved into the field the library sends
+    # it from, since the library's own mark for the field can outrank a line written
+    # in another case.
+    written = {name.lower(): name for name in client._custom_headers}
+    ids = {}
+    for field, header in (("organization", "openai-organization"), ("project", "openai-project")):
+        name = written.get(header)
+        ids[field] = str(client._custom_headers[name]) if name is not None else None
+    client._custom_headers = {
+        name: value
+        for name, value in client._custom_headers.items()
+        if name.lower() not in ("openai-organization", "openai-project")
+    }
+    client.organization = ids["organization"]
+    client.project = ids["project"]
     return client
 
 
