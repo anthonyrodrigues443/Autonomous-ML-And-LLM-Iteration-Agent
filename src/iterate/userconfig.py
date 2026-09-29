@@ -180,7 +180,7 @@ def _tables(providers: Any) -> dict[str, dict[str, Any]]:
 def save_user_config(
     values: dict[str, Any],
     *,
-    allowed: Iterable[str] | None | _Keep = KEEP,
+    allowed: Iterable[str] | _Keep | None = KEEP,
     providers: Mapping[str, SavedProvider] | _Keep = KEEP,
 ) -> Path:
     """Write the recognized, non-empty values to the config file, readable by its
