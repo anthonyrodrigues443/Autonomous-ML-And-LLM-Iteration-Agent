@@ -363,7 +363,8 @@ def test_the_client_reads_nothing_the_environment_holds(monkeypatch: pytest.Monk
     sdk = AnthropicClient(model="claude-haiku-4-5", api_key="sk-ant-given")._client
     assert str(sdk.base_url).rstrip("/") == "https://api.anthropic.com"
     assert (sdk.api_key, sdk.auth_token) == ("sk-ant-given", None)
-    assert dict(sdk._custom_headers) == {}
+    # What the client sends, not the attribute cleared: a renamed one would still send.
+    assert not {"X-Gateway-Auth", "X-Team"} & set(sdk.default_headers)
 
 
 def test_a_gateway_is_sent_what_a_cell_would_send_it(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -378,7 +379,7 @@ def test_a_gateway_is_sent_what_a_cell_would_send_it(monkeypatch: pytest.MonkeyP
         model="claude-haiku-4-5", api_key="k", base_url="https://gateway.test/anthropic"
     )._client
     assert str(sdk.base_url).rstrip("/") == "https://gateway.test/anthropic"
-    assert dict(sdk._custom_headers) == {}
+    assert "X-Gateway-Auth" not in sdk.default_headers
 
 
 # ─── which models the key is served ───────────────────────────────────────────

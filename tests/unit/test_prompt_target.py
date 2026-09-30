@@ -1021,10 +1021,49 @@ def test_two_passes_are_compared_on_the_records_both_got_an_answer_for(
 def test_a_session_that_lost_one_record_is_scored_on_the_rest(
     dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    out = _session(dataset, tmp_path, monkeypatch, misses=1000, failing=1)
+    out = _session(
+        dataset, tmp_path, monkeypatch, misses=1000, failing=1, cells=("submit(BASE)",)
+    )
 
     assert out.result.error is None
     assert out.result.metrics is not None
     assert out.result.metrics.n_samples == dataset.n_test - 1
     assert out.result.metrics.primary_value == 1.0
     assert json.loads(out.result.artifacts["answers.json"])[0] == "__no_reply__"
+    # Tokens per record are over the records answered: one never answered cost none.
+    assert json.loads(out.result.artifacts["prompt.json"])["tokens_in_per_record"] == 5.0
+
+
+def test_the_final_rescore_counts_the_records_it_scored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from rich.console import Console
+
+    from iterate.cli import _rescore_winner_on_full_holdout
+
+    def rows(n: int, name: str) -> TabularDataset:
+        lines = ["text,label"] + [f"comment {i},{'toxic' if i % 2 else 'fine'}" for i in range(n)]
+        (tmp_path / name).write_text("\n".join(lines), encoding="utf-8")
+        return load_csv(tmp_path / name, target="label")
+
+    full, loop = rows(40, "full.csv"), rows(20, "loop.csv")
+    lost = str(full.test_features["text"].iloc[0])
+
+    class OneLost(ScriptedClient):
+        def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
+            if str(messages[-1].content) == lost:
+                raise RuntimeError("connection refused")
+            return super().chat(messages, **kwargs)
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", lambda *a, **k: OneLost("toxic"))
+    winner = json.dumps({"system": "s", "user_template": "{text}"})
+    result = SimpleNamespace(
+        best=SimpleNamespace(result=SimpleNamespace(artifacts={codegen.PROMPT_JSON: winner}))
+    )
+    final = _rescore_winner_on_full_holdout(
+        result, full, _target(loop), console=Console(record=True, width=400)
+    )
+    assert final is not None
+    assert final["n"] == full.n_test - 1
