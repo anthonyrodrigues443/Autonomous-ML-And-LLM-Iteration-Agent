@@ -3121,3 +3121,41 @@ def test_a_network_held_back_then_trained_after_a_raise_is_not_called_never_trie
     text = _plain(captured.get())
     assert "never tried" not in text
     assert "no candidate beat the baseline." in text
+
+
+def test_the_summary_shows_the_common_records_comparison_it_banked_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stored, the winner's score is over fewer records and reads as worse than the
+    baseline; the bracket says what the loop weighed."""
+    from iterate.core.agent_loop import COMPARED_ON_COMMON
+    from iterate.core.orchestrator import RunResult
+
+    monkeypatch.setenv("COLUMNS", "200")
+    baseline = ExperimentResult(
+        experiment_id="b",
+        metrics=Metrics(values={"f1": 0.7}, primary="f1", direction="maximize", n_samples=20),
+    )
+    winner = Experiment(
+        candidate=Candidate(
+            description="shorter prompt",
+            changes={COMPARED_ON_COMMON: [0.6875, 0.625]},
+            rationale="r",
+        ),
+        target="t",
+        hypothesis="h",
+        status="completed",
+        iteration=1,
+        result=ExperimentResult(
+            experiment_id="e",
+            metrics=Metrics(
+                values={"f1": 0.6875}, primary="f1", direction="maximize", n_samples=16
+            ),
+        ),
+    )
+    result = RunResult(baseline=baseline, history=[winner], best=winner, stopped_because="patience")
+    with cli_module.console.capture() as captured:
+        cli_module._render_summary(result, "f1")
+    text = " ".join(_plain(captured.get()).split())
+    assert "(0.6875 vs 0.6250 on common records)" in text
+    assert "the loop weighed it against the best so far on the records both got answers for" in text

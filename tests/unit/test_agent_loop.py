@@ -1390,3 +1390,25 @@ def test_the_loop_weighs_a_pass_by_the_targets_paired_score() -> None:
     # Stored, 0.40 loses to the baseline's 0.50; on the common records it wins.
     assert result.best is not None
     assert result.best.result.metrics.primary_value == 0.40
+
+
+def test_the_loop_records_the_common_records_comparison_on_the_experiment() -> None:
+    from iterate.core.agent_loop import COMPARED_ON_COMMON
+
+    class _PairingTarget(_FakeTarget):
+        def paired_scores(
+            self, result: ExperimentResult, bar: ExperimentResult
+        ) -> tuple[float, float]:
+            return (0.61234, 0.5)
+
+    coders = iter([_FakeCoder(_result(0.40))])
+    result = run_supervised(
+        target=_PairingTarget(),  # type: ignore[arg-type]
+        dataset=object(),  # type: ignore[arg-type]
+        supervisor=_FakeSupervisor([SupervisorDecision(False, "a", "try a")]),  # type: ignore[arg-type]
+        make_coder=lambda: next(coders),  # type: ignore[arg-type,return-value]
+        terminator=MaxIterations(1),  # type: ignore[arg-type]
+        memory=InMemoryMemory(),
+        data_summary="d",
+    )
+    assert result.history[0].candidate.changes[COMPARED_ON_COMMON] == [0.6123, 0.5]

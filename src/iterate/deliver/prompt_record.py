@@ -181,8 +181,11 @@ def build(
         document["full_holdout_records"] = int(final_score["n"])
         document["note"] = (
             "Per-version scores below are on the smaller slice every candidate was "
-            "ranked against. best_score_on_full_holdout above is the winner measured "
-            "on the whole holdout and is the number to quote."
+            "ranked against, each over the records its pass got answers for. "
+            "best_score_on_full_holdout above is the winner measured on the whole "
+            "holdout, over full_holdout_records of its records, and is the number to "
+            "quote. The best is the loop's own: a pass the provider left records out of "
+            "was weighed against the best so far on the records both got answers for."
         )
     if serving is not None:
         document["serving"] = serving

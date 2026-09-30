@@ -3152,6 +3152,8 @@ def _render_summary(
     serving: ServingProfile | None = None,
     wall: Wall | None = None,
 ) -> None:
+    from iterate.core.agent_loop import COMPARED_ON_COMMON
+
     baseline_score = (
         result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
     )
@@ -3179,10 +3181,19 @@ def _render_summary(
         score = exp.result.metrics.primary_value
         delta = (score - baseline_score) if baseline_score is not None else 0.0
         arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "—")
-        table.add_row(str(exp.iteration), model_name, f"{score:.4f}", f"{arrow} {delta:+.4f}")
+        shown_score = f"{score:.4f}"
+        if (paired := exp.candidate.changes.get(COMPARED_ON_COMMON)) is not None:
+            shown_score += f" ({paired[0]:.4f} vs {paired[1]:.4f} on common records)"
+        table.add_row(str(exp.iteration), model_name, shown_score, f"{arrow} {delta:+.4f}")
 
     console.print()
     console.print(table)
+    if any(COMPARED_ON_COMMON in exp.candidate.changes for exp in result.history):
+        console.print(
+            "[dim]a pass the provider left records out of is scored on the records it got; "
+            "the loop weighed it against the best so far on the records both got answers "
+            "for, shown in brackets[/dim]"
+        )
     console.print(f"\n[bold]stopped:[/bold] {result.stopped_because}")
     if result.stopped_because == "over_budget":
         console.print(_over_budget_stop(wall), markup=False, highlight=False)

@@ -1469,3 +1469,26 @@ def test_the_binary_threshold_guard_is_unchanged() -> None:
 
     assert dead_lever_reason(brief, "f1") is None  # legal on binary f1
     assert dead_lever_reason(brief, "roc_auc") is not None  # ranking metric, still dead
+
+
+def test_the_loops_own_best_settles_the_dead_ends() -> None:
+    """A prompt pass the provider left records out of stores a score over fewer records:
+    higher than the loop's best, and lost to it on the records both got answers for.
+    The loop's best is the ruler, and its own lever is never called a dead end."""
+    from iterate.core.supervisor import _dead_ends
+    from iterate.schemas.experiment import ExperimentDigest
+
+    def digest(helped: str, score: float) -> ExperimentDigest:
+        return ExperimentDigest(
+            techniques=[], score=score, what_helped=[helped], what_hurt=[],
+            data_insights=[], takeaway="t",
+        )
+
+    fewer = _scored_experiment("fewer records", 0.75, "x = 1").model_copy(
+        update={"digest": digest("an example per label: 0.70 -> 0.75", 0.75)}
+    )
+    banked = _scored_experiment("banked", 0.70, "x = 1").model_copy(
+        update={"digest": digest("a definition of toxic: 0.65 -> 0.70", 0.70)}
+    )
+    assert "a definition of toxic" in _dead_ends([fewer, banked])
+    assert "a definition of toxic" not in _dead_ends([fewer, banked], banked)
