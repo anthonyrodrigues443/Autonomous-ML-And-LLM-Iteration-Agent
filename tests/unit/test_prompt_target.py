@@ -244,6 +244,28 @@ def test_the_submitted_prompt_is_captured_as_an_artifact(dataset: TabularDataset
     assert "be terse" in result.artifacts[codegen.PROMPT_JSON]
 
 
+def test_a_one_shot_job_that_marks_rows_submit_did_not_report_is_not_scored(
+    dataset: TabularDataset,
+) -> None:
+    from iterate.adapters.compute.runner import RunResult
+
+    preds = "\n".join(["__no_reply__"] + ["not toxic"] * (dataset.n_test - 1)).encode()
+    run_result = RunResult(
+        stdout="",
+        stderr="",
+        exit_code=0,
+        outputs={
+            codegen.PREDICTIONS_CSV: preds,
+            codegen.PROMPT_JSON: b'{"system": "s", "user_template": "{text}", "no_reply_rows": []}',
+        },
+    )
+
+    result = _target(dataset).score_code_job(run_result, "iter-01")
+
+    assert result.metrics is None
+    assert "submit() did not report" in str(result.error)
+
+
 def test_the_session_preamble_exposes_the_three_helpers(dataset: TabularDataset) -> None:
     preamble = _target(dataset).session_preamble()
 
@@ -1018,6 +1040,11 @@ def test_two_passes_are_compared_on_the_records_both_got_an_answer_for(
         target.paired_scores(missed_first, ExperimentResult(experiment_id="y", metrics=scored))
         is None
     )
+    # Nothing in common: not comparable, never a reason to bank the pass.
+    others_missed = result([truth[0]] + ["__no_reply__"] * (len(truth) - 1))
+    paired = target.paired_scores(missed_first, others_missed)
+    assert paired is not None
+    assert all(value != value for value in paired)
 
 
 def test_a_session_that_lost_one_record_is_scored_on_the_rest(
