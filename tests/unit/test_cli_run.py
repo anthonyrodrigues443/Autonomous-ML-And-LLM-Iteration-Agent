@@ -479,6 +479,8 @@ def _stub_run_supervised(
             raise AssertionError("LLM client should not be invoked in this test")
 
     def _fake_build_client(name: str, **kw: Any) -> _FakeClient:
+        # The first client a run builds is the harness's.
+        captured.setdefault("harness", {"backend": name, **kw})
         return _FakeClient(think=kw.get("think", False))
 
     def _fake_run_supervised(
@@ -1149,6 +1151,7 @@ def _prompt_run(
     finally:
         get_settings.cache_clear()
     built["kernel"] = captured.get("kernel")
+    built["harness"] = captured.get("harness")
     return result, built
 
 
@@ -1185,38 +1188,57 @@ def test_the_model_under_test_never_takes_the_harness_address(
     )
 
 
-def test_the_harness_model_as_its_own_model_under_test_keeps_its_address_and_key(
+def test_the_prompt_runs_on_ollama_whatever_runs_the_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Named with --target-backend or not at all: a harness on a server of yours keeps
+    its address and key, and the model under test is Ollama's."""
     result, built = _prompt_run(
         tmp_path,
         monkeypatch,
         [
             *["--backend", "openai-compatible", "--base-url", "http://gpu-box:8000/v1"],
-            *["--api-key", "box-key", "--model", "my-llama"],
+            *["--api-key", "box-key", "--model", "my-llama", "--target-model", "gemma4:12b"],
         ],
     )
     assert result.exit_code == 0, result.output
-    assert (built["backend"], built["model"]) == ("openai-compatible", "my-llama")
-    assert (built["base_url"], built["api_key"]) == ("http://gpu-box:8000/v1", "box-key")
+    assert (built["backend"], built["model"]) == ("ollama", "gemma4:12b")
+    assert built["kernel"]._target_key is None
+    harness = built["harness"]
+    assert (harness["backend"], harness["model"]) == ("openai-compatible", "my-llama")
+    assert (harness["base_url"], harness["api_key"]) == ("http://gpu-box:8000/v1", "box-key")
+    assert "model under test: ollama gemma4:12b" in " ".join(_plain(result.output).split())
 
 
-def test_a_harness_found_through_the_environment_is_its_own_model_under_test(
+def test_a_harness_not_on_ollama_names_the_ollama_model_the_prompt_is_for(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`ITERATE_BACKEND_URL` is how `.env.example` points the harness at a server. The
-    same model as the model under test is called at the same place."""
+    result, _ = _prompt_run(
+        tmp_path, monkeypatch, ["--backend", "openai", "--api-key", "k", "--model", "gpt-4o-mini"]
+    )
+    text = _refused(result, tmp_path)
+    assert (
+        "the model under test runs on Ollama unless --target-backend names another provider, "
+        "and the harness's model on openai means nothing to Ollama"
+    ) in text
+
+
+def test_a_harness_found_through_the_environment_keeps_its_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ITERATE_BACKEND_URL` is how `.env.example` points the harness at a server."""
     result, built = _prompt_run(
         tmp_path,
         monkeypatch,
-        ["--backend", "openai-compatible", "--model", "my-llama"],
+        ["--backend", "openai-compatible", "--model", "my-llama", "--target-model", "g"],
         env={
             "ITERATE_BACKEND_URL": "http://gpu-box:8000/v1",
             "ITERATE_BACKEND_API_KEY": "box-key",
         },
     )
     assert result.exit_code == 0, result.output
-    assert (built["base_url"], built["api_key"]) == ("http://gpu-box:8000/v1", "box-key")
+    assert built["harness"]["api_key"] == "box-key"
+    assert built["backend"] == "ollama"
 
 
 def test_the_model_under_test_has_an_address_of_its_own(
@@ -1581,27 +1603,34 @@ def test_with_no_list_saved_the_key_saved_for_the_provider_named_is_read(
     assert "prompt providers allowed" not in _plain(result.output)
 
 
-def test_the_harness_model_under_test_is_called_where_the_harness_is(
+def test_with_a_list_saved_the_prompts_default_ollama_has_to_be_on_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An address saved for the prompt provider of the same name is not the harness's."""
+    """The harness saved on groq keeps its key; the model under test is Ollama unless a
+    provider is named, and the list says where records may go."""
     from iterate.userconfig import SavedProvider
+
+    saved = {
+        "harness": {"backend": "groq", "api_key": "gsk-saved-harness"},
+        "allowed": ["groq"],
+        "providers": {"groq": SavedProvider("groq", base_url="https://gateway.test/v1")},
+    }
+    result, _ = _prompt_run(
+        tmp_path, monkeypatch, ["--model", "llama-3.3-70b", "--target-model", "g"], saved=saved
+    )
+    assert "served by ollama, which is not among the prompt providers you allow (groq)" in (
+        _refused(result, tmp_path)
+    )
 
     result, built = _prompt_run(
         tmp_path,
         monkeypatch,
-        ["--model", "llama-3.3-70b"],
-        saved={
-            "harness": {"backend": "groq", "api_key": "gsk-saved-harness"},
-            "allowed": ["groq"],
-            "providers": {"groq": SavedProvider("groq", base_url="https://gateway.test/v1")},
-        },
+        ["--model", "llama-3.3-70b", "--target-model", "g", "--providers", "ollama"],
+        saved=saved,
     )
     assert result.exit_code == 0, result.output
-    assert built["base_url"] == "https://api.groq.com/openai/v1"
-    assert built["api_key"] == "gsk-saved-harness"
-    text = " ".join(_plain(result.output).split())
-    assert "key from the saved config (the harness's key)" in text
+    assert built["harness"]["api_key"] == "gsk-saved-harness"
+    assert built["backend"] == "ollama"
 
 
 def test_a_harness_aimed_at_a_company_takes_that_companys_key(
@@ -1617,12 +1646,11 @@ def test_a_harness_aimed_at_a_company_takes_that_companys_key(
     result, built = _prompt_run(
         tmp_path,
         monkeypatch,
-        harness,
+        [*harness, "--target-model", "g"],
         env={"OPENAI_API_KEY": "sk-openai", "GROQ_API_KEY": "gsk-env"},
     )
     assert result.exit_code == 0, result.output
-    assert built["api_key"] == "gsk-env"
-    assert "key from GROQ_API_KEY" in " ".join(_plain(result.output).split())
+    assert built["harness"]["api_key"] == "gsk-env"
 
 
 def test_every_allowed_provider_is_settled_with_its_key_in_hand(
@@ -1667,21 +1695,20 @@ def test_the_help_names_every_provider_iterate_knows() -> None:
         assert name in text
 
 
-def test_moved_to_another_address_the_model_under_test_leaves_the_harness_key_behind(
+def test_the_harness_key_never_goes_to_the_model_under_test(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Even on the harness's own company at its own address: the model under test is
+    named apart, and takes the key of its provider or none."""
     harness = ["--backend", "openai", "--api-key", "sk-the-harness-key", "--model", "gpt-4o-mini"]
-    result, _ = _prompt_run(
-        tmp_path, monkeypatch, [*harness, "--target-base-url", "https://gateway.test/v1"]
-    )
-    text = _refused(result, tmp_path)
-    assert "openai has no key" in text
-
-    result, built = _prompt_run(
-        tmp_path, monkeypatch, [*harness, "--target-base-url", "https://api.openai.com/v1/"]
-    )
-    assert result.exit_code == 0, result.output
-    assert built["api_key"] == "sk-the-harness-key"
+    target = ["--target-backend", "openai", "--target-model", "gpt-4o-mini"]
+    for address in ("https://gateway.test/v1", "https://api.openai.com/v1/"):
+        result, _ = _prompt_run(
+            tmp_path, monkeypatch, [*harness, *target, "--target-base-url", address]
+        )
+        text = _refused(result, tmp_path)
+        assert "openai has no key" in text
+        assert "sk-the-harness-key" not in text
 
 
 def test_a_provider_the_run_does_not_call_is_not_mended_by_a_flag_of_the_run(
@@ -1801,11 +1828,11 @@ def test_a_saved_key_with_no_backend_beside_it_is_the_runs_backends(
     result, built = _prompt_run(
         tmp_path,
         monkeypatch,
-        ["--backend", "groq"],
+        ["--backend", "groq", "--target-model", "g"],
         saved={"harness": {"model": "saved-model", "api_key": "gsk-saved"}},
     )
     assert result.exit_code == 0, result.output
-    assert (built["model"], built["api_key"]) == ("saved-model", "gsk-saved")
+    assert (built["harness"]["model"], built["harness"]["api_key"]) == ("saved-model", "gsk-saved")
 
 
 def test_a_name_on_the_list_does_not_cover_a_company_it_is_aimed_at(
@@ -1966,6 +1993,37 @@ def test_a_claude_model_the_key_is_not_served_is_refused_up_front(
     assert "anthropic does not serve claude-haiku-4-5-20990101 to this key" in text
 
 
+def test_claude_with_install_consent_gets_its_library_before_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As an image run gets torch: with --install the library is installed, not asked
+    for."""
+    import sys
+
+    from iterate.adapters.compute import deps
+
+    real = pytest.importorskip("anthropic")
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    consents: list[bool] = []
+
+    def installs(*, consent: bool, **kwargs: Any) -> str:
+        consents.append(consent)
+        sys.modules["anthropic"] = real
+        return ""
+
+    monkeypatch.setattr(deps, "ensure_anthropic", installs)
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "anthropic", "--target-model", "claude-haiku-4-5", "--install"],
+        env={"ANTHROPIC_API_KEY": "sk-ant-env"},
+    )
+    assert consents == [True]
+    assert result.exit_code == 0, result.output
+    assert built["backend"] == "anthropic"
+    assert "installs: Anthropic's library is in" in _plain(result.output)
+
+
 def test_claude_without_its_library_is_refused_with_the_command_that_adds_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1979,22 +2037,28 @@ def test_claude_without_its_library_is_refused_with_the_command_that_adds_it(
         env={"ANTHROPIC_API_KEY": "sk-ant-env"},
     )
     text = _refused(result, tmp_path)
-    assert "the anthropic package is not installed: pip install 'iterate-ai[anthropic]'" in text
+    assert (
+        "the anthropic package is not installed: pip install 'iterate-ai[anthropic]' "
+        "(or pass --install)"
+    ) in text
 
 
-def test_the_harnesss_own_model_aimed_at_claudes_address_is_told_both_flags(
+def test_an_ollama_harness_aimed_at_a_company_is_told_both_flags(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """With no --target-backend the model under test is the Ollama harness's own, at its
+    address: an address that is a company's needs the company named, and a model."""
     result, _ = _prompt_run(
         tmp_path,
         monkeypatch,
         [
-            *["--backend", "openai-compatible", "--model", "claude-haiku-4-5"],
-            *["--base-url", "https://api.anthropic.com/v1", "--api-key", "sk-ant-k"],
+            *["--backend", "ollama", "--model", "gpt-4o-mini"],
+            *["--base-url", "https://api.openai.com/v1"],
         ],
+        env={"OPENAI_API_KEY": "sk-env"},
     )
     text = _refused(result, tmp_path)
-    assert "Pass --target-backend anthropic --target-model claude-haiku-4-5" in text
+    assert "Pass --target-backend openai --target-model gpt-4o-mini" in text
 
 
 def test_a_saved_backend_that_cannot_run_the_loop_is_named_as_saved(
@@ -2089,7 +2153,7 @@ def test_a_key_saved_over_https_is_not_sent_over_http(
     assert built["api_key"] == "not-needed"
 
     harness = ["--backend", "vllm", "--base-url", "https://llm.corp.test/v1", "--model", "x"]
-    harness += ["--api-key", "the-harness-key"]
+    harness += ["--api-key", "the-harness-key", "--target-backend", "vllm"]
     result, built = _prompt_run(
         tmp_path, monkeypatch, [*harness, "--target-base-url", "http://llm.corp.test/v1"]
     )
@@ -2165,11 +2229,8 @@ def test_a_refusal_names_the_flag_its_value_came_from(
             "--target-base-url gpu.test/v1 has to start with http:// or https://",
         ),
         (
-            [
-                *["--backend", "vllm", "--model", "m", "--api-key", "k"],
-                *["--base-url", "http://me:pw@gpu.test/v1"],
-            ],
-            "--base-url http://gpu.test/v1 carries a user name, a password or a token",
+            ["--backend", "ollama", "--model", "m", "--base-url", "http://me:pw@gpu.test:11434"],
+            "--base-url http://gpu.test:11434 carries a user name, a password or a token",
         ),
     ):
         result, _ = _prompt_run(tmp_path, monkeypatch, flags)
@@ -2186,14 +2247,11 @@ def test_a_harness_the_environment_aims_at_a_company_takes_that_companys_key(
     result, built = _prompt_run(
         tmp_path,
         monkeypatch,
-        ["--backend", "openai-compatible", "--model", "gpt-4o-mini"],
+        ["--backend", "openai-compatible", "--model", "gpt-4o-mini", "--target-model", "g"],
         env={"ITERATE_BACKEND_URL": "https://api.openai.com/v1", "OPENAI_API_KEY": "sk-env"},
     )
     assert result.exit_code == 0, result.output
-    assert (built["base_url"], built["api_key"]) == ("https://api.openai.com/v1", "sk-env")
-    text = " ".join(_plain(result.output).split())
-    assert "model under test: openai gpt-4o-mini" in text
-    assert "key from OPENAI_API_KEY (the harness's key)" in text
+    assert built["harness"]["api_key"] == "sk-env"
 
 
 def test_a_harness_with_no_key_is_told_which_variables_it_reads(
@@ -2637,6 +2695,7 @@ def test_a_prompt_run_whose_starting_prompt_is_over_the_budget_is_refused(
     _write_tiny_csv(data)
     dot = tmp_path / "dot"
     monkeypatch.setenv("ITERATE_RUNS_DIR", str(dot / "runs"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-for-the-model-under-test")
     get_settings.cache_clear()
     try:
         result = runner.invoke(
@@ -2655,6 +2714,8 @@ def test_a_prompt_run_whose_starting_prompt_is_over_the_budget_is_refused(
                 "openai",
                 "--api-key",
                 "k",
+                "--target-backend",
+                "openai",
                 "--target-model",
                 "gpt-4o-mini",
                 "--serving-budget",
@@ -2696,6 +2757,7 @@ def test_the_prompt_baseline_is_priced_at_the_size_of_the_starting_prompt(
     prompt = tmp_path / "p.txt"
     prompt.write_text("x" * 2000)
     monkeypatch.setenv("ITERATE_RUNS_DIR", str(tmp_path / "dot" / "runs"))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-for-the-model-under-test")
     get_settings.cache_clear()
     try:
         result = runner.invoke(
@@ -2716,6 +2778,8 @@ def test_the_prompt_baseline_is_priced_at_the_size_of_the_starting_prompt(
                 "openai",
                 "--api-key",
                 "k",
+                "--target-backend",
+                "openai",
                 "--target-model",
                 "gpt-4o-mini",
                 "--serving-budget",

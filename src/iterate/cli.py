@@ -863,8 +863,8 @@ def run(
         "--target-backend",
         help="The provider of the model under test: ollama, openai, groq, together, "
         "deepseek, anthropic, or a server you run (openai-compatible, vllm). Defaults to "
-        "--backend, and then the model under test is served where the harness is, with "
-        "its key.",
+        "ollama, whatever runs the loop; on an Ollama harness with no --target-model it "
+        "is the harness's own model, at its address.",
     ),
     target_base_url: str | None = typer.Option(
         None,
@@ -1147,10 +1147,11 @@ def run(
             target_base_url=target_base_url,
             providers=providers,
             compute=compute,
+            install=install,
             settings=settings,
         )
         under_test, under_test_model = settled.provider, settled.model
-        target_backend = settled.backend if target_backend is not None else None
+        target_backend = settled.backend
     elif providers is not None or target_base_url is not None:
         raise typer.BadParameter(
             "--providers and --target-base-url describe the model under test of a prompt "
@@ -1944,6 +1945,21 @@ def _refuse_for_images(*, compute: str, task: str | None, code: bool) -> None:
         )
 
 
+def _ensure_anthropic(consent: bool) -> None:
+    import importlib.util
+
+    from iterate.adapters.compute import deps
+
+    if importlib.util.find_spec("anthropic") is not None:
+        return
+    if consent:
+        console.print("[dim]installs: Anthropic's library, to call Claude[/dim]")
+    if reason := deps.ensure_anthropic(consent=consent):
+        raise typer.BadParameter(reason[-2000:])
+    importlib.invalidate_caches()
+    console.print("[dim]installs: Anthropic's library is in[/dim]")
+
+
 def _ensure_torch(consent: bool) -> None:
     from iterate.adapters.compute import deps
 
@@ -2211,6 +2227,7 @@ def _model_under_test(
     providers: str | None,
     compute: str,
     settings: Any,
+    install: bool = False,
 ) -> UnderTest:
     """The model a prompt run tunes its prompt for: who serves it, where, and with
     whose key. Every refusal a prompt run's model settings can earn is raised here,
@@ -2224,14 +2241,24 @@ def _model_under_test(
         )
     if target_backend is not None:
         target_backend = target_backend.strip().lower()
-    asked = target_backend or backend
+    # With no --target-backend the model under test runs on Ollama, whatever runs the
+    # loop. It is the harness's own model only when the harness is on Ollama too, and
+    # moved to another address it is no longer that.
+    asked = target_backend or "ollama"
     harness_address = _harness_address(backend, base_url, settings)
-    # Named apart, or moved to another address, it is no longer the harness model, and
-    # the harness's address and key stay with the harness.
-    own = target_backend is None and (
-        target_base_url is None or factory.same_place(target_base_url, harness_address)
+    own = (
+        target_backend is None
+        and backend == "ollama"
+        and (target_base_url is None or factory.same_place(target_base_url, harness_address))
     )
-    if target_model is None and target_backend not in (None, backend):
+    if target_model is None and asked != backend:
+        if target_backend is None:
+            raise typer.BadParameter(
+                f"the model under test runs on Ollama unless --target-backend names another "
+                f"provider, and the harness's model on {backend} means nothing to Ollama. "
+                "Pass --target-model with an Ollama model, or --target-backend and "
+                "--target-model for the provider your prompt is for"
+            )
         raise typer.BadParameter(
             f"--target-backend {target_backend} needs --target-model: the harness runs "
             f"on {backend}, and its model name means nothing to {target_backend}"
@@ -2279,6 +2306,8 @@ def _model_under_test(
                 f"{given_as or factory.shown(address or kept)} is {company}'s address, "
                 f"{called}. Pass {fix}"
             )
+        if any(factory.wire_of(n) == "anthropic" for n in (asked, *(allowed or ()))):
+            _ensure_anthropic(install)
         # A name on the list covers a company's address only when that address is the
         # one saved under the name. Settled before any key of the company is looked up.
         covered = asked in (allowed or ()) and (
