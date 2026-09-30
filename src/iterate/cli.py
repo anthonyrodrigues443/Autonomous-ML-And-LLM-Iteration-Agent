@@ -2100,7 +2100,7 @@ def _rescore_winner_on_full_holdout(
             "keeping the loop score[/dim]"
         )
         return None
-    return {"score": final.metrics.primary_value, "n": full_dataset.n_test}
+    return {"score": final.metrics.primary_value, "n": final.metrics.n_samples}
 
 
 def _read_starting_prompt(path: Path) -> Any:

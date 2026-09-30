@@ -40,6 +40,8 @@ PROMPT_JSON = "prompt.json"
 # the session ends with no predictions, so a full submission still stands, and a floor
 # is never banked in the place of prompts that were not answered.
 NO_REPLY_TXT = "no_reply.txt"
+# Not a file: the key a prompt experiment keeps its answers under, in holdout order.
+ANSWERS_JSON = "answers.json"
 # The image path's twin of PROMPT_JSON: the recipe (or own-model line) that produced
 # the predictions on disk, with their digest.
 RECIPE_JSON = "recipe.json"
@@ -216,7 +218,7 @@ def prompt_session_preamble() -> str:
         "import json, random, pandas as pd, numpy as np\n"
         "random.seed(42); np.random.seed(42)\n"
         "from iterate.core.prompting import Prompt\n"
-        "from iterate.core.prompt_runtime import make_ask, AskStats, UNPARSEABLE, NoReplyError\n"
+        "from iterate.core.prompt_runtime import make_ask, AskStats, UNPARSEABLE, NO_REPLY, NoReplyError\n"
         "from iterate.core.scoring import score as _score\n"
         f"with open({META_JSON!r}) as _f:\n"
         "    _meta = json.load(_f)\n"
@@ -258,6 +260,9 @@ def prompt_session_preamble() -> str:
         "    return out\n"
         "def evaluate(answers, truth):\n"
         "    raw = truth.tolist() if hasattr(truth, 'tolist') else list(truth)\n"
+        # A record the provider never answered is left out, as the host leaves it out.
+        "    kept = [i for i, a in enumerate(answers) if str(a) != NO_REPLY]\n"
+        "    answers, raw = [answers[i] for i in kept], [raw[i] for i in kept]\n"
         "    if _task_kind == 'regression':\n"
         # An unusable answer becomes the training median here too. Scoring it any
         # other way in the session than the host does would let the agent chase a
@@ -278,7 +283,7 @@ def prompt_session_preamble() -> str:
         "    _digest = _hl.sha256(chr(10).join(str(a) for a in answers).encode()).hexdigest()\n"
         # The tokens the model under test spent per record, kept for the serving price.
         # Cached answers cost no tokens, so only the records that were really asked count.
-        "    _n = _stats.calls\n"
+        "    _n = _stats.calls - _stats.no_reply\n"
         "    _tokens = {'tokens_in_per_record': _stats.prompt_tokens / _n if _n else None,\n"
         "               'tokens_out_per_record': _stats.completion_tokens / _n if _n else None,\n"
         "               'records_measured': _n}\n"
@@ -967,12 +972,30 @@ def score_predictions(
     expected = dataset.n_test
     if len(preds) != expected:
         return _failed(experiment_id, f"expected {expected} predictions, got {len(preds)}")
+    truth = dataset.test_target
+    artifacts: dict[str, str] = {}
+    kept: list[int] | None = None
+    if open_vocabulary:
+        from iterate.core.prompt_runtime import NO_REPLY
+
+        # A record the provider never answered is left out of the score, and kept in
+        # order so another pass can be compared on the records both got an answer for.
+        artifacts[ANSWERS_JSON] = json.dumps([p.strip() for p in preds])
+        kept = [i for i, p in enumerate(preds) if p.strip() != NO_REPLY]
+        if not kept:
+            return _failed(experiment_id, "the provider answered none of the records")
+        if len(kept) < expected:
+            preds, truth = [preds[i] for i in kept], truth.iloc[kept]
+        else:
+            kept = None
 
     needs_proba = requires_proba(metric)
     y_proba: list[list[float]] | list[float] | None = None
     if probabilities_csv is not None or needs_proba:
         try:
             rows = parse_probabilities(probabilities_csv, expected=expected)
+            if kept is not None:
+                rows = [rows[i] for i in kept]
             y_proba = [row[0] for row in rows] if len(rows[0]) == 1 else rows
         except ValueError as exc:
             if needs_proba:
@@ -985,10 +1008,10 @@ def score_predictions(
     # feed the reason back) rather than letting it crash the loop.
     try:
         task = task_for_metric(metric)
-        y_pred = _coerce(preds, target=dataset.test_target, task=task)
+        y_pred = _coerce(preds, target=truth, task=task)
         values = score(
             task,
-            dataset.test_target.to_numpy(),
+            truth.to_numpy(),
             y_pred,
             y_proba=y_proba,
             average=average,
@@ -1001,7 +1024,7 @@ def score_predictions(
             try:
                 values = score(
                     task_for_metric(metric),
-                    dataset.test_target.to_numpy(),
+                    truth.to_numpy(),
                     y_pred,
                     average=average,
                     include=(metric,),
@@ -1019,9 +1042,9 @@ def score_predictions(
         values=values,
         primary=metric,
         direction=direction(metric),
-        n_samples=expected,
+        n_samples=len(preds),
     )
-    return ExperimentResult(experiment_id=experiment_id, metrics=metrics)
+    return ExperimentResult(experiment_id=experiment_id, metrics=metrics, artifacts=artifacts)
 
 
 def _coerce(preds: list[str], *, target: object, task: str) -> list[int | float | str]:

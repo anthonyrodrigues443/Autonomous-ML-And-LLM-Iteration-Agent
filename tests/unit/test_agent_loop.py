@@ -1344,3 +1344,21 @@ def test_a_stop_typed_during_the_rounds_ends_them_before_the_next_ask() -> None:
     )
     assert decision.stopped_because == "stopped-by-user"
     assert researcher.calls == []
+
+
+def test_a_pass_that_lost_records_is_compared_on_the_records_both_have() -> None:
+    """The ruler is the target's paired score when it gives one; the stored scores
+    stand when it gives none."""
+    from iterate.core.agent_loop import _improves
+
+    def scored(value: float) -> ExperimentResult:
+        return ExperimentResult(
+            experiment_id="e",
+            metrics=Metrics(values={"f1": value}, primary="f1", direction="maximize"),
+        )
+
+    baseline = scored(0.8)
+    assert not _improves(scored(0.7), None, baseline, "maximize")
+    assert _improves(scored(0.7), None, baseline, "maximize", lambda a, b: (0.9, 0.8))
+    assert not _improves(scored(0.9), None, baseline, "maximize", lambda a, b: (0.7, 0.8))
+    assert _improves(scored(0.9), None, baseline, "maximize", lambda a, b: None)

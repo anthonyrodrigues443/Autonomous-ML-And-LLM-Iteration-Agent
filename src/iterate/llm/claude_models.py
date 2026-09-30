@@ -20,14 +20,17 @@ class Rules:
     # tool_choice {"type": "tool"}. Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1
     # answer it with a 400.
     force_tool: bool = False
+    # The tool-use system prompt Anthropic adds to every call with a tool, as iterate
+    # sends it, billed as input: https://platform.claude.com/docs/en/about-claude/pricing
+    tool_prompt_tokens: int = 0
 
 
 # By the longest name a model's ID starts with. None: the family thinks before it
 # answers and a prompt run cannot yet stop it, while an answer is allowed 64 tokens.
 _FAMILIES: dict[str, Rules | None] = {
-    "claude-haiku-4-5": Rules(temperature=True, force_tool=True),
-    "claude-sonnet-5": Rules(disable_thinking=True, force_tool=True),
-    "claude-opus-5": Rules(disable_thinking=True, force_tool=True),
+    "claude-haiku-4-5": Rules(temperature=True, force_tool=True, tool_prompt_tokens=588),
+    "claude-sonnet-5": Rules(disable_thinking=True, force_tool=True, tool_prompt_tokens=474),
+    "claude-opus-5": Rules(disable_thinking=True, force_tool=True, tool_prompt_tokens=406),
     # Its lowest setting, between_tools, is not tried yet.
     "claude-sonnet-5-5": None,
     "claude-opus-5-5": None,

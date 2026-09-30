@@ -76,18 +76,27 @@ def _now() -> datetime:
 
 
 def _improves(
-    result: ExperimentResult, best: Experiment | None, baseline: ExperimentResult, direction: str
+    result: ExperimentResult,
+    best: Experiment | None,
+    baseline: ExperimentResult,
+    direction: str,
+    paired: Callable[[ExperimentResult, ExperimentResult], tuple[float, float] | None]
+    | None = None,
 ) -> bool:
+    """Whether `result` beats the best so far. ``paired`` scores the two over the
+    same records when a target's passes can leave some out."""
     if result.metrics is None:
         return False
-    bar: float | None = None
+    against: ExperimentResult | None = None
     if best is not None and best.result is not None and best.result.metrics is not None:
-        bar = best.result.metrics.primary_value
+        against = best.result
     elif baseline.metrics is not None:
-        bar = baseline.metrics.primary_value
-    if bar is None:
+        against = baseline
+    if against is None or against.metrics is None:
         return True
-    new = result.metrics.primary_value
+    new, bar = result.metrics.primary_value, against.metrics.primary_value
+    if paired is not None and (both := paired(result, against)) is not None:
+        new, bar = both
     return new < bar if direction == "minimize" else new > bar
 
 
@@ -394,7 +403,13 @@ def run_supervised(
                         )
                     if (
                         result.succeeded
-                        and _improves(result, best, baseline, direction)
+                        and _improves(
+                            result,
+                            best,
+                            baseline,
+                            direction,
+                            getattr(target, "paired_scores", None),
+                        )
                         and not was_rejected(experiment)
                         and "over_budget" not in experiment.candidate.changes
                     ):

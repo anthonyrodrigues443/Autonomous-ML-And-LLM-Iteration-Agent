@@ -101,3 +101,17 @@ def test_a_shipped_price_is_dated_by_the_day_its_own_rows_were_read() -> None:
     facts = serving.facts_from_prompt(measured, provider="openai", model="gpt-4o-mini")
     assert serving.profile(facts, 1000, table).prices_as_of == "openai shipped 2026-09-25"
     assert table.api("anthropic", "claude-haiku-4-5").read_on == table.snapshot_date  # type: ignore[union-attr]
+
+
+def test_a_claude_prompt_is_estimated_with_the_tool_prompt_anthropic_adds() -> None:
+    """Measured, the tokens include it; estimated from the prompt's text, a short
+    prompt on Claude would be priced at a fraction of its cost."""
+    facts = serving.facts_from_prompt(
+        None, provider="anthropic", model="claude-haiku-4-5", prompt_chars=400
+    )
+    assert facts.tokens_in == 100 + 588
+    assert "588 of them the tool prompt Anthropic adds to every call" in facts.basis[0]
+    other = serving.facts_from_prompt(
+        None, provider="openai", model="gpt-4o-mini", prompt_chars=400
+    )
+    assert other.tokens_in == 100

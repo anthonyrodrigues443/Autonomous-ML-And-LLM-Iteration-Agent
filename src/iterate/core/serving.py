@@ -329,6 +329,13 @@ def facts_from_prompt(
         # A backend that sends no usage leaves zeros, and zero tokens is not a price.
         why_estimated = "the backend reported no token usage"
     guess_in = max(1.0, prompt_chars / 4)
+    added = ""
+    if provider == "anthropic":
+        from iterate.llm.claude_models import rules_for
+
+        if tool_prompt := rules_for(model).tool_prompt_tokens:
+            guess_in += tool_prompt
+            added = f", {tool_prompt} of them the tool prompt Anthropic adds to every call"
     return ServingFacts(
         family="prompt",
         provider=provider,
@@ -338,8 +345,8 @@ def facts_from_prompt(
         records_measured=0,
         parameters=parameters,
         basis=[
-            f"about {guess_in:.0f} tokens in and 8 out per record, estimated from the prompt "
-            f"text because {why_estimated}"
+            f"about {guess_in:.0f} tokens in and 8 out per record{added}, estimated from the "
+            f"prompt text because {why_estimated}"
         ],
     )
 

@@ -93,6 +93,34 @@ def test_wrong_length_predictions_is_a_captured_failure(tmp_path: Path) -> None:
     assert "expected" in result.error
 
 
+def test_a_record_the_provider_never_answered_is_left_out_of_a_prompts_score(
+    tmp_path: Path,
+) -> None:
+    """Only on the prompt path, and the answers are kept in order for a comparison."""
+    import json
+
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    truth = [str(t) for t in ds.test_target]
+    preds = ["__no_reply__", *truth[1:]]
+    result = codegen.score_predictions(
+        ds,
+        "\n".join(preds).encode(),
+        metric="accuracy",
+        experiment_id="e",
+        open_vocabulary=True,
+    )
+    assert result.metrics is not None
+    assert (result.metrics.n_samples, result.metrics.primary_value) == (ds.n_test - 1, 1.0)
+    assert json.loads(result.artifacts[codegen.ANSWERS_JSON]) == preds
+
+    table = codegen.score_predictions(
+        ds, "\n".join(truth).encode(), metric="accuracy", experiment_id="e"
+    )
+    assert table.artifacts == {}
+    assert table.metrics is not None
+    assert table.metrics.n_samples == ds.n_test
+
+
 def test_unscorable_predictions_are_a_captured_failure(tmp_path: Path) -> None:
     # Garbage predictions (non-numeric for an int target) must be a captured
     # failure, never an exception that escapes and crashes the run.

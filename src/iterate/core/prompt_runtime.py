@@ -5,7 +5,8 @@ between experiments. Calls run concurrently and every answer is cached. The
 allowed answers are a tool schema, not an instruction. A row the model answered
 unusably is retried, then recorded as unparseable and scored as wrong. A row the
 provider never answered is not the model's answer: it is asked once more after the
-pass, and if it is still unanswered the pass raises.
+pass, and if it is still unanswered it comes back as NO_REPLY and is left out of the
+score, or, past one row in five, the pass raises.
 """
 
 from __future__ import annotations
@@ -37,6 +38,9 @@ log = logging.getLogger(__name__)
 # A distinct sentinel rather than an empty string or a guessed label: it must score
 # as wrong, and it must be countable afterwards.
 UNPARSEABLE = "__unparseable__"
+# What a row's answer is when the provider never answered it, asked twice. Not the
+# model's answer: left out of the score, and out of the score it is compared with.
+NO_REPLY = "__no_reply__"
 
 _ANSWER_TOOL = "answer"
 _DEFAULT_WORKERS = 8
@@ -53,10 +57,9 @@ _TURNED_DOWN = ("tool_use_failed", "error parsing tool call")
 
 
 class NoReplyError(RuntimeError):
-    """The provider answered none of the tries for some records, asked twice: an
-    outage, a rate limit that outlasted the retries, a key or a model it refuses. The
-    pass is not scored, since a record left out, or scored as wrong, is a score of
-    another pass."""
+    """The provider answered none of the tries for more than one record in five, asked
+    twice: an outage, a rate limit that outlasted the retries, a key or a model it
+    refuses. Too few records are left to score the pass on."""
 
 
 @dataclass
@@ -428,11 +431,14 @@ def ask(
     if missed:
         counters.no_reply += len(missed)
         counters.errors.extend(missed.values())
-        first = missed[min(missed)]
-        raise NoReplyError(
-            f"the provider did not answer {len(missed)} of {len(rows)} records, each asked "
-            f"twice ({first})"
-        )
+        if len(missed) * 5 > len(rows):
+            first = missed[min(missed)]
+            raise NoReplyError(
+                f"the provider did not answer {len(missed)} of {len(rows)} records, each "
+                f"asked twice ({first}); more than one in five is too many to score"
+            )
+        for index in missed:
+            answers[index] = NO_REPLY
     return [a if a is not None else UNPARSEABLE for a in answers]
 
 
@@ -501,6 +507,7 @@ def make_ask(
 
 
 __all__ = [
+    "NO_REPLY",
     "UNPARSEABLE",
     "AnswerCache",
     "AskStats",

@@ -140,16 +140,17 @@ def test_a_dead_endpoint_is_an_error_not_a_score_of_zero(
     assert result.metrics is None
     assert str(result.error) == (
         f"not scored: the provider did not answer {dataset.n_test} of {dataset.n_test} "
-        "records, each asked twice (RuntimeError: connection refused)"
+        "records, each asked twice (RuntimeError: connection refused); more than one in "
+        "five is too many to score"
     )
     assert "not answered by the provider" in str(result.logs)
 
 
-def test_one_record_the_provider_never_answered_is_not_scored_as_wrong(
+def test_one_record_the_provider_never_answered_is_left_out_of_the_score(
     dataset: TabularDataset, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Scored as wrong, a rate limit on a hard record would read as a worse prompt;
-    left out, the score would be over other records than the incumbent's."""
+    """Scored as wrong, a rate limit on a hard record would read as a worse prompt. Left
+    out, and kept in order so a comparison leaves it out of the other side too."""
     asked: dict[str, int] = {}
 
     class OneMissed(ScriptedClient):
@@ -167,8 +168,12 @@ def test_one_record_the_provider_never_answered_is_not_scored_as_wrong(
 
     result = _target(dataset).baseline()
 
-    assert result.metrics is None
-    assert f"did not answer 1 of {dataset.n_test} records" in str(result.error)
+    assert result.error is None
+    assert result.metrics is not None
+    assert result.metrics.n_samples == dataset.n_test - 1
+    answers = json.loads(result.artifacts["answers.json"])
+    assert answers.count("__no_reply__") == 1
+    assert "1 not answered by the provider" in str(result.logs)
 
 
 def test_a_typed_prompt_candidate_runs(dataset: TabularDataset, scripted: Any) -> None:
@@ -845,13 +850,16 @@ def _session(
     misses: int,
     cells: tuple[str, ...] = ("submit(BASE)", "answers = submit(BASE)"),
     starting_code: str | None = None,
+    failing: int = 2,
 ) -> Any:
     """A coding session whose coder runs `cells` (by default it submits twice; not the
     same cell again, which the coder would turn away unrun), against a model under test
-    that gives the first holdout record no reply for its first `misses` requests."""
+    that gives the first `failing` holdout records no reply for its first `misses`
+    requests."""
     from iterate.core.coder import CodingAgent
 
-    first = str(dataset.test_features["text"].iloc[0])
+    # By default two holdout records of eight: more than one in five.
+    first = {str(t) for t in dataset.test_features["text"].iloc[:failing]}
     sample = str(dataset.train_features["text"].iloc[0])
     truth = dict(zip(dataset.test_features["text"], dataset.test_target.astype(str), strict=True))
     missed = {"n": 0}
@@ -859,7 +867,7 @@ def _session(
     class Flaky(ScriptedClient):
         def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
             text = str(messages[-1].content)
-            if text in (first, sample) and missed["n"] < misses:
+            if (text in first or text == sample) and missed["n"] < misses:
                 missed["n"] += 1
                 raise RuntimeError("APIConnectionError: Connection error.")
             return ChatResponse(
@@ -908,7 +916,7 @@ def test_a_session_whose_prompt_the_provider_left_unanswered_is_not_scored(
 
     assert out.result.metrics is None
     assert str(out.result.error).startswith(
-        f"not scored: the provider did not answer 1 of {dataset.n_test} records"
+        f"not scored: the provider did not answer 2 of {dataset.n_test} records"
     )
     assert not any(cell.source == "fallback" for cell in out.cells)
 
@@ -916,8 +924,9 @@ def test_a_session_whose_prompt_the_provider_left_unanswered_is_not_scored(
 def test_a_later_submit_the_provider_answered_in_full_is_scored(
     dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The first submit's two asks take 6 requests; the second submit's first try works.
-    out = _session(dataset, tmp_path, monkeypatch, misses=6)
+    # Two records, three tries each, asked twice: 12 requests fail the first submit, and
+    # the second submit's first tries work.
+    out = _session(dataset, tmp_path, monkeypatch, misses=12)
 
     assert out.result.error is None
     assert out.result.metrics is not None
@@ -963,7 +972,7 @@ def test_the_final_rescore_says_why_it_kept_the_loop_score(tmp_path: Path, scrip
     assert (
         f"final re-score not scored: the provider did not answer {full.n_test} of "
         f"{full.n_test} records, each asked twice (RuntimeError: connection refused); "
-        "keeping the loop score"
+        "more than one in five is too many to score; keeping the loop score"
     ) in said
 
 
@@ -977,4 +986,45 @@ def test_a_floor_whose_carried_prompt_went_unanswered_is_not_banked(
     )
 
     assert out.result.metrics is None
-    assert str(out.result.error).startswith("not scored: the provider did not answer 1 of")
+    assert str(out.result.error).startswith("not scored: the provider did not answer 2 of")
+
+
+def test_two_passes_are_compared_on_the_records_both_got_an_answer_for(
+    dataset: TabularDataset,
+) -> None:
+    """The pass that lost a record to the provider is not compared with the other's
+    score over every record, but over the same ones."""
+    from iterate.schemas.experiment import ExperimentResult, Metrics
+
+    target = _target(dataset)
+    scored = Metrics(values={"accuracy": 0.5}, primary="accuracy", direction="maximize")
+    truth = [str(t) for t in dataset.test_target]
+    wrong = {"toxic": "not toxic", "not toxic": "toxic"}
+
+    def result(answers: list[str]) -> ExperimentResult:
+        return ExperimentResult(
+            experiment_id="x", metrics=scored, artifacts={"answers.json": json.dumps(answers)}
+        )
+
+    # Right everywhere but the first record, which the provider never answered.
+    missed_first = result(["__no_reply__", *truth[1:]])
+    # Wrong on the first record only.
+    wrong_first = result([wrong[truth[0]], *truth[1:]])
+    assert target.paired_scores(missed_first, wrong_first) == (1.0, 1.0)
+    assert target.paired_scores(result(truth), wrong_first) is None
+    assert (
+        target.paired_scores(missed_first, ExperimentResult(experiment_id="y", metrics=scored))
+        is None
+    )
+
+
+def test_a_session_that_lost_one_record_is_scored_on_the_rest(
+    dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = _session(dataset, tmp_path, monkeypatch, misses=1000, failing=1)
+
+    assert out.result.error is None
+    assert out.result.metrics is not None
+    assert out.result.metrics.n_samples == dataset.n_test - 1
+    assert out.result.metrics.primary_value == 1.0
+    assert json.loads(out.result.artifacts["answers.json"])[0] == "__no_reply__"

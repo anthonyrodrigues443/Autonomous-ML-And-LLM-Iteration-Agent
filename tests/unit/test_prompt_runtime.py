@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from iterate.core.prompt_runtime import (
+    NO_REPLY,
     UNPARSEABLE,
     AnswerCache,
     AskStats,
@@ -208,7 +209,7 @@ class ByRow:
         return reply
 
 
-def test_a_record_the_provider_never_answered_fails_the_pass_once_all_are_asked() -> None:
+def test_more_than_one_record_in_five_never_answered_fails_the_pass() -> None:
     client = ByRow(
         {
             "you are awful": [_tool_reply("toxic")],
@@ -229,13 +230,44 @@ def test_a_record_the_provider_never_answered_fails_the_pass_once_all_are_asked(
 
     assert str(caught.value) == (
         "the provider did not answer 1 of 2 records, each asked twice "
-        "(RuntimeError: connection refused)"
+        "(RuntimeError: connection refused); more than one in five is too many to score"
     )
     assert (stats.no_reply, stats.unparseable) == (1, 0)
     # Three tries in the pass, three more when it is asked again.
     assert client.asked.count("have a nice day") == 6
     assert client.asked.count("you are awful") == 1
     assert stats.summary() == "2 calls, 0 cached, 1 not answered by the provider"
+
+
+def test_a_record_never_answered_is_left_out_and_never_cached(tmp_path: Path) -> None:
+    """One in ten is not the model's answer: it comes back marked, is not scored and is
+    asked again by the next pass."""
+    rows = [{"text": f"comment {i}"} for i in range(10)]
+    script: dict[str, list[Any]] = {r["text"]: [_tool_reply("toxic")] for r in rows}
+    script["comment 3"] = [RuntimeError("503")] * 6
+    client = ByRow(script)
+    cache = AnswerCache(tmp_path / "answers.db")
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT,
+        rows,
+        client_factory=lambda: client,
+        columns=["text"],
+        labels=LABELS,
+        cache=cache,
+        stats=stats,
+    )
+
+    assert answers[3] == NO_REPLY
+    assert answers.count("toxic") == 9
+    assert (stats.no_reply, stats.unparseable) == (1, 0)
+    back = ByRow({"comment 3": [_tool_reply("not toxic")]})
+    again = ask(
+        PROMPT, rows, client_factory=lambda: back, columns=["text"], labels=LABELS, cache=cache
+    )
+    assert again[3] == "not toxic"
+    assert back.asked == ["comment 3"]
 
 
 def test_a_record_missed_in_a_blip_is_answered_when_asked_again() -> None:
