@@ -1490,5 +1490,11 @@ def test_the_loops_own_best_settles_the_dead_ends() -> None:
     banked = _scored_experiment("banked", 0.70, "x = 1").model_copy(
         update={"digest": digest("a definition of toxic: 0.65 -> 0.70", 0.70)}
     )
+    between = _scored_experiment("between", 0.72, "x = 1").model_copy(
+        update={"digest": digest("a shorter system prompt: 0.65 -> 0.72", 0.72)}
+    )
     assert "a definition of toxic" in _dead_ends([fewer, banked])
     assert "a definition of toxic" not in _dead_ends([fewer, banked], banked)
+    # Above the loop's best it lost to no one: the stored 0.75 is not the ruler.
+    assert "a shorter system prompt" in _dead_ends([fewer, between])
+    assert "a shorter system prompt" not in _dead_ends([fewer, between], banked)
