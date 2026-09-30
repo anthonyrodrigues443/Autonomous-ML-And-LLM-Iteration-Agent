@@ -177,6 +177,11 @@ class Prices(BaseModel):
     def machines(self, kind: Kind) -> list[Host]:
         return [h for h in self.hosts if h.kind == kind]
 
+    def read_on(self, cloud: str) -> str:
+        """When this cloud's shipped machine rows were read. The table's own date is its
+        newest row's, which may be a price of another cloud read days later."""
+        return max((h.read_on for h in self.hosts if h.cloud == cloud), default=self.snapshot_date)
+
     def provenance(self, clouds: Iterable[str] | None = None) -> str:
         """What the line prints after the price: per cloud, refreshed or shipped, and
         the date, so an old number is never read as a current one."""
@@ -190,7 +195,7 @@ class Prices(BaseModel):
         for cloud in names:
             source = self.sources.get(cloud)
             parts.append(
-                f"{cloud} {source.label}" if source else f"{cloud} shipped {self.snapshot_date}"
+                f"{cloud} {source.label}" if source else f"{cloud} shipped {self.read_on(cloud)}"
             )
         return ", ".join(parts) if parts else f"shipped {self.snapshot_date}"
 

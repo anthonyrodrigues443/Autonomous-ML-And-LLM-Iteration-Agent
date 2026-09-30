@@ -194,8 +194,8 @@ def test_ollama_takes_no_key_and_its_host_is_settled() -> None:
 
 
 def test_a_name_iterate_does_not_know_is_refused_with_the_names_it_does() -> None:
-    with pytest.raises(factory.ProviderError, match=r"anthropic: not a provider.*Choose from"):
-        _provider("anthropic")
+    with pytest.raises(factory.ProviderError, match=r"mistral: not a provider.*Choose from"):
+        _provider("mistral")
     assert factory.unknown("grok", flag="--target-backend").startswith("--target-backend grok:")
     with pytest.raises(factory.ProviderError, match="grok, openia: not a provider"):
         factory.allowed_names(["groq", "grok", "openia"])
@@ -208,10 +208,10 @@ def test_a_refused_key_is_a_reason_and_a_provider_out_of_reach_is_not() -> None:
     found = _provider("groq", settings=_settings(groq_api_key="gsk-wrong"))
     response = SimpleNamespace(request=None, status_code=401, headers={})
 
-    def refuses(provider: factory.Provider, timeout: float) -> None:
+    def refuses(provider: factory.Provider, timeout: float, model: str | None) -> None:
         raise AuthenticationError("bad key", response=response, body=None)  # type: ignore[arg-type]
 
-    def unreachable(provider: factory.Provider, timeout: float) -> None:
+    def unreachable(provider: factory.Provider, timeout: float, model: str | None) -> None:
         raise APIConnectionError(request=None)  # type: ignore[arg-type]
 
     why = factory.refused_key(found, lister=refuses)
@@ -227,11 +227,28 @@ def test_a_refused_key_is_a_reason_and_a_provider_out_of_reach_is_not() -> None:
         "unset ITERATE_TARGET_API_KEY to use the key saved for groq"
     )
     assert factory.refused_key(found, lister=unreachable) is None
-    assert factory.refused_key(found, lister=lambda provider, timeout: None) is None
+    assert factory.refused_key(found, lister=lambda provider, timeout, model: None) is None
+
+
+def test_a_company_that_does_not_serve_the_model_named_stops_the_run() -> None:
+    """A typo in --target-model is found by the call that checks the key, which already
+    holds the names the key is served, and not by every record of the baseline."""
+    found = _provider("groq", settings=_settings(groq_api_key="gsk-env"))
+    served = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+
+    def lister(provider: factory.Provider, timeout: float, model: str | None) -> list[str]:
+        return served
+
+    assert factory.refused_key(found, model="openai/gpt-oss-20b", lister=lister) is None
+    assert factory.refused_key(found, model="llama-3.3-70b-versatile", lister=lister) == (
+        "groq does not serve llama-3.3-70b-versatile to this key. It serves: "
+        "openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b"
+    )
+    assert factory.refused_key(found, lister=lister) is None
 
 
 def test_a_provider_that_is_sent_no_key_is_not_asked() -> None:
-    def never(provider: factory.Provider, timeout: float) -> None:
+    def never(provider: factory.Provider, timeout: float, model: str | None) -> None:
         raise AssertionError("asked")
 
     assert factory.refused_key(_provider("ollama"), lister=never) is None
@@ -243,7 +260,7 @@ def test_a_key_sent_to_a_server_you_run_is_checked_too() -> None:
     class RefusedError(Exception):
         status_code = 401
 
-    def refuses(provider: factory.Provider, timeout: float) -> None:
+    def refuses(provider: factory.Provider, timeout: float, model: str | None) -> None:
         raise RefusedError
 
     saved = {"vllm": SavedProvider("vllm", api_key="key-a", base_url="http://gpu.test/v1")}
@@ -458,24 +475,65 @@ def test_the_words_for_a_missing_key_fit_where_they_are_read() -> None:
 def test_every_table_is_read_off_the_one_row_a_provider_has(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A provider that cannot run the loop is one row: it is a prompt provider with its
-    own key, and the harness question never offers it."""
-    row = factory._Known("anthropic", "https://api.anthropic.com", "anthropic_api_key")
-    monkeypatch.setitem(factory._PROVIDERS, "anthropic", row)
+    """A provider added later is one row: its key, its address and the harness question
+    are read off it, and a wire with no lister is never checked with another wire's."""
+    row = factory._Known("mistral", "https://api.mistral.ai/v1", "anthropic_api_key")
+    monkeypatch.setitem(factory._PROVIDERS, "mistral", row)
+    assert "mistral" in factory.known_providers()
+    assert "mistral" not in factory.harness_backends()
+    assert factory.own_key_env("mistral") == "ANTHROPIC_API_KEY"
+    found = _provider("mistral", settings=_settings(anthropic_api_key="key"))
+    assert (found.api_key, found.needs_key) == ("key", True)
+
+    # Recorded, not raised: the check swallows what a lister raises.
+    asked: list[Any] = []
+    monkeypatch.setattr(factory, "_list_models", lambda *args: asked.append(args))
+    monkeypatch.setattr(factory, "_claude_serves", lambda *args: asked.append(args))
+    assert factory.refused_key(found) is None
+    assert asked == []
+
+
+def test_the_claude_library_is_asked_for_only_where_its_client_is_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    at_claude = factory.Provider(
+        name="anthropic", base_url="https://api.anthropic.com/v1", api_key="k"
+    )
+    assert "pip install 'iterate-ai[anthropic]'" in str(factory.not_ready(at_claude))
+    assert factory.not_ready(at_claude, wire="openai") is None
+    # A notebook from a run that called Claude through the OpenAI-compatible layer.
+    client = factory.build_target_client(
+        "openai-compatible",
+        model="claude-haiku-4-5",
+        base_url="https://api.anthropic.com/v1",
+        api_key="k",
+    )
+    assert type(client).__name__ == "OpenAICompatibleClient"
+
+
+def test_claude_is_a_provider_for_the_model_under_test_and_not_a_harness() -> None:
     assert "anthropic" in factory.known_providers()
     assert "anthropic" not in factory.harness_backends()
     assert factory.own_key_env("anthropic") == "ANTHROPIC_API_KEY"
-    found = _provider("anthropic", settings=_settings(anthropic_api_key="sk-ant"))
-    assert (found.api_key, found.needs_key) == ("sk-ant", True)
-    # No lister for its wire yet: the check is skipped, never made with another wire's.
-    assert factory.refused_key(found) is None
+    found = _provider("anthropic", settings=_settings(anthropic_api_key="sk-ant-key"))
+    assert (found.name, found.base_url, found.api_key) == (
+        "anthropic",
+        "https://api.anthropic.com",
+        "sk-ant-key",
+    )
+    assert factory.cache_scope("anthropic", None) == "anthropic|api.anthropic.com"
+    with pytest.raises(factory.UnknownBackendError, match=r"comes in v1\.0"):
+        factory.build_client("anthropic", model="claude-haiku-4-5", api_key="k")
 
 
 def test_the_harnesss_key_fields_are_read_off_the_same_rows() -> None:
     assert factory._KEY_FIELDS["groq"] == ("groq_api_key", "iterate_backend_api_key")
     assert factory._KEY_FIELDS["openai-compatible"] == ("iterate_backend_api_key",)
     assert "ollama" not in factory._KEY_FIELDS
-    assert factory.harness_backends() == factory.known_providers()
+    assert set(factory.known_providers()) - set(factory.harness_backends()) == {"anthropic"}
 
 
 def test_a_refusal_is_read_off_the_status_whatever_the_library() -> None:
@@ -488,7 +546,7 @@ def test_a_refusal_is_read_off_the_status_whatever_the_library() -> None:
     found = _provider("groq", settings=_settings(groq_api_key="gsk-wrong"))
 
     def raises(error: Exception) -> Any:
-        def lister(provider: factory.Provider, timeout: float) -> None:
+        def lister(provider: factory.Provider, timeout: float, model: str | None) -> None:
             raise error
 
         return lister
@@ -552,12 +610,44 @@ def test_the_key_check_sends_another_company_nothing_of_openais(
     _openais_environment(monkeypatch)
     found = _provider("groq", settings=_settings(groq_api_key="gsk-env"))
 
-    _the_real_key_check(found, 5.0)
+    _the_real_key_check(found, 5.0, None)
 
     seen = sent_to.seen
     assert seen["url"] == "https://api.groq.com/openai/v1/models"
     assert seen["authorization"] == "Bearer gsk-env"
     assert not set(_OPENAIS) & set(seen)
+
+
+@pytest.mark.parametrize(
+    ("body", "said"),
+    [
+        (
+            {"object": "list", "data": [{"id": "openai/gpt-oss-20b", "object": "model"}]},
+            "groq does not serve llama-3.3-70b-versatile to this key. It serves: "
+            "openai/gpt-oss-20b",
+        ),
+        # Together's shape: a bare list, which the OpenAI library cannot read.
+        ([{"id": "openai/gpt-oss-20b"}], None),
+    ],
+)
+def test_the_names_a_company_serves_are_read_off_its_own_list(
+    monkeypatch: pytest.MonkeyPatch, body: Any, said: str | None
+) -> None:
+    import httpx
+    import openai
+
+    real = openai.OpenAI
+
+    def built(**kwargs: Any) -> Any:
+        answer = httpx.MockTransport(lambda request: httpx.Response(200, json=body))
+        return real(http_client=httpx.Client(transport=answer), **kwargs)
+
+    monkeypatch.setattr(openai, "OpenAI", built)
+    found = _provider("groq", settings=_settings(groq_api_key="gsk-env"))
+    check = _the_real_key_check
+
+    assert factory.refused_key(found, model="llama-3.3-70b-versatile", lister=check) == said
+    assert factory.refused_key(found, model="openai/gpt-oss-20b", lister=check) is None
 
 
 def test_what_the_environment_holds_for_openai_is_sent_to_openai_only(

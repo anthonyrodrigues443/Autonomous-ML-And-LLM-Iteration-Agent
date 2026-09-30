@@ -12,6 +12,7 @@ provider's own, looked up by the provider's name, and never the harness's.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 from dataclasses import dataclass, field
@@ -55,6 +56,7 @@ _PROVIDERS: dict[str, _Known] = {
     "deepseek": _Known("openai", "https://api.deepseek.com/v1", "deepseek_api_key"),
     "openai-compatible": _Known("openai"),
     "vllm": _Known("openai"),
+    "anthropic": _Known("anthropic", "https://api.anthropic.com", "anthropic_api_key"),
 }
 
 # Cloud aliases → their OpenAI-compatible base URL, so `--backend groq` (or a saved
@@ -173,7 +175,26 @@ def build_client(
         return OpenAICompatibleClient(
             base_url=resolve_base_url(name, base_url), model=model, api_key=api_key
         )
+    if name in _PROVIDERS:
+        raise UnknownBackendError(not_a_harness(name))
     raise UnknownBackendError(f"unknown backend {name!r}; choose one of {_KNOWN}")
+
+
+def not_a_harness(name: str) -> str:
+    """Why a provider cannot run the loop."""
+    return (
+        f"{name} runs as the model under test of a prompt run (--target-backend {name}); "
+        f"as the harness that runs the loop it comes in v1.0. Harness backends: "
+        f"{', '.join(harness_backends())}"
+    )
+
+
+def _sdk_missing(wire: str | None) -> str | None:
+    """Why a client of this wire cannot be built here, or None. Claude's SDK is an
+    optional extra."""
+    if wire == "anthropic" and not importlib.util.find_spec("anthropic"):
+        return "the anthropic package is not installed: pip install 'iterate-ai[anthropic]'"
+    return None
 
 
 # Which settings field holds the harness's key for each cloud backend.
@@ -212,6 +233,12 @@ def known_providers() -> tuple[str, ...]:
 def harness_backends() -> tuple[str, ...]:
     """Every name `--backend` takes: the providers a client of the harness's speaks to."""
     return tuple(n for n in known_providers() if _PROVIDERS[n].wire in ("ollama", "openai"))
+
+
+def wire_of(name: str) -> str | None:
+    """Which client speaks to this provider, or None for a name iterate does not know."""
+    known = _PROVIDERS.get(name)
+    return known.wire if known is not None else None
 
 
 def is_self_hosted(name: str) -> bool:
@@ -344,7 +371,7 @@ def _ollama_host(settings: object | None) -> str | None:
     return str(host) if host else None
 
 
-def _bad_address(provider: Provider, given_as: str) -> str | None:
+def _bad_address(provider: Provider, given_as: str, wire: str | None = None) -> str | None:
     """Why an address cannot be used, or None. It is written into meta.json, which is
     delivered with the run, and a key is sent to it. ``given_as`` names where it came
     from, the flag or the saved file, so the refusal says what to change."""
@@ -364,6 +391,8 @@ def _bad_address(provider: Provider, given_as: str) -> str | None:
             f"{what} carries a user name, a password or a token. Give the address "
             f"without it, and the key in {TARGET_KEY_ENV} or `iterate setup`"
         )
+    if (wire or wire_of(provider.name)) == "anthropic" and parsed.path.rstrip("/").endswith("/v1"):
+        return f"{what} ends in /v1, which Anthropic's library adds itself. Drop the /v1"
     if provider.api_key and parsed.scheme == "http" and alias_for_base_url(url) is not None:
         return (
             f"{provider.name} takes its key over https only: {shown(url)} would send it "
@@ -372,16 +401,21 @@ def _bad_address(provider: Provider, given_as: str) -> str | None:
     return None
 
 
-def not_callable(provider: Provider, *, in_a_cell: bool = False, given_as: str = "") -> str | None:
+def not_callable(
+    provider: Provider, *, in_a_cell: bool = False, given_as: str = "", wire: str | None = None
+) -> str | None:
     """Why the model under test cannot be called, or None when it can. ``in_a_cell``
     words the remedy for a kernel or a notebook run by hand, which reads the
-    environment alone. ``given_as`` is the flag its address came from, if one did."""
+    environment alone. ``given_as`` is the flag its address came from, if one did.
+    ``wire`` is the client it is called with, when that is not its provider's own."""
+    if (missing := _sdk_missing(wire or wire_of(provider.name))) is not None:
+        return missing
     if is_self_hosted(provider.name) and not provider.base_url:
         return (
             f"{provider.name} is a server you run, so it has no address of its own: "
             f"save its base URL with `iterate setup` or pass --target-base-url"
         )
-    if provider.base_url and (why := _bad_address(provider, given_as)) is not None:
+    if provider.base_url and (why := _bad_address(provider, given_as, wire)) is not None:
         return why
     if provider.needs_key and not provider.api_key:
         variable = own_key_env(provider.name)
@@ -391,12 +425,15 @@ def not_callable(provider: Provider, *, in_a_cell: bool = False, given_as: str =
     return None
 
 
-def not_ready(provider: Provider) -> str | None:
+def not_ready(provider: Provider, *, wire: str | None = None) -> str | None:
     """Why a provider the list allows could not be called, in a few words, or None. No
-    flag of a run mends it: the run calls another provider."""
+    flag of a run mends it: the run calls another provider. ``wire`` is the client it
+    is saved to be called with, when that is not its provider's own."""
+    if (missing := _sdk_missing(wire or wire_of(provider.name))) is not None:
+        return missing
     if is_self_hosted(provider.name) and not provider.base_url:
         return "no base URL saved"
-    if provider.base_url and _bad_address(provider, "") is not None:
+    if provider.base_url and _bad_address(provider, "", wire) is not None:
         return "its saved address cannot be used"
     if provider.needs_key and not provider.api_key:
         return f"no key, set {own_key_env(provider.name)}"
@@ -406,20 +443,22 @@ def not_ready(provider: Provider) -> str | None:
 def refused_key(
     provider: Provider,
     *,
+    model: str | None = None,
     timeout: float = 5.0,
-    lister: Callable[[Provider, float], None] | None = None,
+    lister: Callable[[Provider, float, str | None], list[str] | None] | None = None,
 ) -> str | None:
-    """Ask the provider for its model list, which costs nothing, and return why it
-    refused the key, or None. Only a plain no to the key is a refusal. A provider that
-    cannot be reached, a key that may chat and may not list models, a list that cannot
-    be read: the run goes on, and the first real call says so."""
+    """Ask the provider which models it serves this key, which costs nothing, and return
+    why the run cannot go on, or None. Two reasons count: a plain no to the key, and a
+    company that does not serve the model named. A provider that cannot be reached, a
+    key that may chat and may not list models, a list that cannot be read: the run goes
+    on, and the first real call says so."""
     if not provider.api_key or provider.name not in _PROVIDERS:
         return None
     ask = lister or _LISTERS.get(_PROVIDERS[provider.name].wire)
     if ask is None:
         return None
     try:
-        ask(provider, timeout)
+        served = ask(provider, timeout, model)
     except Exception as exc:
         # Read off the status, not the class: each wire's library has its own classes.
         if getattr(exc, "status_code", None) == 401:
@@ -433,21 +472,40 @@ def refused_key(
                 f"key from {provider.key_from}. Check the key, or {remedy}"
             )
         logger.info("could not check the %s key (%s)", provider.name, type(exc).__name__)
-    return None
+        return None
+    # A server the user runs, or a gateway, may list its models by other names.
+    company = alias_for_base_url(provider.base_url) == provider.name
+    if model is None or served is None or not company or model in served:
+        return None
+    shown_names = sorted(served)
+    listing = ", ".join(shown_names) if 0 < len(shown_names) <= 12 else ""
+    return f"{provider.name} does not serve {model} to this key." + (
+        f" It serves: {listing}" if listing else " Check the name in its model list"
+    )
 
 
-def _list_models(provider: Provider, timeout: float) -> None:
+def _list_models(provider: Provider, timeout: float, model: str | None) -> list[str]:
     from openai import OpenAI
 
     client = OpenAI(
         base_url=provider.base_url, api_key=provider.api_key, timeout=timeout, max_retries=0
     )
-    keep_openais_own_at_home(client, provider.base_url or "").models.list()
+    listing = keep_openais_own_at_home(client, provider.base_url or "").models.list()
+    return [str(entry.id) for entry in listing]
 
 
-# How each wire lists its models. The call is looked up when it is made.
-_LISTERS: dict[str, Callable[[Provider, float], None]] = {
-    "openai": lambda provider, timeout: _list_models(provider, timeout),
+def _claude_serves(provider: Provider, timeout: float, model: str | None) -> list[str] | None:
+    from iterate.llm import anthropic_client
+
+    return anthropic_client.served(
+        model, base_url=provider.base_url or "", api_key=provider.api_key or "", timeout=timeout
+    )
+
+
+# How each wire says which models it serves. The call is looked up when it is made.
+_LISTERS: dict[str, Callable[[Provider, float, str | None], list[str] | None]] = {
+    "openai": lambda provider, timeout, model: _list_models(provider, timeout, model),
+    "anthropic": lambda provider, timeout, model: _claude_serves(provider, timeout, model),
 }
 
 
@@ -458,6 +516,19 @@ def build_target_client(
     to it, so it never falls through to the harness's settings."""
     if backend == "ollama":
         return build_client(backend, model=model, base_url=base_url, api_key=None)
+    if _PROVIDERS.get(backend, _Known("")).wire == "anthropic":
+        found = Provider(
+            name=backend,
+            base_url=resolve_base_url(backend, base_url),
+            api_key=None if api_key == NO_KEY else api_key,
+        )
+        if (why := not_callable(found, in_a_cell=True)) is not None:
+            raise ProviderError(why)
+        from iterate.llm.anthropic_client import AnthropicClient
+
+        return AnthropicClient(
+            model=model, api_key=found.api_key or "", base_url=found.base_url or ""
+        )
     if base_url is None and is_self_hosted(backend):
         # A run folder from before v0.7 wrote no address for a server the user runs:
         # its notebook finds the server where that run did, in the environment.
@@ -469,7 +540,7 @@ def build_target_client(
         base_url=resolve_base_url(backend, base_url),
         api_key=None if api_key == NO_KEY else api_key,
     )
-    if (why := not_callable(provider, in_a_cell=True)) is not None:
+    if (why := not_callable(provider, in_a_cell=True, wire=wire_of(backend))) is not None:
         raise ProviderError(why)
     return build_client(
         backend, model=model, base_url=provider.base_url, api_key=provider.api_key or NO_KEY
@@ -513,6 +584,7 @@ __all__ = [
     "harness_backends",
     "is_self_hosted",
     "known_providers",
+    "not_a_harness",
     "not_callable",
     "not_ready",
     "own_key_env",
@@ -525,4 +597,5 @@ __all__ = [
     "shown",
     "takes_a_key",
     "unknown",
+    "wire_of",
 ]

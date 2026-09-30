@@ -63,5 +63,41 @@ def test_api_rows_are_the_models_a_prompt_run_can_name() -> None:
 
     assert table.api("openai", "gpt-4o-mini") is not None
     assert table.api("OpenAI", "GPT-4o-mini") is not None
+    # Enterprise only now, with no public price.
     assert table.api("groq", "llama-3.3-70b-versatile") is None
-    assert all(row.cloud in {"openai", "together", "deepseek"} for row in table.api_models)
+    assert table.api("groq", "openai/gpt-oss-20b") is not None
+    assert {row.cloud for row in table.api_models} == {
+        "openai",
+        "together",
+        "deepseek",
+        "groq",
+        "anthropic",
+    }
+
+
+def test_claude_is_priced_under_every_name_the_api_takes() -> None:
+    """The lookup is by the name typed, and Haiku 4.5 answers to two."""
+    table = prices.shipped()
+    alias = table.api("anthropic", "claude-haiku-4-5")
+    dated = table.api("anthropic", "claude-haiku-4-5-20251001")
+
+    assert alias is not None
+    assert dated is not None
+    assert (alias.usd_per_1m_in, alias.usd_per_1m_out) == (1.0, 5.0)
+    assert (dated.usd_per_1m_in, dated.usd_per_1m_out) == (1.0, 5.0)
+
+
+def test_a_shipped_price_is_dated_by_the_day_its_own_rows_were_read() -> None:
+    """The table is dated by its newest row; a machine read days before must not look
+    as new as that."""
+    table = prices.shipped()
+
+    assert table.read_on("aws") == "2026-09-25"
+    assert (
+        table.provenance()
+        == "aws shipped 2026-09-25, azure shipped 2026-09-25, gcp shipped 2026-09-25"
+    )
+    measured = '{"system": "s", "user_template": "{t}", "tokens_in_per_record": 600.0}'
+    facts = serving.facts_from_prompt(measured, provider="openai", model="gpt-4o-mini")
+    assert serving.profile(facts, 1000, table).prices_as_of == "openai shipped 2026-09-25"
+    assert table.api("anthropic", "claude-haiku-4-5").read_on == table.snapshot_date  # type: ignore[union-attr]

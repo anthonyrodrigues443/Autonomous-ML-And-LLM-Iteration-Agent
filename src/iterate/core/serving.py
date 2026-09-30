@@ -655,7 +655,7 @@ def _api_profile(facts: ServingFacts, rate: int, prices: Prices) -> ServingProfi
         requests_per_hour=rate,
         chosen=HostCost(host=row, usd_per_month=month),
         usd_per_1k_requests=per_request * 1000,
-        prices_as_of=f"{row.cloud} shipped {prices.snapshot_date}",
+        prices_as_of=f"{row.cloud} shipped {row.read_on}",
         basis=[*facts.basis, "rate limits are not modelled"],
     )
 

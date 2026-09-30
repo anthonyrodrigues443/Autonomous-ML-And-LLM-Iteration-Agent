@@ -79,7 +79,12 @@ def is_secret(name: str) -> bool:
     upper = name.upper()
     if upper in _KEPT:
         return False
-    return upper in KERNEL_SECRETS or not _SECRET_WORDS.isdisjoint(upper.split("_"))
+    return (
+        upper in KERNEL_SECRETS
+        # Every one the Anthropic SDK reads by itself: an address, a profile, headers.
+        or upper.startswith("ANTHROPIC_")
+        or not _SECRET_WORDS.isdisjoint(upper.split("_"))
+    )
 
 
 def _shape_of(key: str) -> re.Pattern[str]:

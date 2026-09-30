@@ -135,14 +135,18 @@ A prompt eval set is a CSV like any other: input columns plus one column holding
 iterate run --data eval.csv --target label --task "decide whether this ticket is urgent"
 iterate run --data eval.csv --target label --task "..." --prompt-file current_prompt.txt   # start from the prompt you ship today
 iterate run --data pairs.csv --target score --task "rate how similar the two sentences are, 0 to 5" --metric pearson
-iterate run --data eval.csv --target label --task "..." --target-model gemma4:12b --target-backend ollama --model llama-3.3-70b-versatile --backend groq
+iterate run --data eval.csv --target label --task "..." --target-model gemma4:12b --target-backend ollama --model openai/gpt-oss-120b --backend groq
 ```
 
 The last form tunes a prompt for one model while a stronger model drives the run. The cost line is honest: a pass is one model call per record, so 100 records on a local 12B is minutes, not seconds. Every answer is cached under the provider, the host and the model that gave it, so re-measuring a prompt the run has already tried is free.
 
 **Two sets of model settings.** The harness is the model that runs the loop: `--backend`, `--model`, `--base-url`, `--api-key`. The model under test is the one your prompt is tuned for: `--target-backend`, `--target-model`, `--target-base-url`. Named apart with `--target-backend`, it takes nothing from the harness, not its address and not its key. Its address is the flag, else the one you saved for that provider, else the provider's public address. Its key is looked up by the provider's name: `ITERATE_TARGET_API_KEY` if you exported one for this run, else the key you saved for that provider, else the provider's own variable (`GROQ_API_KEY` for groq, `OPENAI_API_KEY` for openai). It never takes the harness's `ITERATE_BACKEND_API_KEY`, and a server you run (`openai-compatible`, `vllm`) never takes OpenAI's key; aimed at a company's address it is that company, with that company's key. With no `--target-backend` the model under test is served where the harness is, at the harness's address with the harness's key, and it is the harness's model unless `--target-model` names another. A line at the start of the run says which model is under test, where it is called and where its key came from.
 
-`iterate setup` saves both sets, and the list of providers a prompt run may call. A provider outside the list is refused before its key is looked up, even when the key sits in the same file; `--providers openai,groq` replaces the list for one run. Before the memory is archived or the run folder is made, every allowed provider must have its key, and the key of the model under test is checked with one free call to the provider; only a plain no to the key stops the run. `iterate config` shows what is saved and where each key would come from, every key masked. The file is `~/.config/iterate/config.toml`, readable by you only.
+`iterate setup` saves both sets, and the list of providers a prompt run may call. A provider outside the list is refused before its key is looked up, even when the key sits in the same file; `--providers openai,groq` replaces the list for one run. Before the memory is archived or the run folder is made, every allowed provider must have its key, and the key of the model under test is checked with one free call to the provider; a plain no to the key stops the run, and so does a company that does not serve the model named. `iterate config` shows what is saved and where each key would come from, every key masked. The file is `~/.config/iterate/config.toml`, readable by you only.
+
+**Claude as the model under test.** `pip install 'iterate-ai[anthropic]'`, set `ANTHROPIC_API_KEY` (or save it with `iterate setup`), and pass `--target-backend anthropic --target-model claude-haiku-4-5`. Claude is called through Anthropic's own library, with the answer tool forced where the model allows it. Claude Haiku 4.5, Sonnet 5 and Opus 5 run today. Sonnet 5.5, Opus 5.5 and Fable 5.1 think before they answer, and an answer is allowed 64 tokens, so they are refused before the run starts, as is a Claude model iterate has no rule for yet. Claude runs the loop in v1.0, not before: `--backend anthropic` is refused. The key check also asks whether your key is served the model you named, so a typo stops the run before anything is written.
+
+**A record the provider never answered is not a wrong answer.** A reply that cannot be used is scored as wrong (on a numeric target, as the training median), as before: that is the prompt's fault. A record where every try failed at the provider (an outage, a rate limit that outlasts the retries, a key or a model it refuses) is asked once more 30 seconds after the pass. Still unanswered, it fails the whole pass with a count, `not scored: the provider did not answer 2 of 100 records, each asked twice`, and nothing is banked; in the baseline that ends the run. Usable answers are cached, so running again asks only the rest.
 
 ---
 
@@ -205,7 +209,7 @@ iterate run --data train.clean.csv --target churn --metric f1 --compute e2b
 
 # Use a cloud LLM backend (aliases: groq, together, deepseek, openai):
 iterate run --data train.clean.csv --target churn --metric f1 \
-            --backend groq --model llama-3.3-70b-versatile --api-key "$GROQ_API_KEY"
+            --backend groq --model openai/gpt-oss-120b --api-key "$GROQ_API_KEY"
 
 # Seed the baseline from an existing notebook/script (read as text, never executed):
 iterate run --data train.clean.csv --target churn --metric f1 \

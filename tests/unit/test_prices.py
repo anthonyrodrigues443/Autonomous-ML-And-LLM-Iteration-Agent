@@ -410,7 +410,7 @@ def test_load_reads_the_cache_for_a_cloud_that_has_one_and_the_shipped_file_othe
     assert table.sources["aws"].kind == "refreshed"
     assert table.sources["gcp"].kind == "shipped"
     assert table.provenance(("aws", "gcp")) == (
-        f"aws refreshed {prices.today()} (us-east-1), gcp shipped {table.snapshot_date} (us-central1)"
+        f"aws refreshed {prices.today()} (us-east-1), gcp shipped {table.read_on('gcp')} (us-central1)"
     )
 
 
@@ -420,7 +420,7 @@ def test_with_no_cache_everything_is_shipped_and_dated() -> None:
     assert {h.cloud for h in table.hosts} == {"aws", "gcp"}
     assert (
         table.provenance()
-        == f"aws shipped {table.snapshot_date} (us-east-1), gcp shipped {table.snapshot_date} (us-central1)"
+        == "aws shipped 2026-09-25 (us-east-1), gcp shipped 2026-09-25 (us-central1)"
     )
 
 
@@ -428,7 +428,7 @@ def test_the_profile_line_says_which_list_it_used() -> None:
     facts = serving.facts_from_recipe({"backbone": "resnet18", "image_size": 128})
     line = serving.profile(facts, 1000, serving.load_prices(("aws",))).render()[0]
 
-    assert line.endswith(f"prices: aws shipped {prices.shipped().snapshot_date} (us-east-1)")
+    assert line.endswith("prices: aws shipped 2026-09-25 (us-east-1)")
 
 
 def test_describe_names_every_cloud_and_the_timm_table() -> None:
@@ -439,6 +439,10 @@ def test_describe_names_every_cloud_and_the_timm_table() -> None:
     assert lines[2].startswith("azure eastus: shipped rows")
     assert lines[3].startswith("timm:")
     assert "api models" in lines[4]
+    # Each dated by the day it was read, not by the newest row of the table.
+    assert "2026-09-25)" in lines[0]
+    assert lines[3].endswith("shipped 2026-09-26")
+    assert "shipped read 2026-09-25 to 2026-09-30" in lines[4]
 
 
 # ─── the Pricer with live lists ──────────────────────────────────────────

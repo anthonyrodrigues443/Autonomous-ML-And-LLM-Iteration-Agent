@@ -862,8 +862,9 @@ def run(
         None,
         "--target-backend",
         help="The provider of the model under test: ollama, openai, groq, together, "
-        "deepseek, or a server you run (openai-compatible, vllm). Defaults to --backend, "
-        "and then the model under test is served where the harness is, with its key.",
+        "deepseek, anthropic, or a server you run (openai-compatible, vllm). Defaults to "
+        "--backend, and then the model under test is served where the harness is, with "
+        "its key.",
     ),
     target_base_url: str | None = typer.Option(
         None,
@@ -1098,6 +1099,7 @@ def run(
     cfg = _saved_config()
 
     # ─── Resolve: explicit flag > saved config > built-in default ──────────
+    backend_saved = backend is None and bool(cfg.get("backend"))
     backend = backend or cfg.get("backend") or "ollama"
     saved_harness = _saved_for(backend, base_url, cfg)
     model = model or saved_harness.get("model")
@@ -1106,6 +1108,7 @@ def run(
     install = install if install is not None else bool(cfg.get("install", False))
     if compute not in ("local", "e2b"):
         raise typer.BadParameter(f"--compute must be 'local' or 'e2b', got {compute!r}")
+    _check_harness(backend, saved=backend_saved)
     notebooks = notebooks.lower()
     if notebooks not in ("best", "all", "none"):
         raise typer.BadParameter(f"--notebooks must be best | all | none, got {notebooks!r}")
@@ -2076,6 +2079,10 @@ def _rescore_winner_on_full_holdout(
         )
         return None
     if final.metrics is None:
+        console.print(
+            f"[dim]final re-score {escape(final.error or 'gave no score')}; "
+            "keeping the loop score[/dim]"
+        )
         return None
     return {"score": final.metrics.primary_value, "n": full_dataset.n_test}
 
@@ -2106,6 +2113,25 @@ def _read_starting_prompt(path: Path) -> Any:
     if not raw.strip():
         raise typer.BadParameter(f"{path} is empty")
     return Prompt(system=raw.strip(), user_template="{input}")
+
+
+def _check_harness(backend: str, *, saved: bool = False) -> None:
+    """Refuse a harness backend that cannot run the loop, before anything is written."""
+    from iterate.llm import factory
+
+    if backend in factory.harness_backends():
+        return
+    named = (
+        f"the saved backend {backend} (change it with `iterate setup`)"
+        if saved
+        else f"--backend {backend}"
+    )
+    if backend in factory.known_providers():
+        raise typer.BadParameter(f"{named}: {factory.not_a_harness(backend)}")
+    raise typer.BadParameter(
+        f"{named}: not a backend iterate knows. Choose from "
+        f"{', '.join(factory.harness_backends())}"
+    )
 
 
 def _saved_for(backend: str, base_url: str | None, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -2240,10 +2266,18 @@ def _model_under_test(
                 "drop --target-backend"
             )
         company = factory.provider_name(asked, address or kept)
-        if asked == "ollama" and company != asked:
+        if company != asked and factory.wire_of(company) != factory.wire_of(asked):
+            called = (
+                "not an Ollama server"
+                if asked == "ollama"
+                else f"and iterate calls {company} with its own client, not {asked}'s"
+            )
+            fix = f"--target-backend {company}"
+            if target_backend is None:
+                fix += f" --target-model {target_model or model or '<model>'}"
             raise factory.ProviderError(
-                f"{given_as or factory.shown(address or kept)} is {company}'s address, not an "
-                f"Ollama server. Pass --target-backend {company}"
+                f"{given_as or factory.shown(address or kept)} is {company}'s address, "
+                f"{called}. Pass {fix}"
             )
         # A name on the list covers a company's address only when that address is the
         # one saved under the name. Settled before any key of the company is looked up.
@@ -2264,26 +2298,39 @@ def _model_under_test(
             harness_key=api_key if own else None,
             harness_key_from=f"{api_key_from} (the harness's key)",
         )
-        others = [
-            factory.prompt_provider(n, saved=entries, settings=settings, environ={})
+        # By the name saved: a server saved at a company's address is still called
+        # with the client its name says.
+        saved_as = {
+            n: factory.prompt_provider(n, saved=entries, settings=settings, environ={})
             for n in allowed or ()
             if n not in (asked, under_test.name)
-        ]
+        }
+        others = list(saved_as.values())
     except (factory.ProviderError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if (why := factory.not_callable(under_test, given_as=given_as)) is not None:
         raise typer.BadParameter(why)
-    if waiting := [f"{p.name} ({why})" for p in others if (why := factory.not_ready(p))]:
+    if waiting := [
+        f"{p.name} ({why})"
+        for n, p in saved_as.items()
+        if (why := factory.not_ready(p, wire=factory.wire_of(n)))
+    ]:
         raise typer.BadParameter(
             f"these allowed prompt providers are not ready: {', '.join(waiting)}. Save them "
             f"with `iterate setup`, or pass --providers {asked} to allow only the model "
             "under test"
         )
-    if (why := factory.refused_key(under_test)) is not None:
+    model_named = target_model or model or settings.iterate_model
+    if factory.wire_of(under_test.name) == "anthropic":
+        from iterate.llm.claude_models import refused
+
+        if (why := refused(model_named)) is not None:
+            raise typer.BadParameter(why)
+    if (why := factory.refused_key(under_test, model=model_named)) is not None:
         raise typer.BadParameter(why)
     settled = factory.UnderTest(
         provider=under_test,
-        model=target_model or model or settings.iterate_model,
+        model=model_named,
         backend=asked,
         allowed=(under_test, *others),
         listed=allowed,

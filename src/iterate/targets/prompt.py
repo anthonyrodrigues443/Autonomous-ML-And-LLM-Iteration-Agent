@@ -17,7 +17,7 @@ import pandas as pd
 
 from iterate.adapters.compute.base import CodeJob
 from iterate.core import codegen
-from iterate.core.prompt_runtime import UNPARSEABLE, AskStats, make_ask
+from iterate.core.prompt_runtime import UNPARSEABLE, AskStats, NoReplyError, make_ask
 from iterate.core.prompting import Prompt, baseline_prompt
 from iterate.core.scoring import score, task_for_metric
 from iterate.schemas.experiment import ExperimentResult, Metrics
@@ -311,6 +311,10 @@ class PromptTarget:
         stats = AskStats()
         try:
             answers = ask(prompt, rows, stats=stats)
+        except NoReplyError as exc:
+            return ExperimentResult(
+                experiment_id=experiment_id, error=f"not scored: {exc}", logs=stats.summary()
+            )
         except Exception as exc:
             return ExperimentResult(
                 experiment_id=experiment_id, error=f"prompt run failed: {type(exc).__name__}: {exc}"

@@ -36,6 +36,10 @@ PROBABILITIES_CSV = "probabilities.csv"
 # predictions it produced. A run's real output is the prompt you can put into
 # production, and a notebook cannot tell you which of its cells held the winner.
 PROMPT_JSON = "prompt.json"
+# Written when the provider left records of a session's pass unanswered. Read only when
+# the session ends with no predictions, so a full submission still stands, and a floor
+# is never banked in the place of prompts that were not answered.
+NO_REPLY_TXT = "no_reply.txt"
 # The image path's twin of PROMPT_JSON: the recipe (or own-model line) that produced
 # the predictions on disk, with their digest.
 RECIPE_JSON = "recipe.json"
@@ -212,7 +216,7 @@ def prompt_session_preamble() -> str:
         "import json, random, pandas as pd, numpy as np\n"
         "random.seed(42); np.random.seed(42)\n"
         "from iterate.core.prompting import Prompt\n"
-        "from iterate.core.prompt_runtime import make_ask, AskStats, UNPARSEABLE\n"
+        "from iterate.core.prompt_runtime import make_ask, AskStats, UNPARSEABLE, NoReplyError\n"
         "from iterate.core.scoring import score as _score\n"
         f"with open({META_JSON!r}) as _f:\n"
         "    _meta = json.load(_f)\n"
@@ -242,7 +246,12 @@ def prompt_session_preamble() -> str:
         "def _ask_with_stats(prompt, rows):\n"
         "    frame = rows.to_dict(orient='records') if hasattr(rows, 'to_dict') else list(rows)\n"
         "    stats = AskStats()\n"
-        "    return _ask(prompt, frame, stats=stats), stats\n"
+        "    try:\n"
+        "        return _ask(prompt, frame, stats=stats), stats\n"
+        "    except NoReplyError as _missed:\n"
+        f"        with open({NO_REPLY_TXT!r}, 'w') as _f:\n"
+        "            _f.write(str(_missed))\n"
+        "        raise\n"
         "def ask(prompt, rows):\n"
         "    out, stats = _ask_with_stats(prompt, rows)\n"
         "    print('ask:', stats.summary())\n"

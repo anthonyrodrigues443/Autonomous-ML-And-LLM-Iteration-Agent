@@ -329,6 +329,13 @@ def test_every_providers_own_key_is_kept_from_the_kernel() -> None:
         *["AWS_SECRET_ACCESS_KEY", "AZURE_CLIENT_SECRET", "GITHUB_PAT", "MYSQL_PWD", "PASSWD"],
         *["DISCORD_WEBHOOK_URL", "GOOGLE_APPLICATION_CREDENTIALS", "ITERATE_BACKEND_URL"],
         *["KAGGLE_KEY", "STRIPE_KEY_LIVE"],
+        # Every one the Anthropic SDK reads by itself sends a cell's calls elsewhere, or
+        # with other headers, than the host's client, which reads none of them.
+        *["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_PROFILE"],
+        *["ANTHROPIC_WORKSPACE_ID", "ANTHROPIC_LOG", "anthropic_config_dir"],
+        *["ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_SCOPE"],
+        # By the prefix: one the library adds later is kept out too.
+        *["ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_SOMETHING_NEW"],
     ],
 )
 def test_a_name_that_reads_as_a_secret_is_kept_from_the_kernel(name: str) -> None:

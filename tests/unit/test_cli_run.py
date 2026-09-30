@@ -1383,7 +1383,7 @@ def test_a_key_the_provider_refuses_stops_the_run_before_anything_is_written(
 ) -> None:
     from openai import AuthenticationError
 
-    def refuses(provider: Any, timeout: float) -> None:
+    def refuses(provider: Any, timeout: float, model: str | None) -> None:
         response = type("R", (), {"request": None, "status_code": 401, "headers": {}})()
         raise AuthenticationError("bad key", response=response, body=None)
 
@@ -1427,7 +1427,7 @@ def test_a_model_under_test_named_apart_needs_its_own_model_name(
     [
         (
             ["--target-backend", "grok", "--target-model", "m"],
-            "grok: not a provider iterate knows. Choose from ollama, deepseek, groq",
+            "grok: not a provider iterate knows. Choose from ollama, anthropic, deepseek, groq",
         ),
         (["--providers", "openia"], "openia: not a provider iterate knows. Choose from"),
         (
@@ -1882,6 +1882,187 @@ def test_an_ollama_model_under_test_aimed_at_a_company_is_refused(
     )
     text = _refused(result, tmp_path)
     assert "is openai's address, not an Ollama server. Pass --target-backend openai" in text
+
+
+def test_claude_is_the_model_under_test_with_its_own_key_at_its_own_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("anthropic")
+    result, built = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "anthropic", "--target-model", "claude-haiku-4-5"],
+        env={"ANTHROPIC_API_KEY": "sk-ant-env", "ITERATE_BACKEND_API_KEY": "harness-key"},
+    )
+    assert result.exit_code == 0, result.output
+    assert built["base_url"] == "https://api.anthropic.com"
+    assert (built["api_key"], built["kernel"]._target_key) == ("sk-ant-env", "sk-ant-env")
+    assert (
+        "model under test: anthropic claude-haiku-4-5 at https://api.anthropic.com, "
+        "key from ANTHROPIC_API_KEY" in " ".join(_plain(result.output).split())
+    )
+
+
+@pytest.mark.parametrize("backend", ["anthropic", "mistral"])
+def test_a_harness_that_cannot_run_the_loop_is_refused_before_anything_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--backend", backend, "--model", "m"],
+        env={"ANTHROPIC_API_KEY": "sk-ant-env"},
+    )
+    text = _refused(result, tmp_path)
+    said = {
+        "anthropic": "anthropic runs as the model under test of a prompt run "
+        "(--target-backend anthropic); as the harness that runs the loop it comes in v1.0",
+        "mistral": "--backend mistral: not a backend iterate knows. Choose from ollama,",
+    }
+    assert said[backend] in text
+
+
+@pytest.mark.parametrize(
+    ("model", "said"),
+    [
+        ("claude-opus-5-5", "thinks before it answers"),
+        ("claude-sonnet-5-5", "thinks before it answers"),
+        ("claude-fable-5-1", "thinks before it answers"),
+        ("claude-opus-4-8", "is not a Claude model iterate knows how to ask yet"),
+    ],
+)
+def test_a_claude_model_a_prompt_run_cannot_ask_is_refused_up_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model: str, said: str
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "anthropic", "--target-model", model],
+        env={"ANTHROPIC_API_KEY": "sk-ant-env"},
+    )
+    text = _refused(result, tmp_path)
+    assert f"{model} {said}" in text
+    assert "Pick claude-haiku-4-5, claude-sonnet-5 or claude-opus-5" in text
+
+
+def test_a_claude_model_the_key_is_not_served_is_refused_up_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[str | None] = []
+
+    def serves(provider: Any, timeout: float, model: str | None) -> list[str]:
+        asked.append(model)
+        return []
+
+    monkeypatch.setattr("iterate.llm.factory._claude_serves", serves)
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "anthropic", "--target-model", "claude-haiku-4-5-20990101"],
+        env={"ANTHROPIC_API_KEY": "sk-ant-env"},
+    )
+    text = _refused(result, tmp_path)
+    assert asked == ["claude-haiku-4-5-20990101"]
+    assert "anthropic does not serve claude-haiku-4-5-20990101 to this key" in text
+
+
+def test_claude_without_its_library_is_refused_with_the_command_that_adds_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "anthropic", "--target-model", "claude-haiku-4-5"],
+        env={"ANTHROPIC_API_KEY": "sk-ant-env"},
+    )
+    text = _refused(result, tmp_path)
+    assert "the anthropic package is not installed: pip install 'iterate-ai[anthropic]'" in text
+
+
+def test_the_harnesss_own_model_aimed_at_claudes_address_is_told_both_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        [
+            *["--backend", "openai-compatible", "--model", "claude-haiku-4-5"],
+            *["--base-url", "https://api.anthropic.com/v1", "--api-key", "sk-ant-k"],
+        ],
+    )
+    text = _refused(result, tmp_path)
+    assert "Pass --target-backend anthropic --target-model claude-haiku-4-5" in text
+
+
+def test_a_saved_backend_that_cannot_run_the_loop_is_named_as_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _prompt_run(tmp_path, monkeypatch, [], saved={"harness": {"backend": "grok"}})
+    text = _refused(result, tmp_path)
+    assert "the saved backend grok (change it with `iterate setup`): not a backend" in text
+
+
+def test_a_server_saved_at_claudes_address_needs_no_claude_library_for_another_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It is called with the OpenAI client its name says, so a groq run it is allowed
+    beside goes on as before Day 6."""
+    import sys
+
+    from iterate.userconfig import SavedProvider
+
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "groq", "--target-model", "qwen/qwen3.8-27b"],
+        env={"GROQ_API_KEY": "gsk-env"},
+        saved={
+            "allowed": ["groq", "openai-compatible"],
+            "providers": {
+                "openai-compatible": SavedProvider(
+                    "openai-compatible", api_key="k", base_url="https://api.anthropic.com/v1"
+                )
+            },
+        },
+    )
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize(
+    ("extra", "said"),
+    [
+        (
+            [
+                *["--target-backend", "openai-compatible", "--target-model", "m"],
+                *["--target-base-url", "https://api.anthropic.com/v1"],
+            ],
+            "is anthropic's address, and iterate calls anthropic with its own client, not "
+            "openai-compatible's. Pass --target-backend anthropic",
+        ),
+        (
+            [
+                *["--target-backend", "anthropic", "--target-model", "claude-haiku-4-5"],
+                *["--target-base-url", "https://api.groq.com/openai/v1"],
+            ],
+            "is groq's address, and iterate calls groq with its own client, not "
+            "anthropic's. Pass --target-backend groq",
+        ),
+    ],
+)
+def test_a_client_aimed_at_a_company_it_cannot_speak_to_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: list[str], said: str
+) -> None:
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        extra,
+        env={"ANTHROPIC_API_KEY": "sk-ant-env", "GROQ_API_KEY": "gsk-env"},
+    )
+    assert said in _refused(result, tmp_path)
 
 
 def test_a_key_saved_over_https_is_not_sent_over_http(

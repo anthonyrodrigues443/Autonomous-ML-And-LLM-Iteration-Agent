@@ -30,7 +30,22 @@ def _isolate_user_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
 def _no_key_is_checked_over_the_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """A prompt run asks its provider for the model list to check the key. No test may
     reach a provider; one that tests the check passes its own lister."""
-    monkeypatch.setattr("iterate.llm.factory._list_models", lambda provider, timeout: None)
+    monkeypatch.setattr("iterate.llm.factory._list_models", lambda provider, timeout, model: None)
+    monkeypatch.setattr("iterate.llm.factory._claude_serves", lambda provider, timeout, model: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_wait_before_a_record_is_asked_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("iterate.core.prompt_runtime._SECOND_ASK_WAIT", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _no_anthropic_variable_reaches_a_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Anthropic SDK reads these by itself, and a Claude Code shell sets
+    ANTHROPIC_BASE_URL. A test that needs one sets it."""
+    for name in list(os.environ):
+        if name.upper().startswith("ANTHROPIC_"):
+            monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture

@@ -1,5 +1,5 @@
 {
-  "snapshot_date": "2026-09-25",
+  "snapshot_date": "2026-09-30",
   "hosts": [
     {
       "cloud": "gcp",
@@ -267,6 +267,106 @@
       "source": "https://api-docs.deepseek.com/quick_start/pricing",
       "read_on": "2026-09-25",
       "note": "DeepSeek-V4-Pro-0813, cache-miss input, peak hours; off-peak is half"
+    },
+    {
+      "cloud": "anthropic",
+      "name": "claude-haiku-4-5",
+      "kind": "api",
+      "usd_per_1m_in": 1.0,
+      "usd_per_1m_out": 5.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "read_on": "2026-09-30",
+      "note": "alias of claude-haiku-4-5-20251001; standard tier, uncached input. Anthropic bills a tool-use system prompt of 588 input tokens on every call with the tool forced, as iterate calls it (496 with auto)"
+    },
+    {
+      "cloud": "anthropic",
+      "name": "claude-haiku-4-5-20251001",
+      "kind": "api",
+      "usd_per_1m_in": 1.0,
+      "usd_per_1m_out": 5.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "read_on": "2026-09-30",
+      "note": "Claude Haiku 4.5, dated ID; standard tier, uncached input"
+    },
+    {
+      "cloud": "anthropic",
+      "name": "claude-sonnet-5",
+      "kind": "api",
+      "usd_per_1m_in": 2.0,
+      "usd_per_1m_out": 10.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "read_on": "2026-09-30",
+      "note": "legacy, still served; standard tier, uncached input"
+    },
+    {
+      "cloud": "anthropic",
+      "name": "claude-sonnet-5-5",
+      "kind": "api",
+      "usd_per_1m_in": 2.0,
+      "usd_per_1m_out": 10.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "read_on": "2026-09-30",
+      "note": "standard tier, uncached input"
+    },
+    {
+      "cloud": "anthropic",
+      "name": "claude-opus-5",
+      "kind": "api",
+      "usd_per_1m_in": 5.0,
+      "usd_per_1m_out": 25.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "read_on": "2026-09-30",
+      "note": "legacy, still served; standard speed, uncached input"
+    },
+    {
+      "cloud": "anthropic",
+      "name": "claude-opus-5-5",
+      "kind": "api",
+      "usd_per_1m_in": 4.0,
+      "usd_per_1m_out": 20.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "read_on": "2026-09-30",
+      "note": "standard speed (fast mode is $8/$40), uncached input"
+    },
+    {
+      "cloud": "anthropic",
+      "name": "claude-fable-5-1",
+      "kind": "api",
+      "usd_per_1m_in": 10.0,
+      "usd_per_1m_out": 50.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "read_on": "2026-09-30",
+      "note": "uncached input"
+    },
+    {
+      "cloud": "groq",
+      "name": "openai/gpt-oss-20b",
+      "kind": "api",
+      "usd_per_1m_in": 0.075,
+      "usd_per_1m_out": 0.3,
+      "source": "https://console.groq.com/docs/models",
+      "read_on": "2026-09-30",
+      "note": "on-demand, uncached input (cached is $0.037)"
+    },
+    {
+      "cloud": "groq",
+      "name": "openai/gpt-oss-120b",
+      "kind": "api",
+      "usd_per_1m_in": 0.15,
+      "usd_per_1m_out": 0.6,
+      "source": "https://console.groq.com/docs/models",
+      "read_on": "2026-09-30",
+      "note": "on-demand, uncached input (cached is $0.075)"
+    },
+    {
+      "cloud": "groq",
+      "name": "qwen/qwen3.8-27b",
+      "kind": "api",
+      "usd_per_1m_in": 0.8,
+      "usd_per_1m_out": 4.0,
+      "source": "https://console.groq.com/docs/models",
+      "read_on": "2026-09-30",
+      "note": "preview model, may be shut down at short notice; replaced qwen/qwen3.6-27b on 2026-09-14"
     }
   ],
   "cpu_reference": {
