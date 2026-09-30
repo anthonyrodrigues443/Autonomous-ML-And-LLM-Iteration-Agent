@@ -316,17 +316,15 @@ def prompt_provider(
     saved: Mapping[str, SavedProvider] | None = None,
     settings: object | None = None,
     environ: Mapping[str, str] | None = None,
-    harness_key: str | None = None,
-    harness_key_from: str = "the harness key",
 ) -> Provider:
     """The provider a prompt run calls, with its endpoint and its key.
 
     The endpoint is the one given, else the one saved for this provider, else the
     provider's own public address: never the harness's. Ollama alone has no public
     address and is found at `OLLAMA_HOST`. The key is the exported target key, else the
-    ``harness_key`` a caller hands on, else the one saved for this provider, else the
-    provider's own variable. A key saved for a server the user runs goes only to the
-    address saved beside it.
+    one saved for this provider, else the provider's own variable, and never the
+    harness's. A key saved for a server the user runs goes only to the address saved
+    beside it.
     """
     if backend not in _PROVIDERS:
         raise ProviderError(unknown(backend))
@@ -345,7 +343,6 @@ def prompt_provider(
         saved_key = None
     for key, source in (
         ((env.get(TARGET_KEY_ENV) or "").strip(), TARGET_KEY_ENV),
-        (harness_key, harness_key_from),
         (saved_key, "the saved config"),
         (own_key_for(name, settings), own_key_env(name) or ""),
     ):
@@ -438,11 +435,12 @@ def not_callable(
     return None
 
 
-def not_ready(provider: Provider, *, wire: str | None = None) -> str | None:
+def not_ready(provider: Provider, *, wire: str | None = None, library: bool = True) -> str | None:
     """Why a provider the list allows could not be called, in a few words, or None. No
     flag of a run mends it: the run calls another provider. ``wire`` is the client it
-    is saved to be called with, when that is not its provider's own."""
-    if (missing := _sdk_missing(wire or wire_of(provider.name))) is not None:
+    is saved to be called with, when that is not its provider's own. ``library`` as in
+    `not_callable`."""
+    if library and (missing := _sdk_missing(wire or wire_of(provider.name))) is not None:
         return missing
     if is_self_hosted(provider.name) and not provider.base_url:
         return "no base URL saved"

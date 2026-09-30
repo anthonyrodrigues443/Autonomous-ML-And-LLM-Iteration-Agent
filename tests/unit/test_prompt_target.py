@@ -152,6 +152,7 @@ def test_one_record_the_provider_never_answered_is_left_out_of_the_score(
     """Scored as wrong, a rate limit on a hard record would read as a worse prompt. Left
     out, and kept in order so a comparison leaves it out of the other side too."""
     asked: dict[str, int] = {}
+    truth = dict(zip(dataset.test_features["text"], dataset.test_target, strict=True))
 
     class OneMissed(ScriptedClient):
         def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
@@ -161,7 +162,7 @@ def test_one_record_the_provider_never_answered_is_left_out_of_the_score(
                 raise RuntimeError("RateLimitError: 429")
             return ChatResponse(
                 model="fake-12b",
-                tool_calls=[ToolCall(id="1", name="answer", arguments={"value": "toxic"})],
+                tool_calls=[ToolCall(id="1", name="answer", arguments={"value": truth[text]})],
             )
 
     monkeypatch.setattr("iterate.llm.factory.build_client", lambda *a, **k: OneMissed("toxic"))
@@ -171,6 +172,7 @@ def test_one_record_the_provider_never_answered_is_left_out_of_the_score(
     assert result.error is None
     assert result.metrics is not None
     assert result.metrics.n_samples == dataset.n_test - 1
+    assert result.metrics.primary_value == 1.0
     answers = json.loads(result.artifacts["answers.json"])
     assert answers.count("__no_reply__") == 1
     assert "1 not answered by the provider" in str(result.logs)
@@ -1035,6 +1037,8 @@ def test_two_passes_are_compared_on_the_records_both_got_an_answer_for(
     # Wrong on the first record only.
     wrong_first = result([wrong[truth[0]], *truth[1:]])
     assert target.paired_scores(missed_first, wrong_first) == (1.0, 1.0)
+    # The bar lost the record, and the candidate answered every one.
+    assert target.paired_scores(wrong_first, missed_first) == (1.0, 1.0)
     assert target.paired_scores(result(truth), wrong_first) is None
     assert (
         target.paired_scores(missed_first, ExperimentResult(experiment_id="y", metrics=scored))
@@ -1045,6 +1049,35 @@ def test_two_passes_are_compared_on_the_records_both_got_an_answer_for(
     paired = target.paired_scores(missed_first, others_missed)
     assert paired is not None
     assert all(value != value for value in paired)
+
+
+def test_the_loop_reads_the_candidate_first_and_the_common_records_over_the_stored_scores(
+    dataset: TabularDataset,
+) -> None:
+    from iterate.core.agent_loop import _improves
+    from iterate.schemas.experiment import ExperimentResult, Metrics
+
+    target = _target(dataset)
+    truth = [str(t) for t in dataset.test_target]
+    wrong = {"toxic": "not toxic", "not toxic": "toxic"}
+    n = len(truth)
+
+    def result(answers: list[str], value: float) -> ExperimentResult:
+        return ExperimentResult(
+            experiment_id="x",
+            metrics=Metrics(values={"accuracy": value}, primary="accuracy", direction="maximize"),
+            artifacts={"answers.json": json.dumps(answers)},
+        )
+
+    # The bar missed record 0 and got record 1 wrong; the candidate got record 0 wrong.
+    bar = result(["__no_reply__", wrong[truth[1]], *truth[2:]], (n - 2) / (n - 1))
+    candidate = result([wrong[truth[0]], *truth[1:]], (n - 1) / n)
+    assert _improves(candidate, None, bar, "maximize", target.paired_scores)
+    assert not _improves(bar, None, candidate, "maximize", target.paired_scores)
+    # Right on record 0, which the bar never got: level on the records both have.
+    level = result([truth[0], wrong[truth[1]], *truth[2:]], (n - 1) / n)
+    assert _improves(level, None, bar, "maximize")
+    assert not _improves(level, None, bar, "maximize", target.paired_scores)
 
 
 def test_a_session_that_lost_one_record_is_scored_on_the_rest(
@@ -1077,11 +1110,14 @@ def test_the_final_rescore_counts_the_records_it_scored(
 
     full, loop = rows(40, "full.csv"), rows(20, "loop.csv")
     lost = str(full.test_features["text"].iloc[0])
+    truth = dict(zip(full.test_features["text"], full.test_target, strict=True))
 
     class OneLost(ScriptedClient):
         def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
-            if str(messages[-1].content) == lost:
+            text = str(messages[-1].content)
+            if text == lost:
                 raise RuntimeError("connection refused")
+            self._answer = truth[text]
             return super().chat(messages, **kwargs)
 
     monkeypatch.setattr("iterate.llm.factory.build_client", lambda *a, **k: OneLost("toxic"))
@@ -1092,8 +1128,7 @@ def test_the_final_rescore_counts_the_records_it_scored(
     final = _rescore_winner_on_full_holdout(
         result, full, _target(loop), console=Console(record=True, width=400)
     )
-    assert final is not None
-    assert final["n"] == full.n_test - 1
+    assert final == {"score": 1.0, "n": full.n_test - 1}
 
 
 def test_a_cell_that_marks_its_own_unusable_answers_as_unanswered_is_not_scored(

@@ -762,9 +762,13 @@ def test_a_request_the_provider_will_not_take_is_the_prompts_answer() -> None:
     assert (stats.no_reply, stats.unparseable) == (0, 1)
 
 
-@pytest.mark.parametrize(("missed", "scored"), [(1, True), (2, False)])
-def test_one_record_in_five_is_left_out_and_more_fails_the_pass(missed: int, scored: bool) -> None:
-    rows = [{"text": f"comment {i}"} for i in range(5)]
+@pytest.mark.parametrize(
+    ("n", "missed", "scored"), [(5, 1, True), (5, 2, False), (10, 2, True), (10, 3, False)]
+)
+def test_one_record_in_five_is_left_out_and_more_fails_the_pass(
+    n: int, missed: int, scored: bool
+) -> None:
+    rows = [{"text": f"comment {i}"} for i in range(n)]
     script: dict[str, list[Any]] = {r["text"]: [_tool_reply("toxic")] for r in rows}
     for i in range(missed):
         script[f"comment {i}"] = [RuntimeError("503")] * 6
@@ -774,7 +778,7 @@ def test_one_record_in_five_is_left_out_and_more_fails_the_pass(missed: int, sco
         return ask(PROMPT, rows, client_factory=lambda: client, columns=["text"], labels=LABELS)
 
     if scored:
-        assert run().count(NO_REPLY) == 1
+        assert run().count(NO_REPLY) == missed
     else:
         with pytest.raises(NoReplyError):
             run()

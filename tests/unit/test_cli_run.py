@@ -1223,24 +1223,6 @@ def test_a_harness_not_on_ollama_names_the_ollama_model_the_prompt_is_for(
     ) in text
 
 
-def test_a_harness_found_through_the_environment_keeps_its_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`ITERATE_BACKEND_URL` is how `.env.example` points the harness at a server."""
-    result, built = _prompt_run(
-        tmp_path,
-        monkeypatch,
-        ["--backend", "openai-compatible", "--model", "my-llama", "--target-model", "g"],
-        env={
-            "ITERATE_BACKEND_URL": "http://gpu-box:8000/v1",
-            "ITERATE_BACKEND_API_KEY": "box-key",
-        },
-    )
-    assert result.exit_code == 0, result.output
-    assert built["harness"]["api_key"] == "box-key"
-    assert built["backend"] == "ollama"
-
-
 def test_the_model_under_test_has_an_address_of_its_own(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1745,6 +1727,29 @@ def test_claude_allowed_beside_the_model_under_test_is_installed_with_consent(
     assert built["backend"] == "ollama"
 
 
+def test_a_run_refused_for_a_reason_no_library_mends_installs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from iterate.adapters.compute import deps
+    from iterate.userconfig import SavedProvider
+
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    consents: list[bool] = []
+    monkeypatch.setattr(deps, "ensure_anthropic", lambda *, consent, **kw: consents.append(consent))
+    claude = ["--target-backend", "anthropic", "--target-model", "claude-haiku-4-5", "--install"]
+    result, _ = _prompt_run(tmp_path, monkeypatch, claude)
+    assert "anthropic has no key" in _refused(result, tmp_path)
+    saved = {
+        "allowed": ["anthropic", "groq"],
+        "providers": {"anthropic": SavedProvider("anthropic", api_key="sk-ant-saved")},
+    }
+    result, _ = _prompt_run(tmp_path, monkeypatch, claude, saved=saved)
+    assert "groq (no key, set GROQ_API_KEY)" in _refused(result, tmp_path)
+    assert consents == []
+
+
 def test_an_install_this_python_still_cannot_import_is_not_called_done(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1778,7 +1783,6 @@ def test_the_harness_key_never_goes_to_the_model_under_test(
         )
         text = _refused(result, tmp_path)
         assert "openai has no key" in text
-        assert "sk-the-harness-key" not in text
 
 
 def test_a_provider_the_run_does_not_call_is_not_mended_by_a_flag_of_the_run(
@@ -2067,7 +2071,8 @@ def test_claude_with_install_consent_gets_its_library_before_the_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """As an image run gets torch: with --install the library is installed, not asked
-    for."""
+    for, and this Python sees it only once its import caches are refreshed."""
+    import importlib
     import sys
 
     from iterate.adapters.compute import deps
@@ -2078,10 +2083,14 @@ def test_claude_with_install_consent_gets_its_library_before_the_run(
 
     def installs(*, consent: bool, **kwargs: Any) -> str:
         consents.append(consent)
-        sys.modules["anthropic"] = real
         return ""
 
+    def refreshed() -> None:
+        if consents:
+            sys.modules["anthropic"] = real
+
     monkeypatch.setattr(deps, "ensure_anthropic", installs)
+    monkeypatch.setattr(importlib, "invalidate_caches", refreshed)
     result, built = _prompt_run(
         tmp_path,
         monkeypatch,
@@ -2218,14 +2227,6 @@ def test_a_key_saved_over_https_is_not_sent_over_http(
             *["--target-base-url", "http://llm.corp.test/v1"],
         ],
         saved=saved,
-    )
-    assert result.exit_code == 0, result.output
-    assert built["api_key"] == "not-needed"
-
-    harness = ["--backend", "vllm", "--base-url", "https://llm.corp.test/v1", "--model", "x"]
-    harness += ["--api-key", "the-harness-key", "--target-backend", "vllm"]
-    result, built = _prompt_run(
-        tmp_path, monkeypatch, [*harness, "--target-base-url", "http://llm.corp.test/v1"]
     )
     assert result.exit_code == 0, result.output
     assert built["api_key"] == "not-needed"

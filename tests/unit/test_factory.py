@@ -127,23 +127,6 @@ def test_the_saved_key_beats_the_environment_and_the_target_key_beats_both() -> 
     assert (found.api_key, found.key_from) == ("gsk-run", "ITERATE_TARGET_API_KEY")
 
 
-def test_the_harness_key_comes_right_after_the_exported_one() -> None:
-    """It is handed over only when the model under test is the harness model itself,
-    and then it is that model's key: ahead of one saved or found in the environment."""
-    saved = {"openai": SavedProvider("openai", api_key="sk-saved")}
-    settings = _settings(openai_api_key="sk-env")
-    found = _provider("openai", harness_key="sk-harness", saved=saved, settings=settings)
-    assert (found.api_key, found.key_from) == ("sk-harness", "the harness key")
-    found = _provider(
-        "openai",
-        harness_key="sk-harness",
-        settings=settings,
-        environ={"ITERATE_TARGET_API_KEY": "sk-this-run"},
-    )
-    assert found.api_key == "sk-this-run"
-    assert _provider("openai", saved=saved, settings=settings).api_key == "sk-saved"
-
-
 def test_an_exported_key_of_spaces_is_no_key() -> None:
     found = _provider(
         "groq",
@@ -186,7 +169,7 @@ def test_the_address_given_beats_the_saved_one_and_the_saved_one_beats_the_publi
 
 
 def test_ollama_takes_no_key_and_its_host_is_settled() -> None:
-    found = _provider("ollama", environ={"ITERATE_TARGET_API_KEY": "stray"}, harness_key="k")
+    found = _provider("ollama", environ={"ITERATE_TARGET_API_KEY": "stray"})
     assert found.api_key is None
     assert found.base_url == "http://localhost:11434"
     assert factory.not_callable(found) is None

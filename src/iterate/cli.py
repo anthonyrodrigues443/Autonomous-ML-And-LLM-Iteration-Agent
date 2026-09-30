@@ -2153,8 +2153,7 @@ def _check_harness(backend: str, *, saved: bool = False) -> None:
     if backend in factory.known_providers():
         raise typer.BadParameter(f"{named}: {factory.not_a_harness(backend)}")
     raise typer.BadParameter(
-        f"{named}: not a backend iterate knows. Choose from "
-        f"{', '.join(factory.harness_backends())}"
+        f"{named}: not a backend iterate knows. Choose from {', '.join(factory.harness_backends())}"
     )
 
 
@@ -2351,26 +2350,19 @@ def _model_under_test(
 
         if (why := refused(model_named)) is not None:
             raise typer.BadParameter(why)
+    _refuse_waiting(saved_as, asked, library=False)
     # Installed only once every refusal that needs no library has passed.
     if any(factory.wire_of(n) == "anthropic" for n in (asked, *saved_as)):
         _ensure_anthropic(install)
     if (why := factory.not_callable(under_test, given_as=given_as)) is not None:
         raise typer.BadParameter(why)
-    if waiting := [
-        f"{p.name} ({why})"
-        for n, p in saved_as.items()
-        if (why := factory.not_ready(p, wire=factory.wire_of(n)))
-    ]:
-        raise typer.BadParameter(
-            f"these allowed prompt providers are not ready: {', '.join(waiting)}. Save them "
-            f"with `iterate setup`, or pass --providers {asked} to allow only the model "
-            "under test"
-        )
+    _refuse_waiting(saved_as, asked, library=True)
     if (why := factory.refused_key(under_test, model=model_named)) is not None:
         raise typer.BadParameter(why)
-    if under_test.name == "ollama" and (
-        why := factory.ollama_refusal(under_test, model_named)
-    ) is not None:
+    if (
+        under_test.name == "ollama"
+        and (why := factory.ollama_refusal(under_test, model_named)) is not None
+    ):
         raise typer.BadParameter(why)
     settled = factory.UnderTest(
         provider=under_test,
@@ -2381,6 +2373,21 @@ def _model_under_test(
     )
     console.print(f"[dim]{escape(_under_test_line(settled))}[/dim]")
     return settled
+
+
+def _refuse_waiting(saved_as: dict[str, Any], asked: str, *, library: bool) -> None:
+    from iterate.llm import factory
+
+    if waiting := [
+        f"{p.name} ({why})"
+        for n, p in saved_as.items()
+        if (why := factory.not_ready(p, wire=factory.wire_of(n), library=library))
+    ]:
+        raise typer.BadParameter(
+            f"these allowed prompt providers are not ready: {', '.join(waiting)}. Save them "
+            f"with `iterate setup`, or pass --providers {asked} to allow only the model "
+            "under test"
+        )
 
 
 def _saved_entries(asked: str, address: str | None) -> dict[str, Any]:

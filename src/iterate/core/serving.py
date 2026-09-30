@@ -289,9 +289,16 @@ def provider_for(backend: str, base_url: str | None) -> str:
 
 
 def facts_from_prompt(
-    prompt_json: str | None, *, provider: str, model: str, prompt_chars: int = 0
+    prompt_json: str | None,
+    *,
+    provider: str,
+    model: str,
+    prompt_chars: int = 0,
+    why_estimated: str = "every holdout answer came from the cache",
 ) -> ServingFacts:
-    """A prompt winner, by the model under test and the tokens it spent per record."""
+    """A prompt winner, by the model under test and the tokens it spent per record.
+    ``why_estimated`` says why there are no measured tokens to price, when there are
+    none."""
     record: dict[str, Any] = {}
     if prompt_json:
         try:
@@ -310,7 +317,6 @@ def facts_from_prompt(
         return ServingFacts(
             family="prompt", provider=provider, model=model, basis=[why], unpriced_because=why
         )
-    why_estimated = "every holdout answer came from the cache"
     if measured and tokens_in is not None and tokens_out is not None:
         if float(tokens_in) or float(tokens_out):
             return ServingFacts(
@@ -335,7 +341,7 @@ def facts_from_prompt(
 
         if tool_prompt := rules_for(model).tool_prompt_tokens:
             guess_in += tool_prompt
-            added = f", {tool_prompt} of them the tool prompt Anthropic adds to every call"
+            added = f" plus the {tool_prompt}-token tool prompt Anthropic adds to every call"
     return ServingFacts(
         family="prompt",
         provider=provider,
@@ -345,8 +351,8 @@ def facts_from_prompt(
         records_measured=0,
         parameters=parameters,
         basis=[
-            f"about {guess_in:.0f} tokens in and 8 out per record{added}, estimated from the "
-            f"prompt text because {why_estimated}"
+            f"about {guess_in:.0f} tokens in and 8 out per record, estimated from the "
+            f"prompt text{added}, because {why_estimated}"
         ],
     )
 
@@ -367,7 +373,13 @@ def baseline_facts(
     if family == "vision":
         return facts_from_recipe({"backbone": "simple_cnn", "image_size": image_size})
     if family == "prompt":
-        return facts_from_prompt(None, provider=provider, model=model, prompt_chars=prompt_chars)
+        return facts_from_prompt(
+            None,
+            provider=provider,
+            model=model,
+            prompt_chars=prompt_chars,
+            why_estimated="nothing is measured before the run",
+        )
     estimator = (
         "HistGradientBoostingRegressor"
         if task == "regression"
