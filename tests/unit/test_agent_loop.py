@@ -1362,3 +1362,29 @@ def test_a_pass_that_lost_records_is_compared_on_the_records_both_have() -> None
     assert _improves(scored(0.7), None, baseline, "maximize", lambda a, b: (0.9, 0.8))
     assert not _improves(scored(0.9), None, baseline, "maximize", lambda a, b: (0.7, 0.8))
     assert _improves(scored(0.9), None, baseline, "maximize", lambda a, b: None)
+
+
+def test_the_loop_weighs_a_pass_by_the_targets_paired_score() -> None:
+    """A prompt target that lost records scores the two passes on the records both
+    have; the loop takes that ruler over the stored scores."""
+
+    class _PairingTarget(_FakeTarget):
+        def paired_scores(
+            self, result: ExperimentResult, bar: ExperimentResult
+        ) -> tuple[float, float]:
+            return (0.9, 0.5)
+
+    sup = _FakeSupervisor([SupervisorDecision(False, "a", "try a")])
+    coders = iter([_FakeCoder(_result(0.40))])
+    result = run_supervised(
+        target=_PairingTarget(),  # type: ignore[arg-type]
+        dataset=object(),  # type: ignore[arg-type]
+        supervisor=sup,  # type: ignore[arg-type]
+        make_coder=lambda: next(coders),  # type: ignore[arg-type,return-value]
+        terminator=MaxIterations(1),  # type: ignore[arg-type]
+        memory=InMemoryMemory(),
+        data_summary="d",
+    )
+    # Stored, 0.40 loses to the baseline's 0.50; on the common records it wins.
+    assert result.best is not None
+    assert result.best.result.metrics.primary_value == 0.40

@@ -324,9 +324,9 @@ def prompt_provider(
     The endpoint is the one given, else the one saved for this provider, else the
     provider's own public address: never the harness's. Ollama alone has no public
     address and is found at `OLLAMA_HOST`. The key is the exported target key, else the
-    harness's when the model under test is the harness model itself, else the one saved
-    for this provider, else the provider's own variable. A key saved for a server the
-    user runs goes only to the address saved beside it.
+    ``harness_key`` a caller hands on, else the one saved for this provider, else the
+    provider's own variable. A key saved for a server the user runs goes only to the
+    address saved beside it.
     """
     if backend not in _PROVIDERS:
         raise ProviderError(unknown(backend))

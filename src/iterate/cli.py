@@ -110,13 +110,13 @@ def config() -> None:
     typer.echo("")
     if saved.allowed is None:
         typer.echo(
-            "prompt providers: no list saved, so a prompt run calls the one provider its flags name"
+            "prompt providers: no list saved, so a prompt run calls Ollama, or the one "
+            "provider --target-backend names"
         )
     else:
         typer.echo(f"prompt providers allowed: {', '.join(saved.allowed) or 'none'}")
         for name in saved.allowed:
-            harness = name == backend and bool(key)
-            typer.echo(f"  {_provider_line(name, saved.providers, settings, harness=harness)}")
+            typer.echo(f"  {_provider_line(name, saved.providers, settings)}")
     if saved.held_back and saved.allowed is None:
         typer.echo(f"saved, used when a run names it: {', '.join(saved.held_back)}")
     elif saved.held_back:
@@ -132,7 +132,7 @@ def config() -> None:
     )
 
 
-def _provider_line(name: str, saved: Any, settings: Any, *, harness: bool = False) -> str:
+def _provider_line(name: str, saved: Any, settings: Any) -> str:
     from iterate.llm import factory
 
     try:
@@ -144,10 +144,7 @@ def _provider_line(name: str, saved: Any, settings: Any, *, harness: bool = Fals
         parts.append(factory.shown(found.base_url))
     if found.api_key:
         parts.append(f"key {_mask(found.api_key)} from {found.key_from}")
-    why = factory.not_ready(found)
-    if why is not None and harness and found.needs_key and not found.api_key:
-        parts.append("no key of its own; the harness's key when it is the harness model")
-    elif why is not None:
+    if (why := factory.not_ready(found)) is not None:
         parts.append(f"NOT READY, {why}")
     return " ".join(parts)
 
