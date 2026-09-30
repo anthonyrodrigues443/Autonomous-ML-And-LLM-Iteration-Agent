@@ -76,19 +76,51 @@ def _now() -> datetime:
 
 
 def _improves(
-    result: ExperimentResult, best: Experiment | None, baseline: ExperimentResult, direction: str
+    result: ExperimentResult,
+    best: Experiment | None,
+    baseline: ExperimentResult,
+    direction: str,
+    paired: Callable[[ExperimentResult, ExperimentResult], tuple[float, float] | None]
+    | None = None,
 ) -> bool:
+    """Whether `result` beats the best so far. ``paired`` scores the two over the
+    same records when a target's passes can leave some out."""
     if result.metrics is None:
         return False
-    bar: float | None = None
+    against: ExperimentResult | None = None
     if best is not None and best.result is not None and best.result.metrics is not None:
-        bar = best.result.metrics.primary_value
+        against = best.result
     elif baseline.metrics is not None:
-        bar = baseline.metrics.primary_value
-    if bar is None:
+        against = baseline
+    if against is None or against.metrics is None:
         return True
-    new = result.metrics.primary_value
+    new, bar = result.metrics.primary_value, against.metrics.primary_value
+    if paired is not None and (both := paired(result, against)) is not None:
+        new, bar = both
+    if new != new or bar != bar:
+        return False
     return new < bar if direction == "minimize" else new > bar
+
+
+# On an experiment the loop weighed on the records both it and the best so far got
+# answers for: [its score, the best's], over those records.
+COMPARED_ON_COMMON = "compared_on_common_records"
+
+
+def _stamp_pairing(
+    experiment: Experiment,
+    best: Experiment | None,
+    baseline: ExperimentResult,
+    paired: Callable[[ExperimentResult, ExperimentResult], tuple[float, float] | None] | None,
+) -> None:
+    result = experiment.result
+    if paired is None or result is None or result.metrics is None:
+        return
+    against = best.result if best is not None and best.result is not None else baseline
+    if against.metrics is None or (pair := paired(result, against)) is None:
+        return
+    if pair[0] == pair[0] and pair[1] == pair[1]:
+        experiment.candidate.changes[COMPARED_ON_COMMON] = [round(v, 4) for v in pair]
 
 
 def run_supervised(
@@ -392,9 +424,11 @@ def run_supervised(
                             decision.title,
                             result.error,
                         )
+                    paired = getattr(target, "paired_scores", None)
+                    _stamp_pairing(experiment, best, baseline, paired)
                     if (
                         result.succeeded
-                        and _improves(result, best, baseline, direction)
+                        and _improves(result, best, baseline, direction, paired)
                         and not was_rejected(experiment)
                         and "over_budget" not in experiment.candidate.changes
                     ):

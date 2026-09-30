@@ -468,7 +468,7 @@ class Supervisor:
                         metric=self._metric,
                         baseline_score=baseline.metrics.primary_value,
                         carried=carried_best,
-                        dead_ends="" if vision else _dead_ends(history),
+                        dead_ends="" if vision else _dead_ends(history, carried_best),
                         family=self._family,
                     ),
                     # Tabular and prompt runs keep reading the asks from a stopping or
@@ -1117,8 +1117,16 @@ def _holdout_score(exp: Experiment) -> float | None:
     return exp.result.metrics.primary_value
 
 
-def _best_holdout(history: list[Experiment]) -> tuple[float, str] | None:
-    """(best holdout score, direction) across the run, or None if nothing scored."""
+def _best_holdout(
+    history: list[Experiment], best: Experiment | None = None
+) -> tuple[float, str] | None:
+    """(best holdout score, direction) across the run, or None if nothing scored. The
+    loop's own best when it is given: a prompt pass that left records out has a score
+    over fewer records, which the loop weighed on the records both got answers for."""
+    if best is not None and (score := _holdout_score(best)) is not None:
+        assert best.result is not None
+        assert best.result.metrics is not None
+        return score, best.result.metrics.direction
     scores = [s for s in (_holdout_score(e) for e in history) if s is not None]
     if not scores:
         return None
@@ -1146,7 +1154,7 @@ def _executed_ok_corpus(history: list[Experiment]) -> str:
     return "\n".join(parts).lower()
 
 
-def _dead_ends(history: list[Experiment]) -> str:
+def _dead_ends(history: list[Experiment], best: Experiment | None = None) -> str:
     """One compact sentence naming ideas already tried and rejected, composed from
     the digests' what_hurt across the run — the failure knowledge that otherwise
     never reaches the coder (only the supervisor reads digests). Deliberately lean
@@ -1164,7 +1172,7 @@ def _dead_ends(history: list[Experiment]) -> str:
     last_seen: dict[frozenset[str], int] = {}  # group -> occurrence index, for ties
     seen = 0
     executed_ok = _executed_ok_corpus(history)
-    best = _best_holdout(history)
+    settled = _best_holdout(history, best)
     for exp in history:
         if exp.digest is None:
             continue
@@ -1174,8 +1182,8 @@ def _dead_ends(history: list[Experiment]) -> str:
         # live run (a GB swap sold as 0.6593 that had stamped 0.6180). It enters
         # the same do-NOT-retry channel, labeled with the real stamp.
         score = _holdout_score(exp)
-        if best is not None and score is not None:
-            best_score, sense = best
+        if settled is not None and score is not None and exp is not best:
+            best_score, sense = settled
             lost = score > best_score if sense == "minimize" else score < best_score
             if lost:
                 # cut the CLAIM, never the settled reason — a capped cut applied to

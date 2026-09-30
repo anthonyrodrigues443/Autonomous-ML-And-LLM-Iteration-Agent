@@ -7,7 +7,7 @@ path before the CodeProposer (Day 4) generates real functions.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import pytest
@@ -91,6 +91,87 @@ def test_wrong_length_predictions_is_a_captured_failure(tmp_path: Path) -> None:
     assert not result.succeeded
     assert result.error is not None
     assert "expected" in result.error
+
+
+def test_a_record_the_provider_never_answered_is_left_out_of_a_prompts_score(
+    tmp_path: Path,
+) -> None:
+    """Only on the prompt path, and the answers are kept in order for a comparison."""
+    import json
+
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    truth = [str(t) for t in ds.test_target]
+    preds = ["__no_reply__", *truth[1:]]
+    result = codegen.score_predictions(
+        ds,
+        "\n".join(preds).encode(),
+        metric="accuracy",
+        experiment_id="e",
+        open_vocabulary=True,
+    )
+    assert result.metrics is not None
+    assert (result.metrics.n_samples, result.metrics.primary_value) == (ds.n_test - 1, 1.0)
+    assert json.loads(result.artifacts[codegen.ANSWERS_JSON]) == preds
+
+    table = codegen.score_predictions(
+        ds, "\n".join(truth).encode(), metric="accuracy", experiment_id="e"
+    )
+    assert table.artifacts == {}
+    assert table.metrics is not None
+    assert table.metrics.n_samples == ds.n_test
+
+
+def test_a_prompts_kernel_pass_is_scored_as_the_host_scores_it(tmp_path: Path) -> None:
+    """An unusable answer on an integer label is a wrong answer, as on the host, not a
+    pass that cannot be scored; too many left out, or every one unusable, is no score."""
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    truth = [str(t) for t in ds.test_target]
+
+    def scored(preds: list[str]) -> Any:
+        return codegen.score_predictions(
+            ds,
+            "\n".join(preds).encode(),
+            metric="accuracy",
+            experiment_id="e",
+            open_vocabulary=True,
+        )
+
+    one_unusable = scored(["__unparseable__", *truth[1:]])
+    assert one_unusable.error is None
+    assert one_unusable.metrics is not None
+    assert one_unusable.metrics.primary_value == (ds.n_test - 1) / ds.n_test
+    too_many = scored(["__no_reply__"] * (ds.n_test // 5 + 1) + truth[ds.n_test // 5 + 1 :])
+    assert "more than one in five is too many to score" in str(too_many.error)
+    assert "every record came back unusable" in str(scored(["__unparseable__"] * ds.n_test).error)
+
+
+def test_a_prompts_probabilities_leave_out_the_record_its_answers_leave_out(
+    tmp_path: Path,
+) -> None:
+    ds = load_csv(_classification_csv(tmp_path), target="churn")
+    truth = [str(t) for t in ds.test_target]
+    probabilities = [0.9 if t == "1" else 0.1 for t in truth]
+    # Wrong on the record never answered, so it shows if it is scored.
+    probabilities[0] = 1 - probabilities[0]
+    result = codegen.score_predictions(
+        ds,
+        "\n".join(["__no_reply__", *truth[1:]]).encode(),
+        metric="roc_auc",
+        experiment_id="e",
+        probabilities_csv="\n".join(str(p) for p in probabilities).encode(),
+        open_vocabulary=True,
+    )
+    assert result.metrics is not None
+    assert (result.metrics.n_samples, result.metrics.primary_value) == (ds.n_test - 1, 1.0)
+
+
+def test_a_record_marked_never_answered_has_to_be_one_submit_reported() -> None:
+    preds = b"yes\n__no_reply__\nno\n"
+    assert codegen.unreported_no_reply(b'{"no_reply_rows": [1]}', preds) is None
+    assert "1 records as never answered that submit() did not report" in str(
+        codegen.unreported_no_reply(b'{"no_reply_rows": []}', preds)
+    )
+    assert codegen.unreported_no_reply(None, b"yes\nno\n") is None
 
 
 def test_unscorable_predictions_are_a_captured_failure(tmp_path: Path) -> None:

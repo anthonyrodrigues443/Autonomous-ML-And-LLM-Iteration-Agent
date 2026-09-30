@@ -110,13 +110,13 @@ def config() -> None:
     typer.echo("")
     if saved.allowed is None:
         typer.echo(
-            "prompt providers: no list saved, so a prompt run calls the one provider its flags name"
+            "prompt providers: no list saved, so a prompt run calls Ollama, or the one "
+            "provider --target-backend names"
         )
     else:
         typer.echo(f"prompt providers allowed: {', '.join(saved.allowed) or 'none'}")
         for name in saved.allowed:
-            harness = name == backend and bool(key)
-            typer.echo(f"  {_provider_line(name, saved.providers, settings, harness=harness)}")
+            typer.echo(f"  {_provider_line(name, saved.providers, settings)}")
     if saved.held_back and saved.allowed is None:
         typer.echo(f"saved, used when a run names it: {', '.join(saved.held_back)}")
     elif saved.held_back:
@@ -132,7 +132,7 @@ def config() -> None:
     )
 
 
-def _provider_line(name: str, saved: Any, settings: Any, *, harness: bool = False) -> str:
+def _provider_line(name: str, saved: Any, settings: Any) -> str:
     from iterate.llm import factory
 
     try:
@@ -144,10 +144,7 @@ def _provider_line(name: str, saved: Any, settings: Any, *, harness: bool = Fals
         parts.append(factory.shown(found.base_url))
     if found.api_key:
         parts.append(f"key {_mask(found.api_key)} from {found.key_from}")
-    why = factory.not_ready(found)
-    if why is not None and harness and found.needs_key and not found.api_key:
-        parts.append("no key of its own; the harness's key when it is the harness model")
-    elif why is not None:
+    if (why := factory.not_ready(found)) is not None:
         parts.append(f"NOT READY, {why}")
     return " ".join(parts)
 
@@ -233,8 +230,9 @@ def setup() -> None:
         )
         install = typer.confirm(
             "May iterate install packages your generated code imports into iterate's "
-            "environment? It never changes torch, and an install that would change what "
-            "iterate is running on waits for the next run.",
+            "environment, and the library a run needs to call its model under test "
+            "(Anthropic's, for Claude)? It never changes torch, and an install that would "
+            "change what iterate is running on waits for the next run.",
             default=False,
         )
 
@@ -291,7 +289,8 @@ def _ask_prompt_providers(
         answer = str(
             typer.prompt(
                 f"Prompt providers allowed, comma separated ({' / '.join(known)}), "
-                "or any to let each run name its own",
+                "or any to let each run name its own. A prompt run with no "
+                "--target-backend calls Ollama, so keep ollama on the list",
                 default=", ".join(before) if before else "any",
             )
         ).strip()
@@ -855,15 +854,18 @@ def run(
         None,
         "--target-model",
         help="The model whose prompt is being tuned. Separate from the model DRIVING "
-        "the run (--model). Defaults to --model when the model under test is on the "
-        "harness's backend; needed with a --target-backend that differs from --backend.",
+        "the run (--model). Defaults to --model when the model under test runs where the "
+        "harness does (an Ollama harness, or --target-backend equal to --backend); "
+        "needed otherwise.",
     ),
     target_backend: str | None = typer.Option(
         None,
         "--target-backend",
         help="The provider of the model under test: ollama, openai, groq, together, "
-        "deepseek, or a server you run (openai-compatible, vllm). Defaults to --backend, "
-        "and then the model under test is served where the harness is, with its key.",
+        "deepseek, anthropic, or a server you run (openai-compatible, vllm). Defaults to "
+        "ollama, whatever runs the loop; on an Ollama harness it is called at the "
+        "harness's address, and it is the harness's own model unless --target-model "
+        "names another.",
     ),
     target_base_url: str | None = typer.Option(
         None,
@@ -952,8 +954,9 @@ def run(
         None,
         "--install/--no-install",
         help="Let iterate install packages a session imports (local; e2b always installs in "
-        "its sandbox). Cells never install, and on local runs torch and torchvision never "
-        "change mid-run.",
+        "its sandbox), and the library a run needs to call its model under test "
+        "(Anthropic's, for Claude). Cells never install, and on local runs torch and "
+        "torchvision never change mid-run.",
     ),
     max_iterations: int = typer.Option(
         10, "--max-iterations", min=1, help="Hard cap on experiments."
@@ -1098,6 +1101,7 @@ def run(
     cfg = _saved_config()
 
     # ─── Resolve: explicit flag > saved config > built-in default ──────────
+    backend_saved = backend is None and bool(cfg.get("backend"))
     backend = backend or cfg.get("backend") or "ollama"
     saved_harness = _saved_for(backend, base_url, cfg)
     model = model or saved_harness.get("model")
@@ -1106,16 +1110,16 @@ def run(
     install = install if install is not None else bool(cfg.get("install", False))
     if compute not in ("local", "e2b"):
         raise typer.BadParameter(f"--compute must be 'local' or 'e2b', got {compute!r}")
+    _check_harness(backend, saved=backend_saved)
     notebooks = notebooks.lower()
     if notebooks not in ("best", "all", "none"):
         raise typer.BadParameter(f"--notebooks must be best | all | none, got {notebooks!r}")
 
     # ─── Cloud backend? API key required wherever a client is built. ───────
     settings = get_settings()
-    harness_key_from = "--api-key"
     harness_address = _harness_address(backend, base_url, settings)
     if backend != "ollama" and not api_key:
-        api_key, harness_key_from = _harness_key(backend, harness_address, saved_harness, settings)
+        api_key, _ = _harness_key(backend, harness_address, saved_harness, settings)
 
     def _need_key() -> None:
         if backend != "ollama" and not api_key:
@@ -1137,17 +1141,16 @@ def run(
             backend=backend,
             model=model,
             base_url=base_url,
-            api_key=api_key,
-            api_key_from=harness_key_from,
             target_backend=target_backend,
             target_model=target_model,
             target_base_url=target_base_url,
             providers=providers,
             compute=compute,
+            install=install,
             settings=settings,
         )
         under_test, under_test_model = settled.provider, settled.model
-        target_backend = settled.backend if target_backend is not None else None
+        target_backend = settled.backend
     elif providers is not None or target_base_url is not None:
         raise typer.BadParameter(
             "--providers and --target-base-url describe the model under test of a prompt "
@@ -1795,7 +1798,7 @@ def run(
     if is_prompt_run:
         # For a prompt run the artifact is the prompt, and a notebook cannot say
         # which of its cells held the winner. Written by the harness, never by the
-        # agent, so `best` is decided by recorded scores and honours the Critic.
+        # agent: `best` is the loop's own, which honours the Critic and the budget.
         from iterate.deliver import prompt_record
 
         final_score = _rescore_winner_on_full_holdout(
@@ -1816,6 +1819,10 @@ def run(
             ),
             history=result.history,
             serving=serving_profile.model_dump() if serving_profile is not None else None,
+            loop_best=result.best,
+            baseline_records=(
+                result.baseline.metrics.n_samples if result.baseline.metrics is not None else None
+            ),
         )
         console.print(f"[dim]prompts written to {record}[/dim]")
     elif result.best is not None and result.best.result is not None:
@@ -1939,6 +1946,26 @@ def _refuse_for_images(*, compute: str, task: str | None, code: bool) -> None:
             "--spec picks a table estimator from a fixed list; an image run writes its own "
             "cells. Drop --spec"
         )
+
+
+def _ensure_anthropic(consent: bool) -> None:
+    import importlib.util
+
+    from iterate.adapters.compute import deps
+
+    if importlib.util.find_spec("anthropic") is not None:
+        return
+    if consent:
+        console.print("[dim]installs: Anthropic's library, to call Claude[/dim]")
+    if reason := deps.ensure_anthropic(consent=consent):
+        raise typer.BadParameter(reason[-2000:])
+    importlib.invalidate_caches()
+    if importlib.util.find_spec("anthropic") is None:
+        raise typer.BadParameter(
+            "pip reported the install done, but this Python cannot import anthropic: "
+            f"{sys.executable} -m pip install 'iterate-ai[anthropic]'"
+        )
+    console.print("[dim]installs: Anthropic's library is in[/dim]")
 
 
 def _ensure_torch(consent: bool) -> None:
@@ -2076,8 +2103,12 @@ def _rescore_winner_on_full_holdout(
         )
         return None
     if final.metrics is None:
+        console.print(
+            f"[dim]final re-score {escape(final.error or 'gave no score')}; "
+            "keeping the loop score[/dim]"
+        )
         return None
-    return {"score": final.metrics.primary_value, "n": full_dataset.n_test}
+    return {"score": final.metrics.primary_value, "n": final.metrics.n_samples}
 
 
 def _read_starting_prompt(path: Path) -> Any:
@@ -2106,6 +2137,24 @@ def _read_starting_prompt(path: Path) -> Any:
     if not raw.strip():
         raise typer.BadParameter(f"{path} is empty")
     return Prompt(system=raw.strip(), user_template="{input}")
+
+
+def _check_harness(backend: str, *, saved: bool = False) -> None:
+    """Refuse a harness backend that cannot run the loop, before anything is written."""
+    from iterate.llm import factory
+
+    if backend in factory.harness_backends():
+        return
+    named = (
+        f"the saved backend {backend} (change it with `iterate setup`)"
+        if saved
+        else f"--backend {backend}"
+    )
+    if backend in factory.known_providers():
+        raise typer.BadParameter(f"{named}: {factory.not_a_harness(backend)}")
+    raise typer.BadParameter(
+        f"{named}: not a backend iterate knows. Choose from {', '.join(factory.harness_backends())}"
+    )
 
 
 def _saved_for(backend: str, base_url: str | None, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -2177,14 +2226,13 @@ def _model_under_test(
     backend: str,
     model: str | None,
     base_url: str | None,
-    api_key: str | None,
-    api_key_from: str = "--api-key",
     target_backend: str | None,
     target_model: str | None,
     target_base_url: str | None,
     providers: str | None,
     compute: str,
     settings: Any,
+    install: bool = False,
 ) -> UnderTest:
     """The model a prompt run tunes its prompt for: who serves it, where, and with
     whose key. Every refusal a prompt run's model settings can earn is raised here,
@@ -2198,14 +2246,24 @@ def _model_under_test(
         )
     if target_backend is not None:
         target_backend = target_backend.strip().lower()
-    asked = target_backend or backend
+    # With no --target-backend the model under test runs on Ollama, whatever runs the
+    # loop. It is the harness's own model only when the harness is on Ollama too, and
+    # moved to another address it is no longer that.
+    asked = target_backend or "ollama"
     harness_address = _harness_address(backend, base_url, settings)
-    # Named apart, or moved to another address, it is no longer the harness model, and
-    # the harness's address and key stay with the harness.
-    own = target_backend is None and (
-        target_base_url is None or factory.same_place(target_base_url, harness_address)
+    own = (
+        target_backend is None
+        and backend == "ollama"
+        and (target_base_url is None or factory.same_place(target_base_url, harness_address))
     )
-    if target_model is None and target_backend not in (None, backend):
+    if target_model is None and asked != backend:
+        if target_backend is None:
+            raise typer.BadParameter(
+                f"the model under test runs on Ollama unless --target-backend names another "
+                f"provider, and the harness's model on {backend} means nothing to Ollama. "
+                "Pass --target-model with an Ollama model, or --target-backend and "
+                "--target-model for the provider your prompt is for"
+            )
         raise typer.BadParameter(
             f"--target-backend {target_backend} needs --target-model: the harness runs "
             f"on {backend}, and its model name means nothing to {target_backend}"
@@ -2220,8 +2278,7 @@ def _model_under_test(
     )
     try:
         if asked not in factory.known_providers():
-            flag = "--target-backend" if target_backend is not None else "--backend"
-            raise factory.ProviderError(factory.unknown(asked, flag=flag))
+            raise factory.ProviderError(factory.unknown(asked, flag="--target-backend"))
         listed = None
         if providers is not None:
             try:
@@ -2240,10 +2297,18 @@ def _model_under_test(
                 "drop --target-backend"
             )
         company = factory.provider_name(asked, address or kept)
-        if asked == "ollama" and company != asked:
+        if company != asked and factory.wire_of(company) != factory.wire_of(asked):
+            called = (
+                "not an Ollama server"
+                if asked == "ollama"
+                else f"and iterate calls {company} with its own client, not {asked}'s"
+            )
+            fix = f"--target-backend {company}"
+            if target_backend is None:
+                fix += f" --target-model {target_model or model or '<model>'}"
             raise factory.ProviderError(
-                f"{given_as or factory.shown(address or kept)} is {company}'s address, not an "
-                f"Ollama server. Pass --target-backend {company}"
+                f"{given_as or factory.shown(address or kept)} is {company}'s address, "
+                f"{called}. Pass {fix}"
             )
         # A name on the list covers a company's address only when that address is the
         # one saved under the name. Settled before any key of the company is looked up.
@@ -2251,39 +2316,57 @@ def _model_under_test(
             company == asked or factory.same_place(address or kept, kept)
         )
         if allowed is not None and company not in allowed and not covered:
+            named_one = (
+                ", or --target-backend and --target-model for one you allow"
+                if target_backend is None
+                else ""
+            )
             raise factory.ProviderError(
                 f"the model under test is served by {company}, which is not among "
                 f"the prompt providers you allow ({', '.join(allowed) or 'none'}). Pass "
-                f"--providers {company} for this run, or allow it with `iterate setup`"
+                f"--providers {company} for this run{named_one}, or allow it with "
+                "`iterate setup`"
             )
+        # The harness key is never handed on: the model under test runs where the
+        # harness does only on Ollama, which takes none.
         under_test = factory.prompt_provider(
-            asked,
-            base_url=address,
-            saved=entries,
-            settings=settings,
-            harness_key=api_key if own else None,
-            harness_key_from=f"{api_key_from} (the harness's key)",
+            asked, base_url=address, saved=entries, settings=settings
         )
-        others = [
-            factory.prompt_provider(n, saved=entries, settings=settings, environ={})
+        # By the name saved: a server saved at a company's address is still called
+        # with the client its name says.
+        saved_as = {
+            n: factory.prompt_provider(n, saved=entries, settings=settings, environ={})
             for n in allowed or ()
             if n not in (asked, under_test.name)
-        ]
+        }
+        others = list(saved_as.values())
     except (factory.ProviderError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if (why := factory.not_callable(under_test, given_as=given_as, library=False)) is not None:
+        raise typer.BadParameter(why)
+    model_named = target_model or model or settings.iterate_model
+    if factory.wire_of(under_test.name) == "anthropic":
+        from iterate.llm.claude_models import refused
+
+        if (why := refused(model_named)) is not None:
+            raise typer.BadParameter(why)
+    _refuse_waiting(saved_as, asked, library=False)
+    # Installed only once every refusal that needs no library has passed.
+    if any(factory.wire_of(n) == "anthropic" for n in (asked, *saved_as)):
+        _ensure_anthropic(install)
     if (why := factory.not_callable(under_test, given_as=given_as)) is not None:
         raise typer.BadParameter(why)
-    if waiting := [f"{p.name} ({why})" for p in others if (why := factory.not_ready(p))]:
-        raise typer.BadParameter(
-            f"these allowed prompt providers are not ready: {', '.join(waiting)}. Save them "
-            f"with `iterate setup`, or pass --providers {asked} to allow only the model "
-            "under test"
-        )
-    if (why := factory.refused_key(under_test)) is not None:
+    _refuse_waiting(saved_as, asked, library=True)
+    if (why := factory.refused_key(under_test, model=model_named)) is not None:
+        raise typer.BadParameter(why)
+    if (
+        under_test.name == "ollama"
+        and (why := factory.ollama_refusal(under_test, model_named)) is not None
+    ):
         raise typer.BadParameter(why)
     settled = factory.UnderTest(
         provider=under_test,
-        model=target_model or model or settings.iterate_model,
+        model=model_named,
         backend=asked,
         allowed=(under_test, *others),
         listed=allowed,
@@ -2292,10 +2375,25 @@ def _model_under_test(
     return settled
 
 
+def _refuse_waiting(saved_as: dict[str, Any], asked: str, *, library: bool) -> None:
+    from iterate.llm import factory
+
+    if waiting := [
+        f"{p.name} ({why})"
+        for n, p in saved_as.items()
+        if (why := factory.not_ready(p, wire=factory.wire_of(n), library=library))
+    ]:
+        raise typer.BadParameter(
+            f"these allowed prompt providers are not ready: {', '.join(waiting)}. Save them "
+            f"with `iterate setup`, or pass --providers {asked} to allow only the model "
+            "under test"
+        )
+
+
 def _saved_entries(asked: str, address: str | None) -> dict[str, Any]:
-    """With no list saved, a run is allowed the one provider its flags name, and reads
-    what was saved for that one: under the name given, and under the company's when the
-    address is a company's."""
+    """With no list saved, a run is allowed the one provider it calls, Ollama unless
+    --target-backend names another, and reads what was saved for that one: under the
+    name given, and under the company's when the address is a company's."""
     from iterate.llm import factory
 
     first = userconfig.load_prompt_settings([asked]).providers
@@ -3061,6 +3159,8 @@ def _render_summary(
     serving: ServingProfile | None = None,
     wall: Wall | None = None,
 ) -> None:
+    from iterate.core.agent_loop import COMPARED_ON_COMMON
+
     baseline_score = (
         result.baseline.metrics.primary_value if result.baseline.metrics is not None else None
     )
@@ -3088,10 +3188,19 @@ def _render_summary(
         score = exp.result.metrics.primary_value
         delta = (score - baseline_score) if baseline_score is not None else 0.0
         arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "—")
-        table.add_row(str(exp.iteration), model_name, f"{score:.4f}", f"{arrow} {delta:+.4f}")
+        shown_score = f"{score:.4f}"
+        if (paired := exp.candidate.changes.get(COMPARED_ON_COMMON)) is not None:
+            shown_score += f" ({paired[0]:.4f} vs {paired[1]:.4f} on common records)"
+        table.add_row(str(exp.iteration), model_name, shown_score, f"{arrow} {delta:+.4f}")
 
     console.print()
     console.print(table)
+    if any(COMPARED_ON_COMMON in exp.candidate.changes for exp in result.history):
+        console.print(
+            "[dim]a pass the provider left records out of is scored on the records it got; "
+            "the loop weighed it against the best so far on the records both got answers "
+            "for, shown in brackets[/dim]"
+        )
     console.print(f"\n[bold]stopped:[/bold] {result.stopped_because}")
     if result.stopped_because == "over_budget":
         console.print(_over_budget_stop(wall), markup=False, highlight=False)

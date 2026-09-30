@@ -37,6 +37,9 @@ if TYPE_CHECKING:
 
 PRICES_FILE = "serving_prices.json"
 TIMM_FILE = "timm_sizes.csv"
+# The day the shipped copy of timm's table was taken; the price table's own date moves
+# with every row added to it.
+TIMM_READ_ON = "2026-09-26"
 AWS_CSV_URL = (
     "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/{region}/index.csv"
 )
@@ -173,7 +176,7 @@ def load(clouds: Sequence[str] | None = None, region: str | None = None) -> Pric
         else:
             hosts.extend(h for h in base.hosts if h.cloud == cloud)
             sources[cloud] = Source(
-                kind="shipped", date=base.snapshot_date, region=DEFAULT_REGIONS[cloud]
+                kind="shipped", date=base.read_on(cloud), region=DEFAULT_REGIONS[cloud]
             )
     return base.model_copy(update={"hosts": hosts, "sources": sources})
 
@@ -572,7 +575,7 @@ def timm_sizes() -> tuple[dict[str, list[TimmRow]], Source]:
             )
         except (KeyError, ValueError):
             continue
-    return _by_name(rows), Source(kind="shipped", date=shipped().snapshot_date, url=TIMM_CSV_URL)
+    return _by_name(rows), Source(kind="shipped", date=TIMM_READ_ON, url=TIMM_CSV_URL)
 
 
 def _by_name(rows: Iterable[TimmRow]) -> dict[str, list[TimmRow]]:
@@ -609,7 +612,7 @@ def refresh(cloud: str | None, region: str | None, *, log: Log) -> None:
             else ""
         )
         log(
-            f"gcp: shipped rows stand ({len(rows)} machines, {shipped().snapshot_date}); "
+            f"gcp: shipped rows stand ({len(rows)} machines, {shipped().read_on('gcp')}); "
             f"GCP's catalog needs a key, which this version does not take{note}"
         )
     if "azure" in wanted:
@@ -637,7 +640,7 @@ def describe() -> list[str]:
             )
             lines.append(
                 f"{cloud} {default}: shipped rows ({len(rows)} machines, "
-                f"{base.snapshot_date}); {how}"
+                f"{base.read_on(cloud)}); {how}"
             )
             continue
         for path in cached_files:
@@ -654,8 +657,10 @@ def describe() -> list[str]:
     lines.append(
         f"timm: {sum(len(v) for v in sizes.values())} rows over {len(sizes)} networks, {source.kind} {source.date}"
     )
+    read = sorted({row.read_on for row in base.api_models})
+    when = read[0] if len(read) == 1 else f"read {read[0]} to {read[-1]}"
     lines.append(
-        f"api models: {len(base.api_models)} rows, shipped {base.snapshot_date} "
+        f"api models: {len(base.api_models)} rows, shipped {when} "
         "(no cloud publishes these as a feed)"
     )
     return lines

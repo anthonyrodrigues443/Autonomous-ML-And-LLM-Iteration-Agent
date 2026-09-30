@@ -2,8 +2,11 @@
 
 The harness owns the call so the model, temperature and endpoint cannot change
 between experiments. Calls run concurrently and every answer is cached. The
-allowed answers are a tool schema, not an instruction. A failed row is retried,
-then recorded as unparseable and scored as wrong; it never raises.
+allowed answers are a tool schema, not an instruction. A row the model answered
+unusably is retried, then recorded as unparseable and scored as wrong. A row the
+provider never answered is not the model's answer: it is asked once more after the
+pass, and if it is still unanswered it comes back as NO_REPLY and is left out of the
+score, or, past one row in five, the pass raises.
 """
 
 from __future__ import annotations
@@ -35,6 +38,9 @@ log = logging.getLogger(__name__)
 # A distinct sentinel rather than an empty string or a guessed label: it must score
 # as wrong, and it must be countable afterwards.
 UNPARSEABLE = "__unparseable__"
+# What a row's answer is when the provider never answered it, asked twice. Not the
+# model's answer: left out of the score, and out of the score it is compared with.
+NO_REPLY = "__no_reply__"
 
 _ANSWER_TOOL = "answer"
 _DEFAULT_WORKERS = 8
@@ -42,6 +48,22 @@ _DEFAULT_RETRIES = 2
 
 _ANSWER_MAX_TOKENS = 64
 _FREE_TEXT_MAX_TOKENS = 512
+# Long enough for a rate limit's minute or a short outage to pass.
+_SECOND_ASK_WAIT = 30.0
+
+# What a provider says when it turns down the model's own tool call: Ollama's 500 for
+# a call it could not parse. The model answered.
+_TURNED_DOWN = ("tool_use_failed", "error parsing tool call")
+# A request the provider will not take as it was sent: too long for the context, a
+# tool call the model malformed (groq's 400). Left out, a prompt that provoked it would
+# drop its hard records from its own score.
+_REFUSED_AS_SENT = (400, 413, 422)
+
+
+class NoReplyError(RuntimeError):
+    """The provider answered none of the tries for more than one record in five, asked
+    twice: an outage, a rate limit that outlasted the retries, a key or a model it
+    refuses. Too few records are left to score the pass on."""
 
 
 @dataclass
@@ -51,6 +73,9 @@ class AskStats:
     calls: int = 0
     cached: int = 0
     unparseable: int = 0
+    no_reply: int = 0
+    # Where, in the pass, the provider never answered: what submit() reports.
+    no_reply_rows: list[int] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
     errors: list[str] = field(default_factory=list)
@@ -59,8 +84,8 @@ class AskStats:
         parts = [f"{self.calls} calls", f"{self.cached} cached"]
         if self.unparseable:
             parts.append(f"{self.unparseable} unparseable")
-        if self.errors:
-            parts.append(f"{len(self.errors)} errored")
+        if self.no_reply:
+            parts.append(f"{self.no_reply} not answered by the provider")
         return ", ".join(parts)
 
 
@@ -228,8 +253,9 @@ def _one(
     labels: Sequence[str] | None,
     retries: int,
     numeric_range: tuple[float | None, float | None] | None = None,
-) -> tuple[str, int, int, str | None]:
-    """One record. Returns (answer, prompt_tokens, completion_tokens, error)."""
+) -> tuple[str, int, int, str | None, bool]:
+    """One record. Returns (answer, prompt_tokens, completion_tokens, error, replied):
+    ``replied`` is False when no try got a reply from the provider."""
     messages = [
         Message(role="system", content=prompt.system),
         Message(role="user", content=rendered),
@@ -238,6 +264,7 @@ def _one(
         numeric_answer_tool(*numeric_range) if numeric_range else answer_tool(labels)
     ]
     last_error: str | None = None
+    replied = False
     prompt_tokens = 0
     completion_tokens = 0
 
@@ -248,7 +275,9 @@ def _one(
             reply = client.chat(messages, tools=tools, temperature=0.0, max_tokens=cap)
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            replied = replied or _turned_down(exc)
             continue
+        replied = True
         # Counted even on a retry: a run that burned three calls to get one answer
         # spent three calls, and cost that only counts successes is not cost.
         prompt_tokens += reply.usage.prompt_tokens
@@ -263,10 +292,27 @@ def _one(
             coerce_number(text, *numeric_range) if numeric_range else coerce(text, labels)
         )
         if answer != UNPARSEABLE:
-            return answer, prompt_tokens, completion_tokens, None
+            return answer, prompt_tokens, completion_tokens, None, True
         last_error = "model did not produce a usable answer"
 
-    return UNPARSEABLE, prompt_tokens, completion_tokens, last_error
+    return UNPARSEABLE, prompt_tokens, completion_tokens, last_error, replied
+
+
+def _turned_down(exc: BaseException) -> bool:
+    """The provider replied, and what it refused was the request as sent or the
+    model's own tool call: an answer the prompt earned, not a record left unanswered."""
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(response, "status_code", None)
+    if status in _REFUSED_AS_SENT:
+        return True
+    try:
+        body = str(getattr(response, "text", "") or "")
+    except Exception:
+        body = ""
+    said = f"{exc} {body}"
+    return any(words in said for words in _TURNED_DOWN)
 
 
 def _humanise(seconds: float) -> str:
@@ -293,8 +339,12 @@ def ask(
     max_workers: int = _DEFAULT_WORKERS,
     retries: int = _DEFAULT_RETRIES,
     stats: AskStats | None = None,
+    strict: bool = True,
 ) -> list[str]:
     """Run `prompt` over every record and return one answer per record, in order.
+
+    ``strict`` raises NoReplyError past one record in five never answered; a pass
+    that is not scored, a sample looked at in a session, returns NO_REPLY for them.
 
     A fresh client per worker thread: the backends are HTTP clients that were never
     promised to be thread-safe, and one shared connection quietly serialising the
@@ -304,6 +354,7 @@ def ask(
 
     counters = stats if stats is not None else AskStats()
     answers: list[str | None] = [None] * len(rows)
+    missed: dict[int, str] = {}
     local = threading.local()
 
     def client() -> LLMClient:
@@ -313,26 +364,34 @@ def ask(
             local.client = existing
         return existing
 
-    def handle(index: int) -> None:
+    def handle(index: int, *, again: bool = False) -> None:
         rendered = render(prompt.user_template, rows[index], columns)
         # With the model's name in hand no client is built for an answer already
         # cached, so a pass served whole from the cache needs no key.
         key = _key(cache_scope, model if model is not None else client().model, prompt, rendered)
 
         if cache is not None and (hit := cache.get(key)) is not None:
+            # A twin of a record the provider missed can have been answered since.
             answers[index] = hit
-            counters.cached += 1
+            missed.pop(index, None)
+            if not again:
+                counters.cached += 1
             if hit == UNPARSEABLE:
                 counters.unparseable += 1
             return
 
-        answer, prompt_tokens, completion_tokens, error = _one(
+        answer, prompt_tokens, completion_tokens, error, replied = _one(
             client(), prompt, rendered, labels, retries, numeric_range
         )
         answers[index] = answer
-        counters.calls += 1
+        if not again:
+            counters.calls += 1
         counters.prompt_tokens += prompt_tokens
         counters.completion_tokens += completion_tokens
+        if not replied:
+            missed[index] = error or "no reply"
+            return
+        missed.pop(index, None)
         if answer == UNPARSEABLE:
             counters.unparseable += 1
             if error:
@@ -379,6 +438,27 @@ def ask(
         with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(rows)))) as pool:
             list(pool.map(tracked, range(len(rows))))
 
+    if missed:
+        log.warning(
+            "prompt pass: the provider did not answer %d records; asking them once more in %ds",
+            len(missed),
+            int(_SECOND_ASK_WAIT),
+        )
+        time.sleep(_SECOND_ASK_WAIT)
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(missed)))) as pool:
+            list(pool.map(lambda index: handle(index, again=True), sorted(missed)))
+    if missed:
+        counters.no_reply += len(missed)
+        counters.no_reply_rows.extend(sorted(missed))
+        counters.errors.extend(missed.values())
+        if strict and len(missed) * 5 > len(rows):
+            first = missed[min(missed)]
+            raise NoReplyError(
+                f"the provider did not answer {len(missed)} of {len(rows)} records, each "
+                f"asked twice ({first}); more than one in five is too many to score"
+            )
+        for index in missed:
+            answers[index] = NO_REPLY
     return [a if a is not None else UNPARSEABLE for a in answers]
 
 
@@ -428,6 +508,7 @@ def make_ask(
         rows: Sequence[Mapping[str, Any]],
         *,
         stats: AskStats | None = None,
+        strict: bool = True,
     ) -> list[str]:
         return ask(
             prompt,
@@ -441,15 +522,18 @@ def make_ask(
             model=model,
             max_workers=max_workers,
             stats=stats,
+            strict=strict,
         )
 
     return bound
 
 
 __all__ = [
+    "NO_REPLY",
     "UNPARSEABLE",
     "AnswerCache",
     "AskStats",
+    "NoReplyError",
     "answer_tool",
     "ask",
     "coerce",

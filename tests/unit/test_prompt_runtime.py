@@ -1,4 +1,5 @@
-"""`ask()`: the answer tool, coercion, caching, and never letting one row kill a run."""
+"""`ask()`: the answer tool, coercion, caching, one unusable row never killing a run, and
+a row the provider never answered never scored."""
 
 from __future__ import annotations
 
@@ -8,9 +9,11 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from iterate.core.prompt_runtime import (
+    NO_REPLY,
     UNPARSEABLE,
     AnswerCache,
     AskStats,
+    NoReplyError,
     answer_tool,
     ask,
     coerce,
@@ -183,22 +186,176 @@ def test_an_unusable_row_is_recorded_not_raised() -> None:
     assert stats.unparseable == 2
 
 
-def test_a_raising_backend_does_not_kill_the_pass() -> None:
-    client = FakeClient([RuntimeError("connection refused")])
+class ByRow:
+    """Replies scripted per record, each record's in the order they are asked for, so
+    the pass's threads cannot shuffle them."""
+
+    def __init__(self, script: dict[str, list[Any]]) -> None:
+        self._script = {text: list(replies) for text, replies in script.items()}
+        self.asked: list[str] = []
+        self._lock = threading.Lock()
+
+    @property
+    def model(self) -> str:
+        return "fake-12b"
+
+    def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
+        text = str(messages[-1].content)
+        with self._lock:
+            self.asked.append(text)
+            reply = self._script[text].pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def test_more_than_one_record_in_five_never_answered_fails_the_pass() -> None:
+    client = ByRow(
+        {
+            "you are awful": [_tool_reply("toxic")],
+            "have a nice day": [RuntimeError("connection refused")] * 6,
+        }
+    )
+    stats = AskStats()
+
+    with pytest.raises(NoReplyError) as caught:
+        ask(
+            PROMPT,
+            ROWS,
+            client_factory=lambda: client,
+            columns=["text"],
+            labels=LABELS,
+            stats=stats,
+        )
+
+    assert str(caught.value) == (
+        "the provider did not answer 1 of 2 records, each asked twice "
+        "(RuntimeError: connection refused); more than one in five is too many to score"
+    )
+    assert (stats.no_reply, stats.unparseable) == (1, 0)
+    # Three tries in the pass, three more when it is asked again.
+    assert client.asked.count("have a nice day") == 6
+    assert client.asked.count("you are awful") == 1
+    assert stats.summary() == "2 calls, 0 cached, 1 not answered by the provider"
+
+
+def test_a_record_never_answered_is_left_out_and_never_cached(tmp_path: Path) -> None:
+    """One in ten is not the model's answer: it comes back marked, is not scored and is
+    asked again by the next pass."""
+    rows = [{"text": f"comment {i}"} for i in range(10)]
+    script: dict[str, list[Any]] = {r["text"]: [_tool_reply("toxic")] for r in rows}
+    script["comment 3"] = [RuntimeError("503")] * 6
+    client = ByRow(script)
+    cache = AnswerCache(tmp_path / "answers.db")
     stats = AskStats()
 
     answers = ask(
         PROMPT,
-        ROWS,
+        rows,
         client_factory=lambda: client,
         columns=["text"],
         labels=LABELS,
-        retries=0,
+        cache=cache,
         stats=stats,
     )
 
+    assert answers[3] == NO_REPLY
+    assert answers.count("toxic") == 9
+    assert (stats.no_reply, stats.unparseable) == (1, 0)
+    back = ByRow({"comment 3": [_tool_reply("not toxic")]})
+    again = ask(
+        PROMPT, rows, client_factory=lambda: back, columns=["text"], labels=LABELS, cache=cache
+    )
+    assert again[3] == "not toxic"
+    assert back.asked == ["comment 3"]
+
+
+def test_a_record_missed_in_a_blip_is_answered_when_asked_again() -> None:
+    client = ByRow(
+        {
+            "you are awful": [_tool_reply("toxic")],
+            "have a nice day": [RuntimeError("503")] * 3 + [_tool_reply("not toxic")],
+        }
+    )
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT, ROWS, client_factory=lambda: client, columns=["text"], labels=LABELS, stats=stats
+    )
+
+    assert answers == ["toxic", "not toxic"]
+    assert (stats.calls, stats.no_reply) == (2, 0)
+
+
+def test_a_tool_call_the_provider_turns_down_is_the_models_answer() -> None:
+    """groq answers a malformed tool call with a 400 and Ollama with a 500. The model
+    answered, badly: as no reply, it would fail every pass on the same record."""
+
+    class RejectedError(Exception):
+        def __init__(self, said: str, body: str = "") -> None:
+            super().__init__(said)
+            self.response = type("R", (), {"text": body})()
+
+    client = ByRow(
+        {
+            "you are awful": [RejectedError("Error code: 400 - {'code': 'tool_use_failed'}")] * 3,
+            "have a nice day": [RejectedError("Server error '500'", "error parsing tool call")] * 3,
+        }
+    )
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT, ROWS, client_factory=lambda: client, columns=["text"], labels=LABELS, stats=stats
+    )
+
     assert answers == [UNPARSEABLE, UNPARSEABLE]
-    assert any("connection refused" in error for error in stats.errors)
+    assert (stats.no_reply, stats.unparseable) == (0, 2)
+
+
+def test_a_record_with_any_reply_is_the_models_answer() -> None:
+    """The model had its chance: a try the provider failed between two the model
+    answered changes nothing."""
+    client = ByRow(
+        {
+            "you are awful": [RuntimeError("503"), _text_reply("hmm"), RuntimeError("503")],
+            "have a nice day": [RuntimeError("429"), _tool_reply("not toxic")],
+        }
+    )
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT, ROWS, client_factory=lambda: client, columns=["text"], labels=LABELS, stats=stats
+    )
+
+    assert answers == [UNPARSEABLE, "not toxic"]
+    assert (stats.no_reply, stats.unparseable) == (0, 1)
+
+
+def test_only_the_records_the_provider_never_answered_are_asked_again(tmp_path: Path) -> None:
+    cache = AnswerCache(tmp_path / "answers.sqlite")
+    outage = ByRow(
+        {
+            "you are awful": [_tool_reply("toxic")],
+            "have a nice day": [RuntimeError("overloaded")] * 6,
+        }
+    )
+    with pytest.raises(NoReplyError, match="did not answer 1 of 2 records"):
+        ask(
+            PROMPT,
+            ROWS,
+            client_factory=lambda: outage,
+            columns=["text"],
+            labels=LABELS,
+            cache=cache,
+        )
+
+    back = ByRow({"have a nice day": [_tool_reply("not toxic")]})
+    answers = ask(
+        PROMPT, ROWS, client_factory=lambda: back, columns=["text"], labels=LABELS, cache=cache
+    )
+
+    assert answers == ["toxic", "not toxic"]
+    assert back.asked == ["have a nice day"]
 
 
 def test_tokens_are_counted_even_when_a_retry_was_needed() -> None:
@@ -290,15 +447,16 @@ def test_the_cache_survives_a_new_process(tmp_path: Path) -> None:
 def test_a_failure_is_never_cached(tmp_path: Path) -> None:
     """Caching a transient network blip would make it permanent for the whole run."""
     cache = AnswerCache(tmp_path / "answers.db")
-    ask(
-        PROMPT,
-        ROWS[:1],
-        client_factory=lambda: FakeClient([RuntimeError("boom")]),
-        columns=["text"],
-        labels=LABELS,
-        cache=cache,
-        retries=0,
-    )
+    with pytest.raises(NoReplyError):
+        ask(
+            PROMPT,
+            ROWS[:1],
+            client_factory=lambda: FakeClient([RuntimeError("boom")]),
+            columns=["text"],
+            labels=LABELS,
+            cache=cache,
+            retries=0,
+        )
 
     stats = AskStats()
     answers = ask(
@@ -552,3 +710,93 @@ def test_a_contained_label_does_not_swallow_a_genuine_ambiguity() -> None:
     assert coerce("could be toxic or not toxic", ["toxic", "not toxic"]) == UNPARSEABLE
     assert coerce("not toxic", ["toxic", "not toxic"]) == "not toxic"
     assert coerce("I think this is toxic", ["toxic", "not toxic"]) == "toxic"
+
+
+def test_a_record_whose_twin_was_answered_is_answered_on_the_second_ask() -> None:
+    """Two records that render the same share a cache key: the second ask finds the
+    twin's answer, and the record is no longer missed."""
+    client = ByRow(
+        {
+            "thanks!": [RuntimeError("429")] * 3 + [_tool_reply("not toxic")],
+            "you are awful": [_tool_reply("toxic")],
+        }
+    )
+    rows = [{"text": "thanks!"}, {"text": "thanks!"}, {"text": "you are awful"}]
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT,
+        rows,
+        client_factory=lambda: client,
+        columns=["text"],
+        labels=LABELS,
+        cache=AnswerCache(None),
+        max_workers=1,
+        stats=stats,
+    )
+
+    assert answers == ["not toxic", "not toxic", "toxic"]
+    assert (stats.no_reply, stats.no_reply_rows, stats.cached) == (0, [], 0)
+
+
+def test_a_request_the_provider_will_not_take_is_the_prompts_answer() -> None:
+    """A 400 for a prompt too long for the context is the prompt's doing: left out, a
+    prompt that provoked it would drop its hard records from its own score."""
+
+    class TooLongError(Exception):
+        status_code = 400
+
+    client = ByRow(
+        {
+            "you are awful": [TooLongError("context_length_exceeded")] * 3,
+            "have a nice day": [_tool_reply("not toxic")],
+        }
+    )
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT, ROWS, client_factory=lambda: client, columns=["text"], labels=LABELS, stats=stats
+    )
+
+    assert answers == [UNPARSEABLE, "not toxic"]
+    assert (stats.no_reply, stats.unparseable) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    ("n", "missed", "scored"), [(5, 1, True), (5, 2, False), (10, 2, True), (10, 3, False)]
+)
+def test_one_record_in_five_is_left_out_and_more_fails_the_pass(
+    n: int, missed: int, scored: bool
+) -> None:
+    rows = [{"text": f"comment {i}"} for i in range(n)]
+    script: dict[str, list[Any]] = {r["text"]: [_tool_reply("toxic")] for r in rows}
+    for i in range(missed):
+        script[f"comment {i}"] = [RuntimeError("503")] * 6
+    client = ByRow(script)
+
+    def run() -> list[str]:
+        return ask(PROMPT, rows, client_factory=lambda: client, columns=["text"], labels=LABELS)
+
+    if scored:
+        assert run().count(NO_REPLY) == missed
+    else:
+        with pytest.raises(NoReplyError):
+            run()
+
+
+def test_a_sample_that_is_not_scored_never_stops_on_a_missed_record() -> None:
+    client = ByRow({t: [RuntimeError("503")] * 6 for t in ("you are awful", "have a nice day")})
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT,
+        ROWS,
+        client_factory=lambda: client,
+        columns=["text"],
+        labels=LABELS,
+        stats=stats,
+        strict=False,
+    )
+
+    assert answers == [NO_REPLY, NO_REPLY]
+    assert stats.no_reply_rows == [0, 1]

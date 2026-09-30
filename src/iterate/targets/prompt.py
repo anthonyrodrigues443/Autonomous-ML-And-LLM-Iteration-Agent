@@ -17,7 +17,7 @@ import pandas as pd
 
 from iterate.adapters.compute.base import CodeJob
 from iterate.core import codegen
-from iterate.core.prompt_runtime import UNPARSEABLE, AskStats, make_ask
+from iterate.core.prompt_runtime import NO_REPLY, UNPARSEABLE, AskStats, NoReplyError, make_ask
 from iterate.core.prompting import Prompt, baseline_prompt
 from iterate.core.scoring import score, task_for_metric
 from iterate.schemas.experiment import ExperimentResult, Metrics
@@ -220,6 +220,10 @@ class PromptTarget:
         artifacts = dict(result.artifacts)
         if (submitted := run_result.outputs.get(codegen.PROMPT_JSON)) is not None:
             artifacts[codegen.PROMPT_JSON] = submitted.decode(errors="replace")
+        if unreported := codegen.unreported_no_reply(
+            submitted, run_result.outputs.get(codegen.PREDICTIONS_CSV)
+        ):
+            result = result.model_copy(update={"error": unreported, "metrics": None})
         return result.model_copy(update={"logs": stdout_tail, "artifacts": artifacts})
 
     # ─── session wiring ────────────────────────────────────────────────────
@@ -311,12 +315,17 @@ class PromptTarget:
         stats = AskStats()
         try:
             answers = ask(prompt, rows, stats=stats)
+        except NoReplyError as exc:
+            return ExperimentResult(
+                experiment_id=experiment_id, error=f"not scored: {exc}", logs=stats.summary()
+            )
         except Exception as exc:
             return ExperimentResult(
                 experiment_id=experiment_id, error=f"prompt run failed: {type(exc).__name__}: {exc}"
             )
 
-        if all(answer == UNPARSEABLE for answer in answers) and answers:
+        answered = [i for i, answer in enumerate(answers) if answer != NO_REPLY]
+        if answered and all(answers[i] == UNPARSEABLE for i in answered):
             # Every row unusable is not a score of zero, it is a broken run: the
             # endpoint is down, the model is missing, or the prompt provokes nothing.
             # Reporting 0.0 would bank a number and teach the next iteration a lie.
@@ -326,44 +335,86 @@ class PromptTarget:
                 error=f"every record came back unusable ({detail})",
                 logs=stats.summary(),
             )
+        return ExperimentResult(
+            experiment_id=experiment_id,
+            metrics=Metrics(
+                values=self._score(answers, answered),
+                primary=self._metric,
+                direction=_direction(self._metric),
+                n_samples=len(answered),
+            ),
+            logs=stats.summary(),
+            artifacts={ANSWERS: json.dumps(answers)},
+        )
 
+    def paired_scores(
+        self, result: ExperimentResult, bar: ExperimentResult
+    ) -> tuple[float, float] | None:
+        """Both scores over the records both got an answer for, when either pass left
+        some out; None when neither did, and each stored score stands."""
+        answers = [_answers(r, self._dataset.n_test) for r in (result, bar)]
+        if answers[0] is None or answers[1] is None:
+            return None
+        if NO_REPLY not in answers[0] and NO_REPLY not in answers[1]:
+            return None
+        common = [
+            i
+            for i in range(self._dataset.n_test)
+            if answers[0][i] != NO_REPLY and answers[1][i] != NO_REPLY
+        ]
+        if not common:
+            # Not comparable: never a reason to bank a pass.
+            return (float("nan"), float("nan"))
+        return (
+            self._score(answers[0], common)[self._metric],
+            self._score(answers[1], common)[self._metric],
+        )
+
+    def _score(self, answers: list[str], rows: list[int]) -> dict[str, float]:
+        """The run's metric over the holdout records at `rows`."""
+        truth = self._dataset.test_target.iloc[rows]
+        picked = [answers[i] for i in rows]
         if self._task_kind == "regression":
             # An unusable answer becomes the training median. Measured across four
             # options: DROPPING the unparseable rows scores BETTER than answering
             # them honestly, so refusing the hard ones would be a winning strategy.
             # The median penalises without letting a few refusals swamp the score.
             floor = median_answer(self._dataset)
-            numeric = [floor if a == UNPARSEABLE else float(a) for a in answers]
-            values = score(
+            numeric = [floor if a == UNPARSEABLE else float(a) for a in picked]
+            return score(
                 "regression",
-                pd.to_numeric(self._dataset.test_target, errors="coerce").to_numpy(),
+                pd.to_numeric(truth, errors="coerce").to_numpy(),
                 numeric,
                 include=(self._metric,),
             )
-        else:
-            values = score(
-                "classification",
-                self._dataset.test_target.astype(str),
-                answers,
-                average=self._average,
-                include=(self._metric,),
-                # A model that will not answer usably yields a sentinel, which is a
-                # value the target column never contains. It has to count as wrong
-                # rather than register as a new class — untagged, ONE such answer in
-                # 300 turns a binary target multiclass and the metric refuses to
-                # score at all. Measured on the first live run.
-                open_vocabulary=True,
-            )
-        return ExperimentResult(
-            experiment_id=experiment_id,
-            metrics=Metrics(
-                values=values,
-                primary=self._metric,
-                direction=_direction(self._metric),
-                n_samples=len(answers),
-            ),
-            logs=stats.summary(),
+        return score(
+            "classification",
+            truth.astype(str),
+            picked,
+            average=self._average,
+            include=(self._metric,),
+            # A model that will not answer usably yields a sentinel, which is a
+            # value the target column never contains. It has to count as wrong
+            # rather than register as a new class — untagged, ONE such answer in
+            # 300 turns a binary target multiclass and the metric refuses to
+            # score at all. Measured on the first live run.
+            open_vocabulary=True,
         )
+
+
+# The answer to every holdout record, in order, kept on a prompt experiment so two
+# passes can be compared on the records both got an answer for.
+ANSWERS = codegen.ANSWERS_JSON
+
+
+def _answers(result: ExperimentResult, n_test: int) -> list[str] | None:
+    try:
+        answers = json.loads(result.artifacts.get(ANSWERS) or "null")
+    except ValueError:
+        return None
+    if not isinstance(answers, list) or len(answers) != n_test:
+        return None
+    return [str(a) for a in answers]
 
 
 def _direction(metric: str) -> Any:

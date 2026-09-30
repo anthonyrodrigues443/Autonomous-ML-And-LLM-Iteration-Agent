@@ -95,6 +95,12 @@ def _best_index(entries: list[dict[str, Any]], direction: str) -> int | None:
     return picker(scored, key=lambda pair: pair[1])[0]
 
 
+# The loop's own verdict, when it is given: its best experiment, or None for the
+# baseline. It weighed two passes on the records both got answers for, which their
+# stored scores, each over its own records, cannot.
+_BY_SCORES: Any = object()
+
+
 def build(
     *,
     task: str,
@@ -106,6 +112,8 @@ def build(
     history: Sequence[Experiment],
     final_score: dict[str, Any] | None = None,
     serving: dict[str, Any] | None = None,
+    loop_best: Any = _BY_SCORES,
+    baseline_records: int | None = None,
 ) -> str:
     """Render the whole record. Pure, so it is testable without a run.
 
@@ -126,6 +134,9 @@ def build(
             "user_template": _Block(baseline_prompt.user_template),
         }
     ]
+    if baseline_records is not None:
+        entries[0]["records"] = baseline_records
+    position_of: dict[int, int] = {}
 
     for position, experiment in enumerate(history, start=1):
         prompt = _submitted_prompt(experiment)
@@ -140,13 +151,22 @@ def build(
             "system": _Block(prompt.system),
             "user_template": _Block(prompt.user_template),
         }
+        metrics = experiment.result.metrics if experiment.result is not None else None
+        if metrics is not None and metrics.n_samples is not None:
+            entry["records"] = metrics.n_samples
         if rejected:
             entry["rejected"] = rejected
         if over:
             entry["over_budget"] = over
+        position_of[id(experiment)] = len(entries)
         entries.append(entry)
 
-    best = _best_index(entries, direction)
+    if loop_best is _BY_SCORES:
+        best = _best_index(entries, direction)
+    elif loop_best is None:
+        best = 0 if baseline_score is not None else None
+    else:
+        best = position_of.get(id(loop_best))
     for index, entry in enumerate(entries):
         entry["best"] = index == best
 
@@ -161,8 +181,11 @@ def build(
         document["full_holdout_records"] = int(final_score["n"])
         document["note"] = (
             "Per-version scores below are on the smaller slice every candidate was "
-            "ranked against. best_score_on_full_holdout above is the winner measured "
-            "on the whole holdout and is the number to quote."
+            "ranked against, each over the records its pass got answers for. "
+            "best_score_on_full_holdout above is the winner measured on the whole "
+            "holdout, over full_holdout_records of its records, and is the number to "
+            "quote. The best is the loop's own: a pass the provider left records out of "
+            "was weighed against the best so far on the records both got answers for."
         )
     if serving is not None:
         document["serving"] = serving

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from iterate.core import codegen
 from iterate.core.scoring import direction, metric_guidance, requires_proba, task_for_metric
 from iterate.prompts import PROMPTS
+from iterate.schemas.experiment import ExperimentResult
 from iterate.schemas.llm import Message, ToolSpec
 
 if TYPE_CHECKING:
@@ -32,7 +33,6 @@ if TYPE_CHECKING:
     from iterate.adapters.data.tabular import TabularDataset
     from iterate.core.interactive import RunController
     from iterate.llm.base import LLMClient
-    from iterate.schemas.experiment import ExperimentResult
 
 
 class CodingAgentError(RuntimeError):
@@ -408,7 +408,8 @@ class CodingAgent:
                 requires_proba(self._metric)
                 and _validate_probabilities(probs, dataset.n_test) is not None
             )
-            if unusable:
+            missed = self._kernel.read_output(codegen.NO_REPLY_TXT) if unusable else None
+            if unusable and missed is None:
                 self._bank_floor(
                     cells,
                     starting_code=starting_code,
@@ -417,6 +418,20 @@ class CodingAgent:
                 )
                 preds = self._kernel.read_output(codegen.PREDICTIONS_CSV)
                 probs = self._kernel.read_output(codegen.PROBABILITIES_CSV)
+                # The carried code asks the provider too.
+                missed = self._kernel.read_output(codegen.NO_REPLY_TXT)
+            if missed is not None:
+                # The prompts were not answered in full, and a floor banked in their
+                # place would be credited to the brief.
+                return CodingResult(
+                    result=ExperimentResult(
+                        experiment_id=experiment_id,
+                        error=f"not scored: {missed.decode(errors='replace')}",
+                        logs=_tail("\n".join(c.stdout for c in cells if c.stdout)) or None,
+                    ),
+                    cells=cells,
+                    predictions_sha256=None,
+                )
             result = codegen.score_predictions(
                 dataset,
                 preds,
@@ -434,13 +449,19 @@ class CodingAgent:
                     **result.artifacts,
                     codegen.PROMPT_JSON: submitted.decode(errors="replace"),
                 }
-                if swapped := codegen.submission_was_swapped(submitted, preds):
+                if swapped := codegen.submission_was_swapped(
+                    submitted, preds
+                ) or codegen.unreported_no_reply(submitted, preds):
                     # Predictions on disk are not the ones `submit()` produced, so
                     # they did not come from the model under test. Verifiable, so a
                     # hard rejection rather than a Critic flag.
                     log.warning("coder[%s]: %s", experiment_id, swapped)
                     result = result.model_copy(update={"error": swapped, "metrics": None})
                 result = result.model_copy(update={"artifacts": artifacts})
+            elif self._family == "prompt" and (
+                unreported := codegen.unreported_no_reply(None, preds)
+            ):
+                result = result.model_copy(update={"error": unreported, "metrics": None})
             # The image path's twin: the recipe a submit helper recorded, kept only when
             # it still describes the predictions on disk (a later cell, or the floor,
             # can have written over them).

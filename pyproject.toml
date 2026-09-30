@@ -78,9 +78,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Anthropic Claude is the only major backend that's NOT OpenAI-compatible —
-# install only if you want to use Claude as a backend.
-anthropic = ["anthropic>=0.40.0"]
+# Claude as the model under test of a prompt run, through Anthropic's own library.
+anthropic = ["anthropic>=0.104.1,<2"]
 # Vision transfer learning (v0.6). Kept out of core: torch is too large to install for
 # a tabular run.
 vision = ["torch>=2.9", "torchvision>=0.24"]

@@ -141,6 +141,16 @@ def own_requirements() -> tuple[str, ...]:
     return tuple(f"{req.name}{req.specifier}" for req in _requirements(""))
 
 
+# pyproject's own bound, for a source tree whose package metadata cannot be read.
+CLAUDE_REQUIREMENT = "anthropic>=0.104.1,<2"
+
+
+def claude_requirements() -> tuple[str, ...]:
+    return tuple(f"{req.name}{req.specifier}" for req in _requirements("anthropic")) or (
+        CLAUDE_REQUIREMENT,
+    )
+
+
 def vision_requirements() -> tuple[str, ...]:
     return tuple(f"{req.name}{req.specifier}" for req in _requirements("vision")) or (
         "torch",
@@ -650,6 +660,30 @@ def ensure_torch(
         return _ladder(python, list(vision_requirements()), pins, timeout=None, run=None)
 
 
+def ensure_anthropic(
+    *, consent: bool, python: str = sys.executable, host_modules: Iterable[str] | None = None
+) -> str:
+    """Before a prompt run that calls Claude: "" when Anthropic's library imports, else
+    why not."""
+    import importlib.util
+
+    if importlib.util.find_spec("anthropic") is not None:
+        return ""
+    if not consent:
+        return (
+            "the anthropic package is not installed: pip install 'iterate-ai[anthropic]' "
+            "(or pass --install)"
+        )
+    versions = installed()
+    loaded = distributions_of(host_modules if host_modules is not None else list(sys.modules))
+    with tempfile.TemporaryDirectory(prefix="iterate-pins-") as tmp:
+        pins = Path(tmp) / "constraints-start.txt"
+        pins.write_text("\n".join((*pin_lines(loaded, versions), *own_requirements())) + "\n")
+        return _ladder(
+            python, list(claude_requirements()), pins, timeout=INSTALL_TIMEOUT, run=None
+        )
+
+
 __all__ = [
     "DRY_RUN_TIMEOUT",
     "FROZEN",
@@ -658,6 +692,7 @@ __all__ = [
     "Plan",
     "Route",
     "canonical",
+    "ensure_anthropic",
     "ensure_torch",
     "find_uv",
     "install",

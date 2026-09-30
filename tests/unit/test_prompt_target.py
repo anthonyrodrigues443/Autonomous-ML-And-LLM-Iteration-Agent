@@ -137,7 +137,45 @@ def test_a_dead_endpoint_is_an_error_not_a_score_of_zero(
     result = _target(dataset).baseline()
 
     assert not result.succeeded
-    assert "unusable" in str(result.error)
+    assert result.metrics is None
+    assert str(result.error) == (
+        f"not scored: the provider did not answer {dataset.n_test} of {dataset.n_test} "
+        "records, each asked twice (RuntimeError: connection refused); more than one in "
+        "five is too many to score"
+    )
+    assert "not answered by the provider" in str(result.logs)
+
+
+def test_one_record_the_provider_never_answered_is_left_out_of_the_score(
+    dataset: TabularDataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scored as wrong, a rate limit on a hard record would read as a worse prompt. Left
+    out, and kept in order so a comparison leaves it out of the other side too."""
+    asked: dict[str, int] = {}
+    truth = dict(zip(dataset.test_features["text"], dataset.test_target, strict=True))
+
+    class OneMissed(ScriptedClient):
+        def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
+            text = str(messages[-1].content)
+            asked[text] = asked.get(text, 0) + 1
+            if len(asked) == 1 or asked.get(text, 0) > 1:
+                raise RuntimeError("RateLimitError: 429")
+            return ChatResponse(
+                model="fake-12b",
+                tool_calls=[ToolCall(id="1", name="answer", arguments={"value": truth[text]})],
+            )
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", lambda *a, **k: OneMissed("toxic"))
+
+    result = _target(dataset).baseline()
+
+    assert result.error is None
+    assert result.metrics is not None
+    assert result.metrics.n_samples == dataset.n_test - 1
+    assert result.metrics.primary_value == 1.0
+    answers = json.loads(result.artifacts["answers.json"])
+    assert answers.count("__no_reply__") == 1
+    assert "1 not answered by the provider" in str(result.logs)
 
 
 def test_a_typed_prompt_candidate_runs(dataset: TabularDataset, scripted: Any) -> None:
@@ -206,6 +244,28 @@ def test_the_submitted_prompt_is_captured_as_an_artifact(dataset: TabularDataset
 
     assert result.succeeded
     assert "be terse" in result.artifacts[codegen.PROMPT_JSON]
+
+
+def test_a_one_shot_job_that_marks_rows_submit_did_not_report_is_not_scored(
+    dataset: TabularDataset,
+) -> None:
+    from iterate.adapters.compute.runner import RunResult
+
+    preds = "\n".join(["__no_reply__"] + ["not toxic"] * (dataset.n_test - 1)).encode()
+    run_result = RunResult(
+        stdout="",
+        stderr="",
+        exit_code=0,
+        outputs={
+            codegen.PREDICTIONS_CSV: preds,
+            codegen.PROMPT_JSON: b'{"system": "s", "user_template": "{text}", "no_reply_rows": []}',
+        },
+    )
+
+    result = _target(dataset).score_code_job(run_result, "iter-01")
+
+    assert result.metrics is None
+    assert "submit() did not report" in str(result.error)
 
 
 def test_the_session_preamble_exposes_the_three_helpers(dataset: TabularDataset) -> None:
@@ -745,3 +805,345 @@ def test_submit_keeps_the_tokens_the_model_under_test_spent_per_record(
     assert submitted["tokens_in_per_record"] == 5.0
     assert submitted["tokens_out_per_record"] == 1.0
     assert f"ask: {dataset.n_test} calls, 0 cached" in capsys.readouterr().out
+
+
+class _InProcessKernel:
+    """Cells run in this process, in a folder of their own."""
+
+    def __init__(self, folder: Path) -> None:
+        folder.mkdir()
+        self.dir = folder
+        self.ns: dict[str, Any] = {}
+
+    def start(self, inputs: dict[str, bytes]) -> None:
+        for name, blob in inputs.items():
+            (self.dir / name).write_bytes(blob)
+
+    def run_cell(self, code: str, *, timeout: float) -> Any:
+        import contextlib
+        import io
+        import os
+
+        from iterate.adapters.compute.kernel import CellResult
+
+        if code.strip() == "%reset -f":
+            self.ns = {}
+            return CellResult("", "")
+        out, before = io.StringIO(), os.getcwd()
+        os.chdir(self.dir)
+        try:
+            with contextlib.redirect_stdout(out):
+                exec(code, self.ns)
+            return CellResult(out.getvalue(), "")
+        except Exception as exc:
+            said = f"{type(exc).__name__}: {exc}"
+            return CellResult(out.getvalue(), said, error=said)
+        finally:
+            os.chdir(before)
+
+    def read_output(self, name: str) -> bytes | None:
+        path = self.dir / name
+        return path.read_bytes() if path.exists() else None
+
+    def install(self, packages: Any) -> str:
+        return ""
+
+    def loaded_modules(self) -> None:
+        return None
+
+    def restart(self) -> None:
+        self.ns = {}
+
+    def blocked(self, error: Any) -> None:
+        return None
+
+    def namespace_summary(self) -> str:
+        return ""
+
+    def keepalive(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _session(
+    dataset: TabularDataset,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    misses: int,
+    cells: tuple[str, ...] = ("submit(BASE)", "answers = submit(BASE)"),
+    starting_code: str | None = None,
+    failing: int = 2,
+) -> Any:
+    """A coding session whose coder runs `cells` (by default it submits twice; not the
+    same cell again, which the coder would turn away unrun), against a model under test
+    that gives the first `failing` holdout records no reply for its first `misses`
+    requests."""
+    from iterate.core.coder import CodingAgent
+
+    # By default two holdout records of eight: more than one in five.
+    first = {str(t) for t in dataset.test_features["text"].iloc[:failing]}
+    sample = str(dataset.train_features["text"].iloc[0])
+    truth = dict(zip(dataset.test_features["text"], dataset.test_target.astype(str), strict=True))
+    missed = {"n": 0}
+
+    class Flaky(ScriptedClient):
+        def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
+            text = str(messages[-1].content)
+            if (text in first or text == sample) and missed["n"] < misses:
+                missed["n"] += 1
+                raise RuntimeError("APIConnectionError: Connection error.")
+            return ChatResponse(
+                model="fake-12b",
+                tool_calls=[
+                    ToolCall(id="1", name="answer", arguments={"value": truth.get(text, "toxic")})
+                ],
+                usage=Usage(prompt_tokens=5, completion_tokens=1),
+            )
+
+    def call(name: str, **args: Any) -> ChatResponse:
+        return ChatResponse(
+            model="coder", tool_calls=[ToolCall(id=name, name=name, arguments=args)]
+        )
+
+    class Coder:
+        model = "coder"
+
+        def __init__(self) -> None:
+            self.replies = [*(call("run_cell", code=code) for code in cells), call("finish")]
+
+        def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
+            return self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", lambda *a, **k: Flaky("toxic"))
+    target = _target(dataset, cache_path=tmp_path / "answers.db")
+    agent = CodingAgent(
+        Coder(),  # type: ignore[arg-type]
+        _InProcessKernel(tmp_path / "kernel"),  # type: ignore[arg-type]
+        metric="accuracy",
+        preamble=target.session_preamble(),
+        extra_inputs={codegen.META_JSON: target.meta_json()},
+        floor_cell=codegen.prompt_fallback_baseline(),
+        family="prompt",
+        install=False,
+    )
+    return agent.run(dataset=dataset, brief="b", experiment_id="it-1", starting_code=starting_code)
+
+
+def test_a_session_whose_prompt_the_provider_left_unanswered_is_not_scored(
+    dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coder's floor would have been banked in its place and credited to the
+    brief, with no error."""
+    out = _session(dataset, tmp_path, monkeypatch, misses=1000)
+
+    assert out.result.metrics is None
+    assert str(out.result.error).startswith(
+        f"not scored: the provider did not answer 2 of {dataset.n_test} records"
+    )
+    assert not any(cell.source == "fallback" for cell in out.cells)
+
+
+def test_a_later_submit_the_provider_answered_in_full_is_scored(
+    dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two records, three tries each, asked twice: 12 requests fail the first submit, and
+    # the second submit's first tries work.
+    out = _session(dataset, tmp_path, monkeypatch, misses=12)
+
+    assert out.result.error is None
+    assert out.result.metrics is not None
+    assert out.result.metrics.primary_value == 1.0
+
+
+def test_a_session_whose_every_ask_went_unanswered_banks_no_floor(
+    dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coder tried the prompt on training rows, got no reply, and gave up without
+    submitting: the floor would have been scored as this brief's result."""
+    out = _session(
+        dataset, tmp_path, monkeypatch, misses=1000, cells=("ask(BASE, X_train.head(1))",)
+    )
+
+    assert out.result.metrics is None
+    assert str(out.result.error) == (
+        "not scored: the provider did not answer 1 of 1 records, each asked twice"
+    )
+    assert not any(cell.source == "fallback" for cell in out.cells)
+
+
+def test_the_final_rescore_says_why_it_kept_the_loop_score(tmp_path: Path, scripted: Any) -> None:
+    from types import SimpleNamespace
+
+    from rich.console import Console
+
+    from iterate.cli import _rescore_winner_on_full_holdout
+
+    def rows(n: int, name: str) -> TabularDataset:
+        lines = ["text,label"] + [f"comment {i},{'toxic' if i % 2 else 'fine'}" for i in range(n)]
+        (tmp_path / name).write_text("\n".join(lines), encoding="utf-8")
+        return load_csv(tmp_path / name, target="label")
+
+    full, loop = rows(40, "full.csv"), rows(20, "loop.csv")
+    winner = json.dumps({"system": "s", "user_template": "{text}"})
+    result = SimpleNamespace(
+        best=SimpleNamespace(result=SimpleNamespace(artifacts={codegen.PROMPT_JSON: winner}))
+    )
+    scripted(RuntimeError("connection refused"))
+    console = Console(record=True, width=400)
+
+    assert _rescore_winner_on_full_holdout(result, full, _target(loop), console=console) is None
+    said = " ".join(console.export_text().split())
+    assert (
+        f"final re-score not scored: the provider did not answer {full.n_test} of "
+        f"{full.n_test} records, each asked twice (RuntimeError: connection refused); "
+        "more than one in five is too many to score; keeping the loop score"
+    ) in said
+
+
+def test_a_floor_whose_carried_prompt_went_unanswered_is_not_banked(
+    dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session submitted nothing, and the best code carried in as its floor asks the
+    provider again: unanswered there, the canned answer would have been banked."""
+    out = _session(
+        dataset, tmp_path, monkeypatch, misses=1000, cells=(), starting_code="submit(BASE)"
+    )
+
+    assert out.result.metrics is None
+    assert str(out.result.error).startswith("not scored: the provider did not answer 2 of")
+
+
+def test_two_passes_are_compared_on_the_records_both_got_an_answer_for(
+    dataset: TabularDataset,
+) -> None:
+    """The pass that lost a record to the provider is not compared with the other's
+    score over every record, but over the same ones."""
+    from iterate.schemas.experiment import ExperimentResult, Metrics
+
+    target = _target(dataset)
+    scored = Metrics(values={"accuracy": 0.5}, primary="accuracy", direction="maximize")
+    truth = [str(t) for t in dataset.test_target]
+    wrong = {"toxic": "not toxic", "not toxic": "toxic"}
+
+    def result(answers: list[str]) -> ExperimentResult:
+        return ExperimentResult(
+            experiment_id="x", metrics=scored, artifacts={"answers.json": json.dumps(answers)}
+        )
+
+    # Right everywhere but the first record, which the provider never answered.
+    missed_first = result(["__no_reply__", *truth[1:]])
+    # Wrong on the first record only.
+    wrong_first = result([wrong[truth[0]], *truth[1:]])
+    assert target.paired_scores(missed_first, wrong_first) == (1.0, 1.0)
+    # The bar lost the record, and the candidate answered every one.
+    assert target.paired_scores(wrong_first, missed_first) == (1.0, 1.0)
+    assert target.paired_scores(result(truth), wrong_first) is None
+    assert (
+        target.paired_scores(missed_first, ExperimentResult(experiment_id="y", metrics=scored))
+        is None
+    )
+    # Nothing in common: not comparable, never a reason to bank the pass.
+    others_missed = result([truth[0]] + ["__no_reply__"] * (len(truth) - 1))
+    paired = target.paired_scores(missed_first, others_missed)
+    assert paired is not None
+    assert all(value != value for value in paired)
+
+
+def test_the_loop_reads_the_candidate_first_and_the_common_records_over_the_stored_scores(
+    dataset: TabularDataset,
+) -> None:
+    from iterate.core.agent_loop import _improves
+    from iterate.schemas.experiment import ExperimentResult, Metrics
+
+    target = _target(dataset)
+    truth = [str(t) for t in dataset.test_target]
+    wrong = {"toxic": "not toxic", "not toxic": "toxic"}
+    n = len(truth)
+
+    def result(answers: list[str], value: float) -> ExperimentResult:
+        return ExperimentResult(
+            experiment_id="x",
+            metrics=Metrics(values={"accuracy": value}, primary="accuracy", direction="maximize"),
+            artifacts={"answers.json": json.dumps(answers)},
+        )
+
+    # The bar missed record 0 and got record 1 wrong; the candidate got record 0 wrong.
+    bar = result(["__no_reply__", wrong[truth[1]], *truth[2:]], (n - 2) / (n - 1))
+    candidate = result([wrong[truth[0]], *truth[1:]], (n - 1) / n)
+    assert _improves(candidate, None, bar, "maximize", target.paired_scores)
+    assert not _improves(bar, None, candidate, "maximize", target.paired_scores)
+    # Right on record 0, which the bar never got: level on the records both have.
+    level = result([truth[0], wrong[truth[1]], *truth[2:]], (n - 1) / n)
+    assert _improves(level, None, bar, "maximize")
+    assert not _improves(level, None, bar, "maximize", target.paired_scores)
+
+
+def test_a_session_that_lost_one_record_is_scored_on_the_rest(
+    dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = _session(dataset, tmp_path, monkeypatch, misses=1000, failing=1, cells=("submit(BASE)",))
+
+    assert out.result.error is None
+    assert out.result.metrics is not None
+    assert out.result.metrics.n_samples == dataset.n_test - 1
+    assert out.result.metrics.primary_value == 1.0
+    assert json.loads(out.result.artifacts["answers.json"])[0] == "__no_reply__"
+    # Tokens per record are over the records answered: one never answered cost none.
+    assert json.loads(out.result.artifacts["prompt.json"])["tokens_in_per_record"] == 5.0
+
+
+def test_the_final_rescore_counts_the_records_it_scored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from rich.console import Console
+
+    from iterate.cli import _rescore_winner_on_full_holdout
+
+    def rows(n: int, name: str) -> TabularDataset:
+        lines = ["text,label"] + [f"comment {i},{'toxic' if i % 2 else 'fine'}" for i in range(n)]
+        (tmp_path / name).write_text("\n".join(lines), encoding="utf-8")
+        return load_csv(tmp_path / name, target="label")
+
+    full, loop = rows(40, "full.csv"), rows(20, "loop.csv")
+    lost = str(full.test_features["text"].iloc[0])
+    truth = dict(zip(full.test_features["text"], full.test_target, strict=True))
+
+    class OneLost(ScriptedClient):
+        def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
+            text = str(messages[-1].content)
+            if text == lost:
+                raise RuntimeError("connection refused")
+            self._answer = truth[text]
+            return super().chat(messages, **kwargs)
+
+    monkeypatch.setattr("iterate.llm.factory.build_client", lambda *a, **k: OneLost("toxic"))
+    winner = json.dumps({"system": "s", "user_template": "{text}"})
+    result = SimpleNamespace(
+        best=SimpleNamespace(result=SimpleNamespace(artifacts={codegen.PROMPT_JSON: winner}))
+    )
+    final = _rescore_winner_on_full_holdout(
+        result, full, _target(loop), console=Console(record=True, width=400)
+    )
+    assert final == {"score": 1.0, "n": full.n_test - 1}
+
+
+def test_a_cell_that_marks_its_own_unusable_answers_as_unanswered_is_not_scored(
+    dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relabelled, an unusable answer would be left out of the score; the rows submit()
+    reports are the runtime's own count."""
+    relabel = (
+        "_real = _ask\n"
+        "def _ask(p, f, stats=None, strict=True):\n"
+        "    out = _real(p, f, stats=stats, strict=strict)\n"
+        "    return [NO_REPLY if i == 0 else a for i, a in enumerate(out)]\n"
+        "submit(BASE)"
+    )
+    out = _session(dataset, tmp_path, monkeypatch, misses=0, cells=(relabel,))
+
+    assert out.result.metrics is None
+    assert "submit() did not report" in str(out.result.error)

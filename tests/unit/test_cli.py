@@ -128,7 +128,7 @@ def test_config_shows_a_harness_the_environment_points_at(
     assert "groq: https://api.groq.com/openai/v1 NOT READY, no key, set GROQ_API_KEY" in out
 
 
-def test_config_says_when_a_provider_would_run_on_the_harnesss_key(
+def test_config_never_offers_the_harnesss_key_to_a_prompt_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from iterate.config import get_settings
@@ -141,8 +141,8 @@ def test_config_says_when_a_provider_would_run_on_the_harnesss_key(
         out = runner.invoke(app, ["config"]).output
     finally:
         get_settings.cache_clear()
-    assert "no key of its own; the harness's key when it is the harness model" in out
-    assert "NOT READY" not in out
+    assert "groq: https://api.groq.com/openai/v1 NOT READY, no key, set GROQ_API_KEY" in out
+    assert "gsk-harness-key" not in out
 
 
 def test_config_with_nothing_saved_says_each_run_names_its_provider() -> None:

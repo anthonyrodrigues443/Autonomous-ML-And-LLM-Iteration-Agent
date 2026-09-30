@@ -197,9 +197,7 @@ def test_the_session_asks_and_scores_the_way_the_host_does(
     target = PromptTarget(
         ratings, metric="pearson", task="rate it", target_backend="ollama", target_model="s"
     )
-    job = target.build_code_job(
-        Candidate(description="x", changes={"code": "pass"}, rationale="r")
-    )
+    job = target.build_code_job(Candidate(description="x", changes={"code": "pass"}, rationale="r"))
     for name, blob in job.inputs.items():
         (tmp_path / name).write_bytes(blob)
     monkeypatch.chdir(tmp_path)
@@ -223,3 +221,33 @@ def test_the_session_asks_and_scores_the_way_the_host_does(
     value = namespace["evaluate"](answers, namespace["y_train"].head(4))
     assert isinstance(value, float)
     assert -1.0 <= value <= 1.0  # a correlation, not an f1
+
+    # A record the provider never answered is left out, as the host leaves it out.
+    truth = namespace["y_train"].head(4)
+    left_out = namespace["evaluate"](["__no_reply__", *answers[1:]], truth)
+    assert left_out == namespace["evaluate"](answers[1:], truth.iloc[1:])
+
+
+def test_two_numeric_passes_are_compared_on_the_records_both_got_an_answer_for(
+    ratings: Any,
+) -> None:
+    """Scored, a record never answered would be no number at all."""
+    import json
+
+    from iterate.schemas.experiment import ExperimentResult, Metrics
+
+    target = PromptTarget(
+        ratings, metric="rmse", task="rate it", target_backend="ollama", target_model="s"
+    )
+    scored = Metrics(values={"rmse": 1.0}, primary="rmse", direction="minimize")
+    truth = [str(t) for t in ratings.test_target]
+
+    def result(answers: list[str]) -> ExperimentResult:
+        return ExperimentResult(
+            experiment_id="x", metrics=scored, artifacts={"answers.json": json.dumps(answers)}
+        )
+
+    off_first = result([str(float(truth[0]) + 3), *truth[1:]])
+    missed_first = result(["__no_reply__", *truth[1:]])
+    assert target.paired_scores(off_first, missed_first) == (0.0, 0.0)
+    assert target.paired_scores(missed_first, off_first) == (0.0, 0.0)

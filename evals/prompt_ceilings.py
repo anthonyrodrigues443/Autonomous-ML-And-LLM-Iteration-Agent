@@ -234,6 +234,13 @@ def sweep(
             outcome = target.baseline()
             value = outcome.metrics.primary_value if outcome.metrics is not None else None
             error = outcome.error or ""
+            # A ceiling is over every record: one scored on fewer is not comparable.
+            if outcome.metrics is not None and (outcome.metrics.n_samples or 0) < loaded.n_test:
+                value = None
+                error = (
+                    f"scored on {outcome.metrics.n_samples} of {loaded.n_test} records: "
+                    "the provider left some unanswered"
+                )
         except Exception as exc:
             value, error = None, f"{type(exc).__name__}: {exc}"
 

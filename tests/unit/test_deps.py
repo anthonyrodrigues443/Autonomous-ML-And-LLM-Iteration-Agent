@@ -583,6 +583,56 @@ def test_ensure_torch_installs_the_vision_extra_only_with_consent(
     assert timeout is None
 
 
+def test_ensure_anthropic_installs_the_claude_extra_only_with_consent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.util
+    import sys
+
+    calls: list[tuple[list[str], list[str], float | None]] = []
+
+    def fake(cmd: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((cmd, Path(cmd[cmd.index("-c") + 1]).read_text().split(), kw["timeout"]))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(deps.subprocess, "run", fake)
+    monkeypatch.setattr(deps, "installed", lambda: VERSIONS)
+    monkeypatch.setattr(deps, "claude_requirements", lambda: ("anthropic>=0.104.1,<2",))
+    if importlib.util.find_spec("anthropic") is not None:
+        assert deps.ensure_anthropic(consent=True) == ""
+        assert calls == []
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    assert deps.ensure_anthropic(consent=False) == (
+        "the anthropic package is not installed: pip install 'iterate-ai[anthropic]' "
+        "(or pass --install)"
+    )
+    assert calls == []
+    assert deps.ensure_anthropic(consent=True, host_modules=["numpy"]) == ""
+    [(cmd, pins, timeout)] = calls
+    assert cmd[-1] == "anthropic>=0.104.1,<2"
+    assert "numpy==2.4.6" in pins
+    assert timeout == deps.INSTALL_TIMEOUT
+
+
+def test_the_claude_fallback_is_pyprojects_own_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Imported from a source tree, the package's metadata cannot be read."""
+    import tomllib
+
+    def unreadable(name: str) -> list[str]:
+        raise deps.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(deps.importlib.metadata, "requires", unreadable)
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    extras = tomllib.loads(pyproject.read_text())["project"]["optional-dependencies"]
+    assert deps.claude_requirements() == tuple(extras["anthropic"])
+
+
+def test_the_claude_extra_is_read_off_the_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    lines = ['anthropic>=0.104.1,<2; extra == "anthropic"', 'torch>=2.9; extra == "vision"']
+    monkeypatch.setattr(deps.importlib.metadata, "requires", lambda name: lines)
+    assert deps.claude_requirements() == ("anthropic<2,>=0.104.1",)
+
+
 def test_the_saved_install_runs_before_the_run_imports_pandas(tmp_path: Path) -> None:
     script = (
         "import sys, json\n"
