@@ -320,3 +320,32 @@ def test_the_wall_stamp_on_the_experiment_is_what_the_record_reads() -> None:
     assert "over_budget" not in short.candidate.changes
     assert [v["version"] for v in document["versions"] if v["best"]] == ["v1"]
     assert document["versions"][2]["over_budget"].startswith("costs about $")
+
+
+def test_the_best_is_the_loops_own_and_each_score_says_how_many_records_it_covers() -> None:
+    """A pass that lost records to the provider has a stored score over fewer records;
+    the loop weighed it on the records both got answers for, and its verdict stands."""
+    fewer = _experiment(description="lost two records", score=0.9, system="a")
+    assert fewer.result is not None
+    assert fewer.result.metrics is not None
+    fewer.result.metrics.n_samples = 18
+    full = _experiment(description="every record", score=0.8, system="b")
+
+    def build(loop_best: Experiment | None) -> dict:
+        text = prompt_record.build(
+            task="t",
+            metric="accuracy",
+            direction="maximize",
+            model_under_test="m",
+            baseline_prompt=BASELINE,
+            baseline_score=0.61,
+            history=[fewer, full],
+            loop_best=loop_best,
+            baseline_records=20,
+        )
+        return yaml.safe_load(text)
+
+    document = build(full)
+    assert [v["best"] for v in document["versions"]] == [False, False, True]
+    assert [v.get("records") for v in document["versions"]] == [20, 18, None]
+    assert [v["best"] for v in build(None)["versions"]] == [True, False, False]

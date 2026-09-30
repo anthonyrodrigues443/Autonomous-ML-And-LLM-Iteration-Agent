@@ -32,6 +32,14 @@ def _no_key_is_checked_over_the_network(monkeypatch: pytest.MonkeyPatch) -> None
     reach a provider; one that tests the check passes its own lister."""
     monkeypatch.setattr("iterate.llm.factory._list_models", lambda provider, timeout, model: None)
     monkeypatch.setattr("iterate.llm.factory._claude_serves", lambda provider, timeout, model: None)
+    monkeypatch.setattr("iterate.llm.factory._ollama_models", lambda host, timeout: _EveryModel())
+
+
+class _EveryModel(list[str]):
+    """An Ollama that has pulled whatever a test names."""
+
+    def __contains__(self, name: object) -> bool:
+        return True
 
 
 @pytest.fixture(autouse=True)

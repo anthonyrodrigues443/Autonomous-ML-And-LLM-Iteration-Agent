@@ -230,8 +230,9 @@ def setup() -> None:
         )
         install = typer.confirm(
             "May iterate install packages your generated code imports into iterate's "
-            "environment? It never changes torch, and an install that would change what "
-            "iterate is running on waits for the next run.",
+            "environment, and the library a run needs to call its model under test "
+            "(Anthropic's, for Claude)? It never changes torch, and an install that would "
+            "change what iterate is running on waits for the next run.",
             default=False,
         )
 
@@ -288,7 +289,8 @@ def _ask_prompt_providers(
         answer = str(
             typer.prompt(
                 f"Prompt providers allowed, comma separated ({' / '.join(known)}), "
-                "or any to let each run name its own",
+                "or any to let each run name its own. A prompt run with no "
+                "--target-backend calls Ollama, so keep ollama on the list",
                 default=", ".join(before) if before else "any",
             )
         ).strip()
@@ -852,16 +854,18 @@ def run(
         None,
         "--target-model",
         help="The model whose prompt is being tuned. Separate from the model DRIVING "
-        "the run (--model). Defaults to --model when the model under test is on the "
-        "harness's backend; needed with a --target-backend that differs from --backend.",
+        "the run (--model). Defaults to --model when the model under test runs where the "
+        "harness does (an Ollama harness, or --target-backend equal to --backend); "
+        "needed otherwise.",
     ),
     target_backend: str | None = typer.Option(
         None,
         "--target-backend",
         help="The provider of the model under test: ollama, openai, groq, together, "
         "deepseek, anthropic, or a server you run (openai-compatible, vllm). Defaults to "
-        "ollama, whatever runs the loop; on an Ollama harness with no --target-model it "
-        "is the harness's own model, at its address.",
+        "ollama, whatever runs the loop; on an Ollama harness it is called at the "
+        "harness's address, and it is the harness's own model unless --target-model "
+        "names another.",
     ),
     target_base_url: str | None = typer.Option(
         None,
@@ -950,8 +954,9 @@ def run(
         None,
         "--install/--no-install",
         help="Let iterate install packages a session imports (local; e2b always installs in "
-        "its sandbox). Cells never install, and on local runs torch and torchvision never "
-        "change mid-run.",
+        "its sandbox), and the library a run needs to call its model under test "
+        "(Anthropic's, for Claude). Cells never install, and on local runs torch and "
+        "torchvision never change mid-run.",
     ),
     max_iterations: int = typer.Option(
         10, "--max-iterations", min=1, help="Hard cap on experiments."
@@ -1112,10 +1117,9 @@ def run(
 
     # ─── Cloud backend? API key required wherever a client is built. ───────
     settings = get_settings()
-    harness_key_from = "--api-key"
     harness_address = _harness_address(backend, base_url, settings)
     if backend != "ollama" and not api_key:
-        api_key, harness_key_from = _harness_key(backend, harness_address, saved_harness, settings)
+        api_key, _ = _harness_key(backend, harness_address, saved_harness, settings)
 
     def _need_key() -> None:
         if backend != "ollama" and not api_key:
@@ -1137,8 +1141,6 @@ def run(
             backend=backend,
             model=model,
             base_url=base_url,
-            api_key=api_key,
-            api_key_from=harness_key_from,
             target_backend=target_backend,
             target_model=target_model,
             target_base_url=target_base_url,
@@ -1796,7 +1798,7 @@ def run(
     if is_prompt_run:
         # For a prompt run the artifact is the prompt, and a notebook cannot say
         # which of its cells held the winner. Written by the harness, never by the
-        # agent, so `best` is decided by recorded scores and honours the Critic.
+        # agent: `best` is the loop's own, which honours the Critic and the budget.
         from iterate.deliver import prompt_record
 
         final_score = _rescore_winner_on_full_holdout(
@@ -1817,6 +1819,10 @@ def run(
             ),
             history=result.history,
             serving=serving_profile.model_dump() if serving_profile is not None else None,
+            loop_best=result.best,
+            baseline_records=(
+                result.baseline.metrics.n_samples if result.baseline.metrics is not None else None
+            ),
         )
         console.print(f"[dim]prompts written to {record}[/dim]")
     elif result.best is not None and result.best.result is not None:
@@ -1954,6 +1960,11 @@ def _ensure_anthropic(consent: bool) -> None:
     if reason := deps.ensure_anthropic(consent=consent):
         raise typer.BadParameter(reason[-2000:])
     importlib.invalidate_caches()
+    if importlib.util.find_spec("anthropic") is None:
+        raise typer.BadParameter(
+            "pip reported the install done, but this Python cannot import anthropic: "
+            f"{sys.executable} -m pip install 'iterate-ai[anthropic]'"
+        )
     console.print("[dim]installs: Anthropic's library is in[/dim]")
 
 
@@ -2216,8 +2227,6 @@ def _model_under_test(
     backend: str,
     model: str | None,
     base_url: str | None,
-    api_key: str | None,
-    api_key_from: str = "--api-key",
     target_backend: str | None,
     target_model: str | None,
     target_base_url: str | None,
@@ -2270,8 +2279,7 @@ def _model_under_test(
     )
     try:
         if asked not in factory.known_providers():
-            flag = "--target-backend" if target_backend is not None else "--backend"
-            raise factory.ProviderError(factory.unknown(asked, flag=flag))
+            raise factory.ProviderError(factory.unknown(asked, flag="--target-backend"))
         listed = None
         if providers is not None:
             try:
@@ -2303,26 +2311,27 @@ def _model_under_test(
                 f"{given_as or factory.shown(address or kept)} is {company}'s address, "
                 f"{called}. Pass {fix}"
             )
-        if any(factory.wire_of(n) == "anthropic" for n in (asked, *(allowed or ()))):
-            _ensure_anthropic(install)
         # A name on the list covers a company's address only when that address is the
         # one saved under the name. Settled before any key of the company is looked up.
         covered = asked in (allowed or ()) and (
             company == asked or factory.same_place(address or kept, kept)
         )
         if allowed is not None and company not in allowed and not covered:
+            named_one = (
+                ", or --target-backend and --target-model for one you allow"
+                if target_backend is None
+                else ""
+            )
             raise factory.ProviderError(
                 f"the model under test is served by {company}, which is not among "
                 f"the prompt providers you allow ({', '.join(allowed) or 'none'}). Pass "
-                f"--providers {company} for this run, or allow it with `iterate setup`"
+                f"--providers {company} for this run{named_one}, or allow it with "
+                "`iterate setup`"
             )
+        # The harness key is never handed on: the model under test runs where the
+        # harness does only on Ollama, which takes none.
         under_test = factory.prompt_provider(
-            asked,
-            base_url=address,
-            saved=entries,
-            settings=settings,
-            harness_key=api_key if own else None,
-            harness_key_from=f"{api_key_from} (the harness's key)",
+            asked, base_url=address, saved=entries, settings=settings
         )
         # By the name saved: a server saved at a company's address is still called
         # with the client its name says.
@@ -2334,6 +2343,17 @@ def _model_under_test(
         others = list(saved_as.values())
     except (factory.ProviderError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if (why := factory.not_callable(under_test, given_as=given_as, library=False)) is not None:
+        raise typer.BadParameter(why)
+    model_named = target_model or model or settings.iterate_model
+    if factory.wire_of(under_test.name) == "anthropic":
+        from iterate.llm.claude_models import refused
+
+        if (why := refused(model_named)) is not None:
+            raise typer.BadParameter(why)
+    # Installed only once every refusal that needs no library has passed.
+    if any(factory.wire_of(n) == "anthropic" for n in (asked, *saved_as)):
+        _ensure_anthropic(install)
     if (why := factory.not_callable(under_test, given_as=given_as)) is not None:
         raise typer.BadParameter(why)
     if waiting := [
@@ -2346,13 +2366,11 @@ def _model_under_test(
             f"with `iterate setup`, or pass --providers {asked} to allow only the model "
             "under test"
         )
-    model_named = target_model or model or settings.iterate_model
-    if factory.wire_of(under_test.name) == "anthropic":
-        from iterate.llm.claude_models import refused
-
-        if (why := refused(model_named)) is not None:
-            raise typer.BadParameter(why)
     if (why := factory.refused_key(under_test, model=model_named)) is not None:
+        raise typer.BadParameter(why)
+    if under_test.name == "ollama" and (
+        why := factory.ollama_refusal(under_test, model_named)
+    ) is not None:
         raise typer.BadParameter(why)
     settled = factory.UnderTest(
         provider=under_test,
@@ -2366,9 +2384,9 @@ def _model_under_test(
 
 
 def _saved_entries(asked: str, address: str | None) -> dict[str, Any]:
-    """With no list saved, a run is allowed the one provider its flags name, and reads
-    what was saved for that one: under the name given, and under the company's when the
-    address is a company's."""
+    """With no list saved, a run is allowed the one provider it calls, Ollama unless
+    --target-backend names another, and reads what was saved for that one: under the
+    name given, and under the company's when the address is a company's."""
     from iterate.llm import factory
 
     first = userconfig.load_prompt_settings([asked]).providers

@@ -614,6 +614,19 @@ def test_ensure_anthropic_installs_the_claude_extra_only_with_consent(
     assert timeout == deps.INSTALL_TIMEOUT
 
 
+def test_the_claude_fallback_is_pyprojects_own_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Imported from a source tree, the package's metadata cannot be read."""
+    import tomllib
+
+    def unreadable(name: str) -> list[str]:
+        raise deps.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(deps.importlib.metadata, "requires", unreadable)
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    extras = tomllib.loads(pyproject.read_text())["project"]["optional-dependencies"]
+    assert deps.claude_requirements() == tuple(extras["anthropic"])
+
+
 def test_the_claude_extra_is_read_off_the_package(monkeypatch: pytest.MonkeyPatch) -> None:
     lines = ['anthropic>=0.104.1,<2; extra == "anthropic"', 'torch>=2.9; extra == "vision"']
     monkeypatch.setattr(deps.importlib.metadata, "requires", lambda name: lines)

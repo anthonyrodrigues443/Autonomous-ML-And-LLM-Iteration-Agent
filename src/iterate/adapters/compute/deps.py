@@ -141,9 +141,13 @@ def own_requirements() -> tuple[str, ...]:
     return tuple(f"{req.name}{req.specifier}" for req in _requirements(""))
 
 
+# pyproject's own bound, for a source tree whose package metadata cannot be read.
+CLAUDE_REQUIREMENT = "anthropic>=0.104.1,<2"
+
+
 def claude_requirements() -> tuple[str, ...]:
     return tuple(f"{req.name}{req.specifier}" for req in _requirements("anthropic")) or (
-        "anthropic",
+        CLAUDE_REQUIREMENT,
     )
 
 

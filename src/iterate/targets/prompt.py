@@ -220,6 +220,10 @@ class PromptTarget:
         artifacts = dict(result.artifacts)
         if (submitted := run_result.outputs.get(codegen.PROMPT_JSON)) is not None:
             artifacts[codegen.PROMPT_JSON] = submitted.decode(errors="replace")
+        if unreported := codegen.unreported_no_reply(
+            submitted, run_result.outputs.get(codegen.PREDICTIONS_CSV)
+        ):
+            result = result.model_copy(update={"error": unreported, "metrics": None})
         return result.model_copy(update={"logs": stdout_tail, "artifacts": artifacts})
 
     # ─── session wiring ────────────────────────────────────────────────────
@@ -359,7 +363,8 @@ class PromptTarget:
             if answers[0][i] != NO_REPLY and answers[1][i] != NO_REPLY
         ]
         if not common:
-            return None
+            # Not comparable: never a reason to bank a pass.
+            return (float("nan"), float("nan"))
         return (
             self._score(answers[0], common)[self._metric],
             self._score(answers[1], common)[self._metric],

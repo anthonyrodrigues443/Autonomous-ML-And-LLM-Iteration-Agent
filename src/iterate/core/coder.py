@@ -449,13 +449,19 @@ class CodingAgent:
                     **result.artifacts,
                     codegen.PROMPT_JSON: submitted.decode(errors="replace"),
                 }
-                if swapped := codegen.submission_was_swapped(submitted, preds):
+                if swapped := codegen.submission_was_swapped(
+                    submitted, preds
+                ) or codegen.unreported_no_reply(submitted, preds):
                     # Predictions on disk are not the ones `submit()` produced, so
                     # they did not come from the model under test. Verifiable, so a
                     # hard rejection rather than a Critic flag.
                     log.warning("coder[%s]: %s", experiment_id, swapped)
                     result = result.model_copy(update={"error": swapped, "metrics": None})
                 result = result.model_copy(update={"artifacts": artifacts})
+            elif self._family == "prompt" and (
+                unreported := codegen.unreported_no_reply(None, preds)
+            ):
+                result = result.model_copy(update={"error": unreported, "metrics": None})
             # The image path's twin: the recipe a submit helper recorded, kept only when
             # it still describes the predictions on disk (a later cell, or the floor,
             # can have written over them).

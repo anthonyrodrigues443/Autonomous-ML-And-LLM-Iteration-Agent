@@ -97,6 +97,8 @@ def _improves(
     new, bar = result.metrics.primary_value, against.metrics.primary_value
     if paired is not None and (both := paired(result, against)) is not None:
         new, bar = both
+    if new != new or bar != bar:
+        return False
     return new < bar if direction == "minimize" else new > bar
 
 

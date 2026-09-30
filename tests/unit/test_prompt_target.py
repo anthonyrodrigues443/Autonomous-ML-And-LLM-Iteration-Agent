@@ -943,7 +943,9 @@ def test_a_session_whose_every_ask_went_unanswered_banks_no_floor(
     )
 
     assert out.result.metrics is None
-    assert str(out.result.error).startswith("not scored: the provider did not answer 1 of 1")
+    assert str(out.result.error) == (
+        "not scored: the provider did not answer 1 of 1 records, each asked twice"
+    )
     assert not any(cell.source == "fallback" for cell in out.cells)
 
 
@@ -1021,9 +1023,7 @@ def test_two_passes_are_compared_on_the_records_both_got_an_answer_for(
 def test_a_session_that_lost_one_record_is_scored_on_the_rest(
     dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    out = _session(
-        dataset, tmp_path, monkeypatch, misses=1000, failing=1, cells=("submit(BASE)",)
-    )
+    out = _session(dataset, tmp_path, monkeypatch, misses=1000, failing=1, cells=("submit(BASE)",))
 
     assert out.result.error is None
     assert out.result.metrics is not None
@@ -1067,3 +1067,21 @@ def test_the_final_rescore_counts_the_records_it_scored(
     )
     assert final is not None
     assert final["n"] == full.n_test - 1
+
+
+def test_a_cell_that_marks_its_own_unusable_answers_as_unanswered_is_not_scored(
+    dataset: TabularDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relabelled, an unusable answer would be left out of the score; the rows submit()
+    reports are the runtime's own count."""
+    relabel = (
+        "_real = _ask\n"
+        "def _ask(p, f, stats=None, strict=True):\n"
+        "    out = _real(p, f, stats=stats, strict=strict)\n"
+        "    return [NO_REPLY if i == 0 else a for i, a in enumerate(out)]\n"
+        "submit(BASE)"
+    )
+    out = _session(dataset, tmp_path, monkeypatch, misses=0, cells=(relabel,))
+
+    assert out.result.metrics is None
+    assert "submit() did not report" in str(out.result.error)

@@ -245,23 +245,34 @@ def prompt_session_preamble() -> str:
         # BASEL_PROMPT / BASELINES_PROMPT. The name is long and a 12B fumbles it; a
         # short alias costs one line and removes a recurring wasted turn.
         "BASE = BASELINE_PROMPT\n"
-        "def _ask_with_stats(prompt, rows):\n"
+        "def _ask_with_stats(prompt, rows, strict=True):\n"
         "    frame = rows.to_dict(orient='records') if hasattr(rows, 'to_dict') else list(rows)\n"
         "    stats = AskStats()\n"
         "    try:\n"
-        "        return _ask(prompt, frame, stats=stats), stats\n"
+        "        out = _ask(prompt, frame, stats=stats, strict=strict)\n"
         "    except NoReplyError as _missed:\n"
         f"        with open({NO_REPLY_TXT!r}, 'w') as _f:\n"
         "            _f.write(str(_missed))\n"
         "        raise\n"
+        # Read only if the session ends with no predictions: then the provider, not the
+        # prompt, is why, and no floor is banked in the prompt's place.
+        "    if stats.no_reply:\n"
+        f"        with open({NO_REPLY_TXT!r}, 'w') as _f:\n"
+        "            _f.write(f'the provider did not answer {stats.no_reply} of {len(frame)} "
+        "records, each asked twice')\n"
+        "    return out, stats\n"
+        # A sample is looked at, never scored, so a record missed there does not stop it.
         "def ask(prompt, rows):\n"
-        "    out, stats = _ask_with_stats(prompt, rows)\n"
+        "    out, stats = _ask_with_stats(prompt, rows, strict=False)\n"
         "    print('ask:', stats.summary())\n"
         "    return out\n"
         "def evaluate(answers, truth):\n"
         "    raw = truth.tolist() if hasattr(truth, 'tolist') else list(truth)\n"
         # A record the provider never answered is left out, as the host leaves it out.
         "    kept = [i for i, a in enumerate(answers) if str(a) != NO_REPLY]\n"
+        "    if len(kept) < len(raw):\n"
+        "        print('evaluate: left out', len(raw) - len(kept), "
+        "'records the provider never answered; compare prompts on the records both got')\n"
         "    answers, raw = [answers[i] for i in kept], [raw[i] for i in kept]\n"
         "    if _task_kind == 'regression':\n"
         # An unusable answer becomes the training median here too. Scoring it any
@@ -287,9 +298,13 @@ def prompt_session_preamble() -> str:
         "    _tokens = {'tokens_in_per_record': _stats.prompt_tokens / _n if _n else None,\n"
         "               'tokens_out_per_record': _stats.completion_tokens / _n if _n else None,\n"
         "               'records_measured': _n}\n"
+        "    _missed = list(_stats.no_reply_rows)\n"
         f"    with open({PROMPT_JSON!r}, 'w') as _f:\n"
-        "        json.dump({**prompt.as_dict(), 'answers_sha256': _digest, **_tokens}, _f)\n"
-        "    print('submitted', len(answers), 'answers for the holdout')\n"
+        "        json.dump({**prompt.as_dict(), 'answers_sha256': _digest, **_tokens, "
+        "'no_reply_rows': _missed}, _f)\n"
+        "    print('submitted', len(answers) - len(_missed), 'answers for the holdout', "
+        "(f'and {len(_missed)} records the provider never answered, left out of the score' "
+        "if _missed else ''))\n"
         "    return answers\n"
         "def finish(*args, **kwargs):\n"
         "    print('finish is a tool call, not a Python function. This cell still ran; "
@@ -316,7 +331,8 @@ _WORKED_EXAMPLE = [
     "  print(evaluate(answers, truth))          # scores with THIS run's metric",
     "",
     "  wrong = [(sample.iloc[i].to_dict(), t, a)",
-    "           for i, (t, a) in enumerate(zip(truth, answers)) if str(t) != str(a)]",
+    "           for i, (t, a) in enumerate(zip(truth, answers))",
+    "           if str(t) != str(a) and a != NO_REPLY]   # NO_REPLY: the provider, not the model",
     "  for row, t, a in wrong[:10]: print(t, '!=', a, '|', row)",
     "",
     "  better = Prompt(system=BASE.system + chr(10) + 'your one change',",
@@ -402,6 +418,28 @@ def submission_was_swapped(prompt_json: bytes | None, predictions: bytes | None)
     return (
         "predictions.csv does not match the answers submit() produced, so the "
         "submitted predictions did not come from the model under test"
+    )
+
+
+def unreported_no_reply(prompt_json: bytes | None, predictions: bytes | None) -> str | None:
+    """Why predictions.csv marks records as never answered that `submit()` did not
+    report, or None. A record marked so is left out of the score, which a cell could
+    use to drop the hard ones."""
+    from iterate.core.prompt_runtime import NO_REPLY
+
+    rows = (predictions or b"").decode(errors="replace").strip().splitlines()
+    marked = {i for i, row in enumerate(rows) if row.strip() == NO_REPLY}
+    if not marked:
+        return None
+    try:
+        reported = set(json.loads(prompt_json or b"{}").get("no_reply_rows") or [])
+    except (ValueError, TypeError, AttributeError):
+        reported = set()
+    if marked <= reported:
+        return None
+    return (
+        f"predictions.csv marks {len(marked - reported)} records as never answered that "
+        "submit() did not report, so they are not the provider's to leave out"
     )
 
 
@@ -976,14 +1014,22 @@ def score_predictions(
     artifacts: dict[str, str] = {}
     kept: list[int] | None = None
     if open_vocabulary:
-        from iterate.core.prompt_runtime import NO_REPLY
+        from iterate.core.prompt_runtime import NO_REPLY, UNPARSEABLE
 
         # A record the provider never answered is left out of the score, and kept in
         # order so another pass can be compared on the records both got an answer for.
-        artifacts[ANSWERS_JSON] = json.dumps([p.strip() for p in preds])
-        kept = [i for i, p in enumerate(preds) if p.strip() != NO_REPLY]
-        if not kept:
-            return _failed(experiment_id, "the provider answered none of the records")
+        answers = [p.strip() for p in preds]
+        artifacts[ANSWERS_JSON] = json.dumps(answers)
+        kept = [i for i, a in enumerate(answers) if a != NO_REPLY]
+        if (expected - len(kept)) * 5 > expected:
+            return _failed(
+                experiment_id,
+                f"the provider did not answer {expected - len(kept)} of {expected} records; "
+                "more than one in five is too many to score",
+            )
+        # As the host does: every record unusable is a broken pass, not a score of 0.
+        if all(answers[i] == UNPARSEABLE for i in kept):
+            return _failed(experiment_id, "every record came back unusable")
         if len(kept) < expected:
             preds, truth = [preds[i] for i in kept], truth.iloc[kept]
         else:
@@ -1008,10 +1054,13 @@ def score_predictions(
     # feed the reason back) rather than letting it crash the loop.
     try:
         task = task_for_metric(metric)
-        y_pred = _coerce(preds, target=truth, task=task)
+        if open_vocabulary:
+            y_true, y_pred = _as_the_host_scores(preds, truth, dataset, task=task)
+        else:
+            y_true, y_pred = truth.to_numpy(), _coerce(preds, target=truth, task=task)
         values = score(
             task,
-            truth.to_numpy(),
+            y_true,
             y_pred,
             y_proba=y_proba,
             average=average,
@@ -1045,6 +1094,24 @@ def score_predictions(
         n_samples=len(preds),
     )
     return ExperimentResult(experiment_id=experiment_id, metrics=metrics, artifacts=artifacts)
+
+
+def _as_the_host_scores(
+    preds: list[str], truth: Any, dataset: TabularDataset, *, task: str
+) -> tuple[Any, list[Any]]:
+    """A prompt's answers scored as the host scores them: an unusable one is a wrong
+    label, or the training median on a number. Cast to the column's type, one would
+    fail the whole pass on an integer label."""
+    import pandas as pd
+
+    from iterate.core.prompt_runtime import UNPARSEABLE
+
+    if task == "regression":
+        known = pd.to_numeric(dataset.train_target, errors="coerce").dropna()
+        floor = float(known.median()) if len(known) else 0.0
+        numbers = [floor if p.strip() == UNPARSEABLE else float(p) for p in preds]
+        return pd.to_numeric(truth, errors="coerce").to_numpy(), numbers
+    return truth.astype(str).to_numpy(), [p.strip() for p in preds]
 
 
 def _coerce(preds: list[str], *, target: object, task: str) -> list[int | float | str]:

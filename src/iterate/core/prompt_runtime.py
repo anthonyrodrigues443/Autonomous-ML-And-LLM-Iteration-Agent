@@ -51,9 +51,13 @@ _FREE_TEXT_MAX_TOKENS = 512
 # Long enough for a rate limit's minute or a short outage to pass.
 _SECOND_ASK_WAIT = 30.0
 
-# What a provider says when it turns down the model's own tool call: groq's 400, and
-# Ollama's 500 for a call it could not parse. The model answered.
+# What a provider says when it turns down the model's own tool call: Ollama's 500 for
+# a call it could not parse. The model answered.
 _TURNED_DOWN = ("tool_use_failed", "error parsing tool call")
+# A request the provider will not take as it was sent: too long for the context, a
+# tool call the model malformed (groq's 400). Left out, a prompt that provoked it would
+# drop its hard records from its own score.
+_REFUSED_AS_SENT = (400, 413, 422)
 
 
 class NoReplyError(RuntimeError):
@@ -70,6 +74,8 @@ class AskStats:
     cached: int = 0
     unparseable: int = 0
     no_reply: int = 0
+    # Where, in the pass, the provider never answered: what submit() reports.
+    no_reply_rows: list[int] = field(default_factory=list)
     prompt_tokens: int = 0
     completion_tokens: int = 0
     errors: list[str] = field(default_factory=list)
@@ -293,8 +299,14 @@ def _one(
 
 
 def _turned_down(exc: BaseException) -> bool:
-    """The provider replied, and what it refused was the model's own tool call."""
+    """The provider replied, and what it refused was the request as sent or the
+    model's own tool call: an answer the prompt earned, not a record left unanswered."""
     response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(response, "status_code", None)
+    if status in _REFUSED_AS_SENT:
+        return True
     try:
         body = str(getattr(response, "text", "") or "")
     except Exception:
@@ -327,8 +339,12 @@ def ask(
     max_workers: int = _DEFAULT_WORKERS,
     retries: int = _DEFAULT_RETRIES,
     stats: AskStats | None = None,
+    strict: bool = True,
 ) -> list[str]:
     """Run `prompt` over every record and return one answer per record, in order.
+
+    ``strict`` raises NoReplyError past one record in five never answered; a pass
+    that is not scored, a sample looked at in a session, returns NO_REPLY for them.
 
     A fresh client per worker thread: the backends are HTTP clients that were never
     promised to be thread-safe, and one shared connection quietly serialising the
@@ -355,8 +371,11 @@ def ask(
         key = _key(cache_scope, model if model is not None else client().model, prompt, rendered)
 
         if cache is not None and (hit := cache.get(key)) is not None:
+            # A twin of a record the provider missed can have been answered since.
             answers[index] = hit
-            counters.cached += 1
+            missed.pop(index, None)
+            if not again:
+                counters.cached += 1
             if hit == UNPARSEABLE:
                 counters.unparseable += 1
             return
@@ -430,8 +449,9 @@ def ask(
             list(pool.map(lambda index: handle(index, again=True), sorted(missed)))
     if missed:
         counters.no_reply += len(missed)
+        counters.no_reply_rows.extend(sorted(missed))
         counters.errors.extend(missed.values())
-        if len(missed) * 5 > len(rows):
+        if strict and len(missed) * 5 > len(rows):
             first = missed[min(missed)]
             raise NoReplyError(
                 f"the provider did not answer {len(missed)} of {len(rows)} records, each "
@@ -488,6 +508,7 @@ def make_ask(
         rows: Sequence[Mapping[str, Any]],
         *,
         stats: AskStats | None = None,
+        strict: bool = True,
     ) -> list[str]:
         return ask(
             prompt,
@@ -501,6 +522,7 @@ def make_ask(
             model=model,
             max_workers=max_workers,
             stats=stats,
+            strict=strict,
         )
 
     return bound

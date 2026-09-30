@@ -514,6 +514,34 @@ def test_the_claude_library_is_asked_for_only_where_its_client_is_built(
     assert type(client).__name__ == "OpenAICompatibleClient"
 
 
+def test_ollama_is_asked_for_its_models_before_anything_is_written() -> None:
+    """Free and local: a server that is down, one that is not Ollama, or a model not
+    pulled is found before the run, not on every record of its baseline."""
+    found = factory.Provider(name="ollama", base_url="http://localhost:11434")
+
+    def has(*names: str) -> Any:
+        return lambda host, timeout: list(names)
+
+    def down(host: str, timeout: float) -> list[str]:
+        raise ConnectionError("refused")
+
+    assert factory.ollama_refusal(found, "gemma4:12b", lister=has("gemma4:12b")) is None
+    assert factory.ollama_refusal(found, "qwen3", lister=has("qwen3:latest")) is None
+    assert "has no model gpt-4o-mini: `ollama pull gpt-4o-mini`" in str(
+        factory.ollama_refusal(found, "gpt-4o-mini", lister=has("gemma4:12b"))
+    )
+    assert "no Ollama server answers at http://localhost:11434 (ConnectionError)" in str(
+        factory.ollama_refusal(found, "gemma4:12b", lister=down)
+    )
+
+
+def test_an_ollama_address_ending_in_v1_is_another_servers() -> None:
+    found = factory.Provider(name="ollama", base_url="http://gpu-box:8000/v1")
+    assert "ends in /v1, the OpenAI-compatible door of a server" in str(
+        factory.not_callable(found, given_as="--target-base-url x")
+    )
+
+
 def test_claude_is_a_provider_for_the_model_under_test_and_not_a_harness() -> None:
     assert "anthropic" in factory.known_providers()
     assert "anthropic" not in factory.harness_backends()

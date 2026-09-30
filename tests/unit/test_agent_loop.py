@@ -1362,6 +1362,8 @@ def test_a_pass_that_lost_records_is_compared_on_the_records_both_have() -> None
     assert _improves(scored(0.7), None, baseline, "maximize", lambda a, b: (0.9, 0.8))
     assert not _improves(scored(0.9), None, baseline, "maximize", lambda a, b: (0.7, 0.8))
     assert _improves(scored(0.9), None, baseline, "maximize", lambda a, b: None)
+    nan = float("nan")
+    assert not _improves(scored(0.9), None, baseline, "maximize", lambda a, b: (nan, nan))
 
 
 def test_the_loop_weighs_a_pass_by_the_targets_paired_score() -> None:

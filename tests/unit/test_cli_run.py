@@ -1695,6 +1695,76 @@ def test_the_help_names_every_provider_iterate_knows() -> None:
         assert name in text
 
 
+def test_a_model_ollama_does_not_have_is_refused_before_anything_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A harness on a cloud with --target-model and no --target-backend asks Ollama:
+    one that is not running, or has not pulled the model, stops the run up front."""
+    monkeypatch.setattr("iterate.llm.factory._ollama_models", lambda host, timeout: ["g:1b"])
+    harness = ["--backend", "openai", "--api-key", "k", "--model", "gpt-4o"]
+    result, _ = _prompt_run(tmp_path, monkeypatch, [*harness, "--target-model", "gpt-4o-mini"])
+    assert "Ollama at http://localhost:11434 has no model gpt-4o-mini" in _refused(result, tmp_path)
+
+    def down(host: str, timeout: float) -> list[str]:
+        raise ConnectionError("refused")
+
+    monkeypatch.setattr("iterate.llm.factory._ollama_models", down)
+    result, _ = _prompt_run(tmp_path, monkeypatch, [*harness, "--target-model", "g:1b"])
+    assert "no Ollama server answers at http://localhost:11434" in _refused(result, tmp_path)
+
+
+def test_claude_allowed_beside_the_model_under_test_is_installed_with_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from iterate.adapters.compute import deps
+    from iterate.userconfig import SavedProvider
+
+    real = pytest.importorskip("anthropic")
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    consents: list[bool] = []
+
+    def installs(*, consent: bool, **kwargs: Any) -> str:
+        consents.append(consent)
+        if consent:
+            sys.modules["anthropic"] = real
+            return ""
+        return "the anthropic package is not installed: pip install 'iterate-ai[anthropic]' (or pass --install)"
+
+    monkeypatch.setattr(deps, "ensure_anthropic", installs)
+    saved = {
+        "allowed": ["ollama", "anthropic"],
+        "providers": {"anthropic": SavedProvider("anthropic", api_key="sk-ant-saved")},
+    }
+    result, _ = _prompt_run(tmp_path, monkeypatch, ["--model", "g"], saved=saved)
+    assert "(or pass --install)" in _refused(result, tmp_path)
+    result, built = _prompt_run(tmp_path, monkeypatch, ["--model", "g", "--install"], saved=saved)
+    assert consents == [False, True]
+    assert result.exit_code == 0, result.output
+    assert built["backend"] == "ollama"
+
+
+def test_an_install_this_python_still_cannot_import_is_not_called_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from iterate.adapters.compute import deps
+
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    monkeypatch.setattr(deps, "ensure_anthropic", lambda **kwargs: "")
+    result, _ = _prompt_run(
+        tmp_path,
+        monkeypatch,
+        ["--target-backend", "anthropic", "--target-model", "claude-haiku-4-5", "--install"],
+        env={"ANTHROPIC_API_KEY": "sk-ant-env"},
+    )
+    text = _refused(result, tmp_path)
+    assert "pip reported the install done, but this Python cannot import anthropic" in text
+    assert "Anthropic's library is in" not in text
+
+
 def test_the_harness_key_never_goes_to_the_model_under_test(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

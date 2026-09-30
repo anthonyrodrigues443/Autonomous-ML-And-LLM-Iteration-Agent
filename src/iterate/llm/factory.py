@@ -393,6 +393,12 @@ def _bad_address(provider: Provider, given_as: str, wire: str | None = None) -> 
         )
     if (wire or wire_of(provider.name)) == "anthropic" and parsed.path.rstrip("/").endswith("/v1"):
         return f"{what} ends in /v1, which Anthropic's library adds itself. Drop the /v1"
+    if (wire or wire_of(provider.name)) == "ollama" and parsed.path.rstrip("/").endswith("/v1"):
+        return (
+            f"{what} ends in /v1, the OpenAI-compatible door of a server, and Ollama is "
+            "called at its own address. Drop the /v1, or pass --target-backend "
+            "openai-compatible for a server that speaks OpenAI's API"
+        )
     if provider.api_key and parsed.scheme == "http" and alias_for_base_url(url) is not None:
         return (
             f"{provider.name} takes its key over https only: {shown(url)} would send it "
@@ -402,13 +408,20 @@ def _bad_address(provider: Provider, given_as: str, wire: str | None = None) -> 
 
 
 def not_callable(
-    provider: Provider, *, in_a_cell: bool = False, given_as: str = "", wire: str | None = None
+    provider: Provider,
+    *,
+    in_a_cell: bool = False,
+    given_as: str = "",
+    wire: str | None = None,
+    library: bool = True,
 ) -> str | None:
     """Why the model under test cannot be called, or None when it can. ``in_a_cell``
     words the remedy for a kernel or a notebook run by hand, which reads the
     environment alone. ``given_as`` is the flag its address came from, if one did.
-    ``wire`` is the client it is called with, when that is not its provider's own."""
-    if (missing := _sdk_missing(wire or wire_of(provider.name))) is not None:
+    ``wire`` is the client it is called with, when that is not its provider's own.
+    ``library`` False leaves out whether the client's library is installed, so every
+    other reason is known before one is installed."""
+    if library and (missing := _sdk_missing(wire or wire_of(provider.name))) is not None:
         return missing
     if is_self_hosted(provider.name) and not provider.base_url:
         return (
@@ -482,6 +495,47 @@ def refused_key(
     return f"{provider.name} does not serve {model} to this key." + (
         f" It serves: {listing}" if listing else " Check the name in its model list"
     )
+
+
+def ollama_refusal(
+    provider: Provider,
+    model: str,
+    *,
+    timeout: float = 5.0,
+    lister: Callable[[str, float], list[str]] | None = None,
+) -> str | None:
+    """Why Ollama at the model under test's address cannot answer for ``model``, or
+    None. Its model list is free and local: a server that does not answer, one that is
+    not Ollama, or a model not pulled is found before anything is written, where the
+    run would find it on every record of the baseline."""
+    host = provider.base_url or ""
+    try:
+        names = (lister or _ollama_models)(host, timeout)
+    except Exception as exc:
+        return (
+            f"no Ollama server answers at {shown(host)} ({type(exc).__name__}): start it "
+            "with `ollama serve`, or pass --target-backend and --target-model for the "
+            "provider your prompt is for"
+        )
+    if model in names or f"{model}:latest" in names:
+        return None
+    return (
+        f"Ollama at {shown(host)} has no model {model}: `ollama pull {model}`, or pass "
+        "--target-backend and --target-model for the provider your prompt is for"
+    )
+
+
+def _ollama_models(host: str, timeout: float) -> list[str]:
+    import httpx
+
+    response = httpx.get(f"{host.rstrip('/')}/api/tags", timeout=timeout)
+    response.raise_for_status()
+    return [
+        str(name)
+        for entry in response.json().get("models", [])
+        for name in (entry.get("name"), entry.get("model"))
+        if name
+    ]
 
 
 def _list_models(provider: Provider, timeout: float, model: str | None) -> list[str]:
@@ -587,6 +641,7 @@ __all__ = [
     "not_a_harness",
     "not_callable",
     "not_ready",
+    "ollama_refusal",
     "own_key_env",
     "own_key_for",
     "prompt_provider",

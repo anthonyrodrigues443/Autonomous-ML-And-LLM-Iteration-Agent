@@ -710,3 +710,89 @@ def test_a_contained_label_does_not_swallow_a_genuine_ambiguity() -> None:
     assert coerce("could be toxic or not toxic", ["toxic", "not toxic"]) == UNPARSEABLE
     assert coerce("not toxic", ["toxic", "not toxic"]) == "not toxic"
     assert coerce("I think this is toxic", ["toxic", "not toxic"]) == "toxic"
+
+
+def test_a_record_whose_twin_was_answered_is_answered_on_the_second_ask() -> None:
+    """Two records that render the same share a cache key: the second ask finds the
+    twin's answer, and the record is no longer missed."""
+    client = ByRow(
+        {
+            "thanks!": [RuntimeError("429")] * 3 + [_tool_reply("not toxic")],
+            "you are awful": [_tool_reply("toxic")],
+        }
+    )
+    rows = [{"text": "thanks!"}, {"text": "thanks!"}, {"text": "you are awful"}]
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT,
+        rows,
+        client_factory=lambda: client,
+        columns=["text"],
+        labels=LABELS,
+        cache=AnswerCache(None),
+        max_workers=1,
+        stats=stats,
+    )
+
+    assert answers == ["not toxic", "not toxic", "toxic"]
+    assert (stats.no_reply, stats.no_reply_rows, stats.cached) == (0, [], 0)
+
+
+def test_a_request_the_provider_will_not_take_is_the_prompts_answer() -> None:
+    """A 400 for a prompt too long for the context is the prompt's doing: left out, a
+    prompt that provoked it would drop its hard records from its own score."""
+
+    class TooLongError(Exception):
+        status_code = 400
+
+    client = ByRow(
+        {
+            "you are awful": [TooLongError("context_length_exceeded")] * 3,
+            "have a nice day": [_tool_reply("not toxic")],
+        }
+    )
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT, ROWS, client_factory=lambda: client, columns=["text"], labels=LABELS, stats=stats
+    )
+
+    assert answers == [UNPARSEABLE, "not toxic"]
+    assert (stats.no_reply, stats.unparseable) == (0, 1)
+
+
+@pytest.mark.parametrize(("missed", "scored"), [(1, True), (2, False)])
+def test_one_record_in_five_is_left_out_and_more_fails_the_pass(missed: int, scored: bool) -> None:
+    rows = [{"text": f"comment {i}"} for i in range(5)]
+    script: dict[str, list[Any]] = {r["text"]: [_tool_reply("toxic")] for r in rows}
+    for i in range(missed):
+        script[f"comment {i}"] = [RuntimeError("503")] * 6
+    client = ByRow(script)
+
+    def run() -> list[str]:
+        return ask(PROMPT, rows, client_factory=lambda: client, columns=["text"], labels=LABELS)
+
+    if scored:
+        assert run().count(NO_REPLY) == 1
+    else:
+        with pytest.raises(NoReplyError):
+            run()
+
+
+def test_a_sample_that_is_not_scored_never_stops_on_a_missed_record() -> None:
+    client = ByRow({t: [RuntimeError("503")] * 6 for t in ("you are awful", "have a nice day")})
+    stats = AskStats()
+
+    answers = ask(
+        PROMPT,
+        ROWS,
+        client_factory=lambda: client,
+        columns=["text"],
+        labels=LABELS,
+        stats=stats,
+        strict=False,
+    )
+
+    assert answers == [NO_REPLY, NO_REPLY]
+    assert stats.no_reply_rows == [0, 1]
